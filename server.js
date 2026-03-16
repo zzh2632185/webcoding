@@ -16,7 +16,8 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const PORT = parseInt(process.env.PORT) || 8002;
+const PORT = parseInt(process.env.PORT) || 8001;
+const HOST = process.env.HOST || '0.0.0.0';
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
@@ -32,6 +33,7 @@ const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
+const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -286,6 +288,21 @@ function loadModelConfig() {
 
 function saveModelConfig(config) {
   fs.writeFileSync(MODEL_CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// === Projects Config ===
+function loadProjectsConfig() {
+  try {
+    if (fs.existsSync(PROJECTS_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(PROJECTS_CONFIG_PATH, 'utf8'));
+      return { projects: Array.isArray(raw.projects) ? raw.projects : [] };
+    }
+  } catch {}
+  return { projects: [] };
+}
+
+function saveProjectsConfig(config) {
+  fs.writeFileSync(PROJECTS_CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 function loadCodexConfig() {
@@ -645,6 +662,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
+  if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
   }
@@ -765,6 +783,9 @@ function sendSessionList(ws) {
     for (const f of files) {
       try {
         const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        const localMeta = getSessionAgent(s) === 'claude' && s.claudeSessionId && (!s.cwd || !s.importedFrom)
+          ? resolveClaudeSessionLocalMeta(s.claudeSessionId)
+          : null;
         sessions.push({
           id: s.id,
           title: s.title || 'Untitled',
@@ -772,6 +793,9 @@ function sendSessionList(ws) {
           hasUnread: !!s.hasUnread,
           agent: getSessionAgent(s),
           isRunning: activeProcesses.has(s.id),
+          projectId: s.projectId || null,
+          cwd: s.cwd || localMeta?.cwd || null,
+          importedFrom: s.importedFrom || localMeta?.projectDir || null,
         });
       } catch {}
     }
@@ -932,6 +956,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
 
+  // 先做最后一次读取，再根据完整输出判断失败原因与后续动作。
+  if (entry.tailer) {
+    entry.tailer.readNew();
+    entry.tailer.stop();
+  }
+
   const completeTime = new Date().toISOString();
   const wsConnected = !!entry.ws;
   const disconnectGap = entry.wsDisconnectTime
@@ -977,12 +1007,6 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
   });
-
-  // Final read
-  if (entry.tailer) {
-    entry.tailer.readNew();
-    entry.tailer.stop();
-  }
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   if (pendingSlash) pendingSlashCommands.delete(sessionId);
@@ -1405,6 +1429,21 @@ wss.on('connection', (ws) => {
       case 'list_cwd_suggestions':
         handleListCwdSuggestions(ws);
         break;
+      case 'browse_directory':
+        handleBrowseDirectory(ws, msg);
+        break;
+      case 'get_projects':
+        wsSend(ws, { type: 'projects_config', projects: loadProjectsConfig().projects });
+        break;
+      case 'save_project':
+        handleSaveProject(ws, msg);
+        break;
+      case 'delete_project':
+        handleDeleteProject(ws, msg);
+        break;
+      case 'rename_project':
+        handleRenameProject(ws, msg);
+        break;
       default:
         wsSend(ws, { type: 'error', message: `Unknown type: ${msg.type}` });
     }
@@ -1802,7 +1841,15 @@ function handleNewSession(ws, msg) {
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
-  const resolvedCwd = cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
+  const projectId = msg?.projectId || null;
+  let resolvedCwd = cwd;
+  if (!resolvedCwd && projectId) {
+    const proj = loadProjectsConfig().projects.find(p => p.id === projectId);
+    if (proj) resolvedCwd = proj.path;
+  }
+  if (!resolvedCwd) {
+    resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+  }
   const id = crypto.randomUUID();
   const session = {
     id,
@@ -1818,6 +1865,7 @@ function handleNewSession(ws, msg) {
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
     messages: [],
     cwd: resolvedCwd,
+    projectId,
   };
   saveSession(session);
   wsSessionMap.set(ws, id);
@@ -1830,6 +1878,7 @@ function handleNewSession(ws, msg) {
     model: sessionModelLabel(session),
     agent,
     cwd: session.cwd,
+    projectId: session.projectId,
     totalCost: 0,
     totalUsage: session.totalUsage,
     updated: session.updated,
@@ -1880,6 +1929,7 @@ function handleLoadSession(ws, sessionId) {
     agent: getSessionAgent(session),
     hasUnread: hadUnread,
     cwd: effectiveCwd,
+    projectId: session.projectId || null,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
     historyTotal: session.messages.length,
@@ -2769,6 +2819,123 @@ function handleListCwdSuggestions(ws) {
   wsSend(ws, { type: 'cwd_suggestions', paths: Array.from(paths).sort() });
 }
 
+// === Project Handlers ===
+function handleSaveProject(ws, msg) {
+  const config = loadProjectsConfig();
+  const projectPath = msg.path ? String(msg.path).trim() : null;
+  const projectName = msg.name ? String(msg.name).trim() : null;
+  if (!projectPath) {
+    return wsSend(ws, { type: 'error', message: '项目路径不能为空' });
+  }
+  try {
+    const stat = fs.statSync(projectPath);
+    if (!stat.isDirectory()) {
+      return wsSend(ws, { type: 'error', message: '指定路径不是目录' });
+    }
+  } catch {
+    return wsSend(ws, { type: 'error', message: '路径不存在或无法访问' });
+  }
+  const id = msg.id || crypto.randomUUID();
+  const existing = config.projects.find(p => p.id === id);
+  if (existing) {
+    if (projectName) existing.name = projectName;
+    existing.path = projectPath;
+  } else {
+    const name = projectName || path.basename(projectPath) || projectPath;
+    config.projects.push({ id, name, path: projectPath });
+  }
+  saveProjectsConfig(config);
+  wsSend(ws, { type: 'projects_config', projects: config.projects });
+}
+
+function handleDeleteProject(ws, msg) {
+  const config = loadProjectsConfig();
+  config.projects = config.projects.filter(p => p.id !== msg.projectId);
+  saveProjectsConfig(config);
+  wsSend(ws, { type: 'projects_config', projects: config.projects });
+}
+
+function handleRenameProject(ws, msg) {
+  const config = loadProjectsConfig();
+  const project = config.projects.find(p => p.id === msg.projectId);
+  if (project && msg.name) {
+    project.name = String(msg.name).trim();
+    saveProjectsConfig(config);
+  }
+  wsSend(ws, { type: 'projects_config', projects: config.projects });
+}
+
+function handleBrowseDirectory(ws, msg) {
+  const home = process.env.HOME || process.env.USERPROFILE || '/';
+  let targetPath;
+  try {
+    targetPath = msg.path ? path.resolve(String(msg.path)) : home;
+    targetPath = fs.realpathSync(targetPath);
+  } catch (e) {
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: msg.path || home,
+      parent: msg.path ? path.dirname(path.resolve(String(msg.path))) : null,
+      dirs: [],
+      error: '路径不存在或无法访问',
+    });
+  }
+
+  try {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isDirectory()) {
+      return wsSend(ws, {
+        type: 'directory_listing',
+        path: targetPath,
+        parent: path.dirname(targetPath),
+        dirs: [],
+        error: '指定路径不是目录',
+      });
+    }
+  } catch (e) {
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: targetPath,
+      parent: null,
+      dirs: [],
+      error: '无法读取路径信息',
+    });
+  }
+
+  const showHidden = !!msg.showHidden;
+  let entries;
+  try {
+    entries = fs.readdirSync(targetPath, { withFileTypes: true });
+  } catch (e) {
+    const parentPath = path.dirname(targetPath);
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: targetPath,
+      parent: parentPath !== targetPath ? parentPath : null,
+      dirs: [],
+      error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : `读取失败: ${e.message}`,
+    });
+  }
+
+  const dirs = entries
+    .filter(e => {
+      if (!e.isDirectory()) return false;
+      if (!showHidden && e.name.startsWith('.')) return false;
+      return true;
+    })
+    .map(e => e.name)
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
+  const parentPath = path.dirname(targetPath);
+  wsSend(ws, {
+    type: 'directory_listing',
+    path: targetPath,
+    parent: parentPath !== targetPath ? parentPath : null,
+    dirs,
+    error: null,
+  });
+}
+
 // === Startup ===
 recoverProcesses();
 
@@ -2792,6 +2959,6 @@ setInterval(() => {
 
 plog('INFO', 'server_start', { port: PORT });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`CC-Web server listening on 127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`CC-Web server listening on ${HOST}:${PORT}`);
 });

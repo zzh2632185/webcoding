@@ -1,6 +1,7 @@
 // === CC-Web Frontend ===
 (function () {
   'use strict';
+  window.addEventListener('error', (e) => { console.error('[CC-INIT-ERROR]', e.message, e.filename, e.lineno); });
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
@@ -30,6 +31,11 @@
   const SESSION_CACHE_MAX_WEIGHT = 1_500_000;
   const SIDEBAR_SWIPE_TRIGGER = 72;
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
+  const SIDEBAR_WIDTH_STORAGE_KEY = 'cc-web-sidebar-width';
+  const SIDEBAR_DEFAULT_WIDTH = 320;
+  const SIDEBAR_MIN_WIDTH = 280;
+  const SIDEBAR_MAX_WIDTH = 560;
+  const DESKTOP_INSIGHTS_BREAKPOINT = 1280;
 
   const MODEL_OPTIONS = [
     { value: 'opus', label: 'Opus', desc: '最强大，适合复杂任务' },
@@ -52,26 +58,6 @@
     { value: 'default', label: '默认', desc: '标准权限审批' },
   ];
 
-  const THEME_OPTIONS = [
-    {
-      value: 'washi',
-      label: 'Washi Warm',
-      desc: '暖纸色与朱砂点缀，保留当前熟悉的 CC-Web 气质。',
-      swatches: ['#faf6f0', '#f2ebe2', '#c0553a', '#5d8a54'],
-    },
-    {
-      value: 'coolvibe',
-      label: 'CoolVibe Light',
-      desc: '保留 CoolVibe 的青色科技感，但改成更干净的浅色工作台。',
-      swatches: ['#f7fbfc', '#eef7f9', '#0891b2', '#ffffff'],
-    },
-    {
-      value: 'editorial',
-      label: 'Editorial Sand',
-      desc: '更明亮的留白和更克制的棕色强调，像编辑台一样安静。',
-      swatches: ['#f6f1e8', '#efe8dc', '#8b5e3c', '#2f4b45'],
-    },
-  ];
 
   // --- State ---
   let ws = null;
@@ -91,7 +77,6 @@
   let currentMode = 'yolo';
   let currentModel = 'opus';
   let currentAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
-  let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
@@ -103,6 +88,11 @@
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  let projects = [];
+  let collapsedProjects = new Set((() => { try { return JSON.parse(localStorage.getItem('cc-web-collapsed-projects') || '[]'); } catch { return []; } })());
+  let pendingProjectFocusId = null;
+  let pendingProjectFocusMessage = '';
+  let sidebarResizeState = null;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -115,9 +105,11 @@
   const sessionLoadingOverlay = $('#session-loading-overlay');
   const sessionLoadingLabel = $('#session-loading-label');
   const sidebar = $('#sidebar');
+  const sidebarResizer = $('#sidebar-resizer');
   const sidebarOverlay = $('#sidebar-overlay');
   const menuBtn = $('#menu-btn');
   const chatMain = document.querySelector('.chat-main');
+  const workspaceInsightsContent = $('#workspace-insights-content');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
@@ -125,11 +117,9 @@
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
   const chatTitle = $('#chat-title');
-  const chatAgentBtn = $('#chat-agent-btn');
-  const chatAgentMenu = $('#chat-agent-menu');
   const chatRuntimeState = $('#chat-runtime-state');
-  const chatCwd = $('#chat-cwd');
-  const costDisplay = $('#cost-display');
+  const chatCwd = $('#topbar-chat-cwd');
+  const costDisplay = $('#topbar-cost-display');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
@@ -145,116 +135,266 @@
   function setVH() {
     document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
   }
+
+  function getSidebarWidthLimit() {
+    const reserveWidth = window.matchMedia(`(min-width: ${DESKTOP_INSIGHTS_BREAKPOINT}px)`).matches ? 860 : 440;
+    const viewportMax = Math.max(SIDEBAR_MIN_WIDTH, window.innerWidth - reserveWidth);
+    return Math.min(SIDEBAR_MAX_WIDTH, viewportMax);
+  }
+
+  function clampSidebarWidth(width) {
+    const numericWidth = Number(width);
+    if (!Number.isFinite(numericWidth)) return SIDEBAR_DEFAULT_WIDTH;
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(getSidebarWidthLimit(), Math.round(numericWidth)));
+  }
+
+  function applySidebarWidth(width, options = {}) {
+    const nextWidth = clampSidebarWidth(width);
+    document.documentElement.style.setProperty('--sidebar-width', `${nextWidth}px`);
+    if (!options.skipPersist) {
+      localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
+    }
+    return nextWidth;
+  }
+
+  function canResizeSidebar() {
+    return !!sidebarResizer && window.matchMedia('(min-width: 769px) and (pointer: fine)').matches;
+  }
+
+  function syncSidebarWidthForViewport() {
+    if (!canResizeSidebar()) {
+      document.body.classList.remove('sidebar-resizing');
+      sidebarResizeState = null;
+      return;
+    }
+    const savedWidth = parseInt(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY) || `${SIDEBAR_DEFAULT_WIDTH}`, 10);
+    applySidebarWidth(savedWidth, { skipPersist: true });
+  }
+
   setVH();
   window.addEventListener('resize', setVH);
   window.addEventListener('orientationchange', () => setTimeout(setVH, 100));
+  syncSidebarWidthForViewport();
+  window.addEventListener('resize', syncSidebarWidthForViewport);
 
-  function buildWelcomeMarkup(agent) {
-    const label = AGENT_LABELS[agent] || AGENT_LABELS.claude;
-    return `<div class="welcome-msg"><div class="welcome-icon">✿</div><h3>欢迎使用 CC-Web</h3><p>开始与 ${label} 对话</p></div>`;
-  }
-
-  function normalizeAgent(agent) {
-    return AGENT_LABELS[agent] ? agent : DEFAULT_AGENT;
-  }
-
-  function normalizeTheme(theme) {
-    return THEME_OPTIONS.some((item) => item.value === theme) ? theme : 'washi';
-  }
-
-  function getThemeOption(theme) {
-    return THEME_OPTIONS.find((item) => item.value === normalizeTheme(theme)) || THEME_OPTIONS[0];
-  }
-
-  function refreshThemeSummaries() {
-    const label = getThemeOption(currentTheme).label;
-    document.querySelectorAll('[data-theme-summary]').forEach((node) => {
-      node.textContent = label;
-    });
-  }
-
-  function applyTheme(theme) {
-    currentTheme = normalizeTheme(theme);
-    document.documentElement.dataset.theme = currentTheme;
-    localStorage.setItem('cc-web-theme', currentTheme);
-    refreshThemeSummaries();
-  }
-
-  function buildThemePickerHtml(options = {}) {
-    const { showSectionTitle = true } = options;
+  function buildWorkspaceActionButtons(actions, options = {}) {
+    const className = options.compact ? 'workspace-action-row' : 'workspace-action-grid';
     return `
-      ${showSectionTitle ? '<div class="settings-section-title">界面主题</div>' : ''}
-      <div class="theme-grid">
-        ${THEME_OPTIONS.map((theme) => `
-          <button class="theme-card${theme.value === currentTheme ? ' active' : ''}" type="button" data-theme-value="${theme.value}">
-            <div class="theme-card-preview">
-              ${theme.swatches.map((color) => `<span class="theme-card-swatch" style="background:${color}"></span>`).join('')}
-            </div>
-            <div class="theme-card-title">${escapeHtml(theme.label)}</div>
-            <div class="theme-card-desc">${escapeHtml(theme.desc)}</div>
-          </button>
+      <div class="${className}">
+        ${actions.map((action) => `
+          <button
+            class="workspace-action-btn${action.primary ? ' primary' : ''}"
+            type="button"
+            data-workspace-action="${escapeHtml(action.action)}"
+            ${action.projectId ? `data-project-id="${escapeHtml(action.projectId)}"` : ''}
+          >${escapeHtml(action.label)}</button>
         `).join('')}
       </div>
     `;
   }
 
-  function mountThemePicker(panel) {
-    panel.querySelectorAll('[data-theme-value]').forEach((button) => {
-      button.addEventListener('click', () => {
-        applyTheme(button.dataset.themeValue);
-        panel.querySelectorAll('[data-theme-value]').forEach((item) => {
-          item.classList.toggle('active', item.dataset.themeValue === currentTheme);
-        });
-      });
-    });
+  function getCurrentProjectContext() {
+    const currentMeta = currentSessionId ? getSessionMeta(currentSessionId) : null;
+    if (!currentMeta) return null;
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    return findBestProjectForSession(currentMeta, projectsById) || buildVirtualProjectFromSession(currentMeta);
   }
 
-  function buildThemeEntryHtml() {
+  function sessionBelongsToProject(session, project, projectsById) {
+    if (!session || !project) return false;
+    if (project.isVirtualCwd) {
+      const sessionPath = session.cwd || decodeClaudeProjectDir(session.importedFrom);
+      return !!sessionPath && isSameOrChildPath(project.path, sessionPath);
+    }
+    const matchedProject = findBestProjectForSession(session, projectsById);
+    return matchedProject ? matchedProject.id === project.id : false;
+  }
+
+  function getCurrentProjectSessionCount(project) {
+    if (!project) return 0;
+    const visibleSessions = getVisibleSessions();
+    const projectsById = new Map(projects.map((entry) => [entry.id, entry]));
+    return visibleSessions.filter((session) => sessionBelongsToProject(session, project, projectsById)).length;
+  }
+
+  function getCurrentMessageCount() {
+    const cachedSnapshot = currentSessionId ? buildCachedSessionSnapshot(currentSessionId) : null;
+    if (cachedSnapshot?.messages?.length) return cachedSnapshot.messages.length;
+    return messagesDiv ? messagesDiv.querySelectorAll('.msg').length : 0;
+  }
+
+  function buildWorkspaceInsightsMarkup() {
+    const visibleSessions = getVisibleSessions();
+    const currentMeta = currentSessionId ? getSessionMeta(currentSessionId) : null;
+    const activeProject = getCurrentProjectContext();
+    const runningCount = visibleSessions.filter((session) => session.isRunning).length;
+    const currentMessageCount = getCurrentMessageCount();
+    const usageText = costDisplay?.textContent || (currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
+    const modeLabel = MODE_LABELS[currentMode] || currentMode;
+    const modelLabel = currentModel || (currentAgent === 'codex' ? '会话内决定' : 'Opus');
+    const runtimeLabel = currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
+    const projectSessionCount = getCurrentProjectSessionCount(activeProject);
+    const actionButtons = buildWorkspaceActionButtons([
+      { action: 'new-session', label: '新建会话', primary: true },
+      { action: 'import-session', label: '导入历史' },
+      { action: 'switch-model', label: '切换模型' },
+      { action: 'switch-mode', label: '切换模式' },
+      ...(activeProject && !activeProject.isVirtualCwd ? [{ action: 'focus-project', label: '定位项目', projectId: activeProject.id }] : []),
+      { action: 'open-settings', label: '打开设置' },
+    ]);
+
     return `
-      <div class="settings-section-title">外观</div>
-      <button class="settings-nav-card" type="button" data-open-theme-page>
-        <span class="settings-nav-card-main">
-          <span class="settings-nav-card-title">界面主题</span>
-          <span class="settings-nav-card-meta">当前：<span data-theme-summary>${escapeHtml(getThemeOption(currentTheme).label)}</span></span>
-        </span>
-        <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
-      </button>
+      <div class="insights-shell">
+        <section class="insights-hero">
+          <div class="insights-kicker">Workspace Summary</div>
+          <h2>${currentMeta ? '当前任务已经进入持续工作态' : '先选项目，再进入持续工作态'}</h2>
+          <p>${currentMeta ? '右侧把会话、项目和关键操作集中在一个地方，避免在宽屏里反复来回找。' : '左边负责组织项目，中间负责推进对话，右边负责保留状态与操作入口。'}</p>
+          <div class="insights-hero-stats">
+            <div class="insights-hero-stat">
+              <span>当前代理</span>
+              <strong>${escapeHtml(AGENT_LABELS[currentAgent] || currentAgent)}</strong>
+            </div>
+            <div class="insights-hero-stat">
+              <span>会话总数</span>
+              <strong>${visibleSessions.length}</strong>
+            </div>
+            <div class="insights-hero-stat">
+              <span>运行中</span>
+              <strong>${runningCount}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="insights-card">
+          <div class="insights-card-header">
+            <div>
+              <div class="insights-card-kicker">当前会话</div>
+              <h3>${escapeHtml(currentMeta?.title || '还没有打开会话')}</h3>
+            </div>
+            <span class="insights-status-pill${currentSessionRunning ? ' running' : ''}">${runtimeLabel}</span>
+          </div>
+          <div class="insights-detail-list">
+            <div class="insights-detail-item"><span>模型</span><strong>${escapeHtml(modelLabel)}</strong></div>
+            <div class="insights-detail-item"><span>模式</span><strong>${escapeHtml(modeLabel)}</strong></div>
+            <div class="insights-detail-item"><span>消息数</span><strong>${currentMessageCount > 0 ? `${currentMessageCount} 条` : '暂无'}</strong></div>
+            <div class="insights-detail-item"><span>最近更新</span><strong>${escapeHtml(currentMeta?.updated ? timeAgo(currentMeta.updated) : '尚未开始')}</strong></div>
+          </div>
+          <div class="insights-note">${escapeHtml(usageText)}</div>
+        </section>
+
+        <section class="insights-card">
+          <div class="insights-card-header">
+            <div>
+              <div class="insights-card-kicker">项目上下文</div>
+              <h3>${escapeHtml(activeProject?.name || '未关联项目')}</h3>
+            </div>
+            <span class="insights-status-pill muted">${activeProject ? (activeProject.isVirtualCwd ? '临时目录' : '已保存') : '建议创建'}</span>
+          </div>
+          <div class="insights-path-block">${escapeHtml(activeProject?.path || currentCwd || '当前还没有可复用的项目路径')}</div>
+          <div class="insights-detail-list">
+            <div class="insights-detail-item"><span>项目会话</span><strong>${activeProject ? `${projectSessionCount} 个` : '暂无'}</strong></div>
+            <div class="insights-detail-item"><span>项目总数</span><strong>${projects.length}</strong></div>
+            <div class="insights-detail-item"><span>工作目录</span><strong>${escapeHtml(currentCwd ? '已设置' : '未设置')}</strong></div>
+          </div>
+        </section>
+
+        <section class="insights-card">
+          <div class="insights-card-header">
+            <div>
+              <div class="insights-card-kicker">快捷操作</div>
+              <h3>常用入口</h3>
+            </div>
+          </div>
+          ${actionButtons}
+        </section>
+
+        <section class="insights-card">
+          <div class="insights-card-header">
+            <div>
+              <div class="insights-card-kicker">输入建议</div>
+              <h3>更适合长期任务的提问方式</h3>
+            </div>
+          </div>
+          <ul class="insights-list">
+            <li>先说目标，再给限制条件和你要的最终产物。</li>
+            <li>同一项目里持续补充下一步，比频繁新开会话更省上下文。</li>
+            <li>涉及界面、报错或设计时，优先附图，定位会更快。</li>
+          </ul>
+        </section>
+      </div>
     `;
   }
 
-  function openThemeSubpage() {
-    const overlay = document.createElement('div');
-    overlay.className = 'settings-overlay settings-subpage-overlay';
-    overlay.style.zIndex = '10001';
+  function renderWorkspaceInsights() {
+    if (!workspaceInsightsContent) return;
+    workspaceInsightsContent.innerHTML = buildWorkspaceInsightsMarkup();
+  }
 
-    const panel = document.createElement('div');
-    panel.className = 'settings-panel settings-subpage-panel';
-    panel.innerHTML = `
-      <div class="settings-header settings-subpage-header">
-        <button class="settings-back" type="button" aria-label="返回">‹</button>
-        <div class="settings-subpage-copy">
-          <div class="settings-subpage-kicker">Appearance</div>
-          <h3>界面主题</h3>
+  function buildWelcomeMarkup(agent) {
+    const label = AGENT_LABELS[agent] || AGENT_LABELS.claude;
+    const sessionCount = typeof getVisibleSessions === 'function' ? getVisibleSessions().length : 0;
+    const projectCount = Array.isArray(projects) ? projects.length : 0;
+    return `
+      <div class="welcome-msg">
+        <section class="welcome-panel welcome-panel-main">
+          <div class="welcome-panel-kicker">工作台总览</div>
+          <div class="welcome-icon">✦</div>
+          <h3>${label} 工作区</h3>
+          <p>这里更适合持续推进一个项目任务，而不是一次性聊天。左边整理项目与会话，中间专注对话，右边固定显示当前上下文和关键操作。</p>
+          <div class="welcome-stats">
+            <div class="welcome-stat">
+              <span class="welcome-stat-label">会话数</span>
+              <strong>${sessionCount}</strong>
+              <small>当前 ${label}</small>
+            </div>
+            <div class="welcome-stat">
+              <span class="welcome-stat-label">项目数</span>
+              <strong>${projectCount}</strong>
+              <small>已加入工作区</small>
+            </div>
+            <div class="welcome-stat">
+              <span class="welcome-stat-label">模式</span>
+              <strong>${MODE_LABELS[currentMode] || currentMode}</strong>
+              <small>当前权限配置</small>
+            </div>
+          </div>
+          ${buildWorkspaceActionButtons([
+            { action: 'new-session', label: '新建会话', primary: true },
+            { action: 'import-session', label: '导入历史' },
+            { action: 'switch-model', label: '切换模型' },
+          ], { compact: true })}
+        </section>
+        <div class="welcome-panels">
+          <section class="welcome-panel">
+            <div class="welcome-panel-kicker">开始方式</div>
+            <ul class="welcome-list">
+              <li>先在左侧找到项目，或点击“新建/打开项目”。</li>
+              <li>再描述目标、限制条件和你希望的输出结果。</li>
+              <li>需要继续执行时，直接在底部输入区补充下一步即可。</li>
+            </ul>
+          </section>
+          <section class="welcome-panel">
+            <div class="welcome-panel-kicker">常用指令</div>
+            <ul class="welcome-list">
+              <li><code>/model</code> 查看或切换模型</li>
+              <li><code>/mode</code> 切换权限模式</li>
+              <li><code>/compact</code> 压缩上下文</li>
+            </ul>
+          </section>
+          <section class="welcome-panel">
+            <div class="welcome-panel-kicker">多模态协作</div>
+            <ul class="welcome-list">
+              <li>支持随消息附带图片，适合 UI、截图和报错定位。</li>
+              <li>运行中状态、工作目录和会话信息会持续显示在顶部。</li>
+            </ul>
+          </section>
         </div>
-        <button class="settings-close" type="button" title="关闭">&times;</button>
       </div>
-      ${buildThemePickerHtml({ showSectionTitle: false })}
     `;
+  }
 
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
-    mountThemePicker(panel);
-    refreshThemeSummaries();
-
-    const closeSubpage = () => {
-      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-    };
-
-    panel.querySelector('.settings-back').addEventListener('click', closeSubpage);
-    panel.querySelector('.settings-close').addEventListener('click', closeSubpage);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) closeSubpage();
-    });
+  function normalizeAgent(agent) {
+    return AGENT_LABELS[agent] ? agent : DEFAULT_AGENT;
   }
 
   function getAgentSessionStorageKey(agent) {
@@ -315,6 +455,7 @@
       agent: normalizeAgent(payload.agent),
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
+      projectId: payload.projectId || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
       totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
       updated: payload.updated || null,
@@ -695,20 +836,18 @@
       chatRuntimeState.textContent = running ? '运行中' : '';
     }
     updateCwdBadge();
+    renderWorkspaceInsights();
   }
 
   function updateAgentScopedUI() {
-    if (chatAgentBtn) {
-      chatAgentBtn.textContent = AGENT_LABELS[currentAgent];
-      chatAgentBtn.setAttribute('aria-expanded', chatAgentMenu && !chatAgentMenu.hidden ? 'true' : 'false');
-    }
-    if (chatAgentMenu) {
-      chatAgentMenu.querySelectorAll('.chat-agent-option').forEach((btn) => {
-        const active = btn.dataset.agent === currentAgent;
-        btn.classList.toggle('active', active);
-        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
-      });
-    }
+    // Sync agent tabs
+    document.querySelectorAll('.agent-tab').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.agent === currentAgent);
+    });
+    // Sync mode tabs
+    document.querySelectorAll('.mode-tab').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.mode === currentMode);
+    });
     if (importSessionBtn) {
       importSessionBtn.textContent = currentAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
     }
@@ -720,19 +859,7 @@
     currentMode = localStorage.getItem(getAgentModeStorageKey(currentAgent)) || 'yolo';
     modeSelect.value = currentMode;
     updateAgentScopedUI();
-  }
-
-  function closeAgentMenu() {
-    if (!chatAgentMenu) return;
-    chatAgentMenu.hidden = true;
-    if (chatAgentBtn) chatAgentBtn.setAttribute('aria-expanded', 'false');
-  }
-
-  function toggleAgentMenu() {
-    if (!chatAgentMenu || !chatAgentBtn) return;
-    const willOpen = chatAgentMenu.hidden;
-    chatAgentMenu.hidden = !willOpen;
-    chatAgentBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    renderWorkspaceInsights();
   }
 
   function resetChatView(agent) {
@@ -756,6 +883,7 @@
     setStatsDisplay(null);
     renderPendingAttachments();
     highlightActiveSession();
+    renderWorkspaceInsights();
   }
 
   function applySessionSnapshot(snapshot, options = {}) {
@@ -792,6 +920,7 @@
     if (snapshot.hasUnread && !options.suppressUnreadToast) {
       showToast('后台任务已完成', snapshot.sessionId);
     }
+    renderWorkspaceInsights();
   }
 
   function syncViewForAgent(agent, options = {}) {
@@ -1065,6 +1194,7 @@
           loginOverlay.hidden = true;
           app.hidden = false;
           send({ type: 'get_codex_config' });
+          send({ type: 'get_projects' });
           // Check if must change password
           if (msg.mustChangePassword) {
             showForceChangePassword();
@@ -1168,6 +1298,7 @@
         if (currentSessionId) {
           updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
         }
+        renderWorkspaceInsights();
         break;
 
       case 'usage':
@@ -1178,6 +1309,7 @@
             updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
           }
         }
+        renderWorkspaceInsights();
         break;
 
       case 'done':
@@ -1196,6 +1328,7 @@
           if (currentSessionId) {
             updateCachedSession(currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
           }
+          renderWorkspaceInsights();
         }
         break;
 
@@ -1205,6 +1338,7 @@
           if (currentSessionId) {
             updateCachedSession(currentSessionId, (snapshot) => { snapshot.model = msg.model; });
           }
+          renderWorkspaceInsights();
         }
         break;
 
@@ -1300,8 +1434,18 @@
         if (typeof _onCwdSuggestions === 'function') _onCwdSuggestions(msg.paths || []);
         break;
 
+      case 'directory_listing':
+        if (typeof _onDirectoryListing === 'function') _onDirectoryListing(msg);
+        break;
+
       case 'update_info':
         if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg);
+        break;
+
+      case 'projects_config':
+        projects = msg.projects || [];
+        renderSessionList();
+        flushPendingProjectFocus();
         break;
     }
   }
@@ -2088,65 +2232,461 @@
   updateScrollbar();
 
 
+  function getLatestSessionTimestamp(groupSessions) {
+    return (Array.isArray(groupSessions) ? groupSessions : []).reduce((latest, session) => {
+      const next = new Date(session?.updated || 0).getTime();
+      return Number.isFinite(next) && next > latest ? next : latest;
+    }, 0);
+  }
+
+  function normalizeComparablePath(pathValue) {
+    if (!pathValue) return '';
+    const normalized = String(pathValue).trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    return normalized || '/';
+  }
+
+  function getPathLeaf(pathValue) {
+    const normalized = normalizeComparablePath(pathValue);
+    if (!normalized || normalized === '/') return pathValue || '/';
+    const parts = normalized.split('/');
+    return parts[parts.length - 1] || normalized;
+  }
+
+  function decodeClaudeProjectDir(projectDir) {
+    const raw = String(projectDir || '').trim();
+    if (!raw) return null;
+    if (raw.startsWith('-') && !raw.includes('/') && !raw.includes('\\')) {
+      const parts = raw.split('-').filter(Boolean);
+      if (parts.length > 0) return `/${parts.join('/')}`;
+    }
+    return raw;
+  }
+
+  function isSameOrChildPath(parentPath, childPath) {
+    const parent = normalizeComparablePath(parentPath);
+    const child = normalizeComparablePath(childPath);
+    if (!parent || !child) return false;
+    if (parent === child) return true;
+    if (parent === '/') return child.startsWith('/');
+    return child.startsWith(`${parent}/`);
+  }
+
+  function findBestProjectForSession(session, projectsById) {
+    const comparablePath = session.cwd || decodeClaudeProjectDir(session.importedFrom);
+    if (session.projectId && projectsById.has(session.projectId)) {
+      return projectsById.get(session.projectId);
+    }
+    if (!comparablePath) return null;
+    let matchedProject = null;
+    let matchedPathLength = -1;
+    for (const project of projects) {
+      if (!project?.path || !isSameOrChildPath(project.path, comparablePath)) continue;
+      const projectPathLength = normalizeComparablePath(project.path).length;
+      if (projectPathLength > matchedPathLength) {
+        matchedProject = project;
+        matchedPathLength = projectPathLength;
+      }
+    }
+    return matchedProject;
+  }
+
+  function buildVirtualProjectFromCwd(cwd) {
+    const normalizedCwd = normalizeComparablePath(cwd);
+    return {
+      id: `__cwd__:${normalizedCwd || cwd}`,
+      name: getPathLeaf(normalizedCwd || cwd) || '当前目录',
+      path: cwd,
+      isVirtualCwd: true,
+    };
+  }
+
+  function buildVirtualProjectFromSession(session) {
+    const derivedPath = session.cwd || decodeClaudeProjectDir(session.importedFrom);
+    if (!derivedPath) return null;
+    return buildVirtualProjectFromCwd(derivedPath);
+  }
+
+  function getProjectParentPath(project) {
+    if (project.id === '__ungrouped__') return '';
+    const p = project.path;
+    if (!p) return '';
+    const idx = p.lastIndexOf('/');
+    if (idx <= 0) return p;
+    return p.substring(0, idx);
+  }
+
+  function findProjectGroupElement(projectId) {
+    return [...sessionList.querySelectorAll('.project-group')].find((node) => node.dataset.projectId === projectId) || null;
+  }
+
+  function focusProjectGroup(projectId, options = {}) {
+    if (!projectId) return false;
+
+    if (collapsedProjects.has(projectId)) {
+      collapsedProjects.delete(projectId);
+      saveCollapsedProjects();
+      renderSessionList();
+    }
+
+    const target = findProjectGroupElement(projectId);
+    if (!target) return false;
+
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ block: 'nearest', behavior: options.instant ? 'auto' : 'smooth' });
+      target.classList.remove('project-group-focused');
+      void target.offsetWidth;
+      target.classList.add('project-group-focused');
+      window.setTimeout(() => target.classList.remove('project-group-focused'), 1400);
+    });
+
+    if (options.toast) showToast(options.toast);
+    return true;
+  }
+
+  function queueProjectFocus(projectId, toast) {
+    pendingProjectFocusId = projectId || null;
+    pendingProjectFocusMessage = toast || '';
+  }
+
+  function flushPendingProjectFocus() {
+    if (!pendingProjectFocusId) return;
+    const projectId = pendingProjectFocusId;
+    const toast = pendingProjectFocusMessage;
+    pendingProjectFocusId = null;
+    pendingProjectFocusMessage = '';
+    focusProjectGroup(projectId, { toast });
+  }
+
+  function buildSessionItem(s) {
+    const item = document.createElement('div');
+    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${s.isRunning ? ' is-running' : ''}`;
+    item.dataset.id = s.id;
+
+    const title = document.createElement('span');
+    title.className = 'session-item-title';
+    title.textContent = s.title || 'Untitled';
+    title.title = s.title || 'Untitled';
+
+    const right = document.createElement('div');
+    right.className = 'session-item-right';
+
+    if (s.hasUnread) {
+      const unread = document.createElement('span');
+      unread.className = 'session-unread-dot';
+      right.appendChild(unread);
+    }
+
+    if (s.isRunning) {
+      const status = document.createElement('span');
+      status.className = 'session-item-status';
+      status.textContent = '运行中';
+      right.appendChild(status);
+    }
+
+    const agentBadge = document.createElement('span');
+    agentBadge.className = 'session-item-agent';
+    const agentLabel = AGENT_LABELS[normalizeAgent(s.agent)] || 'Agent';
+    agentBadge.textContent = agentLabel;
+    right.appendChild(agentBadge);
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'session-item-btn edit';
+    editBtn.title = '重命名';
+    editBtn.type = 'button';
+    editBtn.textContent = '\u270E';
+    right.appendChild(editBtn);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'session-item-btn delete';
+    deleteBtn.title = '删除';
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = '\u00D7';
+    right.appendChild(deleteBtn);
+
+    item.appendChild(title);
+    item.appendChild(right);
+
+    item.addEventListener('click', (e) => {
+      const actionBtn = e.target instanceof Element ? e.target.closest('button') : null;
+      if (actionBtn?.classList.contains('delete')) {
+        e.stopPropagation();
+        const doDelete = () => {
+          if (getLastSessionForAgent(currentAgent) === s.id) {
+            localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
+          }
+          invalidateSessionCache(s.id);
+          send({ type: 'delete_session', sessionId: s.id });
+          if (s.id === currentSessionId) {
+            resetChatView(currentAgent);
+          }
+        };
+        if (skipDeleteConfirm) {
+          doDelete();
+        } else {
+          showDeleteConfirm(s.agent, doDelete);
+        }
+        return;
+      }
+      if (actionBtn?.classList.contains('edit')) {
+        e.stopPropagation();
+        startEditSessionTitle(item, s);
+        return;
+      }
+      openSession(s.id);
+    });
+    return item;
+  }
+
+  function saveCollapsedProjects() {
+    localStorage.setItem('cc-web-collapsed-projects', JSON.stringify([...collapsedProjects]));
+  }
+
+  function renderProjectGroup(project, groupSessions, container) {
+    const isSpecialGroup = project.id === '__ungrouped__';
+    const isVirtualCwd = Boolean(project.isVirtualCwd);
+    const containsCurrentSession = groupSessions.some((session) => session.id === currentSessionId);
+    const isCollapsed = containsCurrentSession ? false : collapsedProjects.has(project.id);
+
+    const group = document.createElement('section');
+    group.className = 'project-group'
+      + (containsCurrentSession ? ' active-project' : '')
+      + (groupSessions.length === 0 ? ' empty-project' : '')
+      + (isSpecialGroup ? ' special-project' : '');
+    group.dataset.projectId = project.id;
+
+    const header = document.createElement('div');
+    header.className = 'project-group-header' + (isCollapsed ? ' collapsed' : '');
+    header.dataset.projectId = project.id;
+    header.setAttribute('aria-expanded', String(!isCollapsed));
+
+    const main = document.createElement('div');
+    main.className = 'project-group-main';
+
+    const chevron = document.createElement('span');
+    chevron.className = 'project-group-chevron';
+    chevron.textContent = '\u25B8';
+
+    const copy = document.createElement('div');
+    copy.className = 'project-group-copy';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'project-group-name';
+    nameSpan.textContent = project.name;
+    nameSpan.title = project.name;
+
+    const pathLine = document.createElement('div');
+    pathLine.className = 'project-group-path';
+    // Show parent directory only
+    const parentPath = getProjectParentPath(project);
+    pathLine.textContent = parentPath;
+    if (project.path) pathLine.title = project.path;
+
+    copy.appendChild(nameSpan);
+    if (parentPath) copy.appendChild(pathLine);
+
+    main.appendChild(chevron);
+    main.appendChild(copy);
+
+    const actions = document.createElement('div');
+    actions.className = 'project-group-actions';
+    if (!isSpecialGroup) {
+      const createBtn = document.createElement('button');
+      createBtn.className = 'project-group-create-btn';
+      createBtn.title = '在此项目下新建会话';
+      createBtn.type = 'button';
+      createBtn.textContent = '+';
+      createBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        send(isVirtualCwd
+          ? { type: 'new_session', cwd: project.path, agent: currentAgent, mode: currentMode }
+          : { type: 'new_session', projectId: project.id, agent: currentAgent, mode: currentMode });
+      });
+      actions.appendChild(createBtn);
+      if (!isVirtualCwd) {
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'project-group-btn';
+        renameBtn.title = '重命名';
+        renameBtn.type = 'button';
+        renameBtn.textContent = '\u270E';
+        renameBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          startEditProjectName(header, project);
+        });
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'project-group-btn';
+        deleteBtn.title = '移除项目';
+        deleteBtn.type = 'button';
+        deleteBtn.textContent = '\u2715';
+        deleteBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (confirm(`确定移除项目「${project.name}」？\n（不会删除会话，会话将变为未分组）`)) {
+            send({ type: 'delete_project', projectId: project.id });
+          }
+        });
+        actions.appendChild(renameBtn);
+        actions.appendChild(deleteBtn);
+      }
+    }
+
+    header.appendChild(main);
+    if (actions.childElementCount) header.appendChild(actions);
+
+    header.addEventListener('click', () => {
+      if (isCollapsed) {
+        collapsedProjects.delete(project.id);
+      } else {
+        collapsedProjects.add(project.id);
+      }
+      saveCollapsedProjects();
+      renderSessionList();
+    });
+    group.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'project-group-body' + (isCollapsed ? ' collapsed' : '');
+    if (!isCollapsed) {
+      const sortedSessions = [...groupSessions].sort((a, b) => {
+        if (a.id === currentSessionId) return -1;
+        if (b.id === currentSessionId) return 1;
+        return getLatestSessionTimestamp([b]) - getLatestSessionTimestamp([a]);
+      });
+      for (const s of sortedSessions) {
+        body.appendChild(buildSessionItem(s));
+      }
+      if (sortedSessions.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'project-group-empty';
+        empty.textContent = project.id === '__ungrouped__'
+          ? '还没有未分组对话。'
+          : '这个项目下还没有对话。';
+        body.appendChild(empty);
+      }
+    }
+    group.appendChild(body);
+    container.appendChild(group);
+  }
+
+  function startEditProjectName(headerEl, project) {
+    const nameEl = headerEl.querySelector('.project-group-name');
+    const currentName = project.name || '';
+    const input = document.createElement('input');
+    input.className = 'session-item-edit-input';
+    input.value = currentName;
+    input.maxLength = 50;
+    input.style.fontSize = '12px';
+    input.style.fontWeight = '700';
+
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    const actionsEl = headerEl.querySelector('.project-group-actions');
+    if (actionsEl) actionsEl.style.display = 'none';
+
+    function save() {
+      const newName = input.value.trim();
+      if (newName && newName !== currentName) {
+        send({ type: 'rename_project', projectId: project.id, name: newName });
+      }
+      renderSessionList();
+    }
+    input.addEventListener('blur', save);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+      if (e.key === 'Escape') { input.value = currentName; input.blur(); }
+    });
+  }
+
   function renderSessionList() {
     sessionList.innerHTML = '';
     const visibleSessions = getVisibleSessions();
-    if (visibleSessions.length === 0) {
+    const hasProjects = projects.length > 0;
+
+    if (visibleSessions.length === 0 && !hasProjects) {
       const empty = document.createElement('div');
       empty.className = 'session-list-empty';
-      empty.textContent = `暂无 ${AGENT_LABELS[currentAgent]} 会话，点击“新会话”开始。`;
+      empty.textContent = `暂无 ${AGENT_LABELS[currentAgent]} 会话，点击“新建/打开项目”开始。`;
       sessionList.appendChild(empty);
+      renderWorkspaceInsights();
       return;
     }
 
-    for (const s of visibleSessions) {
-      const item = document.createElement('div');
-      item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
-      item.dataset.id = s.id;
-      item.innerHTML = `
-        <div class="session-item-main">
-          <span class="session-item-title">${escapeHtml(s.title || 'Untitled')}</span>
-          ${s.isRunning ? '<span class="session-item-status">运行中</span>' : ''}
-        </div>
-        ${s.hasUnread ? '<span class="session-unread-dot"></span>' : ''}
-        <span class="session-item-time">${timeAgo(s.updated)}</span>
-        <div class="session-item-actions">
-          <button class="session-item-btn edit" title="重命名">✎</button>
-          <button class="session-item-btn delete" title="删除">×</button>
-        </div>
-      `;
-
-      item.addEventListener('click', (e) => {
-        const target = e.target;
-        if (target.classList.contains('delete')) {
-          e.stopPropagation();
-          const doDelete = () => {
-            if (getLastSessionForAgent(currentAgent) === s.id) {
-              localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
-            }
-            invalidateSessionCache(s.id);
-            send({ type: 'delete_session', sessionId: s.id });
-            if (s.id === currentSessionId) {
-              resetChatView(currentAgent);
-            }
-          };
-          if (skipDeleteConfirm) {
-            doDelete();
-          } else {
-            showDeleteConfirm(s.agent, doDelete);
-          }
-          return;
-        }
-        if (target.classList.contains('edit')) {
-          e.stopPropagation();
-          startEditSessionTitle(item, s);
-          return;
-        }
-        openSession(s.id);
-      });
-
-      sessionList.appendChild(item);
+    if (visibleSessions.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'session-list-empty';
+      empty.textContent = `当前没有 ${AGENT_LABELS[currentAgent]} 会话，你可以从下面任意项目继续新建。`;
+      sessionList.appendChild(empty);
     }
+
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    const grouped = new Map();
+    const virtualProjectsById = new Map();
+    const ungrouped = [];
+    for (const s of visibleSessions) {
+      const matchedProject = findBestProjectForSession(s, projectsById);
+      if (matchedProject) {
+        if (!grouped.has(matchedProject.id)) grouped.set(matchedProject.id, []);
+        grouped.get(matchedProject.id).push(s);
+        continue;
+      }
+      const virtualProject = buildVirtualProjectFromSession(s);
+      if (virtualProject) {
+        if (!virtualProjectsById.has(virtualProject.id)) {
+          virtualProjectsById.set(virtualProject.id, virtualProject);
+        }
+        if (!grouped.has(virtualProject.id)) grouped.set(virtualProject.id, []);
+        grouped.get(virtualProject.id).push(s);
+        continue;
+      }
+      ungrouped.push(s);
+    }
+
+    const groupEntries = projects.map((project) => ({
+      project,
+      groupSessions: grouped.get(project.id) || [],
+      containsCurrentSession: (grouped.get(project.id) || []).some((session) => session.id === currentSessionId),
+      isVirtual: false,
+    }));
+
+    for (const project of virtualProjectsById.values()) {
+      const groupSessions = grouped.get(project.id) || [];
+      groupEntries.push({
+        project,
+        groupSessions,
+        containsCurrentSession: groupSessions.some((session) => session.id === currentSessionId),
+        isVirtual: true,
+      });
+    }
+
+    if (ungrouped.length > 0) {
+      groupEntries.push({
+        project: { id: '__ungrouped__', name: '未分组' },
+        groupSessions: ungrouped,
+        containsCurrentSession: ungrouped.some((session) => session.id === currentSessionId),
+        isVirtual: true,
+      });
+    }
+
+    const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+    groupEntries.sort((a, b) => {
+      if (a.containsCurrentSession !== b.containsCurrentSession) {
+        return a.containsCurrentSession ? -1 : 1;
+      }
+      const aHasSessions = a.groupSessions.length > 0;
+      const bHasSessions = b.groupSessions.length > 0;
+      if (aHasSessions !== bHasSessions) {
+        return aHasSessions ? -1 : 1;
+      }
+      const latestDiff = getLatestSessionTimestamp(b.groupSessions) - getLatestSessionTimestamp(a.groupSessions);
+      if (latestDiff !== 0) return latestDiff;
+      if (a.isVirtual !== b.isVirtual) return a.isVirtual ? 1 : -1;
+      return collator.compare(a.project.name || '', b.project.name || '');
+    });
+
+    for (const entry of groupEntries) {
+      renderProjectGroup(entry.project, entry.groupSessions, sessionList);
+    }
+    renderWorkspaceInsights();
   }
 
   function startEditSessionTitle(itemEl, session) {
@@ -2161,24 +2701,20 @@
     input.focus();
     input.select();
 
-    // Hide actions during edit
-    const actions = itemEl.querySelector('.session-item-actions');
-    const time = itemEl.querySelector('.session-item-time');
-    if (actions) actions.style.display = 'none';
-    if (time) time.style.display = 'none';
+    // Hide right-side controls during edit
+    const rightEl = itemEl.querySelector('.session-item-right');
+    if (rightEl) rightEl.style.display = 'none';
 
     function save() {
       const newTitle = input.value.trim() || currentTitle;
       if (newTitle !== currentTitle) {
         send({ type: 'rename_session', sessionId: session.id, title: newTitle });
       }
-      // Restore
       const span = document.createElement('span');
       span.className = 'session-item-title';
       span.textContent = newTitle;
       input.replaceWith(span);
-      if (actions) actions.style.display = '';
-      if (time) time.style.display = '';
+      if (rightEl) rightEl.style.display = '';
     }
 
     input.addEventListener('blur', save);
@@ -2264,6 +2800,7 @@
     if (!window.matchMedia('(max-width: 768px), (pointer: coarse)').matches) return false;
     if (!sidebar.classList.contains('open')) return false;
     if (!target) return false;
+    if (target.closest('#session-list')) return false;
     return sidebar.contains(target) || target === sidebarOverlay;
   }
 
@@ -2325,6 +2862,40 @@
     } else if (shouldClose) {
       closeSidebar();
     }
+  }
+
+  function handleSidebarResizeStart(e) {
+    if (!canResizeSidebar()) return;
+    if (typeof e.button === 'number' && e.button !== 0) return;
+    sidebarResizeState = {
+      startX: e.clientX,
+      startWidth: sidebar.getBoundingClientRect().width,
+    };
+    document.body.classList.add('sidebar-resizing');
+    if (typeof sidebarResizer?.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      sidebarResizer.setPointerCapture(e.pointerId);
+    }
+    e.preventDefault();
+  }
+
+  function handleSidebarResizeMove(e) {
+    if (!sidebarResizeState) return;
+    const deltaX = e.clientX - sidebarResizeState.startX;
+    applySidebarWidth(sidebarResizeState.startWidth + deltaX, { skipPersist: true });
+  }
+
+  function handleSidebarResizeEnd(e) {
+    if (!sidebarResizeState) return;
+    const releasedPointerId = e?.pointerId;
+    if (typeof sidebarResizer?.releasePointerCapture === 'function' && releasedPointerId !== undefined) {
+      try { sidebarResizer.releasePointerCapture(releasedPointerId); } catch {}
+    }
+    const currentWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width'), 10)
+      || sidebar.getBoundingClientRect().width
+      || SIDEBAR_DEFAULT_WIDTH;
+    applySidebarWidth(currentWidth);
+    sidebarResizeState = null;
+    document.body.classList.remove('sidebar-resizing');
   }
 
   // --- Slash Command Menu ---
@@ -2484,6 +3055,7 @@
       if (currentSessionId) {
         send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
       }
+      renderWorkspaceInsights();
     });
   }
 
@@ -2568,26 +3140,69 @@
   });
 
   sidebarOverlay.addEventListener('click', closeSidebar);
+  if (sidebarResizer) {
+    sidebarResizer.addEventListener('pointerdown', handleSidebarResizeStart);
+    sidebarResizer.addEventListener('dblclick', () => applySidebarWidth(SIDEBAR_DEFAULT_WIDTH));
+    window.addEventListener('pointermove', handleSidebarResizeMove);
+    window.addEventListener('pointerup', handleSidebarResizeEnd);
+    window.addEventListener('pointercancel', handleSidebarResizeEnd);
+  }
   document.addEventListener('touchstart', handleSidebarSwipeStart, { passive: true });
   document.addEventListener('touchmove', handleSidebarSwipeMove, { passive: false });
   document.addEventListener('touchend', handleSidebarSwipeEnd, { passive: true });
   document.addEventListener('touchcancel', () => { sidebarSwipe = null; }, { passive: true });
 
-  if (chatAgentBtn && chatAgentMenu) {
-    chatAgentBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleAgentMenu();
+  // Agent tabs
+  document.querySelectorAll('.agent-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const targetAgent = normalizeAgent(btn.dataset.agent);
+      if (targetAgent === currentAgent) return;
+      syncViewForAgent(targetAgent, { preserveCurrent: false, loadLast: true });
     });
-    chatAgentMenu.querySelectorAll('.chat-agent-option').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        closeAgentMenu();
-        const targetAgent = normalizeAgent(btn.dataset.agent);
-        if (targetAgent === currentAgent) return;
-        syncViewForAgent(targetAgent, { preserveCurrent: false, loadLast: true });
-      });
-    });
-  }
+  });
+
+  document.addEventListener('click', (e) => {
+    const actionBtn = e.target instanceof Element ? e.target.closest('[data-workspace-action]') : null;
+    if (!actionBtn) return;
+    e.preventDefault();
+    const action = actionBtn.dataset.workspaceAction;
+    if (action === 'new-session') {
+      showNewSessionModal();
+      return;
+    }
+    if (action === 'import-session') {
+      if (currentAgent === 'codex') {
+        showImportCodexSessionModal();
+      } else {
+        showImportSessionModal();
+      }
+      return;
+    }
+    if (action === 'switch-model') {
+      showModelPicker();
+      return;
+    }
+    if (action === 'switch-mode') {
+      showModePicker();
+      return;
+    }
+    if (action === 'open-settings') {
+      showSettingsPanel();
+      return;
+    }
+    if (action === 'focus-project' && actionBtn.dataset.projectId) {
+      focusProjectGroup(actionBtn.dataset.projectId, { toast: '已定位到当前项目。' });
+    }
+  });
+
+  // Close dropdown on outside click
+  document.addEventListener('click', (e) => {
+    if (!newChatDropdown.hidden &&
+        !newChatDropdown.contains(e.target) &&
+        e.target !== newChatArrow) {
+      newChatDropdown.hidden = true;
+    }
+  });
 
   // Split new-chat button
   newChatBtn.addEventListener('click', () => showNewSessionModal());
@@ -2601,18 +3216,6 @@
       showImportCodexSessionModal();
     } else {
       showImportSessionModal();
-    }
-  });
-  document.addEventListener('click', (e) => {
-    if (!newChatDropdown.hidden &&
-        !newChatDropdown.contains(e.target) &&
-        e.target !== newChatArrow) {
-      newChatDropdown.hidden = true;
-    }
-    if (chatAgentMenu && !chatAgentMenu.hidden &&
-        !chatAgentMenu.contains(e.target) &&
-        e.target !== chatAgentBtn) {
-      closeAgentMenu();
     }
   });
   sendBtn.addEventListener('click', sendMessage);
@@ -2639,14 +3242,32 @@
     });
   }
 
-  // Mode selector
+  // Mode selector (hidden select kept for legacy sync)
   modeSelect.value = currentMode;
+  // Sync mode-tabs initial state
+  document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === currentMode));
+  // Mode tabs click
+  document.querySelectorAll('.mode-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.mode;
+      currentMode = mode;
+      modeSelect.value = mode;
+      localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+      document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+      if (currentSessionId) {
+        send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+      }
+      renderWorkspaceInsights();
+    });
+  });
   modeSelect.addEventListener('change', () => {
     currentMode = modeSelect.value;
     localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+    document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === currentMode));
     if (currentSessionId) {
       send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
     }
+    renderWorkspaceInsights();
   });
 
   msgInput.addEventListener('input', () => {
@@ -2979,10 +3600,6 @@
 
       <div class="settings-divider"></div>
 
-      ${buildThemeEntryHtml()}
-
-      <div class="settings-divider"></div>
-
       <div class="settings-section-title">通知设置</div>
       <div class="settings-field">
         <label>通知方式</label>
@@ -3009,8 +3626,6 @@
 
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
-    const themePageBtn = panel.querySelector('[data-open-theme-page]');
-    if (themePageBtn) themePageBtn.addEventListener('click', openThemeSubpage);
 
     const closeBtn = panel.querySelector('.settings-close');
     const codexModeSelect = panel.querySelector('#codex-mode');
@@ -3319,10 +3934,6 @@
 
       <div class="settings-divider"></div>
 
-      ${buildThemeEntryHtml()}
-
-      <div class="settings-divider"></div>
-
       <div class="settings-section-title">通知设置</div>
       <div class="settings-field">
         <label>通知方式</label>
@@ -3350,8 +3961,6 @@
 
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
-    const themePageBtn = panel.querySelector('[data-open-theme-page]');
-    if (themePageBtn) themePageBtn.addEventListener('click', openThemeSubpage);
 
     // === Model Config UI ===
     const modelModeSelect = panel.querySelector('#model-mode');
@@ -3861,6 +4470,7 @@
 
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
+  let _onDirectoryListing = null;
 
   function showNewSessionModal() {
     const targetAgent = currentAgent;
@@ -3869,60 +4479,287 @@
     overlay.className = 'modal-overlay';
     overlay.id = 'new-session-overlay';
 
+    let currentBrowsePath = null;
+    let showHidden = false;
+    let addProjectMode = false; // true = save as project after selecting dir
+
     overlay.innerHTML = `
-      <div class="modal-panel">
+      <div class="modal-panel modal-panel-wide">
         <div class="modal-header">
-          <span class="modal-title">新建 ${escapeHtml(targetLabel)} 会话</span>
-          <button class="modal-close-btn" id="ns-close-btn">✕</button>
+          <span class="modal-title">项目列表</span>
+          <button class="modal-close-btn" id="ns-close-btn">\u2715</button>
         </div>
         <div class="modal-body">
-          ${buildAgentContextCard(targetAgent, `当前将在 ${targetLabel} 区创建会话`, `新会话会直接进入 ${targetLabel} 模块，并只出现在 ${targetLabel} 会话列表中。`)}
-          <div class="modal-stack">
+          ${buildAgentContextCard(targetAgent, `先整理项目，再在项目下创建多个 ${targetLabel} 会话`, `项目会长期保存在左侧列表里。选中或新建项目后，可在对应项目下反复点“新建会话”。`)}
+
+          <!-- Step 1: Project Picker -->
+          <div class="modal-stack" id="ns-step-projects">
             <div>
-              <label class="modal-field-label" for="ns-cwd-input">工作目录</label>
-              <div class="modal-field-row">
-                <input type="text" id="ns-cwd-input" class="modal-text-input" placeholder="例如 /home/user/project" list="ns-cwd-list" autocomplete="off">
-                <datalist id="ns-cwd-list"></datalist>
+              <label class="modal-field-label">已保存项目</label>
+              <div class="project-picker-list" id="ns-project-list"></div>
+              <div class="project-picker-actions">
+                <button class="project-picker-action-btn" id="ns-add-project-btn">添加新项目…</button>
+                <button class="project-picker-action-btn" id="ns-browse-btn">临时会话…</button>
+              </div>
+              <div class="project-picker-helper">点击项目后会定位到左侧项目卡片；真正的新会话在项目卡片里创建。</div>
+            </div>
+          </div>
+
+          <!-- Step 2: Directory Browser -->
+          <div class="modal-stack" id="ns-step-browser" style="display:none">
+            <div>
+              <label class="modal-field-label">工作目录</label>
+              <div class="dir-browser-pathbar" id="ns-pathbar">
+                <div class="dir-browser-crumbs" id="ns-crumbs"></div>
+                <button class="dir-browser-edit-btn" id="ns-edit-path-btn" title="直接输入路径">\u270E</button>
+              </div>
+              <div class="dir-browser-manual" id="ns-manual-row" style="display:none">
+                <input type="text" id="ns-manual-input" class="modal-text-input" placeholder="输入绝对路径后回车">
+                <button class="dir-browser-go-btn" id="ns-manual-go">前往</button>
+              </div>
+              <div class="dir-browser-list" id="ns-dir-list">
+                <div class="dir-browser-empty">正在加载…</div>
+              </div>
+              <div class="dir-browser-toolbar">
+                <label class="dir-browser-toggle">
+                  <input type="checkbox" id="ns-show-hidden">
+                  <span>显示隐藏目录</span>
+                </label>
               </div>
             </div>
           </div>
         </div>
         <div class="modal-footer">
+          <button class="modal-btn-secondary" id="ns-back-btn" style="display:none">返回</button>
           <button class="modal-btn-secondary" id="ns-cancel-btn">取消</button>
-          <button class="modal-btn-primary" id="ns-create-btn">创建</button>
+          <button class="modal-btn-primary" id="ns-select-btn" style="display:none">选择此目录</button>
         </div>
       </div>
     `;
 
     document.body.appendChild(overlay);
 
-    const cwdInput = overlay.querySelector('#ns-cwd-input');
-    const cwdList = overlay.querySelector('#ns-cwd-list');
+    const stepProjects = overlay.querySelector('#ns-step-projects');
+    const stepBrowser = overlay.querySelector('#ns-step-browser');
+    const projectListEl = overlay.querySelector('#ns-project-list');
+    const backBtn = overlay.querySelector('#ns-back-btn');
+    const selectBtn = overlay.querySelector('#ns-select-btn');
+    const crumbsEl = overlay.querySelector('#ns-crumbs');
+    const dirListEl = overlay.querySelector('#ns-dir-list');
+    const manualRow = overlay.querySelector('#ns-manual-row');
+    const manualInput = overlay.querySelector('#ns-manual-input');
+    const pathbar = overlay.querySelector('#ns-pathbar');
 
-    // Fetch suggestions on focus
-    cwdInput.addEventListener('focus', () => {
-      _onCwdSuggestions = (paths) => {
-        cwdList.innerHTML = paths.map(p => `<option value="${escapeHtml(p)}"></option>`).join('');
-      };
-      send({ type: 'list_cwd_suggestions' });
+    // --- Step 1: Render project list ---
+    function renderProjectPicker() {
+      projectListEl.innerHTML = '';
+      if (projects.length === 0) {
+        addProjectMode = true;
+        showBrowserStep(false);
+        return;
+      }
+      for (const p of projects) {
+        const card = document.createElement('div');
+        card.className = 'project-picker-item';
+        card.innerHTML = `
+          <span class="project-picker-item-name">${escapeHtml(p.name)}</span>
+          <span class="project-picker-item-path">${escapeHtml(p.path)}</span>
+          <span class="project-picker-item-note">点击后定位到左侧项目，再在项目下新建会话</span>
+        `;
+        card.addEventListener('click', () => {
+          close();
+          focusProjectGroup(p.id, { toast: '已定位到项目，点击项目右侧“新建会话”即可继续。' });
+        });
+        projectListEl.appendChild(card);
+      }
+    }
+
+    // --- Step 2: Directory browser (reused from original) ---
+    function showBrowserStep(canGoBack) {
+      stepProjects.style.display = 'none';
+      stepBrowser.style.display = '';
+      selectBtn.style.display = '';
+      backBtn.style.display = canGoBack ? '' : 'none';
+      selectBtn.textContent = addProjectMode ? '保存为项目' : '创建临时会话';
+      navigateTo(null);
+    }
+
+    function showProjectStep() {
+      stepBrowser.style.display = 'none';
+      stepProjects.style.display = '';
+      selectBtn.style.display = 'none';
+      backBtn.style.display = 'none';
+      addProjectMode = false;
+    }
+
+    function navigateTo(dirPath) {
+      dirListEl.innerHTML = '<div class="dir-browser-empty">正在加载…</div>';
+      send({ type: 'browse_directory', path: dirPath, showHidden });
+    }
+
+    function renderCrumbs(fullPath) {
+      crumbsEl.innerHTML = '';
+      if (!fullPath) return;
+      const parts = fullPath.split('/').filter(Boolean);
+      const rootSpan = document.createElement('span');
+      rootSpan.className = parts.length > 0 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
+      rootSpan.textContent = '/';
+      if (parts.length > 0) {
+        rootSpan.addEventListener('click', () => navigateTo('/'));
+      }
+      crumbsEl.appendChild(rootSpan);
+
+      parts.forEach((seg, i) => {
+        const sep = document.createElement('span');
+        sep.className = 'dir-browser-crumb-sep';
+        sep.textContent = '\u203A';
+        crumbsEl.appendChild(sep);
+
+        const isLast = i === parts.length - 1;
+        const span = document.createElement('span');
+        span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
+        span.textContent = seg;
+        if (!isLast) {
+          const segPath = '/' + parts.slice(0, i + 1).join('/');
+          span.addEventListener('click', () => navigateTo(segPath));
+        }
+        crumbsEl.appendChild(span);
+      });
+
+      crumbsEl.scrollLeft = crumbsEl.scrollWidth;
+    }
+
+    function renderDirList(dirs, parentPath, error) {
+      dirListEl.innerHTML = '';
+      if (error) {
+        const errDiv = document.createElement('div');
+        errDiv.className = 'dir-browser-error';
+        errDiv.textContent = error;
+        if (parentPath) {
+          const backLink = document.createElement('div');
+          backLink.className = 'dir-browser-error-back';
+          backLink.textContent = '返回上级目录';
+          backLink.addEventListener('click', () => navigateTo(parentPath));
+          errDiv.appendChild(backLink);
+        }
+        dirListEl.appendChild(errDiv);
+        return;
+      }
+      if (!dirs || dirs.length === 0) {
+        const emptyDiv = document.createElement('div');
+        emptyDiv.className = 'dir-browser-empty';
+        emptyDiv.textContent = '此目录下没有子目录';
+        dirListEl.appendChild(emptyDiv);
+        return;
+      }
+      for (const name of dirs) {
+        const item = document.createElement('div');
+        item.className = 'dir-browser-item';
+        const icon = document.createElement('span');
+        icon.className = 'dir-browser-item-icon';
+        icon.textContent = '\uD83D\uDCC1';
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'dir-browser-item-name';
+        nameSpan.textContent = name;
+        item.appendChild(icon);
+        item.appendChild(nameSpan);
+        item.addEventListener('click', () => {
+          const childPath = currentBrowsePath === '/' ? '/' + name : currentBrowsePath + '/' + name;
+          navigateTo(childPath);
+        });
+        dirListEl.appendChild(item);
+      }
+    }
+
+    _onDirectoryListing = (msg) => {
+      currentBrowsePath = msg.path || '/';
+      renderCrumbs(currentBrowsePath);
+      renderDirList(msg.dirs || [], msg.parent, msg.error);
+    };
+
+    // Manual path toggle
+    let manualMode = false;
+    overlay.querySelector('#ns-edit-path-btn').addEventListener('click', () => {
+      manualMode = !manualMode;
+      if (manualMode) {
+        manualRow.style.display = 'flex';
+        pathbar.style.display = 'none';
+        manualInput.value = currentBrowsePath || '';
+        manualInput.focus();
+      } else {
+        manualRow.style.display = 'none';
+        pathbar.style.display = 'flex';
+      }
+    });
+
+    function goToManualPath() {
+      const val = manualInput.value.trim();
+      if (val) {
+        manualMode = false;
+        manualRow.style.display = 'none';
+        pathbar.style.display = 'flex';
+        navigateTo(val);
+      }
+    }
+    overlay.querySelector('#ns-manual-go').addEventListener('click', goToManualPath);
+    manualInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') goToManualPath();
+      if (e.key === 'Escape') {
+        manualMode = false;
+        manualRow.style.display = 'none';
+        pathbar.style.display = 'flex';
+      }
+    });
+
+    // Hidden toggle
+    overlay.querySelector('#ns-show-hidden').addEventListener('change', (e) => {
+      showHidden = e.target.checked;
+      navigateTo(currentBrowsePath);
     });
 
     function close() {
       overlay.remove();
-      _onCwdSuggestions = null;
+      _onDirectoryListing = null;
     }
 
     overlay.querySelector('#ns-close-btn').addEventListener('click', close);
     overlay.querySelector('#ns-cancel-btn').addEventListener('click', close);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
-    overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
-      const cwd = cwdInput.value.trim() || null;
-      close();
-      send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode });
+    // Back button — return to project picker
+    backBtn.addEventListener('click', () => {
+      showProjectStep();
+      renderProjectPicker();
     });
 
-    cwdInput.focus();
+    // "Add new project" — browse dir then save as project
+    overlay.querySelector('#ns-add-project-btn').addEventListener('click', () => {
+      addProjectMode = true;
+      showBrowserStep(true);
+    });
+
+    // "Browse directory" — browse dir without saving as project
+    overlay.querySelector('#ns-browse-btn').addEventListener('click', () => {
+      addProjectMode = false;
+      showBrowserStep(true);
+    });
+
+    // Select button — create session (and optionally save project)
+    selectBtn.addEventListener('click', () => {
+      const cwd = currentBrowsePath || null;
+      if (!cwd) return;
+      close();
+      if (addProjectMode && cwd) {
+        const projectId = crypto.randomUUID();
+        queueProjectFocus(projectId, '项目已加入左侧列表，后续可在项目下反复新建会话。');
+        send({ type: 'save_project', id: projectId, path: cwd });
+      } else {
+        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode });
+      }
+    });
+
+    // Initialize — show project picker or browser
+    renderProjectPicker();
   }
 
   // --- Import Native Session Modal ---
@@ -4131,7 +4968,6 @@
   }
 
   // --- Init ---
-  applyTheme(currentTheme);
   setCurrentAgent(currentAgent);
   renderSessionList();
   connect();

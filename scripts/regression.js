@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
@@ -31,18 +32,34 @@ function sql(dbPath, statement) {
   return result.stdout.trim();
 }
 
+function probePort(port, host = '127.0.0.1', timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port, host });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
 async function waitForPort(port, timeoutMs = 10000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const probe = spawnSync('bash', ['-lc', `ss -tln | grep -q ':${port} '`], { encoding: 'utf8' });
-    if (probe.status === 0) return;
+    if (await probePort(port)) return;
     await sleep(100);
   }
   throw new Error(`Timed out waiting for port ${port}`);
 }
 
 async function withServer(env, fn) {
-  const child = spawn('/usr/bin/node', [SERVER_PATH], {
+  const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: REPO_DIR,
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
