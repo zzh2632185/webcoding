@@ -8,3 +8,4 @@ config/auth.json
 config/model.json
 config/codex.json
 CLAUDE.md
+AGENTS.md

@@ -1,17 +1,17 @@
-# CC-Web
+# Webcoding
 
-Claude Code / Codex 轻量级 Web 远程工具 — 在浏览器中与本机 CLI Agent 交互。
+Webcoding 是一个面向 Claude Code / Codex 的轻量级浏览器工作台，用来在网页里远程接入本机 CLI Agent。
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
 [English README](./README.en.md) | [更新日志](./CHANGELOG.md)
 
-Vibe产物，readme比较絮叨，建议直接丢给CC，拷打一番就好。
+当前仓库名、界面品牌与文档示例均以 `Webcoding` 为准。
 
 ## 一键部署：claude
-```
-https://github.com/ZgDaniel/cc-web 给我装！
+```bash
+https://github.com/HsMirage/webcoding 给我装！
 ```
 
 
@@ -52,8 +52,8 @@ https://github.com/ZgDaniel/cc-web 给我装！
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/ZgDaniel/cc-web.git
-cd cc-web
+git clone https://github.com/HsMirage/webcoding.git
+cd webcoding
 npm install
 cp .env.example .env    # 可选，不设密码则首次启动自动生成
 npm start
@@ -62,8 +62,8 @@ npm start
 ### Windows
 
 ```cmd
-git clone https://github.com/ZgDaniel/cc-web.git
-cd cc-web
+git clone https://github.com/HsMirage/webcoding.git
+cd webcoding
 npm install
 copy .env.example .env  & REM 可选
 ```
@@ -71,7 +71,7 @@ copy .env.example .env  & REM 可选
 
 ---
 
-启动后访问 `http://localhost:8002`，输入密码即可使用。
+启动后访问 `http://localhost:8001`，输入密码即可使用。
 
 ## 配置
 
@@ -80,13 +80,15 @@ copy .env.example .env  & REM 可选
 | 变量 | 必填 | 默认值 | 说明 |
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | 否 | 自动生成 | Web 登录密码（首次启动自动迁移到 `config/auth.json`） |
-| `PORT` | 否 | `8002` | 服务监听端口 |
+| `PORT` | 否 | `8001` | 服务监听端口 |
 | `CLAUDE_PATH` | 否 | `claude` | Claude CLI 可执行文件路径 |
 | `CODEX_PATH` | 否 | `codex` | Codex CLI 可执行文件路径 |
 | `CC_WEB_CONFIG_DIR` | 否 | `./config` | 配置目录覆写（主要供隔离测试使用） |
 | `CC_WEB_SESSIONS_DIR` | 否 | `./sessions` | 会话目录覆写（主要供隔离测试使用） |
 | `CC_WEB_LOGS_DIR` | 否 | `./logs` | 日志目录覆写（主要供隔离测试使用） |
 | `PUSHPLUS_TOKEN` | 否 | - | PushPlus Token（首次启动自动迁移到通知配置） |
+
+说明：环境变量前缀仍保留为 `CC_WEB_*`，这是为了兼容旧版本配置，不影响现在的项目名 `Webcoding`。
 
 ### 通知配置
 
@@ -115,7 +117,7 @@ copy .env.example .env  & REM 可选
 ## 项目结构
 
 ```
-cc-web/
+webcoding/
 ├── server.js              # Node.js 后端（HTTP + WebSocket + 进程管理 + 通知）
 ├── lib/
 │   ├── agent-runtime.js    # Claude / Codex 运行时适配层
@@ -187,17 +189,17 @@ tail -f logs/process.log | jq .
 
 ### systemd 服务
 
-创建 `/etc/systemd/system/cc-web.service`：
+创建 `/etc/systemd/system/webcoding.service`：
 
 ```ini
 [Unit]
-Description=CC-Web - Claude Code Web Chat UI
+Description=Webcoding - Claude Code / Codex Web Workspace
 After=network.target
 
 [Service]
 Type=simple
 User=your-user
-WorkingDirectory=/path/to/cc-web
+WorkingDirectory=/path/to/webcoding
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
 RestartSec=5
@@ -211,8 +213,8 @@ WantedBy=multi-user.target
 > **`KillMode=process` 非常重要**：确保 systemd 重启服务时只杀 Node.js 进程，Claude 子进程继续运行，服务恢复后自动重新挂载。
 
 ```bash
-sudo systemctl enable cc-web
-sudo systemctl start cc-web
+sudo systemctl enable webcoding
+sudo systemctl start webcoding
 ```
 
 ### Nginx 反向代理
@@ -226,7 +228,7 @@ server {
     ssl_certificate_key /path/to/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8002;
+        proxy_pass http://127.0.0.1:8001;
         proxy_http_version 1.1;
 
         # WebSocket 支持
@@ -244,17 +246,17 @@ server {
 
 ### Windows 部署
 
-适用于在个人电脑上运行 CC-Web，通过手机远程控制 Claude Code。
+适用于在个人电脑上运行 Webcoding，通过手机远程控制 Claude Code / Codex。
 
 **启动方式**：双击 `start.bat`，或在终端运行：
 ```cmd
-cd cc-web
+cd webcoding
 npm install
 node server.js
 ```
 
 **局域网访问**（手机和电脑在同一 WiFi）：
-- 直接访问 `http://电脑局域网IP:8002`
+- 直接访问 `http://电脑局域网IP:8001`
 
 **远程访问**（外出时用手机控制家里电脑）：
 - 推荐使用 [Tailscale](https://tailscale.com/) — 电脑和手机各安装一个，自动组网，免费够用

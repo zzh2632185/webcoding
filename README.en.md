@@ -1,6 +1,6 @@
-# CC-Web
+# Webcoding
 
-A lightweight browser interface for Claude Code and Codex, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
+Webcoding is a lightweight browser workspace for Claude Code and Codex, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -43,8 +43,8 @@ npm install -g @openai/codex
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/ZgDaniel/cc-web.git
-cd cc-web
+git clone https://github.com/HsMirage/webcoding.git
+cd webcoding
 npm install
 cp .env.example .env    # optional; if omitted, an initial password is auto-generated
 npm start
@@ -53,15 +53,15 @@ npm start
 ### Windows
 
 ```cmd
-git clone https://github.com/ZgDaniel/cc-web.git
-cd cc-web
+git clone https://github.com/HsMirage/webcoding.git
+cd webcoding
 npm install
 copy .env.example .env  & REM optional
 ```
 
 Then run `start.bat`, or start manually with `node server.js`.
 
-After startup, open `http://localhost:8002` and sign in with your password.
+After startup, open `http://localhost:8001` and sign in with your password.
 
 ## Configuration
 
@@ -70,10 +70,12 @@ After startup, open `http://localhost:8002` and sign in with your password.
 | Variable | Required | Default | Description |
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | No | Auto-generated | Web login password (migrated into `config/auth.json` on first start) |
-| `PORT` | No | `8002` | Service port |
+| `PORT` | No | `8001` | Service port |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
 | `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |
+
+Note: the `CC_WEB_*` variable prefix is kept for backward compatibility with older installs. The product name is now `Webcoding`.
 
 ### Notification Configuration
 
@@ -102,7 +104,7 @@ Passwords are stored in `config/auth.json` and support generation + UI updates:
 ## Project Structure
 
 ```text
-cc-web/
+webcoding/
 ├── server.js              # Node.js backend (HTTP + WebSocket + process management + notifications)
 ├── public/
 │   ├── index.html          # UI structure
@@ -168,17 +170,17 @@ tail -f logs/process.log | jq .
 
 ### systemd Service
 
-Create `/etc/systemd/system/cc-web.service`:
+Create `/etc/systemd/system/webcoding.service`:
 
 ```ini
 [Unit]
-Description=CC-Web - Claude Code Web Chat UI
+Description=Webcoding - Claude Code / Codex Web Workspace
 After=network.target
 
 [Service]
 Type=simple
 User=your-user
-WorkingDirectory=/path/to/cc-web
+WorkingDirectory=/path/to/webcoding
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
 RestartSec=5
@@ -192,8 +194,8 @@ WantedBy=multi-user.target
 `KillMode=process` is important. It ensures systemd restart only stops Node.js, while Claude subprocesses continue and are reattached after recovery.
 
 ```bash
-sudo systemctl enable cc-web
-sudo systemctl start cc-web
+sudo systemctl enable webcoding
+sudo systemctl start webcoding
 ```
 
 ### Nginx Reverse Proxy
@@ -207,7 +209,7 @@ server {
     ssl_certificate_key /path/to/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8002;
+        proxy_pass http://127.0.0.1:8001;
         proxy_http_version 1.1;
 
         # WebSocket support
@@ -225,18 +227,18 @@ server {
 
 ### Windows Deployment
 
-Use this mode when running CC-Web on a personal PC and controlling Claude / Codex from mobile.
+Use this mode when running Webcoding on a personal PC and controlling Claude / Codex from mobile.
 
 Start with `start.bat`, or run manually:
 
 ```cmd
-cd cc-web
+cd webcoding
 npm install
 node server.js
 ```
 
 **LAN access** (same Wi-Fi):
-- Open `http://<your-lan-ip>:8002`
+- Open `http://<your-lan-ip>:8001`
 
 **Remote access**:
 - Recommended: [Tailscale](https://tailscale.com/) for secure private networking.
@@ -254,8 +256,8 @@ node server.js
 
 - **v1.2.2**
   - Aligned context compression with Claude Code native behavior: `/compact` is now actually sent to CLI instead of doing a local pseudo-reset.
-  - Added automatic overflow recovery: when `Request too large (max 20MB)` occurs, CC-Web runs `/compact` and replays the failed prompt automatically.
-  - Added retry guard: if context is still too large after compacting, CC-Web stops auto-retry and asks for a narrower prompt range.
+  - Added automatic overflow recovery: when `Request too large (max 20MB)` occurs, Webcoding runs `/compact` and replays the failed prompt automatically.
+  - Added retry guard: if context is still too large after compacting, Webcoding stops auto-retry and asks for a narrower prompt range.
 - **v1.2.1**
   - Fixed missing `AskUserQuestion` options in Web UI by preserving structured tool input in backend and rendering question/option cards on frontend.
   - Added option-to-input shortcut: click an option to append it into the input box for quick confirmation.
