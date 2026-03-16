@@ -71,6 +71,7 @@ After startup, open `http://localhost:8001` and sign in with your password.
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | No | Auto-generated | Web login password (migrated into `config/auth.json` on first start) |
 | `PORT` | No | `8001` | Service port |
+| `HOST` | No | `0.0.0.0` | Service bind address |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
 | `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |

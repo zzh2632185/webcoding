@@ -81,6 +81,7 @@ copy .env.example .env  & REM 可选
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | 否 | 自动生成 | Web 登录密码（首次启动自动迁移到 `config/auth.json`） |
 | `PORT` | 否 | `8001` | 服务监听端口 |
+| `HOST` | 否 | `0.0.0.0` | 服务监听地址 |
 | `CLAUDE_PATH` | 否 | `claude` | Claude CLI 可执行文件路径 |
 | `CODEX_PATH` | 否 | `codex` | Codex CLI 可执行文件路径 |
 | `CC_WEB_CONFIG_DIR` | 否 | `./config` | 配置目录覆写（主要供隔离测试使用） |

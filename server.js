@@ -10,9 +10,11 @@ const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 // Load .env
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
-  for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
-    if (m && !process.env[m[1].trim()]) process.env[m[1].trim()] = m[2].trim();
+    if (!m) continue;
+    const key = m[1].trim();
+    if (key && !process.env[key]) process.env[key] = m[2];
   }
 }
 
@@ -34,11 +36,50 @@ const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
+const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
+const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const AUTH_TOKEN_CLEANUP_MS = 60 * 60 * 1000;
+const HISTORY_CHUNK_BUFFER_LIMIT = 512 * 1024;
+const HISTORY_CHUNK_RETRY_MS = 16;
+const ATTACHMENT_CLEANUP_THROTTLE_MS = 30 * 60 * 1000;
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+
+const jsonConfigCache = new Map();
+
+function cloneJson(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function readCachedJsonConfig(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const stat = fs.statSync(filePath);
+    const cached = jsonConfigCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return cloneJson(cached.value);
+    }
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    jsonConfigCache.set(filePath, { mtimeMs: stat.mtimeMs, value: cloneJson(parsed) });
+    return cloneJson(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedJsonConfig(filePath, value) {
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+  try {
+    const stat = fs.statSync(filePath);
+    jsonConfigCache.set(filePath, { mtimeMs: stat.mtimeMs, value: cloneJson(value) });
+  } catch {
+    jsonConfigCache.set(filePath, { mtimeMs: null, value: cloneJson(value) });
+  }
+}
 
 // === Process Lifecycle Logger ===
 const LOG_FILE = path.join(LOGS_DIR, 'process.log');
@@ -68,11 +109,8 @@ function plog(level, event, data = {}) {
 
 // === Notification System ===
 function loadNotifyConfig() {
-  try {
-    if (fs.existsSync(NOTIFY_CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(NOTIFY_CONFIG_PATH, 'utf8'));
-    }
-  } catch {}
+  const cached = readCachedJsonConfig(NOTIFY_CONFIG_PATH);
+  if (cached) return cached;
   // First run: migrate from .env PUSHPLUS_TOKEN
   const token = process.env.PUSHPLUS_TOKEN || '';
   const config = {
@@ -88,7 +126,7 @@ function loadNotifyConfig() {
 }
 
 function saveNotifyConfig(config) {
-  fs.writeFileSync(NOTIFY_CONFIG_PATH, JSON.stringify(config, null, 2));
+  writeCachedJsonConfig(NOTIFY_CONFIG_PATH, config);
 }
 
 function maskToken(str) {
@@ -239,7 +277,48 @@ function validatePasswordStrength(pw) {
 let authConfig = loadAuthConfig();
 let PASSWORD = authConfig.password;
 
-const activeTokens = new Set();
+const activeTokens = new Map();
+
+function timingSafeStringEqual(left, right) {
+  const leftBuf = Buffer.from(String(left ?? ''), 'utf8');
+  const rightBuf = Buffer.from(String(right ?? ''), 'utf8');
+  const maxLen = Math.max(leftBuf.length, rightBuf.length, 1);
+  const paddedLeft = Buffer.alloc(maxLen);
+  const paddedRight = Buffer.alloc(maxLen);
+  leftBuf.copy(paddedLeft);
+  rightBuf.copy(paddedRight);
+  return crypto.timingSafeEqual(paddedLeft, paddedRight) && leftBuf.length === rightBuf.length;
+}
+
+function rememberActiveToken(token, now = Date.now()) {
+  if (!token) return null;
+  activeTokens.set(token, now + AUTH_TOKEN_TTL_MS);
+  return token;
+}
+
+function hasActiveToken(token, now = Date.now()) {
+  if (!token) return false;
+  const expiresAt = activeTokens.get(token);
+  if (!expiresAt) return false;
+  if (expiresAt <= now) {
+    activeTokens.delete(token);
+    return false;
+  }
+  activeTokens.set(token, now + AUTH_TOKEN_TTL_MS);
+  return true;
+}
+
+function cleanupExpiredTokens(now = Date.now()) {
+  for (const [token, expiresAt] of activeTokens) {
+    if (expiresAt <= now) activeTokens.delete(token);
+  }
+}
+
+function clearPendingSlashCommand(sessionId, expected) {
+  const current = pendingSlashCommands.get(sessionId);
+  if (!current) return;
+  if (!expected || current === expected) pendingSlashCommands.delete(sessionId);
+}
 
 // Pending slash command metadata: sessionId -> { kind: string }
 const pendingSlashCommands = new Map();
@@ -278,56 +357,47 @@ const DEFAULT_CODEX_CONFIG = {
 };
 
 function loadModelConfig() {
-  try {
-    if (fs.existsSync(MODEL_CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(MODEL_CONFIG_PATH, 'utf8'));
-    }
-  } catch {}
-  return JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG));
+  return readCachedJsonConfig(MODEL_CONFIG_PATH) || cloneJson(DEFAULT_MODEL_CONFIG);
 }
 
 function saveModelConfig(config) {
-  fs.writeFileSync(MODEL_CONFIG_PATH, JSON.stringify(config, null, 2));
+  writeCachedJsonConfig(MODEL_CONFIG_PATH, config);
 }
 
 // === Projects Config ===
 function loadProjectsConfig() {
-  try {
-    if (fs.existsSync(PROJECTS_CONFIG_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(PROJECTS_CONFIG_PATH, 'utf8'));
-      return { projects: Array.isArray(raw.projects) ? raw.projects : [] };
-    }
-  } catch {}
+  const raw = readCachedJsonConfig(PROJECTS_CONFIG_PATH);
+  if (raw) {
+    return { projects: Array.isArray(raw.projects) ? raw.projects : [] };
+  }
   return { projects: [] };
 }
 
 function saveProjectsConfig(config) {
-  fs.writeFileSync(PROJECTS_CONFIG_PATH, JSON.stringify(config, null, 2));
+  writeCachedJsonConfig(PROJECTS_CONFIG_PATH, config);
 }
 
 function loadCodexConfig() {
-  try {
-    if (fs.existsSync(CODEX_CONFIG_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(CODEX_CONFIG_PATH, 'utf8'));
-      return {
-        mode: raw.mode === 'custom' ? 'custom' : 'local',
-        activeProfile: raw.activeProfile || '',
-        profiles: Array.isArray(raw.profiles) ? raw.profiles.map((profile) => ({
-          name: String(profile?.name || '').trim(),
-          apiKey: String(profile?.apiKey || ''),
-          apiBase: String(profile?.apiBase || '').trim(),
-        })).filter((profile) => profile.name) : [],
-        enableSearch: false,
-        supportsSearch: false,
-        storedEnableSearch: !!raw.enableSearch,
-      };
-    }
-  } catch {}
-  return JSON.parse(JSON.stringify(DEFAULT_CODEX_CONFIG));
+  const raw = readCachedJsonConfig(CODEX_CONFIG_PATH);
+  if (raw) {
+    return {
+      mode: raw.mode === 'custom' ? 'custom' : 'local',
+      activeProfile: raw.activeProfile || '',
+      profiles: Array.isArray(raw.profiles) ? raw.profiles.map((profile) => ({
+        name: String(profile?.name || '').trim(),
+        apiKey: String(profile?.apiKey || ''),
+        apiBase: String(profile?.apiBase || '').trim(),
+      })).filter((profile) => profile.name) : [],
+      enableSearch: false,
+      supportsSearch: false,
+      storedEnableSearch: !!raw.enableSearch,
+    };
+  }
+  return cloneJson(DEFAULT_CODEX_CONFIG);
 }
 
 function saveCodexConfig(config) {
-  fs.writeFileSync(CODEX_CONFIG_PATH, JSON.stringify({
+  writeCachedJsonConfig(CODEX_CONFIG_PATH, {
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
     profiles: Array.isArray(config.profiles) ? config.profiles.map((profile) => ({
@@ -336,7 +406,7 @@ function saveCodexConfig(config) {
       apiBase: String(profile?.apiBase || '').trim(),
     })).filter((profile) => profile.name) : [],
     enableSearch: false,
-  }, null, 2));
+  });
 }
 
 function getCodexConfigMasked() {
@@ -505,6 +575,11 @@ function wsSend(ws, data) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
 }
 
+function isPathInside(filePath, rootDir) {
+  const relative = path.relative(rootDir, filePath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
 function sanitizeId(id) {
   return String(id).replace(/[^a-zA-Z0-9\-]/g, '');
 }
@@ -574,6 +649,8 @@ function currentAttachmentState(meta) {
   return 'available';
 }
 
+let lastAttachmentCleanupAt = 0;
+
 function normalizeMessageAttachments(attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0) return [];
   const normalized = [];
@@ -612,6 +689,9 @@ function resolveMessageAttachments(attachments) {
 }
 
 function cleanupExpiredAttachments() {
+  const now = Date.now();
+  if (now - lastAttachmentCleanupAt < ATTACHMENT_CLEANUP_THROTTLE_MS) return;
+  lastAttachmentCleanupAt = now;
   try {
     const files = fs.readdirSync(ATTACHMENTS_DIR).filter((name) => name.endsWith('.json'));
     for (const file of files) {
@@ -744,6 +824,23 @@ function splitHistoryMessages(messages) {
     olderChunks.push(older.slice(start, end));
   }
   return { recentMessages, olderChunks };
+}
+
+function sendHistoryChunks(ws, sessionId, chunks, index = 0) {
+  if (!ws || ws.readyState !== 1 || index >= chunks.length) return;
+  wsSend(ws, {
+    type: 'session_history_chunk',
+    sessionId,
+    messages: chunks[index],
+    remaining: Math.max(0, chunks.length - index - 1),
+  });
+  if (index >= chunks.length - 1) return;
+  const scheduleNext = () => sendHistoryChunks(ws, sessionId, chunks, index + 1);
+  if (ws.bufferedAmount > HISTORY_CHUNK_BUFFER_LIMIT) {
+    setTimeout(scheduleNext, HISTORY_CHUNK_RETRY_MS);
+  } else {
+    setImmediate(scheduleNext);
+  }
 }
 
 const IS_WIN = process.platform === 'win32';
@@ -1009,7 +1106,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   });
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
-  if (pendingSlash) pendingSlashCommands.delete(sessionId);
+  clearPendingSlashCommand(sessionId, pendingSlash);
 
   // Save result to session
   const session = loadSession(sessionId);
@@ -1038,7 +1135,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   activeProcesses.delete(sessionId);
   cleanRunDir(sessionId);
-  pendingSlashCommands.delete(sessionId);
+  clearPendingSlashCommand(sessionId, pendingSlash);
 
   // Notify client
   if (entry.ws) {
@@ -1070,25 +1167,26 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
-    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
+    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
     sendSessionList(entry.ws);
   } else {
     // Process completed while browser was disconnected — notify all connected clients
     const session = loadSession(sessionId);
     const title = session?.title || 'Untitled';
     for (const client of wss.clients) {
-      if (client.readyState === 1) {
-        wsSend(client, {
-          type: 'background_done',
-          sessionId,
-          title,
-          costUsd: entry.lastCost || null,
-          responseLen: (entry.fullText || '').length,
-        });
-      }
+      if (client.readyState !== 1 || client.isAuthenticated !== true) continue;
+      sendSessionList(client);
+      if (wsSessionMap.get(client) !== sessionId) continue;
+      wsSend(client, {
+        type: 'background_done',
+        sessionId,
+        title,
+        costUsd: entry.lastCost ?? null,
+        responseLen: (entry.fullText || '').length,
+      });
     }
     // Push notification
-    const cost = entry.lastCost ? `$${entry.lastCost.toFixed(4)}` : '';
+    const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
     const respLen = (entry.fullText || '').length;
     sendNotification(
       `CC-Web 任务完成`,
@@ -1134,6 +1232,7 @@ setInterval(() => {
 
 cleanupExpiredAttachments();
 setInterval(cleanupExpiredAttachments, 6 * 60 * 60 * 1000);
+setInterval(() => cleanupExpiredTokens(), AUTH_TOKEN_CLEANUP_MS);
 
 // Recover processes that were running before server restart
 function recoverProcesses() {
@@ -1210,7 +1309,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
-    if (!token || !activeTokens.has(token)) {
+    if (!token || !hasActiveToken(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
@@ -1284,7 +1383,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'DELETE' && url.pathname.startsWith('/api/attachments/')) {
     const token = extractBearerToken(req);
-    if (!token || !activeTokens.has(token)) {
+    if (!token || !hasActiveToken(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const id = sanitizeId(url.pathname.split('/').pop() || '');
@@ -1295,10 +1394,10 @@ const server = http.createServer((req, res) => {
     return jsonResponse(res, 200, { ok: true });
   }
 
-  let filePath = path.join(PUBLIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
+  let filePath = path.join(PUBLIC_ROOT, url.pathname === '/' ? 'index.html' : url.pathname);
   filePath = path.resolve(filePath);
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  if (!isPathInside(filePath, PUBLIC_ROOT)) {
     res.writeHead(403);
     return res.end('Forbidden');
   }
@@ -1323,6 +1422,8 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   let authenticated = false;
   let authToken = null;
+  ws.isAuthenticated = false;
+  ws.authToken = null;
   const wsId = crypto.randomBytes(4).toString('hex'); // short id for log correlation
   const wsConnectTime = new Date().toISOString();
   plog('INFO', 'ws_connect', { wsId });
@@ -1336,13 +1437,20 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'auth') {
-      if (msg.password === PASSWORD || (msg.token && activeTokens.has(msg.token))) {
-        authToken = msg.token && activeTokens.has(msg.token) ? msg.token : crypto.randomBytes(32).toString('hex');
-        activeTokens.add(authToken);
+      const tokenValid = hasActiveToken(msg.token);
+      if (timingSafeStringEqual(msg.password, PASSWORD) || tokenValid) {
+        authToken = tokenValid ? msg.token : crypto.randomBytes(32).toString('hex');
+        rememberActiveToken(authToken);
         authenticated = true;
+        ws.isAuthenticated = true;
+        ws.authToken = authToken;
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendSessionList(ws);
       } else {
+        authenticated = false;
+        authToken = null;
+        ws.isAuthenticated = false;
+        ws.authToken = null;
         wsSend(ws, { type: 'auth_result', success: false });
       }
       return;
@@ -1394,7 +1502,7 @@ wss.on('connection', (ws) => {
         handleTestNotify(ws);
         break;
       case 'change_password':
-        handleChangePassword(ws, msg, authToken);
+        handleChangePassword(ws, msg);
         break;
       case 'get_model_config':
         wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
@@ -1494,11 +1602,11 @@ function handleTestNotify(ws) {
   });
 }
 
-function handleChangePassword(ws, msg, currentToken) {
+function handleChangePassword(ws, msg) {
   const { currentPassword, newPassword } = msg;
 
   // Validate current password
-  if (currentPassword !== PASSWORD) {
+  if (!timingSafeStringEqual(currentPassword, PASSWORD)) {
     return wsSend(ws, { type: 'password_changed', success: false, message: '当前密码错误' });
   }
 
@@ -1519,7 +1627,9 @@ function handleChangePassword(ws, msg, currentToken) {
 
   // Generate new token for current connection
   const newToken = crypto.randomBytes(32).toString('hex');
-  activeTokens.add(newToken);
+  rememberActiveToken(newToken);
+  ws.authToken = newToken;
+  ws.isAuthenticated = true;
 
   wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
 }
@@ -1940,14 +2050,7 @@ function handleLoadSession(ws, sessionId) {
   });
 
   if (olderChunks.length > 0) {
-    olderChunks.forEach((chunk, index) => {
-      wsSend(ws, {
-        type: 'session_history_chunk',
-        sessionId: session.id,
-        messages: chunk,
-        remaining: Math.max(0, olderChunks.length - index - 1),
-      });
-    });
+    sendHistoryChunks(ws, session.id, olderChunks);
   }
 
   // Resume streaming if process is still active
@@ -2337,6 +2440,10 @@ function handleMessage(ws, msg, options = {}) {
     ws,
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
+    claudeRuntimeSessionId: isClaudeSession(session) ? (session.claudeSessionId || null) : null,
+    persistedClaudeSessionId: isClaudeSession(session) ? (session.claudeSessionId || null) : null,
+    claudePendingCostDelta: 0,
+    claudeSessionTotalCost: session.totalCost || 0,
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],
@@ -2816,6 +2923,21 @@ function handleListCwdSuggestions(ws) {
   // Always include HOME
   const home = process.env.HOME || process.env.USERPROFILE || '';
   if (home) paths.add(home);
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
+    for (const file of files) {
+      const session = loadSession(file.replace(/\.json$/, ''));
+      if (!session) continue;
+      const localMeta = getSessionAgent(session) === 'claude' && session.claudeSessionId && !session.cwd
+        ? resolveClaudeSessionLocalMeta(session.claudeSessionId)
+        : null;
+      const cwd = session.cwd || localMeta?.cwd || activeProcesses.get(session.id)?.cwd || null;
+      if (cwd) paths.add(cwd);
+    }
+  } catch {}
+  for (const entry of activeProcesses.values()) {
+    if (entry.cwd) paths.add(entry.cwd);
+  }
   wsSend(ws, { type: 'cwd_suggestions', paths: Array.from(paths).sort() });
 }
 

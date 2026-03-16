@@ -1,6 +1,8 @@
 node_modules/
 sessions/
 logs/
+server.log
+test-results/
 attachments/
 .env
 config/notify.json
