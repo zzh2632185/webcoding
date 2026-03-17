@@ -4,6 +4,7 @@ logs/
 server.log
 test-results/
 attachments/
+.DS_Store
 .env
 config/notify.json
 config/auth.json
