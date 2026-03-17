@@ -10,6 +10,13 @@ config/notify.json
 config/auth.json
 config/model.json
 config/codex.json
+config/bridge-runtime.json
+config/bridge-state.json
+config/projects.json
+config/codex-runtime-home/
+CODE_REVIEW_REPORT.md
+public/test-components.html
+*.jpg
 CLAUDE.md
 AGENTS.md
 MotherDuck_Design_System.md

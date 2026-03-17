@@ -3,7 +3,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
@@ -15,7 +15,11 @@ if (fs.existsSync(envPath)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (!m) continue;
     const key = m[1].trim();
-    if (key && !process.env[key]) process.env[key] = m[2];
+    let val = String(m[2] || '').trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith('\'') && val.endsWith('\''))) {
+      val = val.slice(1, -1);
+    }
+    if (key && !process.env[key]) process.env[key] = val;
   }
 }
 
@@ -37,12 +41,39 @@ const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
+const BRIDGE_RUNTIME_PATH = path.join(CONFIG_DIR, 'bridge-runtime.json');
+const BRIDGE_STATE_PATH = path.join(CONFIG_DIR, 'bridge-state.json');
+const BRIDGE_SCRIPT_PATH = path.join(__dirname, 'lib', 'local-api-bridge.js');
 const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
+const USER_HOME = process.env.HOME || process.env.USERPROFILE || '';
+const BROWSE_ROOTS = USER_HOME ? [path.resolve(USER_HOME)] : [path.resolve(process.cwd())];
 const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_CLEANUP_MS = 60 * 60 * 1000;
 const HISTORY_CHUNK_BUFFER_LIMIT = 512 * 1024;
 const HISTORY_CHUNK_RETRY_MS = 16;
 const ATTACHMENT_CLEANUP_THROTTLE_MS = 30 * 60 * 1000;
+const BRIDGE_START_TIMEOUT_MS = 5000;
+const HTTP_BODY_MAX_BYTES = 2 * 1024 * 1024;
+const AUTH_LOCK_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 5;
+const PASSWORD_SALT_BYTES = 16;
+const PASSWORD_HASH_BYTES = 64;
+const MAX_AUTO_COMPACT_RETRIES = 2;
+const SESSION_LIST_CACHE_TTL_MS = 300;
+const FILE_TAIL_DEBOUNCE_MS = 40;
+const FILE_TAIL_MAX_READ_BYTES = 8 * 1024 * 1024;
+const IMPORTED_SESSION_IDS_CACHE_TTL_MS = 2000;
+const JSONL_HEAD_READ_BYTES = 128 * 1024;
+const JSONL_TAIL_READ_BYTES = 128 * 1024;
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'X-XSS-Protection': '0',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Content-Security-Policy': "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; frame-ancestors 'none'; base-uri 'none'",
+};
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -50,6 +81,7 @@ fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
 
 const jsonConfigCache = new Map();
+const authAttemptByIp = new Map();
 
 function cloneJson(value) {
   if (value === undefined) return undefined;
@@ -72,14 +104,24 @@ function readCachedJsonConfig(filePath) {
   }
 }
 
+function writeJsonAtomic(filePath, value) {
+  const tempPath = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
+  fs.renameSync(tempPath, filePath);
+}
+
 function writeCachedJsonConfig(filePath, value) {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+  writeJsonAtomic(filePath, value);
   try {
     const stat = fs.statSync(filePath);
     jsonConfigCache.set(filePath, { mtimeMs: stat.mtimeMs, value: cloneJson(value) });
   } catch {
     jsonConfigCache.set(filePath, { mtimeMs: null, value: cloneJson(value) });
   }
+}
+
+function writeHeadWithSecurity(res, statusCode, headers = {}) {
+  res.writeHead(statusCode, { ...SECURITY_HEADERS, ...headers });
 }
 
 // === Process Lifecycle Logger ===
@@ -135,6 +177,26 @@ function maskToken(str) {
   return str.slice(0, 4) + '****' + str.slice(-4);
 }
 
+function validateFeishuWebhook(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || '').trim());
+    if (parsed.protocol !== 'https:') {
+      return { ok: false, error: '飞书 Webhook 必须使用 HTTPS' };
+    }
+    const host = parsed.hostname.toLowerCase();
+    const hostAllowed = host === 'feishu.cn'
+      || host.endsWith('.feishu.cn')
+      || host === 'larksuite.com'
+      || host.endsWith('.larksuite.com');
+    if (!hostAllowed) {
+      return { ok: false, error: '飞书 Webhook 域名不合法' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: '飞书 Webhook URL 无效' };
+  }
+}
+
 function getNotifyConfigMasked() {
   const config = loadNotifyConfig();
   return {
@@ -150,7 +212,6 @@ function getNotifyConfigMasked() {
 function sendNotification(title, content) {
   const config = loadNotifyConfig();
   if (!config.provider || config.provider === 'off') return Promise.resolve({ ok: true, skipped: true });
-  const https = require('https');
 
   return new Promise((resolve) => {
     let url, data;
@@ -176,6 +237,8 @@ function sendNotification(title, content) {
       }
       case 'feishu': {
         if (!config.feishu?.webhook) return resolve({ ok: false, error: '飞书 Webhook 未配置' });
+        const feishuValidation = validateFeishuWebhook(config.feishu.webhook);
+        if (!feishuValidation.ok) return resolve({ ok: false, error: feishuValidation.error });
         url = config.feishu.webhook;
         data = JSON.stringify({ msg_type: 'text', content: { text: `${title}\n\n${content}` } });
         break;
@@ -209,6 +272,7 @@ function sendNotification(title, content) {
       plog('WARN', 'notify_error', { provider: config.provider, error: e.message });
       resolve({ ok: false, error: e.message });
     });
+    req.setTimeout(10000, () => req.destroy(new Error('notification timeout')));
     req.write(data);
     req.end();
   });
@@ -228,26 +292,66 @@ function generateRandomPassword(length = 12) {
   return result;
 }
 
+function hashPassword(password) {
+  const salt = crypto.randomBytes(PASSWORD_SALT_BYTES).toString('hex');
+  const hash = crypto.scryptSync(String(password || ''), salt, PASSWORD_HASH_BYTES).toString('hex');
+  return `scrypt:${salt}:${hash}`;
+}
+
+function isPasswordHashFormat(stored) {
+  const parts = String(stored || '').split(':');
+  return parts.length === 3 && parts[0] === 'scrypt' && parts[1] && /^[a-f0-9]+$/i.test(parts[2]);
+}
+
+function verifyPasswordHash(password, stored) {
+  if (!isPasswordHashFormat(stored)) return false;
+  try {
+    const [, salt, expectedHex] = String(stored).split(':');
+    const derivedHex = crypto.scryptSync(String(password || ''), salt, PASSWORD_HASH_BYTES).toString('hex');
+    return timingSafeStringEqual(derivedHex, expectedHex);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeAuthConfig(raw) {
+  const mustChange = !!raw?.mustChange;
+  if (isPasswordHashFormat(raw?.passwordHash)) {
+    return { passwordHash: String(raw.passwordHash), mustChange };
+  }
+  if (typeof raw?.password === 'string' && raw.password) {
+    return { passwordHash: hashPassword(raw.password), mustChange };
+  }
+  return null;
+}
+
 function loadAuthConfig() {
-  // Priority 1: config/auth.json exists with password
+  // Priority 1: config/auth.json exists
   try {
     if (fs.existsSync(AUTH_CONFIG_PATH)) {
-      const config = JSON.parse(fs.readFileSync(AUTH_CONFIG_PATH, 'utf8'));
-      if (config.password) return config;
+      const rawConfig = JSON.parse(fs.readFileSync(AUTH_CONFIG_PATH, 'utf8'));
+      const normalized = normalizeAuthConfig(rawConfig);
+      if (normalized) {
+        if (!isPasswordHashFormat(rawConfig?.passwordHash) || rawConfig?.password) {
+          saveAuthConfig(normalized);
+          plog('INFO', 'auth_password_migrated_to_hash', {});
+        }
+        return normalized;
+      }
     }
   } catch {}
 
   // Priority 2: .env has CC_WEB_PASSWORD → migrate
   const envPw = process.env.CC_WEB_PASSWORD;
   if (envPw && envPw !== 'changeme') {
-    const config = { password: envPw, mustChange: false };
+    const config = { passwordHash: hashPassword(envPw), mustChange: false };
     saveAuthConfig(config);
     return config;
   }
 
   // Priority 3: Generate random password
   const pw = generateRandomPassword(12);
-  const config = { password: pw, mustChange: true };
+  const config = { passwordHash: hashPassword(pw), mustChange: true };
   saveAuthConfig(config);
   console.log('========================================');
   console.log('  自动生成初始密码: ' + pw);
@@ -257,7 +361,9 @@ function loadAuthConfig() {
 }
 
 function saveAuthConfig(config) {
-  fs.writeFileSync(AUTH_CONFIG_PATH, JSON.stringify(config, null, 2));
+  const normalized = normalizeAuthConfig(config);
+  if (!normalized) return;
+  writeCachedJsonConfig(AUTH_CONFIG_PATH, normalized);
 }
 
 function validatePasswordStrength(pw) {
@@ -276,7 +382,7 @@ function validatePasswordStrength(pw) {
 }
 
 let authConfig = loadAuthConfig();
-let PASSWORD = authConfig.password;
+let PASSWORD_HASH = authConfig.passwordHash || '';
 
 const activeTokens = new Map();
 
@@ -289,6 +395,51 @@ function timingSafeStringEqual(left, right) {
   leftBuf.copy(paddedLeft);
   rightBuf.copy(paddedRight);
   return crypto.timingSafeEqual(paddedLeft, paddedRight) && leftBuf.length === rightBuf.length;
+}
+
+function hasConfiguredPassword() {
+  return !!PASSWORD_HASH;
+}
+
+function verifyConfiguredPassword(inputPassword) {
+  if (!hasConfiguredPassword()) return false;
+  return verifyPasswordHash(inputPassword, PASSWORD_HASH);
+}
+
+function getWsClientIp(req) {
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req?.socket?.remoteAddress || 'unknown';
+}
+
+function getAuthLockState(ip, now = Date.now()) {
+  const state = authAttemptByIp.get(ip);
+  if (!state) return { locked: false, remainingMs: 0, count: 0 };
+  if (state.lockedUntil && state.lockedUntil > now) {
+    return { locked: true, remainingMs: state.lockedUntil - now, count: state.count || 0 };
+  }
+  if (state.lockedUntil && state.lockedUntil <= now) {
+    authAttemptByIp.delete(ip);
+  }
+  return { locked: false, remainingMs: 0, count: 0 };
+}
+
+function clearAuthFailures(ip) {
+  if (!ip) return;
+  authAttemptByIp.delete(ip);
+}
+
+function recordAuthFailure(ip, now = Date.now()) {
+  const prev = authAttemptByIp.get(ip) || { count: 0, firstAt: now, lockedUntil: 0 };
+  const count = (prev.firstAt + AUTH_LOCK_WINDOW_MS < now) ? 1 : (prev.count + 1);
+  const firstAt = (prev.firstAt + AUTH_LOCK_WINDOW_MS < now) ? now : prev.firstAt;
+  const lockedUntil = count >= AUTH_MAX_FAILURES ? now + AUTH_LOCK_WINDOW_MS : 0;
+  const next = { count, firstAt, lockedUntil };
+  authAttemptByIp.set(ip, next);
+  return {
+    locked: lockedUntil > now,
+    remainingMs: lockedUntil > now ? (lockedUntil - now) : 0,
+    count,
+  };
 }
 
 function rememberActiveToken(token, now = Date.now()) {
@@ -315,6 +466,17 @@ function cleanupExpiredTokens(now = Date.now()) {
   }
 }
 
+function cleanupAuthAttempts(now = Date.now()) {
+  for (const [ip, state] of authAttemptByIp) {
+    if (!state) {
+      authAttemptByIp.delete(ip);
+      continue;
+    }
+    const expired = state.lockedUntil ? state.lockedUntil <= now : (state.firstAt + AUTH_LOCK_WINDOW_MS <= now);
+    if (expired) authAttemptByIp.delete(ip);
+  }
+}
+
 function clearPendingSlashCommand(sessionId, expected) {
   const current = pendingSlashCommands.get(sessionId);
   if (!current) return;
@@ -324,7 +486,7 @@ function clearPendingSlashCommand(sessionId, expected) {
 // Pending slash command metadata: sessionId -> { kind: string }
 const pendingSlashCommands = new Map();
 
-// Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string }
+// Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string, autoRetryCount: number }
 const pendingCompactRetries = new Map();
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, segments, lastCost, tailer }
@@ -332,6 +494,44 @@ const activeProcesses = new Map();
 
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
+
+const sessionListCache = {
+  expiresAt: 0,
+  sessions: [],
+};
+
+const importedSessionIdsCache = {
+  expiresAt: 0,
+  ids: new Set(),
+};
+
+function invalidateSessionListCache() {
+  sessionListCache.expiresAt = 0;
+}
+
+function invalidateImportedSessionIdsCache() {
+  importedSessionIdsCache.expiresAt = 0;
+  importedSessionIdsCache.ids = new Set();
+}
+
+function setActiveProcess(sessionId, entry) {
+  activeProcesses.set(sessionId, entry);
+  invalidateSessionListCache();
+}
+
+function removeActiveProcess(sessionId) {
+  const removed = activeProcesses.delete(sessionId);
+  if (removed) invalidateSessionListCache();
+  return removed;
+}
+
+function execFileQuiet(command, args = []) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 4000, maxBuffer: 1024 * 1024 }, (error) => {
+      resolve({ ok: !error, error });
+    });
+  });
+}
 
 const DEFAULT_CLAUDE_MODEL_MAP = {
   opus: 'claude-opus-4-6',
@@ -387,7 +587,11 @@ function resolveActiveApiCredentials() {
     if (config.mode === 'custom' && config.activeTemplate) {
       const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
       if (tpl && tpl.apiKey) {
-        return { apiKey: tpl.apiKey, apiBase: tpl.apiBase || 'https://api.anthropic.com' };
+        return {
+          apiKey: tpl.apiKey,
+          apiBase: tpl.apiBase || 'https://api.anthropic.com',
+          upstreamType: tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+        };
       }
     }
   } catch {}
@@ -396,11 +600,11 @@ function resolveActiveApiCredentials() {
     const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
     const env = settings.env || {};
     const key = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY;
-    if (key) return { apiKey: key, apiBase: env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com' };
+    if (key) return { apiKey: key, apiBase: env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
   } catch {}
   // Fall back to process.env
   const key = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
-  if (key) return { apiKey: key, apiBase: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com' };
+  if (key) return { apiKey: key, apiBase: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
   return null;
 }
 
@@ -408,22 +612,36 @@ function fetchModelsFromApi(credentials) {
   return new Promise((resolve, reject) => {
     const base = (credentials.apiBase || 'https://api.anthropic.com').replace(/\/$/, '');
     const url = new URL(base + '/v1/models');
-    const isAnthropic = url.hostname.includes('anthropic.com');
+    url.searchParams.set('limit', '100');
+    const isAnthropic = credentials.upstreamType === 'anthropic';
     const options = {
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname + (url.search || '') + (url.search ? '&' : '?') + 'limit=100',
+      path: url.pathname + (url.search || ''),
       method: 'GET',
-      headers: {
-        'x-api-key': credentials.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
+      headers: isAnthropic
+        ? {
+            'x-api-key': credentials.apiKey,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+          }
+        : {
+            Authorization: `Bearer ${credentials.apiKey}`,
+            'content-type': 'application/json',
+          },
     };
     const proto = url.protocol === 'https:' ? https : http;
     const req = proto.request(options, (res) => {
       let body = '';
-      res.on('data', d => { body += d; });
+      let bodyBytes = 0;
+      res.on('data', (d) => {
+        bodyBytes += d.length;
+        if (bodyBytes > HTTP_BODY_MAX_BYTES) {
+          req.destroy(new Error('response too large'));
+          return;
+        }
+        body += d;
+      });
       res.on('end', () => {
         if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
         try {
@@ -465,17 +683,43 @@ async function getModelList() {
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
-  templates: [],      // array of { name, apiKey, apiBase, defaultModel, opusModel, sonnetModel, haikuModel }
+  templates: [],      // array of { name, apiKey, apiBase, upstreamType, defaultModel, opusModel, sonnetModel, haikuModel }
   activeTemplate: '', // name of active template (for 'custom' mode)
 };
 
 const DEFAULT_CODEX_CONFIG = {
   mode: 'local',
+  legacyMode: '',
   activeProfile: '',
+  sharedTemplate: '',
   profiles: [],
   enableSearch: false,
   supportsSearch: false,
 };
+
+function normalizeCodexProfile(profile) {
+  return {
+    name: String(profile?.name || '').trim(),
+    apiKey: String(profile?.apiKey || ''),
+    apiBase: String(profile?.apiBase || '').trim(),
+    defaultModel: String(profile?.defaultModel || '').trim(),
+  };
+}
+
+function normalizeCodexProfiles(profiles) {
+  return Array.isArray(profiles)
+    ? profiles.map(normalizeCodexProfile).filter((profile) => profile.name)
+    : [];
+}
+
+function normalizeCodexMode(mode) {
+  return mode === 'unified' || mode === 'shared' || mode === 'custom' ? 'unified' : 'local';
+}
+
+function resolveCodexLegacyMode(raw) {
+  if (raw === 'custom' || raw === 'shared') return raw;
+  return '';
+}
 
 function loadModelConfig() {
   return readCachedJsonConfig(MODEL_CONFIG_PATH) || cloneJson(DEFAULT_MODEL_CONFIG);
@@ -502,13 +746,11 @@ function loadCodexConfig() {
   const raw = readCachedJsonConfig(CODEX_CONFIG_PATH);
   if (raw) {
     return {
-      mode: raw.mode === 'custom' ? 'custom' : 'local',
+      mode: normalizeCodexMode(raw.mode),
+      legacyMode: resolveCodexLegacyMode(raw.legacyMode || raw.mode),
       activeProfile: raw.activeProfile || '',
-      profiles: Array.isArray(raw.profiles) ? raw.profiles.map((profile) => ({
-        name: String(profile?.name || '').trim(),
-        apiKey: String(profile?.apiKey || ''),
-        apiBase: String(profile?.apiBase || '').trim(),
-      })).filter((profile) => profile.name) : [],
+      sharedTemplate: String(raw.sharedTemplate || '').trim(),
+      profiles: normalizeCodexProfiles(raw.profiles),
       enableSearch: false,
       supportsSearch: false,
       storedEnableSearch: !!raw.enableSearch,
@@ -519,13 +761,11 @@ function loadCodexConfig() {
 
 function saveCodexConfig(config) {
   writeCachedJsonConfig(CODEX_CONFIG_PATH, {
-    mode: config.mode === 'custom' ? 'custom' : 'local',
+    mode: normalizeCodexMode(config.mode),
+    legacyMode: resolveCodexLegacyMode(config.legacyMode || config.mode),
     activeProfile: config.activeProfile || '',
-    profiles: Array.isArray(config.profiles) ? config.profiles.map((profile) => ({
-      name: String(profile?.name || '').trim(),
-      apiKey: String(profile?.apiKey || ''),
-      apiBase: String(profile?.apiBase || '').trim(),
-    })).filter((profile) => profile.name) : [],
+    sharedTemplate: String(config.sharedTemplate || '').trim(),
+    profiles: normalizeCodexProfiles(config.profiles),
     enableSearch: false,
   });
 }
@@ -533,12 +773,15 @@ function saveCodexConfig(config) {
 function getCodexConfigMasked() {
   const config = loadCodexConfig();
   return {
-    mode: config.mode === 'custom' ? 'custom' : 'local',
+    mode: normalizeCodexMode(config.mode),
+    legacyMode: resolveCodexLegacyMode(config.legacyMode),
     activeProfile: config.activeProfile || '',
+    sharedTemplate: config.sharedTemplate || '',
     profiles: (config.profiles || []).map((profile) => ({
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
       apiBase: profile.apiBase || '',
+      defaultModel: profile.defaultModel || '',
     })),
     enableSearch: false,
     supportsSearch: false,
@@ -547,8 +790,14 @@ function getCodexConfigMasked() {
 }
 
 function maskSecret(str) {
-  if (!str || str.length <= 8) return str ? '****' : '';
+  if (!str || str.length <= 12) return str ? '****' : '';
   return str.slice(0, 4) + '****' + str.slice(-4);
+}
+
+function mergeSecretField(nextValue, currentValue) {
+  const next = String(nextValue || '');
+  if (next && !next.includes('****')) return next;
+  return String(currentValue || '');
 }
 
 function getModelConfigMasked() {
@@ -560,6 +809,7 @@ function getModelConfigMasked() {
       name: t.name,
       apiKey: maskSecret(t.apiKey),
       apiBase: t.apiBase || '',
+      upstreamType: t.upstreamType || 'openai',
       defaultModel: t.defaultModel || '',
       opusModel: t.opusModel || '',
       sonnetModel: t.sonnetModel || '',
@@ -574,37 +824,116 @@ function tomlString(value) {
   return JSON.stringify(String(value || ''));
 }
 
-function prepareCodexCustomRuntime(config) {
-  if (!config || config.mode !== 'custom') return { mode: 'local' };
-  const profiles = Array.isArray(config.profiles) ? config.profiles : [];
-  const activeProfile = profiles.find((profile) => profile.name === config.activeProfile) || null;
+function resolveCodexCustomProfile(config) {
+  const profiles = Array.isArray(config?.profiles) ? config.profiles : [];
+  const activeProfile = profiles.find((profile) => profile.name === config?.activeProfile) || null;
   if (!activeProfile) {
-    return { error: 'Codex 自定义配置缺少已激活的 profile。请先在设置中创建并激活一个 API 配置。' };
+    return { error: 'Codex 独立配置缺少已激活的配置项。请先在设置中创建并激活一个 API 配置。' };
   }
   if (!activeProfile.apiKey || !activeProfile.apiBase) {
-    return { error: `Codex profile「${activeProfile.name}」缺少 API Key 或 API Base URL。` };
+    return { error: `Codex 配置「${activeProfile.name}」缺少 API Key 或 API Base URL。` };
+  }
+  return {
+    mode: 'custom',
+    name: activeProfile.name,
+    apiKey: activeProfile.apiKey,
+    apiBase: activeProfile.apiBase,
+    upstreamType: 'openai',
+    defaultModel: activeProfile.defaultModel || '',
+  };
+}
+
+function resolveCodexUnifiedSource(config) {
+  const modelConfig = loadModelConfig();
+  const templates = Array.isArray(modelConfig.templates) ? modelConfig.templates : [];
+  const activeTemplateName = String(modelConfig.activeTemplate || '').trim();
+  const fallbackTemplateName = String(config?.sharedTemplate || '').trim();
+  // Fallback priority:
+  // 1) unified activeTemplate
+  // 2) codex sharedTemplate
+  // 3) first available unified template
+  // 4) legacy custom profile
+  // 5) legacy shared(local Claude credentials)
+  const template = (activeTemplateName && templates.find((item) => item.name === activeTemplateName))
+    || (fallbackTemplateName && templates.find((item) => item.name === fallbackTemplateName))
+    || templates[0]
+    || null;
+
+  if (template) {
+    if (!template.apiKey || !template.apiBase) {
+      if (config?.legacyMode === 'custom') return resolveCodexCustomProfile(config);
+      return { error: `统一 API 配置「${template.name}」缺少 API Key 或 API Base URL。` };
+    }
+    return {
+      mode: 'unified',
+      name: template.name,
+      apiKey: template.apiKey,
+      apiBase: template.apiBase,
+      upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+      defaultModel: template.defaultModel || '',
+    };
+  }
+
+  if (config?.legacyMode === 'custom') {
+    return resolveCodexCustomProfile(config);
+  }
+
+  if (config?.legacyMode === 'shared') {
+    const localClaude = readClaudeSettingsCredentials();
+    if (localClaude) {
+      return {
+        mode: 'unified',
+        name: '当前 Claude Code 配置',
+        apiKey: localClaude.apiKey,
+        apiBase: localClaude.apiBase,
+        upstreamType: 'anthropic',
+        defaultModel: localClaude.defaultModel || '',
+      };
+    }
+  }
+
+  return { error: '当前没有可用的统一 API 配置。请先在设置中创建并激活一个 API 配置。' };
+}
+
+function resolveCodexActiveSource(config) {
+  if (!config || normalizeCodexMode(config.mode) === 'local') return { mode: 'local' };
+  return resolveCodexUnifiedSource(config);
+}
+
+function prepareCodexCustomRuntime(config) {
+  const source = resolveCodexActiveSource(config);
+  if (source?.error) return source;
+  if (!source || source.mode === 'local') return { mode: 'local' };
+
+  let bridge = null;
+  try {
+    bridge = ensureBridgeRuntimeForTemplate(source);
+  } catch (error) {
+    return { error: error.message || '本地 API 中间件初始化失败' };
   }
 
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
   const configToml = [
+    bridge.defaultModel ? `model = ${tomlString(bridge.defaultModel)}` : null,
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
     '',
     '[model_providers.openai_compat]',
-    `name = ${tomlString(activeProfile.name || 'OpenAI Compat')}`,
-    `base_url = ${tomlString(activeProfile.apiBase)}`,
+    `name = ${tomlString(source.name || 'Unified API Config')}`,
+    `base_url = ${tomlString(bridge.openaiBaseUrl)}`,
     'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
     '',
-  ].join('\n');
+  ].filter((line) => line !== null).join('\n');
   fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
 
   return {
     mode: 'custom',
     homeDir: CODEX_RUNTIME_HOME,
-    apiKey: activeProfile.apiKey,
-    apiBase: activeProfile.apiBase,
-    profileName: activeProfile.name,
+    apiKey: bridge.token,
+    apiBase: bridge.openaiBaseUrl,
+    profileName: source.name,
+    defaultModel: bridge.defaultModel || '',
   };
 }
 
@@ -626,17 +955,22 @@ function normalizeCodexModelEntries(rawModels) {
   }
   entries.sort((a, b) => (a.priority - b.priority) || a.label.localeCompare(b.label));
   const seen = new Set();
-  return entries.filter((entry) => {
-    if (seen.has(entry.value)) return false;
+  const deduped = [];
+  for (const entry of entries) {
+    if (seen.has(entry.value)) continue;
     seen.add(entry.value);
-    delete entry.priority;
-    return true;
-  });
+    deduped.push({
+      value: entry.value,
+      label: entry.label,
+      desc: entry.desc,
+    });
+  }
+  return deduped;
 }
 
 function loadCodexModelsCacheEntries(cachePath) {
   try {
-    if (!cachePath || !fs.existsSync(cachePath)) return null;
+    if (!cachePath) return null;
     const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     const entries = normalizeCodexModelEntries(parsed.models);
     if (!entries.length) return null;
@@ -653,7 +987,7 @@ function loadCodexModelsCacheEntries(cachePath) {
 
 function getCodexModelsCachePaths(config) {
   const paths = [];
-  if (config?.mode === 'custom') {
+  if (config?.mode && config.mode !== 'local') {
     paths.push(path.join(CODEX_RUNTIME_HOME, 'models_cache.json'));
   }
   const home = process.env.HOME || process.env.USERPROFILE || '';
@@ -663,16 +997,59 @@ function getCodexModelsCachePaths(config) {
   return paths;
 }
 
+function buildFetchModelsUrl(apiBase, agent = 'claude') {
+  const base = String(apiBase || '').trim().replace(/\/+$/, '');
+  if (!base) throw new Error('缺少 API Base URL');
+  if (/\/models$/i.test(base)) return base;
+  if (agent === 'codex') {
+    return /\/v\d+(?:\.\d+)?$/i.test(base) ? `${base}/models` : `${base}/v1/models`;
+  }
+  return `${base}/v1/models`;
+}
+
+function buildModelsRequestSpec(apiBase, apiKey, upstreamType = 'openai', agent = 'claude') {
+  const fullUrl = upstreamType === 'anthropic'
+    ? buildFetchModelsUrl(apiBase, 'claude')
+    : buildFetchModelsUrl(apiBase, agent);
+  const headers = upstreamType === 'anthropic'
+    ? {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      }
+    : {
+        Authorization: `Bearer ${apiKey}`,
+      };
+  return { fullUrl, headers };
+}
+
+function isTlsHandshakeFailure(error) {
+  const text = String(error?.message || error || '').toLowerCase();
+  return /eproto|handshake failure|alert handshake failure|protocol version|ssl3_read_bytes|tlsv1 alert protocol version/.test(text);
+}
+
+function getClaudeFallbackModels() {
+  const models = [];
+  for (const alias of ['opus', 'sonnet', 'haiku']) {
+    const value = MODEL_MAP[alias] || DEFAULT_CLAUDE_MODEL_MAP[alias];
+    if (value) models.push(value);
+  }
+  return Array.from(new Set(models));
+}
+
 function fetchCodexModelsFromApi(profile) {
   return new Promise((resolve, reject) => {
     const base = String(profile?.apiBase || '').trim().replace(/\/$/, '');
     const token = String(profile?.apiKey || '').trim();
+    const upstreamType = profile?.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
     if (!base || !token) {
       return resolve(null);
     }
     let url;
+    let spec;
     try {
-      url = new URL(base + '/models');
+      spec = buildModelsRequestSpec(base, token, upstreamType, upstreamType === 'anthropic' ? 'claude' : 'codex');
+      url = new URL(spec.fullUrl);
     } catch (error) {
       return reject(error);
     }
@@ -682,14 +1059,22 @@ function fetchCodexModelsFromApi(profile) {
       path: url.pathname + (url.search || ''),
       method: 'GET',
       headers: {
-        authorization: `Bearer ${token}`,
+        ...spec.headers,
         'content-type': 'application/json',
       },
     };
     const proto = url.protocol === 'https:' ? https : http;
     const req = proto.request(options, (res) => {
       let body = '';
-      res.on('data', (chunk) => { body += chunk; });
+      let bodyBytes = 0;
+      res.on('data', (chunk) => {
+        bodyBytes += chunk.length;
+        if (bodyBytes > HTTP_BODY_MAX_BYTES) {
+          req.destroy(new Error('response too large'));
+          return;
+        }
+        body += chunk;
+      });
       res.on('end', () => {
         if (res.statusCode !== 200) {
           return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
@@ -712,27 +1097,27 @@ function fetchCodexModelsFromApi(profile) {
 async function getCodexModelMenuPayload(session) {
   const currentFull = session?.model || '';
   const current = currentFull || 'default';
-  const codexConfig = loadCodexConfig();
+  const modelConfig = loadModelConfig();
+  const activeTemplate = modelConfig.mode === 'custom'
+    ? ((modelConfig.templates || []).find((item) => item.name === modelConfig.activeTemplate) || null)
+    : null;
   let dynamicEntries = [];
   let source = null;
 
-  if (codexConfig.mode === 'custom') {
-    const activeProfile = (codexConfig.profiles || []).find((profile) => profile.name === codexConfig.activeProfile) || null;
-    if (activeProfile?.apiBase && activeProfile?.apiKey) {
-      try {
-        const fetched = await fetchCodexModelsFromApi(activeProfile);
-        if (fetched?.entries?.length) {
-          dynamicEntries = fetched.entries;
-          source = fetched.source;
-        }
-      } catch (error) {
-        plog('WARN', 'codex_model_fetch_failed', { error: error.message });
+  if (activeTemplate?.apiBase && activeTemplate?.apiKey) {
+    try {
+      const fetched = await fetchCodexModelsFromApi(activeTemplate);
+      if (fetched?.entries?.length) {
+        dynamicEntries = fetched.entries;
+        source = fetched.source;
       }
+    } catch (error) {
+      plog('WARN', 'codex_model_fetch_failed', { error: error.message });
     }
   }
 
   if (!dynamicEntries.length) {
-    for (const cachePath of getCodexModelsCachePaths(codexConfig)) {
+    for (const cachePath of getCodexModelsCachePaths({ mode: modelConfig.mode })) {
       const cached = loadCodexModelsCacheEntries(cachePath);
       if (cached?.entries?.length) {
         dynamicEntries = cached.entries;
@@ -745,9 +1130,19 @@ async function getCodexModelMenuPayload(session) {
   const entries = [{
     value: 'default',
     label: 'Default',
-    desc: '使用当前 Codex 默认模型',
+    desc: activeTemplate?.defaultModel
+      ? `使用当前 Codex 默认模型（${activeTemplate.defaultModel}）`
+      : '使用当前 Codex 默认模型',
   }];
   const seen = new Set(entries.map((entry) => entry.value));
+  if (activeTemplate?.defaultModel && !seen.has(activeTemplate.defaultModel)) {
+    seen.add(activeTemplate.defaultModel);
+    entries.push({
+      value: activeTemplate.defaultModel,
+      label: activeTemplate.defaultModel,
+      desc: '当前统一配置默认模型',
+    });
+  }
   for (const entry of dynamicEntries) {
     if (seen.has(entry.value)) continue;
     seen.add(entry.value);
@@ -796,23 +1191,83 @@ const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
 
-function applyCustomTemplateToSettings(tpl) {
+function readClaudeSettingsEnv() {
+  try {
+    const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+    return settings?.env && typeof settings.env === 'object' ? settings.env : {};
+  } catch {
+    return {};
+  }
+}
+
+function readClaudeSettingsCredentials() {
+  const env = readClaudeSettingsEnv();
+  const apiKey = String(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || '').trim();
+  const apiBase = String(env.ANTHROPIC_BASE_URL || '').trim();
+  if (!apiKey || !apiBase) return null;
+  return {
+    apiKey,
+    apiBase,
+    defaultModel: String(env.ANTHROPIC_MODEL || env.ANTHROPIC_DEFAULT_OPUS_MODEL || '').trim(),
+  };
+}
+
+function applyCustomTemplateToSettings(tpl, existingBridge) {
+  let bridge = existingBridge || null;
+  if (!bridge) {
+    try {
+      bridge = ensureBridgeRuntimeForTemplate(tpl);
+    } catch {
+      bridge = null;
+    }
+  }
   let settings = {};
   try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
   const cleanedEnv = {};
   for (const [k, v] of Object.entries(settings.env || {})) {
     if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
   }
-  if (tpl.apiKey)       { cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey; cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey; }
-  if (tpl.apiBase)      cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
-  if (tpl.defaultModel) cleanedEnv.ANTHROPIC_MODEL = tpl.defaultModel;
-  if (tpl.opusModel)    cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tpl.opusModel;
-  if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
-  if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
+  const defaultModel = String(tpl.defaultModel || '').trim();
+  const opusModel = String(tpl.opusModel || defaultModel || '').trim();
+  const sonnetModel = String(tpl.sonnetModel || defaultModel || '').trim();
+  const haikuModel = String(tpl.haikuModel || defaultModel || '').trim();
+
+  if (bridge?.token) {
+    cleanedEnv.ANTHROPIC_AUTH_TOKEN = bridge.token;
+    cleanedEnv.ANTHROPIC_API_KEY = bridge.token;
+  } else if (tpl.apiKey) {
+    cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey;
+    cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey;
+  }
+  if (bridge?.anthropicBaseUrl) cleanedEnv.ANTHROPIC_BASE_URL = bridge.anthropicBaseUrl;
+  else if (tpl.apiBase) cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
+  if (defaultModel) cleanedEnv.ANTHROPIC_MODEL = defaultModel;
+  if (opusModel) cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel;
+  if (sonnetModel) cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetModel;
+  if (haikuModel) cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel;
   settings.env = cleanedEnv;
   // 原子写入：先写临时文件再 rename，避免 Claude 子进程读到写了一半的文件
   const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
   try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
+    fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+function clearManagedClaudeSettings() {
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
+  const cleanedEnv = {};
+  for (const [k, v] of Object.entries(settings.env || {})) {
+    if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
+  }
+  settings.env = cleanedEnv;
+  const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
     fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
     fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
   } catch {
@@ -825,10 +1280,11 @@ function applyModelConfig() {
   if (config.mode === 'custom' && config.activeTemplate) {
     const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
     if (tpl) {
-      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel;
-      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel;
-      if (tpl.haikuModel) MODEL_MAP.haiku = tpl.haikuModel;
-      return;
+      const defaultModel = String(tpl.defaultModel || '').trim();
+      if (tpl.opusModel || defaultModel) MODEL_MAP.opus = tpl.opusModel || defaultModel;
+      if (tpl.sonnetModel || defaultModel) MODEL_MAP.sonnet = tpl.sonnetModel || defaultModel;
+      if (tpl.haikuModel || defaultModel) MODEL_MAP.haiku = tpl.haikuModel || defaultModel;
+      if (defaultModel || tpl.opusModel || tpl.sonnetModel || tpl.haikuModel) return;
     }
   }
   // mode === 'local': read model names from ~/.claude.json
@@ -842,6 +1298,15 @@ function applyModelConfig() {
 
 // Apply on startup
 applyModelConfig();
+try {
+  const activeTemplate = getActiveUnifiedTemplate();
+  if (activeTemplate) {
+    const bridge = ensureBridgeRuntimeForTemplate(activeTemplate);
+    applyCustomTemplateToSettings(activeTemplate, bridge);
+  }
+} catch (error) {
+  plog('WARN', 'bridge_startup_init_failed', { error: error.message });
+}
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -856,7 +1321,15 @@ const MIME_TYPES = {
 // === Utility Functions ===
 
 function wsSend(ws, data) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+  if (!ws || ws.readyState !== 1) return;
+  try {
+    ws.send(JSON.stringify(data));
+  } catch (error) {
+    plog('WARN', 'ws_send_failed', {
+      type: data?.type || null,
+      error: error?.message || String(error),
+    });
+  }
 }
 
 function isPathInside(filePath, rootDir) {
@@ -902,6 +1375,31 @@ function extFromMime(mime) {
   }
 }
 
+function detectMimeFromMagic(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) return 'image/png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 6 && (buffer.toString('ascii', 0, 6) === 'GIF87a' || buffer.toString('ascii', 0, 6) === 'GIF89a')) {
+    return 'image/gif';
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) return 'image/webp';
+  return null;
+}
+
 function loadAttachmentMeta(id) {
   try {
     return JSON.parse(fs.readFileSync(attachmentMetaPath(id), 'utf8'));
@@ -911,7 +1409,7 @@ function loadAttachmentMeta(id) {
 }
 
 function saveAttachmentMeta(meta) {
-  fs.writeFileSync(attachmentMetaPath(meta.id), JSON.stringify(meta, null, 2));
+  writeJsonAtomic(attachmentMetaPath(meta.id), meta);
 }
 
 function removeAttachmentById(id) {
@@ -1006,7 +1504,7 @@ function extractBearerToken(req) {
 }
 
 function jsonResponse(res, statusCode, payload) {
-  res.writeHead(statusCode, {
+  writeHeadWithSecurity(res, statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-cache',
   });
@@ -1081,7 +1579,9 @@ function loadSession(id) {
 
 function saveSession(session) {
   normalizeSession(session);
-  fs.writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2));
+  writeJsonAtomic(sessionPath(session.id), session);
+  invalidateSessionListCache();
+  invalidateImportedSessionIdsCache();
 }
 
 function normalizeClaudeModelAliasInput(modelInput) {
@@ -1217,6 +1717,100 @@ function killProcess(pid, force = false) {
   } catch {}
 }
 
+function sleepSync(ms) {
+  if (!ms || ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readBridgeState() {
+  try {
+    if (!fs.existsSync(BRIDGE_STATE_PATH)) return null;
+    const parsed = JSON.parse(fs.readFileSync(BRIDGE_STATE_PATH, 'utf8'));
+    return parsed && typeof parsed.port === 'number' && parsed.port > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadBridgeRuntime() {
+  return readCachedJsonConfig(BRIDGE_RUNTIME_PATH) || null;
+}
+
+function buildLocalBridgeBaseUrl(port, kind) {
+  return `http://127.0.0.1:${port}/${kind}`;
+}
+
+function getActiveUnifiedTemplate() {
+  const config = loadModelConfig();
+  if (config.mode !== 'custom' || !config.activeTemplate) return null;
+  const tpl = (config.templates || []).find((item) => item.name === config.activeTemplate) || null;
+  if (!tpl || !tpl.apiKey || !tpl.apiBase) return null;
+  return tpl;
+}
+
+function isBridgePortReachable(port) {
+  return new Promise((resolve) => {
+    const req = http.request({ hostname: '127.0.0.1', port, path: '/health', method: 'GET', timeout: 500 }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+function ensureLocalBridgeRunning() {
+  const existing = readBridgeState();
+  if (existing?.pid && isProcessRunning(existing.pid) && existing.port) {
+    return existing;
+  }
+
+  const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
+    detached: true,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      CC_WEB_BRIDGE_RUNTIME_PATH: BRIDGE_RUNTIME_PATH,
+      CC_WEB_BRIDGE_STATE_PATH: BRIDGE_STATE_PATH,
+    },
+  });
+  child.unref();
+
+  const start = Date.now();
+  while (Date.now() - start < BRIDGE_START_TIMEOUT_MS) {
+    const state = readBridgeState();
+    if (state?.pid && isProcessRunning(state.pid) && state.port) return state;
+    sleepSync(50);
+  }
+  throw new Error('本地 API 桥接服务启动超时');
+}
+
+function ensureBridgeRuntimeForTemplate(tpl) {
+  const defaultModel = String(tpl.defaultModel || '').trim();
+  const upstreamType = tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
+  const existing = loadBridgeRuntime();
+  const token = existing?.token || crypto.randomBytes(24).toString('hex');
+  writeCachedJsonConfig(BRIDGE_RUNTIME_PATH, {
+    token,
+    upstream: {
+      name: String(tpl.name || '').trim() || 'Unified API',
+      apiKey: String(tpl.apiKey || ''),
+      apiBase: String(tpl.apiBase || '').trim(),
+      kind: upstreamType,
+      defaultModel,
+    },
+    updatedAt: new Date().toISOString(),
+  });
+  const state = ensureLocalBridgeRunning();
+  return {
+    token,
+    defaultModel,
+    anthropicBaseUrl: buildLocalBridgeBaseUrl(state.port, 'anthropic'),
+    openaiBaseUrl: buildLocalBridgeBaseUrl(state.port, 'openai'),
+  };
+}
+
 function cleanRunDir(sessionId) {
   const dir = runDir(sessionId);
   try {
@@ -1224,30 +1818,49 @@ function cleanRunDir(sessionId) {
   } catch {}
 }
 
-function sendSessionList(ws) {
+function collectSessionListSnapshot() {
+  const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+  const sessions = [];
+  for (const f of files) {
+    try {
+      const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+      const localMeta = getSessionAgent(s) === 'claude' && s.claudeSessionId && (!s.cwd || !s.importedFrom)
+        ? resolveClaudeSessionLocalMeta(s.claudeSessionId)
+        : null;
+      sessions.push({
+        id: s.id,
+        title: s.title || 'Untitled',
+        updated: s.updated,
+        hasUnread: !!s.hasUnread,
+        agent: getSessionAgent(s),
+        isRunning: activeProcesses.has(s.id),
+        projectId: s.projectId || null,
+        cwd: s.cwd || localMeta?.cwd || null,
+        importedFrom: s.importedFrom || localMeta?.projectDir || null,
+      });
+    } catch {}
+  }
+  sessions.sort((a, b) => new Date(b.updated) - new Date(a.updated));
+  return sessions;
+}
+
+function getSessionListSnapshot(options = {}) {
+  const now = Date.now();
+  const forceRefresh = !!options.forceRefresh;
+  if (!forceRefresh && sessionListCache.expiresAt > now) {
+    return sessionListCache.sessions;
+  }
+  const sessions = collectSessionListSnapshot();
+  sessionListCache.sessions = sessions;
+  sessionListCache.expiresAt = now + SESSION_LIST_CACHE_TTL_MS;
+  return sessions;
+}
+
+function sendSessionList(ws, options = {}) {
   try {
-    const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'));
-    const sessions = [];
-    for (const f of files) {
-      try {
-        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
-        const localMeta = getSessionAgent(s) === 'claude' && s.claudeSessionId && (!s.cwd || !s.importedFrom)
-          ? resolveClaudeSessionLocalMeta(s.claudeSessionId)
-          : null;
-        sessions.push({
-          id: s.id,
-          title: s.title || 'Untitled',
-          updated: s.updated,
-          hasUnread: !!s.hasUnread,
-          agent: getSessionAgent(s),
-          isRunning: activeProcesses.has(s.id),
-          projectId: s.projectId || null,
-          cwd: s.cwd || localMeta?.cwd || null,
-          importedFrom: s.importedFrom || localMeta?.projectDir || null,
-        });
-      } catch {}
-    }
-    sessions.sort((a, b) => new Date(b.updated) - new Date(a.updated));
+    const sessions = Array.isArray(options.sessions)
+      ? options.sessions
+      : getSessionListSnapshot(options);
     wsSend(ws, { type: 'session_list', sessions });
   } catch {
     wsSend(ws, { type: 'session_list', sessions: [] });
@@ -1265,44 +1878,70 @@ class FileTailer {
     this.watcher = null;
     this.interval = null;
     this.stopped = false;
+    this.readTimer = null;
   }
 
   start() {
     this.readNew();
     try {
       this.watcher = fs.watch(this.filePath, () => {
-        if (!this.stopped) this.readNew();
+        this.scheduleRead();
       });
       this.watcher.on('error', () => {});
     } catch {}
     // Backup poll every 500ms (fs.watch not always reliable on all systems)
     this.interval = setInterval(() => {
-      if (!this.stopped) this.readNew();
+      this.scheduleRead();
     }, 500);
+  }
+
+  scheduleRead() {
+    if (this.stopped || this.readTimer) return;
+    this.readTimer = setTimeout(() => {
+      this.readTimer = null;
+      if (!this.stopped) this.readNew();
+    }, FILE_TAIL_DEBOUNCE_MS);
   }
 
   readNew() {
     try {
       const stat = fs.statSync(this.filePath);
       if (stat.size <= this.offset) return;
-      const buf = Buffer.alloc(stat.size - this.offset);
+
+      const remaining = stat.size - this.offset;
+      const readLen = Math.min(remaining, FILE_TAIL_MAX_READ_BYTES);
+      const buf = Buffer.alloc(readLen);
       const fd = fs.openSync(this.filePath, 'r');
-      fs.readSync(fd, buf, 0, buf.length, this.offset);
-      fs.closeSync(fd);
-      this.offset = stat.size;
-      this.buffer += buf.toString();
+      let bytesRead = 0;
+      try {
+        bytesRead = fs.readSync(fd, buf, 0, buf.length, this.offset);
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      if (bytesRead <= 0) return;
+
+      this.offset += bytesRead;
+      this.buffer += buf.toString('utf8', 0, bytesRead);
       const lines = this.buffer.split('\n');
       this.buffer = lines.pop();
       for (const line of lines) {
         if (line.trim()) this.onLine(line);
       }
-    } catch {}
+    } catch (error) {
+      plog('WARN', 'tailer_read_error', {
+        file: this.filePath,
+        offset: this.offset,
+        error: error?.message || String(error),
+      });
+    }
   }
 
   stop() {
     this.stopped = true;
     if (this.watcher) { this.watcher.close(); this.watcher = null; }
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
+    if (this.readTimer) { clearTimeout(this.readTimer); this.readTimer = null; }
   }
 }
 
@@ -1400,42 +2039,32 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
-function handleProcessComplete(sessionId, exitCode, signal) {
-  const entry = activeProcesses.get(sessionId);
-  if (!entry) return;
+function readProcessStderrSnippet(sessionId) {
+  try {
+    const errPath = path.join(runDir(sessionId), 'error.log');
+    const content = fs.readFileSync(errPath, 'utf8').trim();
+    if (content) return content.slice(-500);
+  } catch {}
+  return '';
+}
 
-  // 先做最后一次读取，再根据完整输出判断失败原因与后续动作。
-  if (entry.tailer) {
-    entry.tailer.readNew();
-    entry.tailer.stop();
-  }
-
+function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
   const completeTime = new Date().toISOString();
   const wsConnected = !!entry.ws;
   const disconnectGap = entry.wsDisconnectTime
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
-
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
-  let contextLimitExceeded = false;
-
-  // Read stderr for error clues
-  let stderrSnippet = '';
-  try {
-    const errPath = path.join(runDir(sessionId), 'error.log');
-    if (fs.existsSync(errPath)) {
-      const content = fs.readFileSync(errPath, 'utf8').trim();
-      if (content) stderrSnippet = content.slice(-500);
-    }
-  } catch {}
-
+  const stderrSnippet = readProcessStderrSnippet(sessionId);
   const rawCompletionError = entry.lastError || (
     ((typeof exitCode === 'number' && exitCode !== 0) || (!!signal && signal !== 'SIGTERM'))
       ? (stderrSnippet || null)
       : null
   );
-  contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
-  const completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
+  const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
+  const completionError = rawCompletionError
+    ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal })
+    : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
@@ -1456,10 +2085,10 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     requestTooLarge: contextLimitExceeded,
   });
 
-  const pendingSlash = pendingSlashCommands.get(sessionId) || null;
-  clearPendingSlashCommand(sessionId, pendingSlash);
+  return { pendingRetry, contextLimitExceeded, completionError };
+}
 
-  // Save result to session
+function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const session = loadSession(sessionId);
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0))) {
     session.messages.push({
@@ -1481,91 +2110,132 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     session.updated = new Date().toISOString();
     saveSession(session);
   }
+  return session;
+}
 
+function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError) {
   let shouldReturnForFollowup = false;
   let shouldAutoCompact = false;
 
-  activeProcesses.delete(sessionId);
-  cleanRunDir(sessionId);
-  clearPendingSlashCommand(sessionId, pendingSlash);
-
-  // Notify client
-  if (entry.ws) {
-    if (pendingSlash?.kind === 'compact') {
-      const retry = pendingCompactRetries.get(sessionId);
-      const autoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
-      if (autoRetryRequested) {
-        if (contextLimitExceeded) {
-          pendingCompactRetries.delete(sessionId);
-          wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
-        } else {
-          wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
-          wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
-          shouldReturnForFollowup = true;
-        }
+  if (pendingSlash?.kind === 'compact') {
+    const retry = pendingCompactRetries.get(sessionId);
+    const autoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
+    if (autoRetryRequested) {
+      if (contextLimitExceeded) {
+        pendingCompactRetries.delete(sessionId);
+        wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
       } else {
         wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
+        wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
+        shouldReturnForFollowup = true;
       }
+    } else {
+      wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
     }
+  }
 
-    if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
-      pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo', reason: 'auto' });
+  if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
+    const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
+    if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
+      pendingCompactRetries.delete(sessionId);
+      wsSend(entry.ws, { type: 'system_message', message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
+    } else {
+      pendingCompactRetries.set(sessionId, {
+        text: pendingRetry?.text || '',
+        mode: pendingRetry?.mode || session.permissionMode || 'yolo',
+        reason: 'auto',
+        autoRetryCount: nextRetryCount,
+      });
       wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
       shouldAutoCompact = true;
     }
-
-    if (completionError && !entry.errorSent && !shouldAutoCompact) {
-      entry.errorSent = true;
-      wsSend(entry.ws, { type: 'error', message: completionError });
-    }
-
-    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
-    sendSessionList(entry.ws);
-  } else {
-    // Process completed while browser was disconnected — notify all connected clients
-    const session = loadSession(sessionId);
-    const title = session?.title || 'Untitled';
-    for (const client of wss.clients) {
-      if (client.readyState !== 1 || client.isAuthenticated !== true) continue;
-      sendSessionList(client);
-      if (wsSessionMap.get(client) !== sessionId) continue;
-      wsSend(client, {
-        type: 'background_done',
-        sessionId,
-        title,
-        costUsd: entry.lastCost ?? null,
-        responseLen: (entry.fullText || '').length,
-      });
-    }
-    // Push notification
-    const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
-    const respLen = (entry.fullText || '').length;
-    sendNotification(
-      `CC-Web 任务完成`,
-      `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
-    );
   }
 
+  if (completionError && !entry.errorSent && !shouldAutoCompact) {
+    entry.errorSent = true;
+    wsSend(entry.ws, { type: 'error', message: completionError });
+  }
+
+  wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
+  sendSessionList(entry.ws);
+  return { shouldReturnForFollowup, shouldAutoCompact };
+}
+
+function handleDisconnectedProcessCompletion(sessionId, entry) {
+  const session = loadSession(sessionId);
+  const title = session?.title || 'Untitled';
+  const sessions = getSessionListSnapshot();
+  for (const client of wss.clients) {
+    if (client.readyState !== 1 || client.isAuthenticated !== true) continue;
+    sendSessionList(client, { sessions });
+    if (wsSessionMap.get(client) !== sessionId) continue;
+    wsSend(client, {
+      type: 'background_done',
+      sessionId,
+      title,
+      costUsd: entry.lastCost ?? null,
+      responseLen: (entry.fullText || '').length,
+    });
+  }
+  const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
+  const respLen = (entry.fullText || '').length;
+  sendNotification(
+    'CC-Web 任务完成',
+    `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
+  );
+}
+
+function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, shouldReturnForFollowup, shouldAutoCompact) {
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
     pendingCompactRetries.delete(sessionId);
   }
 
-  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session) {
-    if (pendingSlash?.kind === 'compact') {
-      const retry = pendingCompactRetries.get(sessionId);
-      if (retry?.text) {
-        pendingCompactRetries.delete(sessionId);
-        handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
-      }
-      return;
+  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session && pendingSlash?.kind === 'compact') {
+    const retry = pendingCompactRetries.get(sessionId);
+    if (retry?.text) {
+      pendingCompactRetries.delete(sessionId);
+      handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
     }
+    return;
   }
 
   if (shouldAutoCompact && entry.ws && entry.ws.readyState === 1 && session) {
     pendingSlashCommands.set(sessionId, { kind: 'compact' });
     handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
-    return;
   }
+}
+
+function handleProcessComplete(sessionId, exitCode, signal) {
+  const entry = activeProcesses.get(sessionId);
+  if (!entry) return;
+
+  if (entry.tailer) {
+    entry.tailer.readNew();
+    entry.tailer.stop();
+  }
+
+  const pendingSlash = pendingSlashCommands.get(sessionId) || null;
+  clearPendingSlashCommand(sessionId, pendingSlash);
+  const { pendingRetry, contextLimitExceeded, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
+  const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
+
+  removeActiveProcess(sessionId);
+  cleanRunDir(sessionId);
+
+  const { shouldReturnForFollowup, shouldAutoCompact } = entry.ws
+    ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
+    : (handleDisconnectedProcessCompletion(sessionId, entry), { shouldReturnForFollowup: false, shouldAutoCompact: false });
+
+  runProcessCompletionFollowup(
+    sessionId,
+    entry,
+    session,
+    pendingSlash,
+    pendingRetry,
+    contextLimitExceeded,
+    shouldReturnForFollowup,
+    shouldAutoCompact
+  );
 }
 
 // Global PID monitor: detect process completion (especially after server restart)
@@ -1585,14 +2255,17 @@ setInterval(() => {
 cleanupExpiredAttachments();
 setInterval(cleanupExpiredAttachments, 6 * 60 * 60 * 1000);
 setInterval(() => cleanupExpiredTokens(), AUTH_TOKEN_CLEANUP_MS);
+setInterval(() => cleanupAuthAttempts(), AUTH_TOKEN_CLEANUP_MS);
 
 // Recover processes that were running before server restart
 function recoverProcesses() {
   try {
-    const entries = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('-run') && fs.statSync(path.join(SESSIONS_DIR, f)).isDirectory());
-    if (entries.length === 0) return;
-    plog('INFO', 'recovery_start', { runDirs: entries.length });
-    for (const dirName of entries) {
+    const runDirs = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.endsWith('-run'))
+      .map((entry) => entry.name);
+    if (runDirs.length === 0) return;
+    plog('INFO', 'recovery_start', { runDirs: runDirs.length });
+    for (const dirName of runDirs) {
       const sessionId = dirName.replace('-run', '');
       const dir = path.join(SESSIONS_DIR, dirName);
       const pidPath = path.join(dir, 'pid');
@@ -1611,7 +2284,7 @@ function recoverProcesses() {
         console.log(`[recovery] Re-attaching to session ${sessionId} (PID ${pid})`);
         plog('INFO', 'recovery_alive', { sessionId: sessionId.slice(0, 8), pid, agent });
         const entry = { pid, ws: null, agent, fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
-        activeProcesses.set(sessionId, entry);
+        setActiveProcess(sessionId, entry);
 
         if (fs.existsSync(outputPath)) {
           entry.tailer = new FileTailer(outputPath, (line) => {
@@ -1666,7 +2339,12 @@ const server = http.createServer((req, res) => {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    const rawName = decodeURIComponent(String(req.headers['x-filename'] || 'image'));
+    let rawName = 'image';
+    try {
+      rawName = decodeURIComponent(String(req.headers['x-filename'] || 'image'));
+    } catch {
+      rawName = String(req.headers['x-filename'] || 'image');
+    }
     const filename = safeFilename(rawName);
     if (!IMAGE_MIME_TYPES.has(mime)) {
       return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片' });
@@ -1691,6 +2369,10 @@ const server = http.createServer((req, res) => {
       const buffer = Buffer.concat(chunks);
       if (buffer.length === 0) {
         return jsonResponse(res, 400, { ok: false, message: '图片内容为空' });
+      }
+      const actualMime = detectMimeFromMagic(buffer);
+      if (!actualMime || actualMime !== mime) {
+        return jsonResponse(res, 400, { ok: false, message: '图片内容与声明类型不一致或文件已损坏' });
       }
       const id = crypto.randomUUID();
       const ext = extFromMime(mime) || path.extname(filename) || '';
@@ -1725,7 +2407,7 @@ const server = http.createServer((req, res) => {
       } catch (err) {
         try { if (fs.existsSync(dataPath)) fs.unlinkSync(dataPath); } catch {}
         try { if (fs.existsSync(attachmentMetaPath(id))) fs.unlinkSync(attachmentMetaPath(id)); } catch {}
-        return jsonResponse(res, 500, { ok: false, message: `保存附件失败: ${err.message}` });
+        return jsonResponse(res, 500, { ok: false, message: '保存附件失败，请稍后重试' });
       }
     });
     req.on('error', () => {
@@ -1751,17 +2433,17 @@ const server = http.createServer((req, res) => {
   filePath = path.resolve(filePath);
 
   if (!isPathInside(filePath, PUBLIC_ROOT)) {
-    res.writeHead(403);
+    writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Forbidden');
   }
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      res.writeHead(404);
+      writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('Not Found');
     }
     const ext = path.extname(filePath);
-    res.writeHead(200, {
+    writeHeadWithSecurity(res, 200, {
       'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
     });
@@ -1770,16 +2452,42 @@ const server = http.createServer((req, res) => {
 });
 
 // === WebSocket Server ===
-const wss = new WebSocketServer({ server });
+function isAllowedWsOrigin(origin, req) {
+  if (!origin) return true; // CLI / non-browser clients may not send Origin
+  let parsedOrigin;
+  try {
+    parsedOrigin = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (!/^https?:$/i.test(parsedOrigin.protocol)) return false;
 
-wss.on('connection', (ws) => {
-  let authenticated = false;
-  let authToken = null;
+  const reqHost = String(req?.headers?.host || '').toLowerCase();
+  const originHost = String(parsedOrigin.host || '').toLowerCase();
+  if (reqHost && originHost === reqHost) return true;
+
+  const allowedHosts = new Set([
+    `localhost:${PORT}`,
+    `127.0.0.1:${PORT}`,
+    `[::1]:${PORT}`,
+  ]);
+  if (HOST && HOST !== '0.0.0.0' && HOST !== '::') {
+    allowedHosts.add(`${HOST}:${PORT}`);
+  }
+  return allowedHosts.has(originHost);
+}
+
+const wss = new WebSocketServer({
+  server,
+  verifyClient: (info) => isAllowedWsOrigin(info.origin || info.req?.headers?.origin || '', info.req),
+});
+
+wss.on('connection', (ws, req) => {
   ws.isAuthenticated = false;
   ws.authToken = null;
   const wsId = crypto.randomBytes(4).toString('hex'); // short id for log correlation
-  const wsConnectTime = new Date().toISOString();
-  plog('INFO', 'ws_connect', { wsId });
+  const clientIp = getWsClientIp(req);
+  plog('INFO', 'ws_connect', { wsId, ip: clientIp });
 
   ws.on('message', (raw) => {
     let msg;
@@ -1790,26 +2498,50 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'auth') {
+      if (!hasConfiguredPassword()) {
+        plog('ERROR', 'auth_no_password_configured', { wsId, ip: clientIp });
+        wsSend(ws, { type: 'auth_result', success: false, error: '服务器密码未配置' });
+        return;
+      }
       const tokenValid = hasActiveToken(msg.token);
-      if (timingSafeStringEqual(msg.password, PASSWORD) || tokenValid) {
-        authToken = tokenValid ? msg.token : crypto.randomBytes(32).toString('hex');
-        rememberActiveToken(authToken);
-        authenticated = true;
+      if (tokenValid) {
+        clearAuthFailures(clientIp);
+        const nextAuthToken = msg.token;
+        rememberActiveToken(nextAuthToken);
         ws.isAuthenticated = true;
-        ws.authToken = authToken;
-        wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
+        ws.authToken = nextAuthToken;
+        wsSend(ws, { type: 'auth_result', success: true, token: nextAuthToken, mustChangePassword: !!authConfig.mustChange });
+        sendSessionList(ws);
+        return;
+      }
+      const lockState = getAuthLockState(clientIp);
+      if (lockState.locked) {
+        const waitSeconds = Math.ceil(lockState.remainingMs / 1000);
+        wsSend(ws, { type: 'auth_result', success: false, error: `登录失败次数过多，请 ${waitSeconds} 秒后重试` });
+        return;
+      }
+      const passwordValid = verifyConfiguredPassword(msg.password);
+      if (passwordValid) {
+        clearAuthFailures(clientIp);
+        const nextAuthToken = crypto.randomBytes(32).toString('hex');
+        rememberActiveToken(nextAuthToken);
+        ws.isAuthenticated = true;
+        ws.authToken = nextAuthToken;
+        wsSend(ws, { type: 'auth_result', success: true, token: nextAuthToken, mustChangePassword: !!authConfig.mustChange });
         sendSessionList(ws);
       } else {
-        authenticated = false;
-        authToken = null;
+        const authState = recordAuthFailure(clientIp);
         ws.isAuthenticated = false;
         ws.authToken = null;
-        wsSend(ws, { type: 'auth_result', success: false });
+        const error = authState.locked
+          ? `登录失败次数过多，请 ${Math.ceil(authState.remainingMs / 1000)} 秒后重试`
+          : '认证失败';
+        wsSend(ws, { type: 'auth_result', success: false, error });
       }
       return;
     }
 
-    if (!authenticated) {
+    if (!ws.isAuthenticated) {
       return wsSend(ws, { type: 'error', message: 'Not authenticated' });
     }
 
@@ -1925,22 +2657,26 @@ function handleSaveNotifyConfig(ws, newConfig) {
   if (!newConfig || !newConfig.provider) {
     return wsSend(ws, { type: 'error', message: '无效的通知配置' });
   }
+  if (newConfig.provider === 'feishu') {
+    const candidateWebhook = String(newConfig.feishu?.webhook || '').trim();
+    if (candidateWebhook && !candidateWebhook.includes('****')) {
+      const validation = validateFeishuWebhook(candidateWebhook);
+      if (!validation.ok) {
+        return wsSend(ws, { type: 'error', message: validation.error });
+      }
+    }
+  }
   const current = loadNotifyConfig();
   // Merge: only update fields that are not masked (contain ****)
   const merged = { provider: newConfig.provider };
-  // pushplus
-  merged.pushplus = { token: (newConfig.pushplus?.token && !newConfig.pushplus.token.includes('****')) ? newConfig.pushplus.token : current.pushplus?.token || '' };
-  // telegram
+  merged.pushplus = { token: mergeSecretField(newConfig.pushplus?.token, current.pushplus?.token) };
   merged.telegram = {
-    botToken: (newConfig.telegram?.botToken && !newConfig.telegram.botToken.includes('****')) ? newConfig.telegram.botToken : current.telegram?.botToken || '',
+    botToken: mergeSecretField(newConfig.telegram?.botToken, current.telegram?.botToken),
     chatId: newConfig.telegram?.chatId !== undefined ? newConfig.telegram.chatId : current.telegram?.chatId || '',
   };
-  // serverchan
-  merged.serverchan = { sendKey: (newConfig.serverchan?.sendKey && !newConfig.serverchan.sendKey.includes('****')) ? newConfig.serverchan.sendKey : current.serverchan?.sendKey || '' };
-  // feishu
-  merged.feishu = { webhook: (newConfig.feishu?.webhook && !newConfig.feishu.webhook.includes('****')) ? newConfig.feishu.webhook : current.feishu?.webhook || '' };
-  // qqbot
-  merged.qqbot = { qmsgKey: (newConfig.qqbot?.qmsgKey && !newConfig.qqbot.qmsgKey.includes('****')) ? newConfig.qqbot.qmsgKey : current.qqbot?.qmsgKey || '' };
+  merged.serverchan = { sendKey: mergeSecretField(newConfig.serverchan?.sendKey, current.serverchan?.sendKey) };
+  merged.feishu = { webhook: mergeSecretField(newConfig.feishu?.webhook, current.feishu?.webhook) };
+  merged.qqbot = { qmsgKey: mergeSecretField(newConfig.qqbot?.qmsgKey, current.qqbot?.qmsgKey) };
 
   saveNotifyConfig(merged);
   plog('INFO', 'notify_config_saved', { provider: merged.provider });
@@ -1959,11 +2695,18 @@ function handleTestNotify(ws) {
 }
 
 function handleChangePassword(ws, msg) {
-  const { currentPassword, newPassword } = msg;
+  const currentPassword = String(msg?.currentPassword || '');
+  const newPassword = String(msg?.newPassword || '');
 
-  // Validate current password
-  if (!timingSafeStringEqual(currentPassword, PASSWORD)) {
-    return wsSend(ws, { type: 'password_changed', success: false, message: '当前密码错误' });
+  // For regular password changes, verify current password. For first-run mustChange flow,
+  // the user has just authenticated with the initial password so we can skip re-check.
+  if (!authConfig?.mustChange) {
+    if (!currentPassword) {
+      return wsSend(ws, { type: 'password_changed', success: false, message: '请输入当前密码' });
+    }
+    if (!verifyConfiguredPassword(currentPassword)) {
+      return wsSend(ws, { type: 'password_changed', success: false, message: '当前密码错误' });
+    }
   }
 
   // Validate new password strength
@@ -1973,12 +2716,12 @@ function handleChangePassword(ws, msg) {
   }
 
   // Save new password
-  authConfig = { password: newPassword, mustChange: false };
+  authConfig = { passwordHash: hashPassword(newPassword), mustChange: false };
   saveAuthConfig(authConfig);
-  PASSWORD = newPassword;
+  PASSWORD_HASH = authConfig.passwordHash;
   plog('INFO', 'password_changed', {});
 
-  // Clear all tokens (force all sessions to re-login)
+  // Clear all tokens so every existing login must re-authenticate.
   activeTokens.clear();
 
   // Generate new token for current connection
@@ -1986,6 +2729,12 @@ function handleChangePassword(ws, msg) {
   rememberActiveToken(newToken);
   ws.authToken = newToken;
   ws.isAuthenticated = true;
+
+  for (const client of wss.clients) {
+    if (client === ws) continue;
+    if (client.isAuthenticated !== true) continue;
+    forceLogoutClient(client, '密码已修改，当前登录状态已失效，请重新登录。');
+  }
 
   wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
 }
@@ -2007,11 +2756,13 @@ function handleSaveModelConfig(ws, newConfig) {
   const oldTemplates = Array.isArray(current.templates) ? current.templates : [];
   for (const nt of newTemplates) {
     if (!nt.name || !nt.name.trim()) continue;
-    const old = oldTemplates.find(t => t.name === nt.name);
+    const originalName = String(nt.originalName || nt.name).trim();
+    const old = oldTemplates.find(t => t.name === originalName);
     merged.templates.push({
       name: nt.name.trim(),
-      apiKey: (nt.apiKey && !nt.apiKey.includes('****')) ? nt.apiKey : (old?.apiKey || ''),
+      apiKey: mergeSecretField(nt.apiKey, old?.apiKey),
       apiBase: nt.apiBase || '',
+      upstreamType: nt.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
       defaultModel: nt.defaultModel || '',
       opusModel: nt.opusModel || '',
       sonnetModel: nt.sonnetModel || '',
@@ -2028,6 +2779,8 @@ function handleSaveModelConfig(ws, newConfig) {
   if (merged.mode === 'custom' && merged.activeTemplate) {
     const tpl = merged.templates.find(t => t.name === merged.activeTemplate);
     if (tpl) applyCustomTemplateToSettings(tpl);
+  } else {
+    clearManagedClaudeSettings();
   }
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
@@ -2039,36 +2792,50 @@ function handleSaveCodexConfig(ws, newConfig) {
     return wsSend(ws, { type: 'error', message: '无效的 Codex 配置' });
   }
   const current = loadCodexConfig();
-  const newProfiles = Array.isArray(newConfig.profiles) ? newConfig.profiles : [];
+  const incomingMode = normalizeCodexMode(newConfig.mode);
+  const incomingLegacyMode = resolveCodexLegacyMode(newConfig.legacyMode || newConfig.mode);
+  const profilesProvided = Array.isArray(newConfig.profiles);
+  const newProfiles = profilesProvided ? newConfig.profiles : (Array.isArray(current.profiles) ? current.profiles : []);
   const oldProfiles = Array.isArray(current.profiles) ? current.profiles : [];
   const mergedProfiles = [];
   for (const profile of newProfiles) {
     const name = String(profile?.name || '').trim();
     if (!name) continue;
-    const old = oldProfiles.find((item) => item.name === name);
+    const originalName = String(profile?.originalName || name).trim();
+    const old = oldProfiles.find((item) => item.name === originalName);
     const rawApiKey = String(profile?.apiKey || '');
     mergedProfiles.push({
       name,
-      apiKey: rawApiKey && !rawApiKey.includes('****') ? rawApiKey : (old?.apiKey || ''),
+      apiKey: mergeSecretField(rawApiKey, old?.apiKey),
       apiBase: String(profile?.apiBase || '').trim(),
+      defaultModel: String(profile?.defaultModel || '').trim(),
     });
   }
   const requestedSearch = !!newConfig.enableSearch;
   const merged = {
-    mode: newConfig.mode === 'custom' ? 'custom' : 'local',
-    activeProfile: String(newConfig.activeProfile || '').trim(),
+    mode: incomingMode,
+    legacyMode: incomingLegacyMode,
+    activeProfile: String(profilesProvided ? (newConfig.activeProfile || '') : (current.activeProfile || '')).trim(),
+    sharedTemplate: String(newConfig.sharedTemplate !== undefined ? newConfig.sharedTemplate : (current.sharedTemplate || '')).trim(),
     profiles: mergedProfiles,
     enableSearch: false,
     supportsSearch: false,
     storedEnableSearch: requestedSearch,
   };
-  if (merged.mode === 'custom' && merged.profiles.length > 0 && !merged.profiles.some((profile) => profile.name === merged.activeProfile)) {
+  if (merged.legacyMode === 'custom' && merged.profiles.length > 0 && !merged.profiles.some((profile) => profile.name === merged.activeProfile)) {
     merged.activeProfile = merged.profiles[0].name;
+  }
+  if (merged.mode === 'unified' && !merged.sharedTemplate) {
+    const modelConfig = loadModelConfig();
+    const templates = Array.isArray(modelConfig.templates) ? modelConfig.templates : [];
+    merged.sharedTemplate = modelConfig.activeTemplate || templates[0]?.name || '';
   }
   saveCodexConfig(merged);
   plog('INFO', 'codex_config_saved', {
     mode: merged.mode,
+    legacyMode: merged.legacyMode || null,
     activeProfile: merged.activeProfile || null,
+    sharedTemplate: merged.sharedTemplate || null,
     profileCount: merged.profiles.length,
     enableSearchRequested: requestedSearch,
     enableSearchEffective: false,
@@ -2084,14 +2851,20 @@ function handleSaveCodexConfig(ws, newConfig) {
 
 // === Fetch Upstream Models ===
 function handleFetchModels(ws, msg) {
-  const { apiBase, apiKey, modelsEndpoint } = msg;
+  const { apiBase, apiKey } = msg;
   if (!apiBase || !apiKey) {
     return wsSend(ws, { type: 'fetch_models_result', success: false, message: '需要填写 API Base 和 API Key' });
   }
-  // Build URL: apiBase + modelsEndpoint (default /v1/models)
-  let base = apiBase.replace(/\/+$/, '');
-  const endpoint = modelsEndpoint || '/v1/models';
-  const fullUrl = base + endpoint;
+  const agent = msg.agent === 'codex' ? 'codex' : 'claude';
+  const upstreamType = msg.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
+  const base = String(apiBase || '').trim().replace(/\/+$/, '');
+  let fullUrl = '';
+  try {
+    const spec = buildModelsRequestSpec(base, apiKey, upstreamType, agent);
+    fullUrl = spec.fullUrl;
+  } catch (error) {
+    return wsSend(ws, { type: 'fetch_models_result', success: false, message: error.message || '无效的 API Base URL' });
+  }
 
   let parsed;
   try { parsed = new URL(fullUrl); } catch {
@@ -2101,33 +2874,69 @@ function handleFetchModels(ws, msg) {
   // Resolve real apiKey (if masked, look up saved config by template name or apiBase)
   let realKey = apiKey;
   if (apiKey.includes('****')) {
-    const config = loadModelConfig();
-    const saved = (config.templates || []);
-    // Match by template name first, then by apiBase
-    const tpl = (msg.templateName && saved.find(t => t.name === msg.templateName))
-      || saved.find(t => t.apiBase && t.apiBase.replace(/\/+$/, '') === base)
-      || null;
-    if (tpl && tpl.apiKey && !tpl.apiKey.includes('****')) realKey = tpl.apiKey;
-    else return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
+    if (msg.templateName) {
+      const config = loadModelConfig();
+      const saved = Array.isArray(config.templates) ? config.templates : [];
+      const template = saved.find((item) => item.name === msg.templateName)
+        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
+        || null;
+      if (template && template.apiKey && !template.apiKey.includes('****')) {
+        realKey = template.apiKey;
+      } else {
+        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
+      }
+    } else if (agent === 'codex') {
+      const config = loadCodexConfig();
+      const saved = Array.isArray(config.profiles) ? config.profiles : [];
+      const profile = (msg.profileName && saved.find((item) => item.name === msg.profileName))
+        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
+        || null;
+      if (profile && profile.apiKey && !profile.apiKey.includes('****')) {
+        realKey = profile.apiKey;
+      } else {
+        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
+      }
+    } else {
+      const config = loadModelConfig();
+      const saved = config.templates || [];
+      const tpl = (msg.templateName && saved.find((item) => item.name === msg.templateName))
+        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
+        || null;
+      if (tpl && tpl.apiKey && !tpl.apiKey.includes('****')) {
+        realKey = tpl.apiKey;
+      } else {
+        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
+      }
+    }
   }
 
   const mod = parsed.protocol === 'https:' ? require('https') : require('http');
   const reqOptions = {
     method: 'GET',
-    headers: { 'Authorization': `Bearer ${realKey}` },
+    headers: buildModelsRequestSpec(base, realKey, upstreamType, agent).headers,
     timeout: 15000,
   };
 
   const req = mod.request(parsed, reqOptions, (res) => {
     let body = '';
-    res.on('data', (chunk) => { body += chunk; });
+    let bodyBytes = 0;
+    res.on('data', (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > HTTP_BODY_MAX_BYTES) {
+        req.destroy(new Error('response too large'));
+        return;
+      }
+      body += chunk;
+    });
     res.on('end', () => {
       if (res.statusCode !== 200) {
         return wsSend(ws, { type: 'fetch_models_result', success: false, message: `HTTP ${res.statusCode}: ${body.slice(0, 200)}` });
       }
       try {
         const json = JSON.parse(body);
-        const models = (json.data || json.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean).sort();
+        const models = agent === 'codex'
+          ? normalizeCodexModelEntries(json.data || json.models || []).map((entry) => entry.value)
+          : (json.data || json.models || []).map((item) => typeof item === 'string' ? item : item.id || item.name || '').filter(Boolean).sort();
         wsSend(ws, { type: 'fetch_models_result', success: true, models });
       } catch (e) {
         wsSend(ws, { type: 'fetch_models_result', success: false, message: '解析响应失败: ' + e.message });
@@ -2136,6 +2945,18 @@ function handleFetchModels(ws, msg) {
   });
 
   req.on('error', (e) => {
+    if (agent === 'claude' && upstreamType === 'anthropic' && isTlsHandshakeFailure(e)) {
+      const fallbackModels = getClaudeFallbackModels();
+      if (fallbackModels.length) {
+        return wsSend(ws, {
+          type: 'fetch_models_result',
+          success: true,
+          models: fallbackModels,
+          fallback: true,
+          message: `上游拒绝了当前直连探测，已改用内置 Claude 模型列表（${fallbackModels.length} 个）。这类只面向官方 Claude Code CLI 的服务常会这样；你也可以直接手填模型 ID。`,
+        });
+      }
+    }
     wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求失败: ' + e.message });
   });
   req.on('timeout', () => {
@@ -2159,7 +2980,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           const entry = activeProcesses.get(sessionId);
           killProcess(entry.pid);
           if (entry.tailer) entry.tailer.stop();
-          activeProcesses.delete(sessionId);
+          removeActiveProcess(sessionId);
           cleanRunDir(sessionId);
         }
         session.messages = [];
@@ -2478,19 +3299,22 @@ function sqlQuote(value) {
 }
 
 function deleteClaudeLocalSession(claudeSessionId) {
-  if (!claudeSessionId) return;
+  const safeId = sanitizeId(claudeSessionId);
+  if (!safeId) return;
   const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
-      const target = path.join(projectsDir, proj, `${claudeSessionId}.jsonl`);
+      const target = path.join(projectsDir, proj, `${safeId}.jsonl`);
       if (fs.existsSync(target)) fs.unlinkSync(target);
     }
   } catch {}
 }
 
-function deleteCodexLocalSession(session) {
+async function deleteCodexLocalSession(session) {
   const threadId = session?.codexThreadId;
-  if (!threadId) return { removedFiles: 0, removedDbRows: false };
+  if (!threadId || !/^[a-zA-Z0-9\-]+$/.test(String(threadId))) {
+    return { removedFiles: 0, removedDbRows: false };
+  }
 
   const rolloutPaths = new Set();
   if (session.importedRolloutPath) rolloutPaths.add(path.resolve(session.importedRolloutPath));
@@ -2512,8 +3336,8 @@ function deleteCodexLocalSession(session) {
 
   let removedDbRows = false;
   try {
-    const sqlitePath = spawnSync('sqlite3', ['-version'], { stdio: 'ignore' });
-    if (sqlitePath.status === 0) {
+    const sqliteAvailable = await execFileQuiet('sqlite3', ['-version']);
+    if (sqliteAvailable.ok) {
       const quotedThreadId = sqlQuote(threadId);
       const stateSql = [
         'PRAGMA foreign_keys = ON;',
@@ -2522,11 +3346,11 @@ function deleteCodexLocalSession(session) {
         `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`,
         `DELETE FROM threads WHERE id = ${quotedThreadId};`,
       ].join(' ');
-      const stateResult = spawnSync('sqlite3', [CODEX_STATE_DB_PATH, stateSql], { stdio: 'ignore' });
-      if (stateResult.status === 0) removedDbRows = true;
+      const stateResult = await execFileQuiet('sqlite3', [CODEX_STATE_DB_PATH, stateSql]);
+      if (stateResult.ok) removedDbRows = true;
 
       if (fs.existsSync(CODEX_LOG_DB_PATH)) {
-        spawnSync('sqlite3', [CODEX_LOG_DB_PATH, `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`], { stdio: 'ignore' });
+        await execFileQuiet('sqlite3', [CODEX_LOG_DB_PATH, `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`]);
       }
     }
   } catch {}
@@ -2541,7 +3365,7 @@ function handleDeleteSession(ws, sessionId) {
     const entry = activeProcesses.get(sessionId);
     try { killProcess(entry.pid); } catch {}
     if (entry.tailer) entry.tailer.stop();
-    activeProcesses.delete(sessionId);
+    removeActiveProcess(sessionId);
     if (entry.ws) wsSend(entry.ws, { type: 'done', sessionId });
   }
   cleanRunDir(sessionId);
@@ -2552,14 +3376,25 @@ function handleDeleteSession(ws, sessionId) {
     for (const attachmentId of collectSessionAttachmentIds(session)) {
       removeAttachmentById(attachmentId);
     }
-    if (fs.existsSync(p)) fs.unlinkSync(p);
+    if (fs.existsSync(p)) {
+      fs.unlinkSync(p);
+      invalidateImportedSessionIdsCache();
+    }
+    invalidateSessionListCache();
     if (sessionAgent === 'codex') {
-      const result = deleteCodexLocalSession(session);
-      plog('INFO', 'codex_local_session_deleted', {
-        sessionId: sessionId.slice(0, 8),
-        threadId: session?.codexThreadId || null,
-        removedFiles: result.removedFiles,
-        removedDbRows: result.removedDbRows,
+      deleteCodexLocalSession(session).then((result) => {
+        plog('INFO', 'codex_local_session_deleted', {
+          sessionId: sessionId.slice(0, 8),
+          threadId: session?.codexThreadId || null,
+          removedFiles: result.removedFiles,
+          removedDbRows: result.removedDbRows,
+        });
+      }).catch((error) => {
+        plog('WARN', 'codex_local_session_delete_failed', {
+          sessionId: sessionId.slice(0, 8),
+          threadId: session?.codexThreadId || null,
+          error: error?.message || String(error),
+        });
       });
     } else {
       deleteClaudeLocalSession(session?.claudeSessionId || null);
@@ -2571,14 +3406,15 @@ function handleDeleteSession(ws, sessionId) {
 }
 
 function handleRenameSession(ws, sessionId, title) {
-  if (!sessionId || !title) return;
-  const session = loadSession(sessionId);
+  const safeSessionId = sanitizeId(sessionId);
+  if (!safeSessionId || !title) return;
+  const session = loadSession(safeSessionId);
   if (session) {
     session.title = String(title).slice(0, 100);
     session.updated = new Date().toISOString();
     saveSession(session);
     sendSessionList(ws);
-    wsSend(ws, { type: 'session_renamed', sessionId, title: session.title });
+    wsSend(ws, { type: 'session_renamed', sessionId: safeSessionId, title: session.title });
   }
 }
 
@@ -2620,6 +3456,16 @@ function handleDetachView(ws) {
   wsSessionMap.delete(ws);
 }
 
+function forceLogoutClient(ws, message) {
+  if (!ws) return;
+  handleDetachView(ws);
+  ws.isAuthenticated = false;
+  ws.authToken = null;
+  if (ws.readyState === 1) {
+    wsSend(ws, { type: 'force_logout', message: message || '登录状态已失效，请重新登录。' });
+  }
+}
+
 function handleAbort(ws) {
   const sessionId = wsSessionMap.get(ws);
   if (!sessionId) return;
@@ -2629,7 +3475,10 @@ function handleAbort(ws) {
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
   killProcess(entry.pid);
   setTimeout(() => {
-    killProcess(entry.pid, true);
+    const activeEntry = activeProcesses.get(sessionId);
+    if (activeEntry && activeEntry.pid === entry.pid) {
+      killProcess(entry.pid, true);
+    }
   }, 3000);
   // handleProcessComplete will be triggered by the PID monitor
 }
@@ -2699,7 +3548,7 @@ function handleMessage(ws, msg, options = {}) {
   }
 
   if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {
-    pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'normal' });
+    pendingCompactRetries.set(session.id, { text: normalizedText, mode: session.permissionMode || 'yolo', reason: 'normal', autoRetryCount: 0 });
   }
 
   if (session.title === 'New Chat' || session.title === 'Untitled') {
@@ -2855,7 +3704,7 @@ function handleMessage(ws, msg, options = {}) {
     errorSent: false,
     tailer: null,
   };
-  activeProcesses.set(currentSessionId, entry);
+  setActiveProcess(currentSessionId, entry);
   sendSessionList(ws);
 
   // Tail the output file for real-time streaming
@@ -3084,59 +3933,114 @@ const {
 });
 
 function getImportedSessionIds() {
+  const now = Date.now();
+  if (importedSessionIdsCache.expiresAt > now) {
+    return importedSessionIdsCache.ids;
+  }
   const imported = new Set();
   try {
-    for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
+    const files = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .map((entry) => entry.name);
+    for (const f of files) {
       try {
         const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
-        if (s.claudeSessionId) imported.add(s.claudeSessionId);
+        if (s?.claudeSessionId) imported.add(String(s.claudeSessionId));
       } catch {}
     }
   } catch {}
+  importedSessionIdsCache.ids = imported;
+  importedSessionIdsCache.expiresAt = now + IMPORTED_SESSION_IDS_CACHE_TTL_MS;
   return imported;
+}
+
+function readFileSliceUtf8(filePath, start, length) {
+  const safeStart = Math.max(0, Number(start) || 0);
+  const safeLength = Math.max(0, Number(length) || 0);
+  if (safeLength <= 0) return '';
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(safeLength);
+    const bytesRead = fs.readSync(fd, buffer, 0, safeLength, safeStart);
+    return buffer.slice(0, bytesRead).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function extractNativeSessionHeadMeta(filePath, sessionId) {
+  const fallbackTitle = sessionId.slice(0, 20);
+  const headText = readFileSliceUtf8(filePath, 0, JSONL_HEAD_READ_BYTES);
+  const lines = headText.split('\n');
+  let title = fallbackTitle;
+  let cwd = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const e = JSON.parse(t);
+      if (e.type !== 'user') continue;
+      if (!cwd) cwd = e.cwd || null;
+      const raw = e.message?.content;
+      let text = '';
+      if (typeof raw === 'string') text = raw;
+      else if (Array.isArray(raw)) text = raw.filter((b) => b.type === 'text').map((b) => b.text || '').join('');
+      if (text.trim()) {
+        title = text.trim().slice(0, 80).replace(/\n/g, ' ');
+        break;
+      }
+    } catch {}
+  }
+  return { title, cwd };
+}
+
+function extractNativeSessionUpdatedAt(filePath, fileSize, fallbackIso) {
+  const size = Number(fileSize) || 0;
+  if (size <= 0) return fallbackIso || null;
+  const readBytes = Math.min(size, JSONL_TAIL_READ_BYTES);
+  const start = size - readBytes;
+  const tailText = readFileSliceUtf8(filePath, start, readBytes);
+  const lines = tailText.split('\n');
+  if (start > 0 && lines.length > 0) lines.shift();
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = (lines[i] || '').trim();
+    if (!t) continue;
+    try {
+      const e = JSON.parse(t);
+      if (e?.timestamp) return e.timestamp;
+    } catch {}
+  }
+  return fallbackIso || null;
 }
 
 function handleListNativeSessions(ws) {
   const groups = [];
   try {
     const imported = getImportedSessionIds();
-    const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR).filter(d => {
-      try { return fs.statSync(path.join(CLAUDE_PROJECTS_DIR, d)).isDirectory(); } catch { return false; }
-    });
-    for (const dir of dirs) {
+    const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory());
+    for (const dirEntry of dirs) {
+      const dir = dirEntry.name;
       const dirPath = path.join(CLAUDE_PROJECTS_DIR, dir);
       const sessionItems = [];
       try {
-        const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'));
-        for (const f of files) {
-          const sessionId = f.replace('.jsonl', '');
-          const filePath = path.join(dirPath, f);
+        const files = fs.readdirSync(dirPath, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'));
+        for (const fileEntry of files) {
+          const sessionId = fileEntry.name.replace('.jsonl', '');
+          const filePath = path.join(dirPath, fileEntry.name);
           try {
-            const content = fs.readFileSync(filePath, 'utf8');
-            const lines = content.split('\n');
-            // Find first user message for title
-            let title = sessionId.slice(0, 20);
-            let cwd = null;
-            let updatedAt = null;
-            let lastTs = null;
-            for (const line of lines) {
-              const t = line.trim();
-              if (!t) continue;
-              try {
-                const e = JSON.parse(t);
-                if (e.timestamp) lastTs = e.timestamp;
-                if (e.type === 'user' && !cwd) {
-                  cwd = e.cwd || null;
-                  const raw = e.message?.content;
-                  let text = '';
-                  if (typeof raw === 'string') text = raw;
-                  else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
-                  if (text.trim()) title = text.trim().slice(0, 80).replace(/\n/g, ' ');
-                }
-              } catch {}
-            }
-            updatedAt = lastTs;
-            sessionItems.push({ sessionId, title, cwd, updatedAt, alreadyImported: imported.has(sessionId) });
+            const stat = fs.statSync(filePath);
+            const fallbackUpdatedAt = stat.mtime ? stat.mtime.toISOString() : null;
+            const meta = extractNativeSessionHeadMeta(filePath, sessionId);
+            const updatedAt = extractNativeSessionUpdatedAt(filePath, stat.size, fallbackUpdatedAt);
+            sessionItems.push({
+              sessionId,
+              title: meta.title,
+              cwd: meta.cwd,
+              updatedAt,
+              alreadyImported: imported.has(sessionId),
+            });
           } catch {}
         }
       } catch {}
@@ -3406,18 +4310,29 @@ function handleRenameProject(ws, msg) {
 }
 
 function handleBrowseDirectory(ws, msg) {
-  const home = process.env.HOME || process.env.USERPROFILE || '/';
+  const home = USER_HOME || '/';
+  const requestedPath = msg && typeof msg.path === 'string' ? msg.path : '';
   let targetPath;
   try {
-    targetPath = msg.path ? path.resolve(String(msg.path)) : home;
+    targetPath = requestedPath ? path.resolve(String(requestedPath)) : home;
     targetPath = fs.realpathSync(targetPath);
   } catch (e) {
     return wsSend(ws, {
       type: 'directory_listing',
-      path: msg.path || home,
-      parent: msg.path ? path.dirname(path.resolve(String(msg.path))) : null,
+      path: requestedPath || home,
+      parent: requestedPath ? path.dirname(path.resolve(String(requestedPath))) : null,
       dirs: [],
       error: '路径不存在或无法访问',
+    });
+  }
+
+  if (!BROWSE_ROOTS.some((root) => isPathInside(targetPath, root))) {
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: targetPath,
+      parent: null,
+      dirs: [],
+      error: '路径不在允许浏览范围内',
     });
   }
 
@@ -3442,7 +4357,7 @@ function handleBrowseDirectory(ws, msg) {
     });
   }
 
-  const showHidden = !!msg.showHidden;
+  const showHidden = !!(msg && msg.showHidden);
   let entries;
   try {
     entries = fs.readdirSync(targetPath, { withFileTypes: true });
@@ -3453,7 +4368,7 @@ function handleBrowseDirectory(ws, msg) {
       path: targetPath,
       parent: parentPath !== targetPath ? parentPath : null,
       dirs: [],
-      error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : `读取失败: ${e.message}`,
+      error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : '读取目录失败',
     });
   }
 

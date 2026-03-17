@@ -45,6 +45,10 @@
   const SIDEBAR_MIN_WIDTH = 280;
   const SIDEBAR_MAX_WIDTH = 560;
   const DESKTOP_INSIGHTS_BREAKPOINT = 1280;
+  const VISIBILITY_RESYNC_THROTTLE_MS = 2500;
+  const SESSION_LIST_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+  const INPUT_MAX_HEIGHT_FALLBACK = 200;
+  const RECONNECT_MAX_ATTEMPTS = 8;
 
   const MODE_PICKER_OPTIONS = [
     { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
@@ -67,26 +71,83 @@
   let renderTimer = null;
   let activeToolCalls = new Map();
   let cmdMenuIndex = -1;
+  let cmdMenuDelegated = false;
   let currentMode = 'yolo';
   let currentModel = '';
-  let selectedAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
+  const savedAgent = localStorage.getItem('cc-web-agent');
+  let selectedAgent = AGENT_LABELS[savedAgent] ? savedAgent : DEFAULT_AGENT;
   let currentAgent = selectedAgent;
+  let modelConfigCache = null;
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
-  let loginPasswordValue = ''; // store login password for force-change flow
   let currentCwd = null;
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
-  let collapsedProjects = new Set((() => { try { return JSON.parse(localStorage.getItem('cc-web-collapsed-projects') || '[]'); } catch { return []; } })());
+  let collapsedProjects = new Set();
   let pendingProjectFocusId = null;
   let pendingProjectFocusMessage = '';
   let sidebarResizeState = null;
+  let lastVisibilityResyncAt = 0;
+  let localIdCounter = 0;
+  let cachedInputMaxHeight = INPUT_MAX_HEIGHT_FALLBACK;
+  const toastQueue = [];
+  let activeToast = null;
+
+  // Stage-1 state grouping: keep legacy vars as source of truth, expose grouped accessors.
+  const connectionState = {
+    get ws() { return ws; },
+    set ws(value) { ws = value; },
+    get reconnectAttempts() { return reconnectAttempts; },
+    set reconnectAttempts(value) { reconnectAttempts = value; },
+    get reconnectTimer() { return reconnectTimer; },
+    set reconnectTimer(value) { reconnectTimer = value; },
+    get pendingInitialSessionLoad() { return pendingInitialSessionLoad; },
+    set pendingInitialSessionLoad(value) { pendingInitialSessionLoad = value; },
+    get authToken() { return authToken; },
+    set authToken(value) { authToken = value; },
+  };
+
+  const sessionState = {
+    get currentSessionId() { return currentSessionId; },
+    set currentSessionId(value) { currentSessionId = value; },
+    get currentAgent() { return currentAgent; },
+    set currentAgent(value) { currentAgent = value; },
+    get currentMode() { return currentMode; },
+    set currentMode(value) { currentMode = value; },
+    get currentModel() { return currentModel; },
+    set currentModel(value) { currentModel = value; },
+    get sessions() { return sessions; },
+    set sessions(value) { sessions = value; },
+    get sessionCache() { return sessionCache; },
+    set sessionCache(value) { sessionCache = value; },
+    get loadedHistorySessionId() { return loadedHistorySessionId; },
+    set loadedHistorySessionId(value) { loadedHistorySessionId = value; },
+    get activeSessionLoad() { return activeSessionLoad; },
+    set activeSessionLoad(value) { activeSessionLoad = value; },
+    get currentCwd() { return currentCwd; },
+    set currentCwd(value) { currentCwd = value; },
+    get currentSessionRunning() { return currentSessionRunning; },
+    set currentSessionRunning(value) { currentSessionRunning = value; },
+  };
+
+  const composeState = {
+    get isGenerating() { return isGenerating; },
+    set isGenerating(value) { isGenerating = value; },
+    get pendingText() { return pendingText; },
+    set pendingText(value) { pendingText = value; },
+    get activeToolCalls() { return activeToolCalls; },
+    set activeToolCalls(value) { activeToolCalls = value; },
+    get pendingAttachments() { return pendingAttachments; },
+    set pendingAttachments(value) { pendingAttachments = value; },
+    get uploadingAttachments() { return uploadingAttachments; },
+    set uploadingAttachments(value) { uploadingAttachments = value; },
+  };
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -125,6 +186,55 @@
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
   const modeSelect = $('#mode-select');
+
+  function parseStoredCollapsedProjects() {
+    try {
+      const raw = localStorage.getItem('cc-web-collapsed-projects') || '[]';
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function nextLocalId(prefix = 'tmp') {
+    localIdCounter += 1;
+    return `${prefix}-${Date.now()}-${localIdCounter}`;
+  }
+
+  function refreshInputMaxHeightCache() {
+    const raw = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--input-max-height'), 10);
+    cachedInputMaxHeight = Number.isFinite(raw) && raw > 0 ? raw : INPUT_MAX_HEIGHT_FALLBACK;
+  }
+
+  function createOverlayPanel({
+    overlayClass = 'settings-overlay',
+    overlayId = '',
+    panelClass = 'settings-panel',
+    zIndex = '',
+    maxWidth = '',
+    panelHtml = '',
+  } = {}) {
+    const overlay = document.createElement('div');
+    overlay.className = overlayClass;
+    if (overlayId) overlay.id = overlayId;
+    if (zIndex) overlay.style.zIndex = String(zIndex);
+
+    const panel = document.createElement('div');
+    panel.className = panelClass;
+    if (maxWidth) panel.style.maxWidth = maxWidth;
+    if (panelHtml) panel.innerHTML = panelHtml;
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    return {
+      overlay,
+      panel,
+      close: () => overlay.remove(),
+    };
+  }
+
+  collapsedProjects = new Set(parseStoredCollapsedProjects());
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -167,8 +277,11 @@
   }
 
   setVH();
+  refreshInputMaxHeightCache();
   window.addEventListener('resize', setVH);
   window.addEventListener('orientationchange', () => setTimeout(setVH, 100));
+  window.addEventListener('resize', refreshInputMaxHeightCache);
+  window.addEventListener('orientationchange', () => setTimeout(refreshInputMaxHeightCache, 100));
   syncSidebarWidthForViewport();
   window.addEventListener('resize', syncSidebarWidthForViewport);
 
@@ -189,7 +302,7 @@
   }
 
   function getCurrentProjectContext() {
-    const currentMeta = currentSessionId ? getSessionMeta(currentSessionId) : null;
+    const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     if (!currentMeta) return null;
     const projectsById = new Map(projects.map((project) => [project.id, project]));
     return findBestProjectForSession(currentMeta, projectsById) || buildVirtualProjectFromSession(currentMeta);
@@ -213,23 +326,23 @@
   }
 
   function getCurrentMessageCount() {
-    const cachedSnapshot = currentSessionId ? buildCachedSessionSnapshot(currentSessionId) : null;
+    const cachedSnapshot = sessionState.currentSessionId ? buildCachedSessionSnapshot(sessionState.currentSessionId) : null;
     if (cachedSnapshot?.messages?.length) return cachedSnapshot.messages.length;
     return messagesDiv ? messagesDiv.querySelectorAll('.msg').length : 0;
   }
 
   function buildWorkspaceInsightsMarkup() {
     const visibleSessions = getVisibleSessions();
-    const currentMeta = currentSessionId ? getSessionMeta(currentSessionId) : null;
+    const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     const activeProject = getCurrentProjectContext();
     const runningCount = visibleSessions.filter((session) => session.isRunning).length;
     const currentMessageCount = getCurrentMessageCount();
-    const usageText = costDisplay?.textContent || (currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
-    const modeLabel = MODE_LABELS[currentMode] || currentMode;
-    const modelLabel = currentModel || (currentAgent === 'codex' ? '会话内决定' : 'Default');
+    const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
+    const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
+    const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '会话内决定' : 'Default');
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
-    const currentAgentLabel = AGENT_LABELS[currentAgent] || currentAgent;
-    const runtimeLabel = currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
+    const currentAgentLabel = AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent;
+    const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
     const projectSessionCount = getCurrentProjectSessionCount(activeProject);
     const actionButtons = buildWorkspaceActionButtons([
       { action: 'new-session', label: '新建会话', primary: true },
@@ -265,7 +378,7 @@
               <div class="insights-card-kicker">当前会话</div>
               <h3>${escapeHtml(currentMeta?.title || '还没有打开会话')}</h3>
             </div>
-            <span class="insights-status-pill${currentSessionRunning ? ' running' : ''}">${runtimeLabel}</span>
+            <span class="insights-status-pill${sessionState.currentSessionRunning ? ' running' : ''}">${runtimeLabel}</span>
           </div>
           <div class="insights-detail-list">
             <div class="insights-detail-item"><span>当前代理</span><strong>${escapeHtml(currentAgentLabel)}</strong></div>
@@ -314,7 +427,7 @@
             <span>项目数</span>
           </div>
           <div class=”welcome-stat”>
-            <strong>${MODE_LABELS[currentMode] || currentMode}</strong>
+            <strong>${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode}</strong>
             <span>模式</span>
           </div>
         </div>
@@ -367,12 +480,87 @@
   }
 
   function getSessionMeta(sessionId) {
-    return sessions.find((s) => s.id === sessionId) || null;
+    return sessionState.sessions.find((s) => s.id === sessionId) || null;
   }
 
   function deepClone(value) {
     if (value === null || value === undefined) return value;
+    if (typeof structuredClone === 'function') return structuredClone(value);
     return JSON.parse(JSON.stringify(value));
+  }
+
+  const wsEventListeners = new Map();
+  let settingsPanelUnsubscribers = [];
+
+  function onWsEvent(type, handler, options = {}) {
+    if (!type || typeof handler !== 'function') return () => {};
+    const listener = {
+      fn: handler,
+      once: !!options.once,
+    };
+    if (!wsEventListeners.has(type)) wsEventListeners.set(type, new Set());
+    const bucket = wsEventListeners.get(type);
+    bucket.add(listener);
+    return () => {
+      bucket.delete(listener);
+      if (bucket.size === 0) wsEventListeners.delete(type);
+    };
+  }
+
+  function emitWsEvent(type, payload) {
+    const bucket = wsEventListeners.get(type);
+    if (!bucket || bucket.size === 0) return;
+    for (const listener of Array.from(bucket)) {
+      try {
+        listener.fn(payload);
+      } catch (error) {
+        console.error('[CC-WS-EVENT]', type, error);
+      }
+      if (listener.once) {
+        bucket.delete(listener);
+      }
+    }
+    if (bucket.size === 0) wsEventListeners.delete(type);
+  }
+
+  function clearWsEvent(type) {
+    if (!type) return;
+    wsEventListeners.delete(type);
+  }
+
+  function clearSettingsPanelSubscriptions() {
+    for (const dispose of settingsPanelUnsubscribers) {
+      try { dispose(); } catch {}
+    }
+    settingsPanelUnsubscribers = [];
+  }
+
+  function registerSettingsPanelHandler(type, handler, options = {}) {
+    const dispose = onWsEvent(type, handler, options);
+    settingsPanelUnsubscribers.push(dispose);
+    return dispose;
+  }
+
+  function waitForWsEvent(type, options = {}) {
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
+    const predicate = typeof options.predicate === 'function' ? options.predicate : null;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (fn) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+        fn();
+      };
+      const off = onWsEvent(type, (payload) => {
+        if (predicate && !predicate(payload)) return;
+        done(() => resolve(payload));
+      });
+      const timer = setTimeout(() => {
+        done(() => reject(new Error(`等待 ${type} 回包超时`)));
+      }, timeoutMs);
+    });
   }
 
   function cloneMessages(messages) {
@@ -479,9 +667,9 @@
 
   function reconcileSessionCacheWithSessions() {
     const knownIds = new Set(sessions.map((session) => session.id));
-    for (const [sessionId, entry] of sessionCache) {
+    for (const [sessionId, entry] of sessionState.sessionCache) {
       if (!knownIds.has(sessionId)) {
-        sessionCache.delete(sessionId);
+        sessionState.sessionCache.delete(sessionId);
         continue;
       }
       const meta = getSessionMeta(sessionId);
@@ -490,7 +678,7 @@
   }
 
   function getSessionCacheDisposition(sessionId) {
-    const entry = sessionCache.get(sessionId);
+    const entry = sessionState.sessionCache.get(sessionId);
     const meta = getSessionMeta(sessionId);
     if (!entry?.snapshot?.complete || !meta) return 'miss';
     if (entry.version === (meta.updated || null) && !meta.hasUnread && !meta.isRunning) {
@@ -500,7 +688,7 @@
   }
 
   function buildCachedSessionSnapshot(sessionId) {
-    const entry = sessionCache.get(sessionId);
+    const entry = sessionState.sessionCache.get(sessionId);
     if (!entry?.snapshot) return null;
     const snapshot = deepClone(entry.snapshot);
     const meta = getSessionMeta(sessionId) || entry.meta;
@@ -522,7 +710,7 @@
   }
 
   function syncAttachmentActions() {
-    const uploading = uploadingAttachments.length > 0;
+    const uploading = composeState.uploadingAttachments.length > 0;
     if (attachBtn) attachBtn.disabled = uploading;
   }
 
@@ -598,17 +786,16 @@
 
   function ensureAuthenticatedWs() {
     return new Promise((resolve, reject) => {
-      if (ws && ws.readyState === 1 && authToken) {
-        resolve(authToken);
+      if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN && connectionState.authToken) {
+        resolve(connectionState.authToken);
         return;
       }
-      const savedPassword = localStorage.getItem('cc-web-pw');
-      if (!savedPassword) {
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+      if (!connectionState.authToken) {
+        reject(new Error('登录状态已失效，请重新登录后再上传图片。'));
         return;
       }
       const timeout = setTimeout(() => {
-        reject(new Error('登录状态恢复超时，请刷新页面后重试。'));
+        reject(new Error('登录状态恢复超时，请重新登录后重试。'));
       }, 8000);
 
       const cleanup = () => {
@@ -618,7 +805,7 @@
       };
       const onRestored = () => {
         cleanup();
-        resolve(authToken);
+        resolve(connectionState.authToken);
       };
       const onFailed = () => {
         cleanup();
@@ -627,10 +814,10 @@
       document.addEventListener('cc-web-auth-restored', onRestored);
       document.addEventListener('cc-web-auth-failed', onFailed);
 
-      if (!ws || ws.readyState > 1) {
+      if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) {
         connect();
-      } else if (ws.readyState === 1) {
-        send({ type: 'auth', password: savedPassword });
+      } else if (connectionState.ws.readyState === WebSocket.OPEN) {
+        send({ type: 'auth', token: connectionState.authToken });
       }
     });
   }
@@ -647,14 +834,14 @@
 
   function renderPendingAttachments() {
     if (!attachmentTray) return;
-    if (!pendingAttachments.length && !uploadingAttachments.length) {
+    if (!composeState.pendingAttachments.length && !composeState.uploadingAttachments.length) {
       attachmentTray.hidden = true;
       attachmentTray.innerHTML = '';
       syncAttachmentActions();
       return;
     }
     attachmentTray.hidden = false;
-    const uploadingHtml = uploadingAttachments.map((attachment) => `
+    const uploadingHtml = composeState.uploadingAttachments.map((attachment) => `
       <div class="attachment-chip uploading">
         <div class="attachment-chip-meta">
           <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
@@ -662,7 +849,7 @@
         </div>
       </div>
     `).join('');
-    const readyHtml = pendingAttachments.map((attachment, index) => `
+    const readyHtml = composeState.pendingAttachments.map((attachment, index) => `
       <div class="attachment-chip" data-index="${index}">
         <div class="attachment-chip-meta">
           <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
@@ -672,7 +859,7 @@
       </div>
     `).join('');
     const noteHtml = [
-      uploadingAttachments.length > 0
+      composeState.uploadingAttachments.length > 0
         ? '<div class="attachment-tray-note">图片上传中，此时发送不会包含尚未完成的图片。</div>'
         : '',
     ].join('');
@@ -681,7 +868,7 @@
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         const index = Number(btn.dataset.index);
-        const [removed] = pendingAttachments.splice(index, 1);
+        const [removed] = composeState.pendingAttachments.splice(index, 1);
         renderPendingAttachments();
         deleteUploadedAttachment(removed?.id);
       });
@@ -692,7 +879,7 @@
   async function uploadImageFile(file) {
     await ensureAuthenticatedWs();
     const headers = {
-      'Authorization': `Bearer ${authToken}`,
+      'Authorization': `Bearer ${connectionState.authToken}`,
       'Content-Type': file.type || 'application/octet-stream',
       'X-Filename': encodeURIComponent(file.name || 'image'),
     };
@@ -723,16 +910,17 @@
   async function handleSelectedImageFiles(fileList) {
     const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
     if (!files.length) return;
-    if (pendingAttachments.length + files.length > 4) {
+    const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
+    if (totalAttachments > 4) {
       appendError('单条消息最多附带 4 张图片。');
       return;
     }
     const batch = files.map((file, index) => ({
-      id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+      id: nextLocalId(`upload-${index}`),
       filename: file.name || 'image',
       size: file.size || 0,
     }));
-    uploadingAttachments.push(...batch);
+    composeState.uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
       const results = await Promise.allSettled(files.map(async (file) => {
@@ -742,7 +930,7 @@
       const errors = [];
       for (const result of results) {
         if (result.status === 'fulfilled') {
-          pendingAttachments.push(result.value);
+          composeState.pendingAttachments.push(result.value);
         } else {
           errors.push(result.reason?.message || '图片上传失败');
         }
@@ -753,14 +941,14 @@
     } catch (err) {
       appendError(err.message || '图片上传失败');
     } finally {
-      uploadingAttachments = uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
+      composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
       renderPendingAttachments();
       if (imageUploadInput) imageUploadInput.value = '';
     }
   }
 
   function getVisibleSessions() {
-    return sessions;
+    return sessionState.sessions;
   }
 
   function shouldOverlayRuntimeBadge() {
@@ -769,21 +957,21 @@
 
   function updateCwdBadge() {
     if (!chatCwd) return;
-    if (currentCwd) {
-      const parts = currentCwd.replace(/\/+$/, '').split('/');
-      const short = parts.slice(-2).join('/') || currentCwd;
+    if (sessionState.currentCwd) {
+      const parts = sessionState.currentCwd.replace(/\/+$/, '').split('/');
+      const short = parts.slice(-2).join('/') || sessionState.currentCwd;
       chatCwd.textContent = '~/' + short;
-      chatCwd.title = currentCwd;
+      chatCwd.title = sessionState.currentCwd;
     } else {
       chatCwd.textContent = '';
       chatCwd.title = '';
     }
-    chatCwd.hidden = !currentCwd || (currentSessionRunning && shouldOverlayRuntimeBadge());
+    chatCwd.hidden = !sessionState.currentCwd || (sessionState.currentSessionRunning && shouldOverlayRuntimeBadge());
   }
 
   function setCurrentSessionRunningState(isRunning) {
     const running = !!isRunning;
-    currentSessionRunning = running;
+    sessionState.currentSessionRunning = running;
     if (chatRuntimeState) {
       chatRuntimeState.hidden = !running;
       chatRuntimeState.textContent = running ? '运行中' : '';
@@ -794,20 +982,20 @@
 
   function updateAgentScopedUI() {
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
-    const currentAgentLabel = currentSessionId ? (AGENT_LABELS[currentAgent] || currentAgent) : '未开始';
+    const currentAgentLabel = sessionState.currentSessionId ? (AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent) : '未开始';
     // Sync agent tabs
     document.querySelectorAll('.agent-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.agent === selectedAgent);
     });
     // Sync mode tabs
     document.querySelectorAll('.mode-tab').forEach((btn) => {
-      btn.classList.toggle('active', btn.dataset.mode === currentMode);
+      btn.classList.toggle('active', btn.dataset.mode === sessionState.currentMode);
     });
     // Sync mobile selects
     const mas = document.getElementById('mobile-agent-select');
     const mms = document.getElementById('mobile-mode-select');
     if (mas) mas.value = selectedAgent;
-    if (mms) mms.value = currentMode;
+    if (mms) mms.value = sessionState.currentMode;
     if (importSessionBtn) {
       importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
     }
@@ -824,21 +1012,21 @@
     selectedAgent = normalizeAgent(agent);
     localStorage.setItem('cc-web-agent', selectedAgent);
     if (options.syncMode) {
-      currentMode = getSavedModeForAgent(selectedAgent);
-      modeSelect.value = currentMode;
+      sessionState.currentMode = getSavedModeForAgent(selectedAgent);
+      modeSelect.value = sessionState.currentMode;
     }
     updateAgentScopedUI();
   }
 
   function setCurrentAgent(agent) {
-    currentAgent = normalizeAgent(agent);
+    sessionState.currentAgent = normalizeAgent(agent);
     updateAgentScopedUI();
   }
 
   function handleAgentSelectionChange(agent) {
     const targetAgent = normalizeAgent(agent);
     if (targetAgent === selectedAgent) return;
-    const hadOpenSession = !!currentSessionId;
+    const hadOpenSession = !!sessionState.currentSessionId;
     setSelectedAgent(targetAgent, { syncMode: !hadOpenSession });
     if (!hadOpenSession) {
       resetChatView(targetAgent);
@@ -874,21 +1062,23 @@
   function resetChatView(agent) {
     const baseAgent = normalizeAgent(agent || selectedAgent);
     setCurrentAgent(baseAgent);
-    currentSessionId = null;
-    loadedHistorySessionId = null;
+    sessionState.currentSessionId = null;
+    sessionState.loadedHistorySessionId = null;
     clearSessionLoading();
     setCurrentSessionRunningState(false);
-    currentCwd = null;
-    currentModel = '';
-    isGenerating = false;
-    pendingText = '';
-    pendingAttachments = [];
-    uploadingAttachments = [];
-    activeToolCalls.clear();
+    sessionState.currentCwd = null;
+    sessionState.currentModel = '';
+    composeState.isGenerating = false;
+    composeState.pendingText = '';
+    composeState.pendingAttachments = [];
+    composeState.uploadingAttachments = [];
+    composeState.activeToolCalls.clear();
+    _previewCodeMap.clear();
+    _previewCodeId = 0;
     sendBtn.hidden = false;
     abortBtn.hidden = true;
-    currentMode = getSavedModeForAgent(baseAgent);
-    modeSelect.value = currentMode;
+    sessionState.currentMode = getSavedModeForAgent(baseAgent);
+    modeSelect.value = sessionState.currentMode;
     updateAgentScopedUI();
     chatTitle.textContent = '新会话';
     updateCwdBadge();
@@ -901,30 +1091,30 @@
 
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
-    const preserveStreaming = !!(options.preserveStreaming && isGenerating && snapshot.sessionId === currentSessionId && snapshot.isRunning);
-    if (isGenerating && !preserveStreaming) {
-      isGenerating = false;
+    const preserveStreaming = !!(options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning);
+    if (composeState.isGenerating && !preserveStreaming) {
+      composeState.isGenerating = false;
       sendBtn.hidden = false;
       abortBtn.hidden = true;
-      pendingText = '';
-      activeToolCalls.clear();
+      composeState.pendingText = '';
+      composeState.activeToolCalls.clear();
     }
-    currentSessionId = snapshot.sessionId;
-    loadedHistorySessionId = snapshot.sessionId;
-    setLastSessionForAgent(snapshot.agent, currentSessionId);
+    sessionState.currentSessionId = snapshot.sessionId;
+    sessionState.loadedHistorySessionId = snapshot.sessionId;
+    setLastSessionForAgent(snapshot.agent, sessionState.currentSessionId);
     chatTitle.textContent = snapshot.title || '新会话';
     setCurrentAgent(snapshot.agent);
     setCurrentSessionRunningState(snapshot.isRunning);
     setStatsDisplay(snapshot);
-    currentCwd = snapshot.cwd || null;
+    sessionState.currentCwd = snapshot.cwd || null;
     updateCwdBadge();
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
-      currentMode = snapshot.mode;
-      modeSelect.value = currentMode;
-      localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+      sessionState.currentMode = snapshot.mode;
+      modeSelect.value = sessionState.currentMode;
+      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
     }
     updateAgentScopedUI();
-    currentModel = snapshot.model || '';
+    sessionState.currentModel = snapshot.model || '';
     if (!preserveStreaming) {
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
     }
@@ -946,7 +1136,7 @@
   function setSessionLoading(sessionId, options = {}) {
     const loading = !!sessionId;
     const blocking = options.blocking !== false;
-    activeSessionLoad = loading ? { sessionId, blocking, snapshot: null } : null;
+    sessionState.activeSessionLoad = loading ? { sessionId, blocking, snapshot: null } : null;
     const showOverlay = !!(loading && blocking);
     document.body.classList.toggle('session-loading-active', showOverlay);
     sessionLoadingOverlay.hidden = !showOverlay;
@@ -962,14 +1152,14 @@
   }
 
   function clearSessionLoading(sessionId) {
-    if (sessionId && activeSessionLoad && activeSessionLoad.sessionId !== sessionId) return;
+    if (sessionId && sessionState.activeSessionLoad && sessionState.activeSessionLoad.sessionId !== sessionId) return;
     setSessionLoading(null, { blocking: false });
   }
 
   function isBlockingSessionLoad(sessionId) {
-    return !!(activeSessionLoad &&
-      activeSessionLoad.blocking &&
-      (!sessionId || activeSessionLoad.sessionId === sessionId));
+    return !!(sessionState.activeSessionLoad &&
+      sessionState.activeSessionLoad.blocking &&
+      (!sessionId || sessionState.activeSessionLoad.sessionId === sessionId));
   }
 
   function finishSessionSwitch(sessionId) {
@@ -982,9 +1172,9 @@
   }
 
   function finalizeLoadedSession(sessionId) {
-    if (activeSessionLoad?.sessionId === sessionId && activeSessionLoad.snapshot) {
-      activeSessionLoad.snapshot.complete = true;
-      cacheSessionSnapshot(activeSessionLoad.snapshot);
+    if (sessionState.activeSessionLoad?.sessionId === sessionId && sessionState.activeSessionLoad.snapshot) {
+      sessionState.activeSessionLoad.snapshot.complete = true;
+      cacheSessionSnapshot(sessionState.activeSessionLoad.snapshot);
     }
     finishSessionSwitch(sessionId);
   }
@@ -993,10 +1183,10 @@
     if (!sessionId) return;
     const blocking = options.blocking !== false;
     const force = options.force === true;
-    if (!force && activeSessionLoad?.sessionId === sessionId) return;
-    if (!force && sessionId === currentSessionId && !activeSessionLoad) return;
+    if (!force && sessionState.activeSessionLoad?.sessionId === sessionId) return;
+    if (!force && sessionId === sessionState.currentSessionId && !sessionState.activeSessionLoad) return;
     renderEpoch++;
-    loadedHistorySessionId = null;
+    sessionState.loadedHistorySessionId = null;
     setSessionLoading(sessionId, { blocking, label: options.label });
     send({ type: 'load_session', sessionId });
   }
@@ -1004,7 +1194,7 @@
   function showCachedSession(sessionId) {
     const snapshot = buildCachedSessionSnapshot(sessionId);
     if (!snapshot) return false;
-    if (currentSessionId && currentSessionId !== sessionId) {
+    if (sessionState.currentSessionId && sessionState.currentSessionId !== sessionId) {
       send({ type: 'detach_view' });
     }
     clearSessionLoading();
@@ -1019,7 +1209,7 @@
       beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
       return;
     }
-    if (!options.force && sessionId === currentSessionId && !activeSessionLoad) return;
+    if (!options.force && sessionId === sessionState.currentSessionId && !sessionState.activeSessionLoad) return;
 
     const disposition = getSessionCacheDisposition(sessionId);
     if (disposition === 'strong') {
@@ -1034,7 +1224,7 @@
   }
 
   function setStatsDisplay(msg) {
-    if (currentAgent === 'codex' && msg && msg.totalUsage) {
+    if (sessionState.currentAgent === 'codex' && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
         const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
@@ -1061,10 +1251,10 @@
     }
 
     addOption('default', 'Default', '使用当前 Codex 默认模型');
-    addOption(currentModel, currentModel, '当前会话模型');
-    sessions
+    addOption(sessionState.currentModel, sessionState.currentModel, '当前会话模型');
+    sessionState.sessions
       .filter((s) => normalizeAgent(s.agent) === 'codex')
-      .forEach((s) => addOption(s.model, s.model, s.id === currentSessionId ? '当前会话已保存模型' : '其他 Codex 会话模型'));
+      .forEach((s) => addOption(s.model, s.model, s.id === sessionState.currentSessionId ? '当前会话已保存模型' : '其他 Codex 会话模型'));
 
     return options;
   }
@@ -1073,8 +1263,42 @@
   const PREVIEW_LANGS = new Set(['html', 'svg']);
   const _previewCodeMap = new Map();
   let _previewCodeId = 0;
+  const PREVIEW_SRCDOC_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:; media-src data:; script-src 'none';">`;
+
+  function sanitizePreviewMarkup(markup) {
+    if (!markup) return '';
+    let safe = String(markup);
+    safe = safe.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
+    safe = safe.replace(/<iframe[\s\S]*?>[\s\S]*?<\/iframe>/gi, '');
+    safe = safe.replace(/\son[a-z]+\s*=\s*(['"]).*?\1/gis, '');
+    safe = safe.replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, '');
+    safe = safe.replace(/\s(href|src)\s*=\s*(['"])\s*javascript:[\s\S]*?\2/gi, ' $1="#"');
+    safe = safe.replace(/\s(href|src)\s*=\s*javascript:[^\s>]+/gi, ' $1="#"');
+    return safe;
+  }
+
+  function buildSafePreviewSrcdoc(markup) {
+    return `${PREVIEW_SRCDOC_CSP}${sanitizePreviewMarkup(markup)}`;
+  }
 
   const renderer = new marked.Renderer();
+  renderer.html = function (html) {
+    return escapeHtml(html || '');
+  };
+  renderer.link = function (href, title, text) {
+    const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: true });
+    if (!safeHref) return text || '';
+    const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
+    const isExternal = /^https?:\/\//i.test(safeHref);
+    const externalAttrs = isExternal ? ' target="_blank" rel="noopener noreferrer"' : '';
+    return `<a href="${escapeHtml(safeHref)}"${safeTitle}${externalAttrs}>${text || ''}</a>`;
+  };
+  renderer.image = function (href, title, text) {
+    const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: false, allowDataImage: true });
+    if (!safeHref) return '';
+    const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text || '')}"${safeTitle}>`;
+  };
   renderer.code = function (code, language) {
     const lang = (language || 'plaintext').toLowerCase();
     let highlighted;
@@ -1092,7 +1316,7 @@
       ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
       : '';
     const previewPane = canPreview
-      ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-scripts" loading="lazy"></iframe></div>`
+      ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-same-origin" loading="lazy" referrerpolicy="no-referrer"></iframe></div>`
       : '';
     const cid = canPreview ? (++_previewCodeId) : 0;
     if (canPreview) _previewCodeMap.set(cid, code);
@@ -1110,10 +1334,38 @@
     const wrapper = btn.closest('.code-block-wrapper');
     const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
     const code = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : wrapper.querySelector('code').textContent;
-    navigator.clipboard.writeText(code).then(() => {
+    const fallbackCopy = (text) => {
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+    const onCopied = () => {
       btn.textContent = 'Copied!';
       setTimeout(() => btn.textContent = 'Copy', 1500);
-    });
+    };
+    const onFailed = () => {
+      showToast('复制失败，请手动复制代码');
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(code).then(onCopied).catch(() => {
+        if (fallbackCopy(code)) onCopied();
+        else onFailed();
+      });
+      return;
+    }
+    if (fallbackCopy(code)) onCopied();
+    else onFailed();
   };
 
   window.ccTogglePreview = function (btn) {
@@ -1126,7 +1378,8 @@
       const iframe = wrapper.querySelector('.code-preview-iframe');
       if (iframe && !iframe.dataset.loaded) {
         const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
-        iframe.srcdoc = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
+        const rawMarkup = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
+        iframe.srcdoc = buildSafePreviewSrcdoc(rawMarkup);
         iframe.dataset.loaded = '1';
       }
       wrapper.classList.add('preview-mode');
@@ -1136,343 +1389,391 @@
 
   // --- WebSocket ---
   function connect() {
-    if (ws && ws.readyState <= 1) return;
-    ws = new WebSocket(WS_URL);
+    if (connectionState.ws && (connectionState.ws.readyState === WebSocket.CONNECTING || connectionState.ws.readyState === WebSocket.OPEN)) return;
+    connectionState.ws = new WebSocket(WS_URL);
 
-    ws.onopen = () => {
-      reconnectAttempts = 0;
-      if (authToken) send({ type: 'auth', token: authToken });
+    connectionState.ws.onopen = () => {
+      connectionState.reconnectAttempts = 0;
+      // Show reconnection success toast if this was a reconnect
+      if (connectionState.reconnectAttempts === 0 && document.body.classList.contains('ws-reconnecting')) {
+        document.body.classList.remove('ws-reconnecting');
+        showToast('连接已恢复');
+      }
+      if (connectionState.authToken) send({ type: 'auth', token: connectionState.authToken });
     };
 
-    ws.onmessage = (e) => {
+    connectionState.ws.onmessage = (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       handleServerMessage(msg);
     };
 
-    ws.onclose = () => {
+    connectionState.ws.onclose = () => {
       clearSessionLoading();
       scheduleReconnect();
     };
-    ws.onerror = () => {};
+    connectionState.ws.onerror = () => {
+      // Show connection error indicator
+      if (connectionState.reconnectAttempts === 0) {
+        document.body.classList.add('ws-reconnecting');
+      }
+    };
   }
 
   function send(data) {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+    if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN) {
+      connectionState.ws.send(JSON.stringify(data));
+    } else {
+      // Warn user if trying to send while disconnected
+      showToast('连接已断开，正在重连…');
+    }
   }
 
   function scheduleReconnect() {
-    if (reconnectTimer) return;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
+    if (connectionState.reconnectTimer) return;
+    if (connectionState.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+      // Max reconnect attempts reached - show persistent error
+      appendError('连接已断开且重连失败，请刷新页面重试。', { type: 'connection', dismissible: false });
+      return;
+    }
+    if (navigator.onLine === false) {
+      // Offline - wait for online event
+      showToast('网络已断开，等待恢复…');
+      return;
+    }
+    
+    document.body.classList.add('ws-reconnecting');
+    
+    const delay = Math.min(1000 * Math.pow(2, connectionState.reconnectAttempts), 30000);
+    connectionState.reconnectAttempts++;
+    
+    // Show reconnection attempt toast every few attempts
+    if (connectionState.reconnectAttempts <= 3 || connectionState.reconnectAttempts % 3 === 0) {
+      showToast(`正在重连 (${connectionState.reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS})…`);
+    }
+    
+    connectionState.reconnectTimer = setTimeout(() => {
+      connectionState.reconnectTimer = null;
       connect();
     }, delay);
   }
 
   // --- Server Message Handler ---
-  function handleServerMessage(msg) {
-    switch (msg.type) {
-      case 'auth_result':
-        if (msg.success) {
-          authToken = msg.token;
-          localStorage.setItem('cc-web-token', msg.token);
-          document.dispatchEvent(new CustomEvent('cc-web-auth-restored'));
-          loginOverlay.hidden = true;
-          app.hidden = false;
-          send({ type: 'get_codex_config' });
-          send({ type: 'get_projects' });
-          // Check if must change password
-          if (msg.mustChangePassword) {
-            showForceChangePassword();
-          } else {
-            pendingInitialSessionLoad = true;
-          }
-        } else {
-          authToken = null;
-          localStorage.removeItem('cc-web-token');
-          document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
-          loginOverlay.hidden = false;
-          app.hidden = true;
-          loginError.hidden = false;
-        }
-        break;
-
-      case 'session_list':
-        sessions = msg.sessions || [];
-        reconcileSessionCacheWithSessions();
-        renderSessionList();
-        if (currentSessionId) {
-          setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
-        }
-        if (pendingInitialSessionLoad) {
-          pendingInitialSessionLoad = false;
-          restoreInitialSession(selectedAgent);
-        } else if (currentSessionId && !getSessionMeta(currentSessionId)) {
-          resetChatView(selectedAgent);
-        }
-        break;
-
-      case 'session_info':
-        const snapshot = normalizeSessionSnapshot(msg);
-        if (activeSessionLoad?.sessionId === msg.sessionId) {
-          activeSessionLoad.snapshot = snapshot;
-        }
-        applySessionSnapshot(snapshot, {
-          immediate: isBlockingSessionLoad(msg.sessionId),
-          suppressUnreadToast: false,
-          preserveStreaming: msg.sessionId === currentSessionId && msg.isRunning,
-        });
-        if (!msg.historyPending) {
-          if (activeSessionLoad?.sessionId === msg.sessionId) {
-            finalizeLoadedSession(msg.sessionId);
-          } else {
-            cacheSessionSnapshot(snapshot);
-            finishSessionSwitch(msg.sessionId);
-          }
-        }
-        break;
-
-      case 'session_history_chunk':
-        if (msg.sessionId === currentSessionId && loadedHistorySessionId === msg.sessionId) {
-          const blocking = isBlockingSessionLoad(msg.sessionId);
-          if (activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.snapshot) {
-            activeSessionLoad.snapshot.messages = cloneMessages(msg.messages || []).concat(activeSessionLoad.snapshot.messages);
-          }
-          prependHistoryMessages(msg.messages || [], {
-            preserveScroll: !blocking,
-            skipScrollbar: blocking,
-          });
-          if (!msg.remaining) {
-            finalizeLoadedSession(msg.sessionId);
-          }
-        }
-        break;
-
-      case 'session_renamed':
-        sessions = sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
-        updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
-        if (msg.sessionId === currentSessionId) {
-          chatTitle.textContent = msg.title;
-        }
-        renderSessionList();
-        break;
-
-      case 'text_delta':
-        if (!isGenerating) startGenerating();
-        pendingText += msg.text;
-        scheduleRender();
-        break;
-
-      case 'tool_start':
-        if (!isGenerating) startGenerating();
-        if (pendingText) flushRender();
-        activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
-        appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
-        break;
-
-      case 'tool_end':
-        if (activeToolCalls.has(msg.toolUseId)) {
-          activeToolCalls.get(msg.toolUseId).done = true;
-          if (msg.kind) activeToolCalls.get(msg.toolUseId).kind = msg.kind;
-          if (msg.meta) activeToolCalls.get(msg.toolUseId).meta = msg.meta;
-          activeToolCalls.get(msg.toolUseId).result = msg.result;
-        }
-        updateToolCall(msg.toolUseId, msg.result);
-        break;
-
-      case 'cost':
-        costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
-        if (currentSessionId) {
-          updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
-        }
-        renderWorkspaceInsights();
-        break;
-
-      case 'usage':
-        if (msg.totalUsage) {
-          const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-          costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
-          if (currentSessionId) {
-            updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
-          }
-        }
-        renderWorkspaceInsights();
-        break;
-
-      case 'done':
-        finishGenerating(msg.sessionId);
-        break;
-
-      case 'system_message':
-        appendSystemMessage(msg.message);
-        break;
-
-      case 'mode_changed':
-        if (msg.mode && MODE_LABELS[msg.mode]) {
-          currentMode = msg.mode;
-          modeSelect.value = currentMode;
-          localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
-          updateAgentScopedUI();
-          if (currentSessionId) {
-            updateCachedSession(currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
-          }
-          renderWorkspaceInsights();
-        }
-        break;
-
-      case 'model_changed':
-        if (msg.model !== undefined) {
-          currentModel = msg.model || '';
-          if (currentSessionId) {
-            updateCachedSession(currentSessionId, (snapshot) => { snapshot.model = msg.model; });
-          }
-          renderWorkspaceInsights();
-        }
-        break;
-
-      case 'model_list':
-        if ((msg.agent || currentAgent) === 'codex') {
-          const options = Array.isArray(msg.entries) && msg.entries.length > 0 ? msg.entries : getCodexModelOptions();
-          const activeValue = msg.currentFull || currentModel || 'default';
-          showOptionPicker('选择 Codex 模型', options, activeValue, (value) => {
-            send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: 'codex' });
-          });
-        } else if (msg.models) {
-          showClaudeModelPicker(msg.entries, msg.models, msg.current, msg.currentFull);
-        }
-        break;
-
-      case 'resume_generating':
-        // Server has an active process for this session — resume streaming
-        setCurrentSessionRunningState(true);
-        if (!isGenerating || !document.getElementById('streaming-msg')) {
-          startGenerating();
-        } else {
-          sendBtn.hidden = true;
-          abortBtn.hidden = false;
-          activeToolCalls.clear();
-          const bubble = document.querySelector('#streaming-msg .msg-bubble');
-          if (bubble) bubble.innerHTML = '';
-        }
-        const resumedSegments = Array.isArray(msg.segments) && msg.segments.length > 0 ? msg.segments : null;
-        if (resumedSegments) {
-          renderStreamingSegments(resumedSegments);
-          for (const segment of resumedSegments) {
-            if (segment?.type !== 'tool_call' || !segment.id) continue;
-            activeToolCalls.set(segment.id, {
-              name: segment.name,
-              input: segment.input,
-              result: segment.result,
-              kind: segment.kind || null,
-              meta: segment.meta || null,
-              done: segment.done !== false,
-            });
-          }
-          pendingText = '';
-        } else {
-          pendingText = msg.text || '';
-          flushRender();
-          if (msg.toolCalls && msg.toolCalls.length > 0) {
-            for (const tc of msg.toolCalls) {
-              activeToolCalls.set(tc.id, {
-                name: tc.name,
-                input: tc.input,
-                result: tc.result,
-                kind: tc.kind || null,
-                meta: tc.meta || null,
-                done: tc.done,
-              });
-              appendToolCall(tc.id, tc.name, tc.input, tc.done, tc.kind || null, tc.meta || null);
-              if (tc.done && tc.result) {
-                updateToolCall(tc.id, tc.result);
-              }
-            }
-          }
-        }
-        break;
-
-      case 'error':
-        appendError(msg.message);
-        clearSessionLoading();
-        if (!isGenerating && currentSessionId) {
-          setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
-        }
-        if (isGenerating) finishGenerating();
-        break;
-
-      case 'notify_config':
-        if (typeof _onNotifyConfig === 'function') _onNotifyConfig(msg.config);
-        break;
-
-      case 'notify_test_result':
-        if (typeof _onNotifyTestResult === 'function') _onNotifyTestResult(msg);
-        break;
-
-      case 'model_config':
-        if (typeof _onModelConfig === 'function') _onModelConfig(msg.config);
-        break;
-
-      case 'codex_config':
-        codexConfigCache = msg.config || null;
-        if (typeof _onCodexConfig === 'function') _onCodexConfig(msg.config);
-        break;
-
-      case 'fetch_models_result':
-        if (typeof _onFetchModelsResult === 'function') _onFetchModelsResult(msg);
-        break;
-
-      case 'background_done':
-        // A background task completed (browser was disconnected or viewing another session)
-        showToast(`「${msg.title}」任务完成`, msg.sessionId);
-        showBrowserNotification(msg.title);
-        if (msg.sessionId === currentSessionId) {
-          // Reload current session to show completed response
-          openSession(msg.sessionId, { forceSync: true, blocking: false });
-        } else {
-          send({ type: 'list_sessions' });
-        }
-        break;
-
-      case 'password_changed':
-        handlePasswordChanged(msg);
-        break;
-
-      case 'native_sessions':
-        if (typeof _onNativeSessions === 'function') _onNativeSessions(msg.groups || []);
-        break;
-
-      case 'codex_sessions':
-        if (typeof _onCodexSessions === 'function') _onCodexSessions(msg.sessions || []);
-        break;
-
-      case 'cwd_suggestions':
-        if (typeof _onCwdSuggestions === 'function') _onCwdSuggestions(msg.paths || []);
-        break;
-
-      case 'directory_listing':
-        if (typeof _onDirectoryListing === 'function') _onDirectoryListing(msg);
-        break;
-
-      case 'update_info':
-        if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg);
-        break;
-
-      case 'projects_config':
-        projects = msg.projects || [];
-        renderSessionList();
-        flushPendingProjectFocus();
-        break;
+  function handleAuthResultMessage(msg) {
+    if (msg.success) {
+      connectionState.authToken = msg.token;
+      localStorage.setItem('cc-web-token', msg.token);
+      document.dispatchEvent(new CustomEvent('cc-web-auth-restored'));
+      loginOverlay.hidden = true;
+      app.hidden = false;
+      send({ type: 'get_codex_config' });
+      send({ type: 'get_projects' });
+      if (msg.mustChangePassword) {
+        showForceChangePassword();
+      } else {
+        connectionState.pendingInitialSessionLoad = true;
+      }
+      return;
     }
+    connectionState.authToken = null;
+    localStorage.removeItem('cc-web-token');
+    document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
+    loginOverlay.hidden = false;
+    app.hidden = true;
+    loginError.hidden = false;
+  }
+
+  function handleSessionListMessage(msg) {
+    sessionState.sessions = msg.sessions || [];
+    reconcileSessionCacheWithSessions();
+    renderSessionList();
+    if (sessionState.currentSessionId) {
+      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+    }
+    if (connectionState.pendingInitialSessionLoad) {
+      connectionState.pendingInitialSessionLoad = false;
+      restoreInitialSession(selectedAgent);
+    } else if (sessionState.currentSessionId && !getSessionMeta(sessionState.currentSessionId)) {
+      resetChatView(selectedAgent);
+    }
+  }
+
+  function handleSessionInfoMessage(msg) {
+    const snapshot = normalizeSessionSnapshot(msg);
+    
+    // Guard against stale responses from previous session loads
+    // Only apply if this is the expected session or if no load is in progress
+    const expectedSessionId = sessionState.activeSessionLoad?.sessionId;
+    const isExpectedResponse = !expectedSessionId || expectedSessionId === msg.sessionId;
+    
+    // If we're waiting for a different session, ignore this stale response
+    if (!isExpectedResponse && sessionState.activeSessionLoad?.blocking) {
+      return;
+    }
+    
+    if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
+      sessionState.activeSessionLoad.snapshot = snapshot;
+    }
+    applySessionSnapshot(snapshot, {
+      immediate: isBlockingSessionLoad(msg.sessionId),
+      suppressUnreadToast: false,
+      preserveStreaming: msg.sessionId === sessionState.currentSessionId && msg.isRunning,
+    });
+    if (msg.historyPending) return;
+    if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
+      finalizeLoadedSession(msg.sessionId);
+      return;
+    }
+    cacheSessionSnapshot(snapshot);
+    finishSessionSwitch(msg.sessionId);
+  }
+
+  function handleSessionHistoryChunkMessage(msg) {
+    // Guard against stale history chunks from different sessions
+    if (msg.sessionId !== sessionState.currentSessionId) return;
+    if (sessionState.loadedHistorySessionId !== msg.sessionId) return;
+    
+    // Additional guard: ignore if we're loading a different session
+    const activeLoadId = sessionState.activeSessionLoad?.sessionId;
+    if (activeLoadId && activeLoadId !== msg.sessionId) return;
+    
+    const blocking = isBlockingSessionLoad(msg.sessionId);
+    if (sessionState.activeSessionLoad?.sessionId === msg.sessionId && sessionState.activeSessionLoad.snapshot) {
+      sessionState.activeSessionLoad.snapshot.messages = cloneMessages(msg.messages || []).concat(sessionState.activeSessionLoad.snapshot.messages);
+    }
+    prependHistoryMessages(msg.messages || [], {
+      preserveScroll: !blocking,
+      skipScrollbar: blocking,
+    });
+    if (!msg.remaining) {
+      finalizeLoadedSession(msg.sessionId);
+    }
+  }
+
+  function handleSessionRenamedMessage(msg) {
+    sessionState.sessions = sessionState.sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
+    updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
+    if (msg.sessionId === sessionState.currentSessionId) {
+      chatTitle.textContent = msg.title;
+    }
+    renderSessionList();
+  }
+
+  function handleTextDeltaMessage(msg) {
+    if (!composeState.isGenerating) startGenerating();
+    composeState.pendingText += msg.text;
+    scheduleRender();
+  }
+
+  function handleToolStartMessage(msg) {
+    if (!composeState.isGenerating) startGenerating();
+    if (composeState.pendingText) flushRender();
+    composeState.activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
+    appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
+  }
+
+  function handleToolEndMessage(msg) {
+    if (composeState.activeToolCalls.has(msg.toolUseId)) {
+      composeState.activeToolCalls.get(msg.toolUseId).done = true;
+      if (msg.kind) composeState.activeToolCalls.get(msg.toolUseId).kind = msg.kind;
+      if (msg.meta) composeState.activeToolCalls.get(msg.toolUseId).meta = msg.meta;
+      composeState.activeToolCalls.get(msg.toolUseId).result = msg.result;
+    }
+    updateToolCall(msg.toolUseId, msg.result);
+  }
+
+  function handleCostMessage(msg) {
+    costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
+    }
+    renderWorkspaceInsights();
+  }
+
+  function handleUsageMessage(msg) {
+    if (msg.totalUsage) {
+      const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
+      costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+      if (sessionState.currentSessionId) {
+        updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
+      }
+    }
+    renderWorkspaceInsights();
+  }
+
+  function handleModeChangedMessage(msg) {
+    if (!msg.mode || !MODE_LABELS[msg.mode]) return;
+    sessionState.currentMode = msg.mode;
+    modeSelect.value = sessionState.currentMode;
+    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
+    }
+    renderWorkspaceInsights();
+  }
+
+  function handleModelChangedMessage(msg) {
+    if (msg.model === undefined) return;
+    sessionState.currentModel = msg.model || '';
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.model = msg.model; });
+    }
+    renderWorkspaceInsights();
+  }
+
+  function handleModelListMessage(msg) {
+    if ((msg.agent || sessionState.currentAgent) === 'codex') {
+      const options = Array.isArray(msg.entries) && msg.entries.length > 0 ? msg.entries : getCodexModelOptions();
+      const activeValue = msg.currentFull || sessionState.currentModel || 'default';
+      showOptionPicker('选择 Codex 模型', options, activeValue, (value) => {
+        send({ type: 'message', text: `/model ${value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: 'codex' });
+      });
+      return;
+    }
+    if (msg.models) {
+      showClaudeModelPicker(msg.entries, msg.models, msg.current, msg.currentFull);
+    }
+  }
+
+  function handleResumeGeneratingMessage(msg) {
+    setCurrentSessionRunningState(true);
+    if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
+      startGenerating();
+    } else {
+      sendBtn.hidden = true;
+      abortBtn.hidden = false;
+      composeState.activeToolCalls.clear();
+      const bubble = document.querySelector('#streaming-msg .msg-bubble');
+      if (bubble) bubble.innerHTML = '';
+    }
+    const resumedSegments = Array.isArray(msg.segments) && msg.segments.length > 0 ? msg.segments : null;
+    if (resumedSegments) {
+      renderStreamingSegments(resumedSegments);
+      for (const segment of resumedSegments) {
+        if (segment?.type !== 'tool_call' || !segment.id) continue;
+        composeState.activeToolCalls.set(segment.id, {
+          name: segment.name,
+          input: segment.input,
+          result: segment.result,
+          kind: segment.kind || null,
+          meta: segment.meta || null,
+          done: segment.done !== false,
+        });
+      }
+      composeState.pendingText = '';
+      return;
+    }
+    composeState.pendingText = msg.text || '';
+    flushRender();
+    if (!(msg.toolCalls && msg.toolCalls.length > 0)) return;
+    for (const tc of msg.toolCalls) {
+      composeState.activeToolCalls.set(tc.id, {
+        name: tc.name,
+        input: tc.input,
+        result: tc.result,
+        kind: tc.kind || null,
+        meta: tc.meta || null,
+        done: tc.done,
+      });
+      appendToolCall(tc.id, tc.name, tc.input, tc.done, tc.kind || null, tc.meta || null);
+      if (tc.done && tc.result) {
+        updateToolCall(tc.id, tc.result);
+      }
+    }
+  }
+
+  function handleErrorMessage(msg) {
+    const errorMsg = msg.message || '发生未知错误';
+    appendError(errorMsg);
+    // Also show toast for critical errors to ensure user notice
+    if (msg.critical || msg.fatal) {
+      showToast(`错误: ${errorMsg}`, null);
+    }
+    clearSessionLoading();
+    if (!composeState.isGenerating && sessionState.currentSessionId) {
+      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+    }
+    if (composeState.isGenerating) finishGenerating();
+  }
+
+  function handleBackgroundDoneMessage(msg) {
+    showToast(`「${msg.title}」任务完成`, msg.sessionId);
+    showBrowserNotification(msg.title);
+    if (msg.sessionId === sessionState.currentSessionId) {
+      openSession(msg.sessionId, { forceSync: true, blocking: false });
+    } else {
+      send({ type: 'list_sessions' });
+    }
+  }
+
+  function handleModelConfigMessage(msg) {
+    modelConfigCache = msg.config || null;
+    emitWsEvent('model_config', msg.config);
+  }
+
+  function handleCodexConfigMessage(msg) {
+    codexConfigCache = msg.config || null;
+    emitWsEvent('codex_config', msg.config);
+  }
+
+  function handleProjectsConfigMessage(msg) {
+    projects = msg.projects || [];
+    renderSessionList();
+    flushPendingProjectFocus();
+  }
+
+  const SERVER_MESSAGE_HANDLERS = Object.freeze({
+    auth_result: handleAuthResultMessage,
+    session_list: handleSessionListMessage,
+    session_info: handleSessionInfoMessage,
+    session_history_chunk: handleSessionHistoryChunkMessage,
+    session_renamed: handleSessionRenamedMessage,
+    text_delta: handleTextDeltaMessage,
+    tool_start: handleToolStartMessage,
+    tool_end: handleToolEndMessage,
+    cost: handleCostMessage,
+    usage: handleUsageMessage,
+    done: (msg) => finishGenerating(msg.sessionId),
+    system_message: (msg) => appendSystemMessage(msg.message),
+    mode_changed: handleModeChangedMessage,
+    model_changed: handleModelChangedMessage,
+    model_list: handleModelListMessage,
+    resume_generating: handleResumeGeneratingMessage,
+    error: handleErrorMessage,
+    notify_config: (msg) => {
+      emitWsEvent('notify_config', msg.config);
+    },
+    notify_test_result: (msg) => {
+      emitWsEvent('notify_test_result', msg);
+    },
+    model_config: handleModelConfigMessage,
+    codex_config: handleCodexConfigMessage,
+    fetch_models_result: (msg) => {
+      emitWsEvent('fetch_models_result', msg);
+    },
+    background_done: handleBackgroundDoneMessage,
+    password_changed: handlePasswordChanged,
+    force_logout: handleForcedLogout,
+    native_sessions: (msg) => { if (typeof _onNativeSessions === 'function') _onNativeSessions(msg.groups || []); },
+    codex_sessions: (msg) => { if (typeof _onCodexSessions === 'function') _onCodexSessions(msg.sessions || []); },
+    cwd_suggestions: (msg) => { if (typeof _onCwdSuggestions === 'function') _onCwdSuggestions(msg.paths || []); },
+    directory_listing: (msg) => { if (typeof _onDirectoryListing === 'function') _onDirectoryListing(msg); },
+    update_info: (msg) => { if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg); },
+    projects_config: handleProjectsConfigMessage,
+  });
+
+  function handleServerMessage(msg) {
+    const handler = SERVER_MESSAGE_HANDLERS[msg?.type];
+    if (typeof handler === 'function') handler(msg);
   }
 
   // --- Generating State ---
   function startGenerating() {
-    isGenerating = true;
+    composeState.isGenerating = true;
     setCurrentSessionRunningState(true);
-    pendingText = '';
-    activeToolCalls.clear();
+    composeState.pendingText = '';
+    composeState.activeToolCalls.clear();
     sendBtn.hidden = true;
     abortBtn.hidden = false;
     // 不禁用输入框，允许用户继续输入（但无法发送）
@@ -1490,20 +1791,22 @@
   }
 
   function finishGenerating(sessionId) {
-    isGenerating = false;
+    composeState.isGenerating = false;
     sendBtn.hidden = false;
     abortBtn.hidden = true;
     setCurrentSessionRunningState(false);
     msgInput.focus();
 
-    if (pendingText) flushRender();
+    if (composeState.pendingText) flushRender();
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) streamEl.removeAttribute('id');
 
-    if (sessionId) currentSessionId = sessionId;
-    pendingText = '';
-    activeToolCalls.clear();
+    if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
+      sessionState.currentSessionId = sessionId;
+    }
+    composeState.pendingText = '';
+    composeState.activeToolCalls.clear();
   }
 
   // --- Rendering ---
@@ -1516,13 +1819,13 @@
   }
 
   function flushRender() {
-    if (!pendingText) return;
+    if (!composeState.pendingText) return;
     const textDiv = ensureStreamingTextSegment();
     if (!textDiv) return;
-    const nextText = `${textDiv.dataset.rawText || ''}${pendingText}`;
+    const nextText = `${textDiv.dataset.rawText || ''}${composeState.pendingText}`;
     textDiv.dataset.rawText = nextText;
     textDiv.innerHTML = renderMarkdown(nextText);
-    pendingText = '';
+    composeState.pendingText = '';
     scrollToBottom();
   }
 
@@ -1586,7 +1889,7 @@
 
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    avatar.textContent = role === 'user' ? 'U' : (currentAgent === 'codex' ? 'O' : 'C');
+    avatar.textContent = role === 'user' ? 'U' : (sessionState.currentAgent === 'codex' ? 'O' : 'C');
 
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
@@ -1784,7 +2087,7 @@
     if (!summary || !inner) return;
     const items = Array.from(inner.querySelectorAll(':scope > .tool-call')).map((call) => {
       const toolUseId = call.id ? call.id.replace(/^tool-/, '') : '';
-      const active = toolUseId ? activeToolCalls.get(toolUseId) : null;
+      const active = toolUseId ? composeState.activeToolCalls.get(toolUseId) : null;
       const fallbackTool = {
         id: toolUseId,
         name: call.dataset.toolName || '',
@@ -1808,7 +2111,7 @@
     group.appendChild(inner);
 
     toolItems.forEach((tool) => {
-      const details = createToolCallElement(tool.id || `saved-${Math.random().toString(36).slice(2)}`, tool, tool.done !== false);
+      const details = createToolCallElement(tool.id || nextLocalId('saved'), tool, tool.done !== false);
       inner.appendChild(details);
     });
 
@@ -1822,7 +2125,7 @@
       return createToolGroupElement(segment.items || []);
     }
     if (segment.type === 'tool_call') {
-      const details = createToolCallElement(segment.id || `saved-${Math.random().toString(36).slice(2)}`, segment, segment.done !== false);
+      const details = createToolCallElement(segment.id || nextLocalId('saved'), segment, segment.done !== false);
       details.classList.add('msg-segment');
       return details;
     }
@@ -1861,9 +2164,11 @@
   function renderMessages(messages, options = {}) {
     renderEpoch++;
     const epoch = renderEpoch;
+    _previewCodeMap.clear();
+    _previewCodeId = 0;
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
-      messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+      messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
       return;
     }
     if (options.immediate) {
@@ -1873,18 +2178,25 @@
       scrollToBottom();
       return;
     }
-    // Batch render: last 10 first, then next 20, then the rest
-    const batches = [];
+    
+    // Adaptive batch sizing based on message count for better performance
     const len = messages.length;
-    if (len <= 10) {
-      batches.push([0, len]);
-    } else if (len <= 30) {
-      batches.push([len - 10, len]);
-      batches.push([0, len - 10]);
-    } else {
-      batches.push([len - 10, len]);
-      batches.push([len - 30, len - 10]);
-      batches.push([0, len - 30]);
+    const BATCH_SIZE = len > 100 ? 15 : (len > 50 ? 12 : 10);
+    const BATCH_DELAY = len > 100 ? 24 : (len > 50 ? 20 : 16);
+    
+    // Calculate batches - render from newest to oldest
+    const batches = [];
+    // First batch: most recent messages (visible immediately)
+    const firstBatchEnd = Math.min(BATCH_SIZE, len);
+    batches.push([len - firstBatchEnd, len]);
+    
+    // Remaining batches: older messages
+    let currentStart = len - firstBatchEnd;
+    while (currentStart > 0) {
+      const batchEnd = currentStart;
+      const batchStart = Math.max(0, currentStart - BATCH_SIZE);
+      batches.push([batchStart, batchEnd]);
+      currentStart = batchStart;
     }
 
     // Render first batch immediately
@@ -1893,23 +2205,35 @@
     messagesDiv.appendChild(frag0);
     scrollToBottom();
 
-    // Render remaining batches asynchronously, prepending each
-    // Use scrollHeight delta to keep current view position stable after prepend
-    let delay = 0;
-    for (let b = 1; b < batches.length; b++) {
-      const [start, end] = batches[b];
-      delay += 16;
-      setTimeout(() => {
-        if (renderEpoch !== epoch) return; // session switched, abort stale render
-        const prevHeight = messagesDiv.scrollHeight;
-        const prevScrollTop = messagesDiv.scrollTop;
-        const frag = document.createDocumentFragment();
-        for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
-        messagesDiv.insertBefore(frag, messagesDiv.firstChild);
-        // Compensate scrollTop so visible area stays unchanged
-        messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
-        updateScrollbar();
-      }, delay);
+    // Render remaining batches asynchronously with requestAnimationFrame
+    // This prevents blocking the main thread and maintains responsiveness
+    let batchIndex = 1;
+    
+    function renderNextBatch() {
+      if (renderEpoch !== epoch || batchIndex >= batches.length) return;
+      
+      const [start, end] = batches[batchIndex];
+      const prevHeight = messagesDiv.scrollHeight;
+      const prevScrollTop = messagesDiv.scrollTop;
+      
+      const frag = document.createDocumentFragment();
+      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
+      messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+      
+      // Compensate scrollTop so visible area stays unchanged
+      messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+      updateScrollbar();
+      
+      batchIndex++;
+      if (batchIndex < batches.length) {
+        // Use requestAnimationFrame for smoother rendering
+        requestAnimationFrame(renderNextBatch);
+      }
+    }
+    
+    // Start async rendering after a short delay
+    if (batches.length > 1) {
+      setTimeout(() => requestAnimationFrame(renderNextBatch), BATCH_DELAY);
     }
   }
 
@@ -2203,7 +2527,7 @@
   function updateToolCall(toolUseId, result) {
     const el = document.getElementById(`tool-${toolUseId}`);
     if (!el) return;
-    const tool = activeToolCalls.get(toolUseId) || {
+    const tool = composeState.activeToolCalls.get(toolUseId) || {
       id: toolUseId,
       name: el.dataset.toolName || '',
       kind: el.dataset.toolKind || null,
@@ -2230,24 +2554,17 @@
   }
 
   function showDeleteConfirm(agent, onConfirm) {
-    const overlay = document.createElement('div');
-    overlay.className = 'settings-overlay';
-    overlay.style.zIndex = '10002';
-
-    const box = document.createElement('div');
-    box.className = 'settings-panel';
-    box.innerHTML = `
+    const { overlay, panel: box, close } = createOverlayPanel({
+      zIndex: '10002',
+      panelHtml: `
       <div style="font-size:0.9em;color:var(--text-primary);margin-bottom:20px;line-height:1.7">${escapeHtml(getDeleteConfirmMessage(agent))}</div>
       <div style="display:flex;flex-direction:column;gap:8px">
         <button id="del-confirm-ok" style="width:100%;padding:10px;border:none;border-radius:10px;background:var(--accent);color:#fff;font-size:0.95em;font-weight:600;cursor:pointer;font-family:inherit">确认删除</button>
         <button id="del-confirm-skip" style="width:100%;padding:9px;border:1px solid var(--border-color);border-radius:10px;background:var(--bg-tertiary);color:var(--text-secondary);font-size:0.85em;cursor:pointer;font-family:inherit">确认且不再提示</button>
         <button id="del-confirm-cancel" style="width:100%;padding:9px;border:none;border-radius:10px;background:transparent;color:var(--text-muted);font-size:0.85em;cursor:pointer;font-family:inherit">取消</button>
       </div>
-    `;
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
-
-    const close = () => document.body.removeChild(overlay);
+    `,
+    });
     box.querySelector('#del-confirm-ok').addEventListener('click', () => { close(); onConfirm(); });
     box.querySelector('#del-confirm-skip').addEventListener('click', () => {
       skipDeleteConfirm = true;
@@ -2266,12 +2583,31 @@
     scrollToBottom();
   }
 
-  function appendError(message) {
+  function appendError(message, options = {}) {
+    const errorType = options.type || 'error';
+    const dismissible = options.dismissible !== false;
+    
     const div = document.createElement('div');
-    div.className = 'msg system';
-    div.innerHTML = `<div class="msg-bubble" style="border-color:var(--danger);color:var(--danger)">⚠ ${escapeHtml(message)}</div>`;
+    div.className = 'msg system error-msg';
+    div.setAttribute('data-error-type', errorType);
+    
+    const bubbleStyle = options.style || 'border-color:var(--danger);color:var(--danger)';
+    const icon = options.icon || '⚠';
+    
+    div.innerHTML = `<div class="msg-bubble" style="${bubbleStyle}">${icon} ${escapeHtml(message)}${dismissible ? '<button class="error-dismiss-btn" aria-label="关闭">×</button>' : ''}</div>`;
+    
+    if (dismissible) {
+      const dismissBtn = div.querySelector('.error-dismiss-btn');
+      if (dismissBtn) {
+        dismissBtn.addEventListener('click', () => div.remove());
+      }
+    }
+    
     messagesDiv.appendChild(div);
     scrollToBottom();
+    
+    // Auto-scroll to make error visible
+    div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
   function scrollToBottom() {
@@ -2352,10 +2688,15 @@
   updateScrollbar();
 
 
-  function getLatestSessionTimestamp(groupSessions) {
+  function getSessionUpdatedTimestamp(session) {
+    const next = new Date(session?.updated || 0).getTime();
+    return Number.isFinite(next) ? next : 0;
+  }
+
+  function getLatestSessionTimestamp(groupSessions, timestampCache = null) {
     return (Array.isArray(groupSessions) ? groupSessions : []).reduce((latest, session) => {
-      const next = new Date(session?.updated || 0).getTime();
-      return Number.isFinite(next) && next > latest ? next : latest;
+      const next = timestampCache?.get(session?.id) ?? getSessionUpdatedTimestamp(session);
+      return next > latest ? next : latest;
     }, 0);
   }
 
@@ -2380,6 +2721,18 @@
       if (parts.length > 0) return `/${parts.join('/')}`;
     }
     return raw;
+  }
+
+  function formatClaudeImportGroupPath(projectDir) {
+    const raw = String(projectDir || '').trim();
+    if (!raw) return '/';
+    const decoded = decodeClaudeProjectDir(raw);
+    if (decoded && decoded !== raw) {
+      return normalizeComparablePath(decoded);
+    }
+    let readablePath = raw.replace(/-/g, '/');
+    if (!readablePath.startsWith('/')) readablePath = '/' + readablePath;
+    return readablePath.replace(/\/+/g, '/');
   }
 
   function isSameOrChildPath(parentPath, childPath) {
@@ -2479,8 +2832,11 @@
 
   function buildSessionItem(s) {
     const item = document.createElement('div');
-    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${s.isRunning ? ' is-running' : ''}`;
+    item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${s.isRunning ? ' is-running' : ''}`;
     item.dataset.id = s.id;
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('role', 'button');
+    item.setAttribute('aria-label', `会话: ${s.title || 'Untitled'}`);
 
     const title = document.createElement('span');
     title.className = 'session-item-title';
@@ -2538,7 +2894,7 @@
           if (localStorage.getItem('cc-web-session') === s.id) localStorage.removeItem('cc-web-session');
           invalidateSessionCache(s.id);
           send({ type: 'delete_session', sessionId: s.id });
-          if (s.id === currentSessionId) {
+          if (s.id === sessionState.currentSessionId) {
             resetChatView(selectedAgent);
           }
         };
@@ -2556,6 +2912,14 @@
       }
       openSession(s.id);
     });
+
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openSession(s.id);
+      }
+    });
+
     return item;
   }
 
@@ -2563,10 +2927,10 @@
     localStorage.setItem('cc-web-collapsed-projects', JSON.stringify([...collapsedProjects]));
   }
 
-  function renderProjectGroup(project, groupSessions, container) {
+  function renderProjectGroup(project, groupSessions, container, timestampCache) {
     const isSpecialGroup = project.id === '__ungrouped__';
     const isVirtualCwd = Boolean(project.isVirtualCwd);
-    const containsCurrentSession = groupSessions.some((session) => session.id === currentSessionId);
+    const containsCurrentSession = groupSessions.some((session) => session.id === sessionState.currentSessionId);
     const isCollapsed = containsCurrentSession ? false : collapsedProjects.has(project.id);
 
     const group = document.createElement('section');
@@ -2669,7 +3033,9 @@
     body.className = 'project-group-body' + (isCollapsed ? ' collapsed' : '');
     if (!isCollapsed) {
       const sortedSessions = [...groupSessions].sort((a, b) => {
-        return getLatestSessionTimestamp([b]) - getLatestSessionTimestamp([a]);
+        const bTs = timestampCache?.get(b.id) ?? getSessionUpdatedTimestamp(b);
+        const aTs = timestampCache?.get(a.id) ?? getSessionUpdatedTimestamp(a);
+        return bTs - aTs;
       });
       for (const s of sortedSessions) {
         body.appendChild(buildSessionItem(s));
@@ -2722,13 +3088,19 @@
     const savedScrollTop = sessionList.scrollTop;
     sessionList.innerHTML = '';
     const visibleSessions = getVisibleSessions();
+    const listFragment = document.createDocumentFragment();
     const hasProjects = projects.length > 0;
+    const sessionTimestampCache = new Map();
+    for (const session of visibleSessions) {
+      sessionTimestampCache.set(session.id, getSessionUpdatedTimestamp(session));
+    }
 
     if (visibleSessions.length === 0 && !hasProjects) {
       const empty = document.createElement('div');
       empty.className = 'session-list-empty';
       empty.textContent = '暂无会话，点击“新建/打开项目”开始。';
-      sessionList.appendChild(empty);
+      listFragment.appendChild(empty);
+      sessionList.appendChild(listFragment);
       renderWorkspaceInsights();
       return;
     }
@@ -2737,7 +3109,7 @@
       const empty = document.createElement('div');
       empty.className = 'session-list-empty';
       empty.textContent = '当前还没有会话，你可以从下面任意项目继续新建。';
-      sessionList.appendChild(empty);
+      listFragment.appendChild(empty);
     }
 
     const projectsById = new Map(projects.map((project) => [project.id, project]));
@@ -2766,8 +3138,9 @@
     const groupEntries = projects.map((project) => ({
       project,
       groupSessions: grouped.get(project.id) || [],
-      containsCurrentSession: (grouped.get(project.id) || []).some((session) => session.id === currentSessionId),
+      containsCurrentSession: (grouped.get(project.id) || []).some((session) => session.id === sessionState.currentSessionId),
       isVirtual: false,
+      latestTimestamp: getLatestSessionTimestamp(grouped.get(project.id) || [], sessionTimestampCache),
     }));
 
     for (const project of virtualProjectsById.values()) {
@@ -2775,8 +3148,9 @@
       groupEntries.push({
         project,
         groupSessions,
-        containsCurrentSession: groupSessions.some((session) => session.id === currentSessionId),
+        containsCurrentSession: groupSessions.some((session) => session.id === sessionState.currentSessionId),
         isVirtual: true,
+        latestTimestamp: getLatestSessionTimestamp(groupSessions, sessionTimestampCache),
       });
     }
 
@@ -2784,12 +3158,12 @@
       groupEntries.push({
         project: { id: '__ungrouped__', name: '未分组' },
         groupSessions: ungrouped,
-        containsCurrentSession: ungrouped.some((session) => session.id === currentSessionId),
+        containsCurrentSession: ungrouped.some((session) => session.id === sessionState.currentSessionId),
         isVirtual: true,
+        latestTimestamp: getLatestSessionTimestamp(ungrouped, sessionTimestampCache),
       });
     }
 
-    const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
     groupEntries.sort((a, b) => {
       if (a.containsCurrentSession !== b.containsCurrentSession) {
         return a.containsCurrentSession ? -1 : 1;
@@ -2799,15 +3173,16 @@
       if (aHasSessions !== bHasSessions) {
         return aHasSessions ? -1 : 1;
       }
-      const latestDiff = getLatestSessionTimestamp(b.groupSessions) - getLatestSessionTimestamp(a.groupSessions);
+      const latestDiff = b.latestTimestamp - a.latestTimestamp;
       if (latestDiff !== 0) return latestDiff;
       if (a.isVirtual !== b.isVirtual) return a.isVirtual ? 1 : -1;
-      return collator.compare(a.project.name || '', b.project.name || '');
+      return SESSION_LIST_COLLATOR.compare(a.project.name || '', b.project.name || '');
     });
 
     for (const entry of groupEntries) {
-      renderProjectGroup(entry.project, entry.groupSessions, sessionList);
+      renderProjectGroup(entry.project, entry.groupSessions, listFragment, sessionTimestampCache);
     }
+    sessionList.appendChild(listFragment);
     renderWorkspaceInsights();
     sessionList.scrollTop = savedScrollTop;
   }
@@ -2849,16 +3224,16 @@
 
   function highlightActiveSession() {
     document.querySelectorAll('.session-item').forEach((el) => {
-      el.classList.toggle('active', el.dataset.id === currentSessionId);
+      el.classList.toggle('active', el.dataset.id === sessionState.currentSessionId);
     });
   }
 
   // --- Header title editing (contenteditable) ---
   chatTitle.addEventListener('click', () => {
-    if (!currentSessionId || chatTitle.contentEditable === 'true') return;
+    if (!sessionState.currentSessionId || chatTitle.contentEditable === 'true') return;
     const originalText = chatTitle.textContent;
     chatTitle.contentEditable = 'true';
-    chatTitle.style.background = '#fff';
+    chatTitle.style.background = 'var(--chat-title-edit-bg)';
     chatTitle.style.outline = '1px solid var(--accent)';
     chatTitle.style.borderRadius = '6px';
     chatTitle.style.padding = '2px 8px';
@@ -2875,6 +3250,7 @@
     sel.addRange(range);
 
     function finish(save) {
+      chatTitle.removeEventListener('keydown', handler);
       chatTitle.contentEditable = 'false';
       chatTitle.style.background = '';
       chatTitle.style.outline = '';
@@ -2886,16 +3262,17 @@
       chatTitle.style.textOverflow = '';
       const newTitle = chatTitle.textContent.trim() || originalText;
       chatTitle.textContent = newTitle;
-      if (save && newTitle !== originalText && currentSessionId) {
-        send({ type: 'rename_session', sessionId: currentSessionId, title: newTitle });
+      if (save && newTitle !== originalText && sessionState.currentSessionId) {
+        send({ type: 'rename_session', sessionId: sessionState.currentSessionId, title: newTitle });
       }
     }
 
     chatTitle.addEventListener('blur', () => finish(true), { once: true });
-    chatTitle.addEventListener('keydown', function handler(e) {
+    function handler(e) {
       if (e.key === 'Enter') { e.preventDefault(); chatTitle.removeEventListener('keydown', handler); chatTitle.blur(); }
       if (e.key === 'Escape') { chatTitle.textContent = originalText; chatTitle.removeEventListener('keydown', handler); chatTitle.blur(); }
-    });
+    }
+    chatTitle.addEventListener('keydown', handler);
   });
 
   // --- Sidebar ---
@@ -3022,6 +3399,35 @@
   }
 
   // --- Slash Command Menu ---
+  function applySlashCommandSelection(cmd) {
+    if (!cmd) return;
+    if (cmd === '/model') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showModelPicker();
+      return;
+    }
+    if (cmd === '/mode') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showModePicker();
+      return;
+    }
+    msgInput.value = `${cmd} `;
+    hideCmdMenu();
+    msgInput.focus();
+  }
+
+  function ensureCmdMenuDelegation() {
+    if (cmdMenuDelegated) return;
+    cmdMenuDelegated = true;
+    cmdMenu.addEventListener('click', (event) => {
+      const cmdItem = event.target instanceof Element ? event.target.closest('.cmd-item') : null;
+      if (!cmdItem || !cmdMenu.contains(cmdItem)) return;
+      applySlashCommandSelection(cmdItem.dataset.cmd || '');
+    });
+  }
+
   function showCmdMenu(filter) {
     const filtered = SLASH_COMMANDS.filter(c =>
       c.cmd.startsWith(filter) || c.desc.includes(filter.slice(1))
@@ -3034,34 +3440,13 @@
     }
     cmdMenuIndex = 0;
     cmdMenu.innerHTML = filtered.map((c, i) =>
-      `<div class="cmd-item${i === 0 ? ' active' : ''}" data-cmd="${c.cmd}">
-        <span class="cmd-item-cmd">${c.cmd}</span>
-        <span class="cmd-item-desc">${c.desc}</span>
+      `<div class="cmd-item${i === 0 ? ' active' : ''}" data-cmd="${escapeHtml(c.cmd)}">
+        <span class="cmd-item-cmd">${escapeHtml(c.cmd)}</span>
+        <span class="cmd-item-desc">${escapeHtml(c.desc)}</span>
       </div>`
     ).join('');
     cmdMenu.hidden = false;
-
-    // Click handlers
-    cmdMenu.querySelectorAll('.cmd-item').forEach(el => {
-      el.addEventListener('click', () => {
-        const cmd = el.dataset.cmd;
-        if (cmd === '/model') {
-          hideCmdMenu();
-          msgInput.value = '';
-          showModelPicker();
-          return;
-        }
-        if (cmd === '/mode') {
-          hideCmdMenu();
-          msgInput.value = '';
-          showModePicker();
-          return;
-        }
-        msgInput.value = cmd + ' ';
-        hideCmdMenu();
-        msgInput.focus();
-      });
-    });
+    ensureCmdMenuDelegation();
   }
 
   function hideCmdMenu() {
@@ -3080,22 +3465,7 @@
   function selectCmdMenuItem() {
     const items = cmdMenu.querySelectorAll('.cmd-item');
     if (cmdMenuIndex >= 0 && items[cmdMenuIndex]) {
-      const cmd = items[cmdMenuIndex].dataset.cmd;
-      if (cmd === '/model') {
-        hideCmdMenu();
-        msgInput.value = '';
-        showModelPicker();
-        return;
-      }
-      if (cmd === '/mode') {
-        hideCmdMenu();
-        msgInput.value = '';
-        showModePicker();
-        return;
-      }
-      msgInput.value = cmd + ' ';
-      hideCmdMenu();
-      msgInput.focus();
+      applySlashCommandSelection(items[cmdMenuIndex].dataset.cmd || '');
     }
   }
 
@@ -3161,12 +3531,12 @@
   }
 
   function showModelPicker() {
-    if (currentAgent === 'codex') {
-      send({ type: 'message', text: '/model', sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    if (sessionState.currentAgent === 'codex') {
+      send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
       return;
     }
     // Request real model list from server — server responds with model_list event
-    send({ type: 'message', text: '/model', sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
   }
 
   function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
@@ -3254,7 +3624,7 @@
     // Click & hover on items
     picker.querySelectorAll('.option-picker-item').forEach(el => {
       el.addEventListener('click', () => {
-        send({ type: 'message', text: `/model ${el.dataset.value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+        send({ type: 'message', text: `/model ${el.dataset.value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
         hideOptionPicker();
       });
       el.addEventListener('mouseenter', () => updateFocus(parseInt(el.dataset.index)));
@@ -3268,7 +3638,7 @@
           e.preventDefault();
           const val = customInput.value.trim();
           if (val) {
-            send({ type: 'message', text: `/model ${val}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+            send({ type: 'message', text: `/model ${val}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
             hideOptionPicker();
           }
         } else if (e.key === 'Escape') {
@@ -3284,7 +3654,7 @@
         updateFocus((focusIdx - 1 + entries.length) % entries.length);
       } else if (e.key === 'Enter') {
         e.preventDefault();
-        send({ type: 'message', text: `/model ${entries[focusIdx].value || entries[focusIdx].alias}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+        send({ type: 'message', text: `/model ${entries[focusIdx].value || entries[focusIdx].alias}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
         hideOptionPicker();
       } else if (e.key === 'Escape') {
         hideOptionPicker();
@@ -3306,13 +3676,14 @@
   }
 
   function showModePicker() {
-    showOptionPicker('选择权限模式', MODE_PICKER_OPTIONS, currentMode, (value) => {
-      currentMode = value;
-      modeSelect.value = currentMode;
-      localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
-      if (currentSessionId) {
-        send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+    showOptionPicker('选择权限模式', MODE_PICKER_OPTIONS, sessionState.currentMode, (value) => {
+      sessionState.currentMode = value;
+      modeSelect.value = sessionState.currentMode;
+      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      if (sessionState.currentSessionId) {
+        send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       }
+      updateAgentScopedUI();
       renderWorkspaceInsights();
     });
   }
@@ -3320,13 +3691,13 @@
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
-    if ((!text && pendingAttachments.length === 0) || isGenerating || isBlockingSessionLoad()) return;
+    if ((!text && composeState.pendingAttachments.length === 0) || composeState.isGenerating || isBlockingSessionLoad()) return;
     hideCmdMenu();
     hideOptionPicker();
 
     // Slash commands: don't show as user bubble
     if (text.startsWith('/')) {
-      if (pendingAttachments.length > 0) {
+      if (composeState.pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
         return;
       }
@@ -3344,7 +3715,7 @@
         autoResize();
         return;
       }
-      send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+      send({ type: 'message', text, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
       msgInput.value = '';
       autoResize();
       return;
@@ -3353,13 +3724,13 @@
     // Regular message
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
-    const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
+    const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
     messagesDiv.appendChild(createMsgElement('user', text, attachments));
     scrollToBottom();
 
-    send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    send({ type: 'message', text, attachments, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
     msgInput.value = '';
-    pendingAttachments = [];
+    composeState.pendingAttachments = [];
     renderPendingAttachments();
     autoResize();
     startGenerating();
@@ -3367,8 +3738,7 @@
 
   function autoResize() {
     msgInput.style.height = 'auto';
-    const max = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--input-max-height')) || 200;
-    msgInput.style.height = Math.min(msgInput.scrollHeight, max) + 'px';
+    msgInput.style.height = Math.min(msgInput.scrollHeight, cachedInputMaxHeight) + 'px';
   }
 
   function isMobileInputMode() {
@@ -3381,13 +3751,6 @@
     const pw = loginPassword.value;
     if (!pw) return;
     loginError.hidden = true;
-    loginPasswordValue = pw;
-    // Remember password
-    if (rememberPw.checked) {
-      localStorage.setItem('cc-web-pw', pw);
-    } else {
-      localStorage.removeItem('cc-web-pw');
-    }
     send({ type: 'auth', password: pw });
     // Request notification permission on first user interaction
     requestNotificationPermission();
@@ -3430,19 +3793,18 @@
   if (mobileModeSelect) {
     mobileModeSelect.addEventListener('change', () => {
       const mode = mobileModeSelect.value;
-      currentMode = mode;
+      sessionState.currentMode = mode;
       modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
       updateAgentScopedUI();
-      if (currentSessionId) send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+      if (sessionState.currentSessionId) send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       renderWorkspaceInsights();
     });
   }
 
-  document.addEventListener('click', (e) => {
-    const actionBtn = e.target instanceof Element ? e.target.closest('[data-workspace-action]') : null;
+  function handleWorkspaceActionClick(actionBtn, event) {
     if (!actionBtn) return;
-    e.preventDefault();
+    event.preventDefault();
     const action = actionBtn.dataset.workspaceAction;
     if (action === 'new-session') {
       showNewSessionModal();
@@ -3471,16 +3833,25 @@
     if (action === 'focus-project' && actionBtn.dataset.projectId) {
       focusProjectGroup(actionBtn.dataset.projectId, { toast: '已定位到当前项目。' });
     }
-  });
+  }
 
-  // Close dropdown on outside click
-  document.addEventListener('click', (e) => {
+  function handleGlobalDocumentClick(event) {
+    const target = event.target;
+    const actionBtn = target instanceof Element ? target.closest('[data-workspace-action]') : null;
+    handleWorkspaceActionClick(actionBtn, event);
+
     if (!newChatDropdown.hidden &&
-        !newChatDropdown.contains(e.target) &&
-        e.target !== newChatArrow) {
+        !newChatDropdown.contains(target) &&
+        target !== newChatArrow) {
       newChatDropdown.hidden = true;
     }
-  });
+
+    if (!cmdMenu.contains(target) && target !== msgInput) {
+      hideCmdMenu();
+    }
+  }
+
+  document.addEventListener('click', handleGlobalDocumentClick);
 
   // Split new-chat button
   newChatBtn.addEventListener('click', () => showNewSessionModal());
@@ -3521,29 +3892,29 @@
   }
 
   // Mode selector (hidden select kept for legacy sync)
-  modeSelect.value = currentMode;
+  modeSelect.value = sessionState.currentMode;
   // Sync mode-tabs initial state
-  document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === currentMode));
+  document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === sessionState.currentMode));
   // Mode tabs click
   document.querySelectorAll('.mode-tab').forEach((btn) => {
     btn.addEventListener('click', () => {
       const mode = btn.dataset.mode;
-      currentMode = mode;
+      sessionState.currentMode = mode;
       modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
       updateAgentScopedUI();
-      if (currentSessionId) {
-        send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+      if (sessionState.currentSessionId) {
+        send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       }
       renderWorkspaceInsights();
     });
   });
   modeSelect.addEventListener('change', () => {
-    currentMode = modeSelect.value;
-    localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
+    sessionState.currentMode = modeSelect.value;
+    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
     updateAgentScopedUI();
-    if (currentSessionId) {
-      send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
     }
     renderWorkspaceInsights();
   });
@@ -3599,31 +3970,47 @@
     }
   });
 
-  // Close cmd menu on outside click
-  document.addEventListener('click', (e) => {
-    if (!cmdMenu.contains(e.target) && e.target !== msgInput) {
-      hideCmdMenu();
-    }
-  });
-
   // --- Toast Notification ---
-  function showToast(text, sessionId) {
+  function consumeToastQueue() {
+    if (activeToast || toastQueue.length === 0) return;
+    const next = toastQueue.shift();
     const toast = document.createElement('div');
     toast.className = 'toast-notification';
-    toast.textContent = text;
-    if (sessionId) {
+    toast.textContent = next.text;
+
+    const closeToast = () => {
+      if (!activeToast || activeToast.element !== toast) return;
+      clearTimeout(activeToast.hideTimer);
+      toast.classList.remove('show');
+      activeToast.removeTimer = setTimeout(() => {
+        toast.remove();
+        activeToast = null;
+        consumeToastQueue();
+      }, 300);
+    };
+
+    if (next.sessionId) {
       toast.style.cursor = 'pointer';
       toast.addEventListener('click', () => {
-        openSession(sessionId);
-        toast.remove();
+        openSession(next.sessionId);
+        closeToast();
       });
     }
+
     document.body.appendChild(toast);
     setTimeout(() => toast.classList.add('show'), 10);
-    setTimeout(() => {
-      toast.classList.remove('show');
-      setTimeout(() => toast.remove(), 300);
-    }, 5000);
+    const hideTimer = setTimeout(closeToast, 5000);
+    activeToast = {
+      element: toast,
+      hideTimer,
+      removeTimer: null,
+    };
+  }
+
+  function showToast(text, sessionId) {
+    if (!text) return;
+    toastQueue.push({ text: String(text), sessionId: sessionId || null });
+    consumeToastQueue();
   }
 
   // --- Browser Notification (via Service Worker for mobile) ---
@@ -3636,23 +4023,36 @@
           tag: 'cc-web-task',
           renotify: true,
         });
-      }).catch(() => {});
+      }).catch((error) => {
+        console.warn('[notify] failed to show notification', error);
+      });
     }
   }
 
   function requestNotificationPermission() {
     if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission();
+      const result = Notification.requestPermission();
+      if (result && typeof result.catch === 'function') {
+        result.catch((error) => {
+          console.warn('[notify] request permission failed', error);
+        });
+      }
     }
   }
 
   // --- Settings Panel ---
-  let _onNotifyConfig = null;
-  let _onNotifyTestResult = null;
-  let _onModelConfig = null;
-  let _onCodexConfig = null;
-  let _onFetchModelsResult = null;
   let _onCodexSessions = null;
+
+  function renderFetchModelsResult(fetchStatus, datalist, result) {
+    if (result.success) {
+      datalist.innerHTML = (result.models || []).map((model) => `<option value="${escapeHtml(model)}">`).join('');
+      fetchStatus.textContent = result.message || `获取到 ${result.models.length} 个模型`;
+      fetchStatus.style.color = 'var(--text-success, #5dbe5d)';
+      return;
+    }
+    fetchStatus.textContent = result.message || '获取失败';
+    fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+  }
 
   const settingsBtn = $('#settings-btn');
 
@@ -3664,6 +4064,586 @@
     { value: 'feishu', label: '飞书机器人' },
     { value: 'qqbot', label: 'QQ（Qmsg）' },
   ];
+
+  function buildUnifiedSettingsPanelHtml(providerOptions) {
+    return `
+      <h3>
+        ⚙ 系统设置
+        <button class="settings-close" title="关闭">&times;</button>
+      </h3>
+
+      <div class="settings-section-title">代理运行方式</div>
+      <div class="settings-field">
+        <label>Claude 接入方式</label>
+        <select class="settings-select" id="unified-claude-mode">
+          <option value="local">读取本地 Claude 配置</option>
+          <option value="custom">使用统一 API 配置</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>Codex 接入方式</label>
+        <select class="settings-select" id="unified-codex-mode">
+          <option value="local">读取本机 Codex 登录态 / ~/.codex/config.toml</option>
+          <option value="unified">使用统一 API 配置</option>
+        </select>
+      </div>
+      <div class="settings-inline-note">
+        这里不再区分“复用 Claude 配置”或“独立 Codex 配置”。Claude 和 Codex 需要走远程接口时，都直接使用下方同一套统一 API 配置。
+      </div>
+
+      <div class="settings-divider"></div>
+
+      <div class="settings-section-title">统一 API 配置</div>
+      <div id="unified-template-area"></div>
+      <div class="settings-actions">
+        <button class="btn-save" id="unified-save-btn">保存统一配置</button>
+      </div>
+      <div class="settings-status" id="unified-status"></div>
+
+      <div class="settings-divider"></div>
+
+      <div class="settings-section-title">通知设置</div>
+      <div class="settings-field">
+        <label>通知方式</label>
+        <select class="settings-select" id="notify-provider">
+          ${providerOptions.map((o) => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
+        </select>
+      </div>
+      <div id="notify-fields"></div>
+      <div class="settings-actions">
+        <button class="btn-test" id="notify-test-btn">测试</button>
+        <button class="btn-save" id="notify-save-btn">保存</button>
+      </div>
+      <div class="settings-status" id="notify-status"></div>
+
+      <div class="settings-divider"></div>
+
+      <div class="settings-section-title">系统</div>
+      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
+        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
+        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
+      </div>
+      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
+    `;
+  }
+
+  function buildUnifiedTemplateModalHtml(current, draft) {
+    return `
+      <div class="settings-header">
+        <h3>${current ? `编辑配置: ${escapeHtml(current.name)}` : '新建统一 API 配置'}</h3>
+        <button class="settings-close" id="unified-template-modal-close">&times;</button>
+      </div>
+      <div class="settings-field">
+        <label>配置名称</label>
+        <input type="text" id="unified-template-name" value="${escapeHtml(draft.name || '')}">
+      </div>
+      <div class="settings-field">
+        <label>API Key</label>
+        <input type="text" id="unified-template-apikey" placeholder="sk-..." value="${escapeHtml(draft.apiKey || '')}">
+      </div>
+      <div class="settings-field">
+        <label>API Base URL</label>
+        <input type="text" id="unified-template-apibase" placeholder="https://api.openai.com/v1" value="${escapeHtml(draft.apiBase || '')}">
+      </div>
+      <div class="settings-field">
+        <label>上游协议</label>
+        <select class="settings-select" id="unified-template-upstream-type">
+          <option value="openai" ${draft.upstreamType === 'anthropic' ? '' : 'selected'}>OpenAI / Responses</option>
+          <option value="anthropic" ${draft.upstreamType === 'anthropic' ? 'selected' : ''}>Anthropic / Messages</option>
+        </select>
+      </div>
+
+      <div class="settings-divider" style="margin:12px 0"></div>
+
+      <div class="settings-field">
+        <div class="tpl-fetch-toolbar">
+          <div class="tpl-fetch-toolbar-title">获取上游模型列表</div>
+          <button class="btn-test tpl-fetch-toolbar-btn" id="unified-template-fetch-models">获取模型</button>
+          <span id="unified-template-fetch-status" class="tpl-fetch-toolbar-status"></span>
+        </div>
+      </div>
+
+      <div class="settings-divider" style="margin:12px 0"></div>
+
+      <div class="settings-field">
+        <label>默认模型</label>
+        <input type="text" id="unified-template-default" list="unified-template-models" placeholder="例如 claude-sonnet-4-6 / gpt-5.4 / gemini-2.5-pro" value="${escapeHtml(draft.defaultModel || '')}" autocomplete="off">
+      </div>
+      <div class="settings-field">
+        <label>Opus 模型名</label>
+        <input type="text" id="unified-template-opus" list="unified-template-models" placeholder="claude-opus-4-6" value="${escapeHtml(draft.opusModel || '')}" autocomplete="off">
+      </div>
+      <div class="settings-field">
+        <label>Sonnet 模型名</label>
+        <input type="text" id="unified-template-sonnet" list="unified-template-models" placeholder="claude-sonnet-4-6" value="${escapeHtml(draft.sonnetModel || '')}" autocomplete="off">
+      </div>
+      <div class="settings-field">
+        <label>Haiku 模型名</label>
+        <input type="text" id="unified-template-haiku" list="unified-template-models" placeholder="claude-haiku-4-5" value="${escapeHtml(draft.haikuModel || '')}" autocomplete="off">
+      </div>
+      <datalist id="unified-template-models"></datalist>
+      <div class="settings-inline-note">
+        这套配置会同时服务 Claude 与 Codex。Codex 主要使用 API Key、API Base URL 和默认模型；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
+      </div>
+      <div class="settings-actions">
+        <button class="btn-save" id="unified-template-ok">确定</button>
+      </div>
+    `;
+  }
+
+  function buildPasswordModalHtml() {
+    return `
+      <div class="settings-header">
+        <h3>修改密码</h3>
+        <button class="settings-close" id="pw-modal-close">&times;</button>
+      </div>
+      <div class="settings-field">
+        <label>当前密码</label>
+        <input type="password" id="pw-modal-current" placeholder="输入当前密码" autocomplete="current-password">
+      </div>
+      <div class="settings-field">
+        <label>新密码</label>
+        <input type="password" id="pw-modal-new" placeholder="新密码" autocomplete="new-password">
+        <div class="password-hint" id="pw-modal-hint">至少 8 位，包含大写/小写/数字/特殊字符中的 2 种</div>
+      </div>
+      <div class="settings-field">
+        <label>确认新密码</label>
+        <input type="password" id="pw-modal-confirm" placeholder="确认新密码" autocomplete="new-password">
+      </div>
+      <div class="settings-actions">
+        <button class="btn-save" id="pw-modal-submit" disabled>修改密码</button>
+      </div>
+      <div class="settings-status" id="pw-modal-status"></div>
+    `;
+  }
+
+  function showUnifiedSettingsPanel() {
+    clearSettingsPanelSubscriptions();
+    const { overlay, panel } = createOverlayPanel({
+      overlayId: 'settings-overlay',
+      panelHtml: buildUnifiedSettingsPanelHtml(PROVIDER_OPTIONS),
+    });
+
+    const closeBtn = panel.querySelector('.settings-close');
+    const claudeModeSelect = panel.querySelector('#unified-claude-mode');
+    const codexModeSelect = panel.querySelector('#unified-codex-mode');
+    const templateArea = panel.querySelector('#unified-template-area');
+    const unifiedSaveBtn = panel.querySelector('#unified-save-btn');
+    const unifiedStatusDiv = panel.querySelector('#unified-status');
+
+    const providerSelect = panel.querySelector('#notify-provider');
+    const fieldsDiv = panel.querySelector('#notify-fields');
+    const notifyStatusDiv = panel.querySelector('#notify-status');
+    const testBtn = panel.querySelector('#notify-test-btn');
+    const saveBtn = panel.querySelector('#notify-save-btn');
+
+    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
+    const checkUpdateBtn = panel.querySelector('#check-update-btn');
+    const updateStatusEl = panel.querySelector('#update-status');
+
+    let currentNotifyConfig = null;
+    let currentCodexConfig = null;
+    let modelConfigLoaded = false;
+    let codexConfigLoaded = false;
+    let modelEditingTemplates = [];
+    let modelActiveTemplate = '';
+    let _onUpdateInfo = null;
+
+    function syncUnifiedControlsState() {
+      const ready = modelConfigLoaded && codexConfigLoaded;
+      claudeModeSelect.disabled = !ready;
+      codexModeSelect.disabled = !ready;
+      unifiedSaveBtn.disabled = !ready;
+    }
+
+    function applyModelConfigToPanel(config, markLoaded = true) {
+      const normalized = config || { mode: 'local', activeTemplate: '', templates: [] };
+      if (markLoaded) modelConfigLoaded = true;
+      modelEditingTemplates = (normalized.templates || []).map((template) => ({
+        ...template,
+        originalName: template.originalName || template.name || '',
+      }));
+      modelActiveTemplate = normalized.activeTemplate || (modelEditingTemplates[0]?.name || '');
+      claudeModeSelect.value = normalized.mode || 'local';
+    }
+
+    function applyCodexConfigToPanel(config, markLoaded = true) {
+      if (markLoaded) codexConfigLoaded = true;
+      currentCodexConfig = config || { mode: 'local', legacyMode: '' };
+      codexModeSelect.value = currentCodexConfig.mode || 'local';
+    }
+
+    function showUnifiedStatus(msg, type) {
+      unifiedStatusDiv.textContent = msg;
+      unifiedStatusDiv.className = 'settings-status ' + (type || '');
+    }
+
+    function showNotifyStatus(msg, type) {
+      notifyStatusDiv.textContent = msg;
+      notifyStatusDiv.className = 'settings-status ' + (type || '');
+    }
+
+    function renderFields(provider) {
+      renderNotifyFields(fieldsDiv, currentNotifyConfig, provider);
+    }
+
+    function collectNotifyConfig() {
+      return collectNotifyConfigFromPanel(panel, currentNotifyConfig, providerSelect.value);
+    }
+
+    function ensureActiveTemplateSelection() {
+      if (!modelActiveTemplate && modelEditingTemplates.length) {
+        modelActiveTemplate = modelEditingTemplates[0].name;
+      }
+      const active = modelEditingTemplates.find((template) => template.name === modelActiveTemplate) || null;
+      if (!active && modelEditingTemplates.length) {
+        modelActiveTemplate = modelEditingTemplates[0].name;
+        return modelEditingTemplates[0];
+      }
+      return active;
+    }
+
+    function renderTemplateArea() {
+      if (!modelConfigLoaded || !codexConfigLoaded) {
+        templateArea.innerHTML = `
+          <div class="settings-inline-note">
+            正在加载统一配置...
+          </div>
+        `;
+        return;
+      }
+
+      const activeTemplate = ensureActiveTemplateSelection();
+      const legacyMode = currentCodexConfig?.legacyMode || '';
+      const legacyNote = legacyMode === 'custom'
+        ? '检测到旧版 Codex 独立配置。当前页面不再维护那套分叉逻辑；你保存后，Codex 会切到统一 API 配置。'
+        : (legacyMode === 'shared'
+          ? '检测到旧版“复用 Claude 配置”模式。当前页面已经改成统一 API 逻辑，保存后会按统一 API 配置运行。'
+          : '');
+
+      if (!modelEditingTemplates.length) {
+        templateArea.innerHTML = `
+          <div class="settings-inline-note">
+            统一 API 配置为空。只要 Claude 或 Codex 有一个需要走远程接口，就先在这里新建一套 API 配置。
+          </div>
+          ${legacyNote ? `<div class="settings-inline-note warning">${legacyNote}</div>` : ''}
+          <div class="settings-actions" style="margin-top:0">
+            <button class="btn-test" id="unified-template-add-first">+ 新建配置</button>
+          </div>
+        `;
+        panel.querySelector('#unified-template-add-first').addEventListener('click', () => openUnifiedTemplateModal());
+        return;
+      }
+
+      const options = modelEditingTemplates.map((template) =>
+        `<option value="${escapeHtml(template.name)}" ${template.name === modelActiveTemplate ? 'selected' : ''}>${escapeHtml(template.name)}</option>`
+      ).join('');
+      const upstreamLabel = activeTemplate?.upstreamType === 'anthropic' ? 'Anthropic / Messages' : 'OpenAI / Responses';
+      const summaryBase = activeTemplate?.apiBase ? escapeHtml(activeTemplate.apiBase) : '未设置 API Base URL';
+      const summaryModel = activeTemplate?.defaultModel ? escapeHtml(activeTemplate.defaultModel) : '未设置（Claude / Codex 将沿用各自工具默认模型）';
+      const claudeModeLabel = claudeModeSelect.value === 'custom' ? '统一 API' : '本地配置';
+      const codexModeLabel = codexModeSelect.value === 'unified' ? '统一 API' : '本机登录态';
+
+      templateArea.innerHTML = `
+        <div class="settings-inline-note">
+          Claude 当前走：<strong>${claudeModeLabel}</strong>；Codex 当前走：<strong>${codexModeLabel}</strong>。当任一代理切到统一 API 时，都会使用这里的激活配置。
+        </div>
+        ${legacyNote ? `<div class="settings-inline-note warning">${legacyNote}</div>` : ''}
+        <div class="settings-field">
+          <label>激活配置</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select class="settings-select" id="unified-template-select" style="flex:1">
+              ${options}
+              <option value="__new__">+ 新建配置</option>
+            </select>
+            <button class="btn-test" id="unified-template-edit" style="padding:4px 10px">编辑</button>
+            <button class="btn-test" id="unified-template-del" title="删除" style="padding:4px 8px">删除</button>
+          </div>
+        </div>
+        <div class="settings-inline-note">
+          当前激活配置：<strong>${escapeHtml(activeTemplate?.name || '未选择')}</strong><br>
+          上游协议：<code>${escapeHtml(upstreamLabel)}</code><br>
+          API Base URL：<code>${summaryBase}</code><br>
+          默认模型：<code>${summaryModel}</code>
+        </div>
+      `;
+
+      panel.querySelector('#unified-template-select').addEventListener('change', (e) => {
+        if (e.target.value === '__new__') {
+          openUnifiedTemplateModal();
+          return;
+        }
+        modelActiveTemplate = e.target.value;
+        renderTemplateArea();
+      });
+
+      panel.querySelector('#unified-template-edit').addEventListener('click', () => {
+        openUnifiedTemplateModal(modelActiveTemplate);
+      });
+
+      panel.querySelector('#unified-template-del').addEventListener('click', () => {
+        if (!modelActiveTemplate) return;
+        if (!confirm(`确认删除配置「${modelActiveTemplate}」?`)) return;
+        modelEditingTemplates = modelEditingTemplates.filter((template) => template.name !== modelActiveTemplate);
+        modelActiveTemplate = modelEditingTemplates[0]?.name || '';
+        renderTemplateArea();
+      });
+    }
+
+    function openUnifiedTemplateModal(templateName = '') {
+      const current = templateName
+        ? modelEditingTemplates.find((template) => template.name === templateName)
+        : null;
+      const draft = current || {
+        name: '',
+        originalName: '',
+        apiKey: '',
+        apiBase: '',
+        upstreamType: 'openai',
+        defaultModel: '',
+        opusModel: '',
+        sonnetModel: '',
+        haikuModel: '',
+      };
+
+      const { overlay: modalOverlay, panel: modal, close: closeModal } = createOverlayPanel({
+        zIndex: '10001',
+        maxWidth: '460px',
+        panelHtml: buildUnifiedTemplateModalHtml(current, draft),
+      });
+
+      const fetchBtn = modal.querySelector('#unified-template-fetch-models');
+      const fetchStatus = modal.querySelector('#unified-template-fetch-status');
+      const datalist = modal.querySelector('#unified-template-models');
+      let disposeFetchModelsResult = null;
+
+      fetchBtn.addEventListener('click', () => {
+        const apiBase = modal.querySelector('#unified-template-apibase').value.trim();
+        const apiKey = modal.querySelector('#unified-template-apikey').value.trim();
+        const upstreamType = modal.querySelector('#unified-template-upstream-type').value;
+        if (!apiBase || !apiKey) {
+          fetchStatus.textContent = '请先填写 API Base 和 API Key';
+          fetchStatus.style.color = 'var(--text-error, #e85d5d)';
+          return;
+        }
+        fetchBtn.disabled = true;
+        fetchStatus.textContent = '正在获取...';
+        fetchStatus.style.color = 'var(--text-secondary)';
+
+        if (disposeFetchModelsResult) disposeFetchModelsResult();
+        disposeFetchModelsResult = onWsEvent('fetch_models_result', (result) => {
+          disposeFetchModelsResult = null;
+          fetchBtn.disabled = false;
+          renderFetchModelsResult(fetchStatus, datalist, result);
+        }, { once: true });
+
+        send({
+          type: 'fetch_models',
+          apiBase,
+          apiKey,
+          upstreamType,
+          templateName: current?.name || modal.querySelector('#unified-template-name').value.trim(),
+        });
+      });
+
+      const closeTemplateModal = () => {
+        if (disposeFetchModelsResult) {
+          disposeFetchModelsResult();
+          disposeFetchModelsResult = null;
+        }
+        closeModal();
+      };
+
+      modal.querySelector('#unified-template-modal-close').addEventListener('click', closeTemplateModal);
+      modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeTemplateModal(); });
+
+      modal.querySelector('#unified-template-ok').addEventListener('click', () => {
+        const name = modal.querySelector('#unified-template-name').value.trim();
+        const apiKey = modal.querySelector('#unified-template-apikey').value.trim();
+        const apiBase = modal.querySelector('#unified-template-apibase').value.trim();
+        const upstreamType = modal.querySelector('#unified-template-upstream-type').value;
+        const defaultModel = modal.querySelector('#unified-template-default').value.trim();
+        const opusModel = modal.querySelector('#unified-template-opus').value.trim();
+        const sonnetModel = modal.querySelector('#unified-template-sonnet').value.trim();
+        const haikuModel = modal.querySelector('#unified-template-haiku').value.trim();
+
+        if (!name) {
+          alert('请填写配置名称');
+          return;
+        }
+        if (!apiKey) {
+          alert('请填写 API Key');
+          return;
+        }
+        if (!apiBase) {
+          alert('请填写 API Base URL');
+          return;
+        }
+
+        const existing = modelEditingTemplates.find((template) => template.name === name);
+        if (existing && existing !== current) {
+          alert('配置名称已存在');
+          return;
+        }
+
+        if (current) {
+          if (!current.originalName) current.originalName = current.name;
+          current.name = name;
+          current.apiKey = apiKey;
+          current.apiBase = apiBase;
+          current.upstreamType = upstreamType;
+          current.defaultModel = defaultModel;
+          current.opusModel = opusModel;
+          current.sonnetModel = sonnetModel;
+          current.haikuModel = haikuModel;
+        } else {
+          modelEditingTemplates.push({
+            name,
+            originalName: '',
+            apiKey,
+            apiBase,
+            upstreamType,
+            defaultModel,
+            opusModel,
+            sonnetModel,
+            haikuModel,
+          });
+        }
+
+        modelActiveTemplate = name;
+        closeTemplateModal();
+        renderTemplateArea();
+      });
+    }
+
+    claudeModeSelect.addEventListener('change', renderTemplateArea);
+    codexModeSelect.addEventListener('change', renderTemplateArea);
+    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
+
+    unifiedSaveBtn.addEventListener('click', async () => {
+      if (!modelConfigLoaded || !codexConfigLoaded) {
+        showUnifiedStatus('正在同步当前配置，请稍后再保存', 'error');
+        return;
+      }
+
+      const needsUnifiedTemplate = claudeModeSelect.value === 'custom' || codexModeSelect.value === 'unified';
+      if (needsUnifiedTemplate && modelEditingTemplates.length === 0) {
+        showUnifiedStatus('至少需要一个统一 API 配置', 'error');
+        return;
+      }
+
+      const activeTemplate = ensureActiveTemplateSelection();
+      if (needsUnifiedTemplate && (!activeTemplate || !activeTemplate.apiKey || !activeTemplate.apiBase)) {
+        showUnifiedStatus('激活配置缺少 API Key 或 API Base URL', 'error');
+        return;
+      }
+
+      showUnifiedStatus('正在保存...', '');
+      const waitModelConfig = waitForWsEvent('model_config', { timeoutMs: 8000 });
+      const waitCodexConfig = waitForWsEvent('codex_config', { timeoutMs: 8000 });
+      send({
+        type: 'save_model_config',
+        config: {
+          mode: claudeModeSelect.value,
+          activeTemplate: modelActiveTemplate,
+          templates: modelEditingTemplates,
+        },
+      });
+      send({
+        type: 'save_codex_config',
+        config: {
+          mode: codexModeSelect.value,
+          legacyMode: '',
+          sharedTemplate: modelActiveTemplate || currentCodexConfig?.sharedTemplate || '',
+          enableSearch: false,
+        },
+      });
+      try {
+        await Promise.all([waitModelConfig, waitCodexConfig]);
+        showUnifiedStatus('已保存', 'success');
+      } catch (error) {
+        showUnifiedStatus(error?.message || '保存失败，请重试', 'error');
+      }
+    });
+
+    testBtn.addEventListener('click', () => {
+      const config = collectNotifyConfig();
+      send({ type: 'save_notify_config', config });
+      showNotifyStatus('正在发送测试消息...', '');
+      send({ type: 'test_notify' });
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      const config = collectNotifyConfig();
+      showNotifyStatus('正在保存...', '');
+      const waitNotifyConfig = waitForWsEvent('notify_config', { timeoutMs: 8000 });
+      send({ type: 'save_notify_config', config });
+      try {
+        await waitNotifyConfig;
+        showNotifyStatus('已保存', 'success');
+      } catch (error) {
+        showNotifyStatus(error?.message || '保存失败，请重试', 'error');
+      }
+    });
+
+    pwOpenModalBtn.addEventListener('click', openPasswordModal);
+
+    checkUpdateBtn.addEventListener('click', () => {
+      updateStatusEl.textContent = '正在检查...';
+      updateStatusEl.className = 'settings-status';
+      _onUpdateInfo = (info) => {
+        _onUpdateInfo = null;
+        if (info.error) {
+          updateStatusEl.textContent = '检查失败: ' + info.error;
+          updateStatusEl.className = 'settings-status error';
+          return;
+        }
+        if (info.hasUpdate) {
+          updateStatusEl.innerHTML = buildUpdateStatusHtml(info);
+          updateStatusEl.className = 'settings-status success';
+        } else {
+          updateStatusEl.textContent = `已是最新版本 v${info.localVersion}`;
+          updateStatusEl.className = 'settings-status success';
+        }
+      };
+      send({ type: 'check_update' });
+    });
+
+    registerSettingsPanelHandler('notify_config', (config) => {
+      currentNotifyConfig = config;
+      providerSelect.value = config.provider || 'off';
+      renderFields(config.provider || 'off');
+    });
+
+    registerSettingsPanelHandler('notify_test_result', (msg) => {
+      showNotifyStatus(msg.message, msg.success ? 'success' : 'error');
+    });
+
+    registerSettingsPanelHandler('model_config', (config) => {
+      applyModelConfigToPanel(config);
+      syncUnifiedControlsState();
+      renderTemplateArea();
+    });
+
+    registerSettingsPanelHandler('codex_config', (config) => {
+      applyCodexConfigToPanel(config);
+      syncUnifiedControlsState();
+      renderTemplateArea();
+    });
+
+    closeBtn.addEventListener('click', hideSettingsPanel);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) hideSettingsPanel(); });
+    window._ccOnUpdateInfo = (info) => { if (_onUpdateInfo) _onUpdateInfo(info); };
+    document.addEventListener('keydown', _settingsEscape);
+
+    if (modelConfigCache) applyModelConfigToPanel(modelConfigCache, false);
+    if (codexConfigCache) applyCodexConfigToPanel(codexConfigCache, false);
+    syncUnifiedControlsState();
+    renderTemplateArea();
+    send({ type: 'get_notify_config' });
+    send({ type: 'get_model_config' });
+    send({ type: 'get_codex_config' });
+  }
 
   function buildNotifyFieldsHtml(config, provider) {
     if (provider === 'pushplus') {
@@ -3724,6 +4704,63 @@
     `;
   }
 
+  function buildImportModalBody(agent, title, copy, extraHtml = '') {
+    return `${buildAgentContextCard(agent, title, copy)}${extraHtml}`;
+  }
+
+  function createImportSessionsModal({
+    overlayId,
+    title,
+    closeBtnId,
+    bodyId,
+    agent,
+    cardTitle,
+    cardCopy,
+    loadingText,
+    onClose,
+  }) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = overlayId;
+    overlay.innerHTML = `
+      <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+          <span class="modal-title">${escapeHtml(title)}</span>
+          <button class="modal-close-btn" id="${escapeHtml(closeBtnId)}">✕</button>
+        </div>
+        <div class="modal-body" id="${escapeHtml(bodyId)}">
+          ${buildImportModalBody(agent, cardTitle, cardCopy, `<div class="modal-loading">${escapeHtml(loadingText)}</div>`)}
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    const body = overlay.querySelector(`#${bodyId}`);
+
+    function renderBody(extraHtml = '') {
+      if (!body) return null;
+      body.innerHTML = buildImportModalBody(agent, cardTitle, cardCopy, extraHtml);
+      return body;
+    }
+
+    function close() {
+      overlay.remove();
+      if (typeof onClose === 'function') onClose();
+    }
+
+    overlay.querySelector(`#${closeBtnId}`)?.addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    return {
+      overlay,
+      body,
+      close,
+      renderBody,
+      renderEmpty: (message) => renderBody(`<div class="modal-empty">${escapeHtml(message)}</div>`),
+    };
+  }
+
   function renderNotifyFields(fieldsDiv, config, provider) {
     fieldsDiv.innerHTML = buildNotifyFieldsHtml(config, provider);
   }
@@ -3749,49 +4786,30 @@
   }
 
   function openPasswordModal() {
-    const pwOverlay = document.createElement('div');
-    pwOverlay.className = 'settings-overlay';
-    pwOverlay.style.zIndex = '10001';
-    const pwModal = document.createElement('div');
-    pwModal.className = 'settings-panel';
-    pwModal.style.maxWidth = '400px';
-    pwModal.innerHTML = `
-      <div class="settings-header">
-        <h3>修改密码</h3>
-        <button class="settings-close" id="pw-modal-close">&times;</button>
-      </div>
-      <div class="settings-field">
-        <label>当前密码</label>
-        <input type="password" id="pw-modal-current" placeholder="当前密码" autocomplete="current-password">
-      </div>
-      <div class="settings-field">
-        <label>新密码</label>
-        <input type="password" id="pw-modal-new" placeholder="新密码" autocomplete="new-password">
-        <div class="password-hint" id="pw-modal-hint">至少 8 位，包含大写/小写/数字/特殊字符中的 2 种</div>
-      </div>
-      <div class="settings-field">
-        <label>确认新密码</label>
-        <input type="password" id="pw-modal-confirm" placeholder="确认新密码" autocomplete="new-password">
-      </div>
-      <div class="settings-actions">
-        <button class="btn-save" id="pw-modal-submit" disabled>修改密码</button>
-      </div>
-      <div class="settings-status" id="pw-modal-status"></div>
-    `;
-    pwOverlay.appendChild(pwModal);
-    document.body.appendChild(pwOverlay);
+    const { overlay: pwOverlay, panel: pwModal, close: closePwModal } = createOverlayPanel({
+      zIndex: '10001',
+      maxWidth: '400px',
+      panelHtml: buildPasswordModalHtml(),
+    });
 
-    const currentPwIn = pwModal.querySelector('#pw-modal-current');
     const newPwIn = pwModal.querySelector('#pw-modal-new');
     const confirmPwIn = pwModal.querySelector('#pw-modal-confirm');
+    const currentPwIn = pwModal.querySelector('#pw-modal-current');
     const hint = pwModal.querySelector('#pw-modal-hint');
     const submitBtn = pwModal.querySelector('#pw-modal-submit');
     const status = pwModal.querySelector('#pw-modal-status');
 
     function checkPw() {
+      const currentPw = currentPwIn.value;
       const newPw = newPwIn.value;
       const confirmPw = confirmPwIn.value;
-      const currentPw = currentPwIn.value;
+      
+      // Check if current password is entered
+      if (!currentPw) {
+        submitBtn.disabled = true;
+        return;
+      }
+      
       if (!newPw) {
         hint.textContent = '至少 8 位，包含大写/小写/数字/特殊字符中的 2 种';
         hint.className = 'password-hint';
@@ -3807,21 +4825,35 @@
       }
       hint.textContent = '密码强度符合要求';
       hint.className = 'password-hint success';
-      submitBtn.disabled = !currentPw || !confirmPw || confirmPw !== newPw;
+      submitBtn.disabled = !confirmPw || confirmPw !== newPw;
     }
 
     currentPwIn.addEventListener('input', checkPw);
     newPwIn.addEventListener('input', checkPw);
     confirmPwIn.addEventListener('input', checkPw);
 
-    const closePwModal = () => { document.body.removeChild(pwOverlay); };
-    pwModal.querySelector('#pw-modal-close').addEventListener('click', closePwModal);
-    pwOverlay.addEventListener('click', (e) => { if (e.target === pwOverlay) closePwModal(); });
+    // Password change timeout cleanup
+    let pwChangeTimeoutId = null;
+    const closePwModalWithCleanup = () => {
+      clearTimeout(pwChangeTimeoutId);
+      pwChangeTimeoutId = null;
+      _onPasswordChanged = null;
+      closePwModal();
+    };
+
+    pwModal.querySelector('#pw-modal-close').addEventListener('click', closePwModalWithCleanup);
+    pwOverlay.addEventListener('click', (e) => { if (e.target === pwOverlay) closePwModalWithCleanup(); });
 
     submitBtn.addEventListener('click', () => {
       const currentPw = currentPwIn.value;
       const newPw = newPwIn.value;
       const confirmPw = confirmPwIn.value;
+      
+      if (!currentPw) {
+        status.textContent = '请输入当前密码';
+        status.className = 'settings-status error';
+        return;
+      }
       if (newPw !== confirmPw) {
         status.textContent = '两次密码不一致';
         status.className = 'settings-status error';
@@ -3831,773 +4863,45 @@
       status.textContent = '正在修改...';
       status.className = 'settings-status';
       _onPasswordChanged = (result) => {
+        clearTimeout(pwChangeTimeoutId);
+        pwChangeTimeoutId = null;
         if (result.success) {
           status.textContent = result.message || '密码修改成功';
           status.className = 'settings-status success';
-          setTimeout(closePwModal, 1200);
+          // Clear password fields on success
+          currentPwIn.value = '';
+          newPwIn.value = '';
+          confirmPwIn.value = '';
+          setTimeout(closePwModalWithCleanup, 1200);
         } else {
           status.textContent = result.message || '修改失败';
           status.className = 'settings-status error';
           submitBtn.disabled = false;
         }
       };
+      // Timeout cleanup for password change callback
+      pwChangeTimeoutId = setTimeout(() => {
+        _onPasswordChanged = null;
+        pwChangeTimeoutId = null;
+        status.textContent = '请求超时，请重试';
+        status.className = 'settings-status error';
+        submitBtn.disabled = false;
+      }, 15000);
       send({ type: 'change_password', currentPassword: currentPw, newPassword: newPw });
     });
 
-    currentPwIn.focus();
-  }
-
-  function showCodexSettingsPanel() {
-    send({ type: 'get_notify_config' });
-    send({ type: 'get_codex_config' });
-
-    const overlay = document.createElement('div');
-    overlay.className = 'settings-overlay';
-    overlay.id = 'settings-overlay';
-
-    const panel = document.createElement('div');
-    panel.className = 'settings-panel';
-    panel.innerHTML = `
-      <h3>
-        ⚙ Codex 设置
-        <button class="settings-close" title="关闭">&times;</button>
-      </h3>
-
-      <div class="settings-section-title">Codex 运行配置</div>
-      <div class="settings-field">
-        <label>配置模式</label>
-        <select class="settings-select" id="codex-mode">
-          <option value="local">读取本机 Codex 登录态 / ~/.codex/config.toml</option>
-          <option value="custom">自定义 API Profile</option>
-        </select>
-      </div>
-      <div id="codex-profile-area"></div>
-      <div class="settings-actions">
-        <button class="btn-save" id="codex-save-btn">保存 Codex 配置</button>
-      </div>
-      <div class="settings-status" id="codex-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">通知设置</div>
-      <div class="settings-field">
-        <label>通知方式</label>
-        <select class="settings-select" id="notify-provider">
-          ${PROVIDER_OPTIONS.map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div id="notify-fields"></div>
-      <div class="settings-actions">
-        <button class="btn-test" id="notify-test-btn">测试</button>
-        <button class="btn-save" id="notify-save-btn">保存</button>
-      </div>
-      <div class="settings-status" id="notify-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">系统</div>
-      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
-        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
-        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
-      </div>
-      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
-    `;
-
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
-
-    const closeBtn = panel.querySelector('.settings-close');
-    const codexModeSelect = panel.querySelector('#codex-mode');
-    const codexProfileArea = panel.querySelector('#codex-profile-area');
-    const codexStatus = panel.querySelector('#codex-status');
-    const codexSaveBtn = panel.querySelector('#codex-save-btn');
-
-    const providerSelect = panel.querySelector('#notify-provider');
-    const fieldsDiv = panel.querySelector('#notify-fields');
-    const statusDiv = panel.querySelector('#notify-status');
-    const testBtn = panel.querySelector('#notify-test-btn');
-    const saveBtn = panel.querySelector('#notify-save-btn');
-    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
-    const checkUpdateBtn = panel.querySelector('#check-update-btn');
-    const updateStatusEl = panel.querySelector('#update-status');
-
-    let currentNotifyConfig = null;
-    let currentCodexConfig = null;
-    let codexEditingProfiles = [];
-    let codexActiveProfile = '';
-    let _onUpdateInfo = null;
-
-    function showCodexStatus(msg, type) {
-      codexStatus.textContent = msg;
-      codexStatus.className = 'settings-status ' + (type || '');
-    }
-
-    function renderFields(provider) {
-      renderNotifyFields(fieldsDiv, currentNotifyConfig, provider);
-    }
-
-    function collectNotifyConfig() {
-      return collectNotifyConfigFromPanel(panel, currentNotifyConfig, providerSelect.value);
-    }
-
-    function showNotifyStatus(msg, type) {
-      statusDiv.textContent = msg;
-      statusDiv.className = 'settings-status ' + (type || '');
-    }
-
-    function renderCodexProfileArea() {
-      const mode = codexModeSelect.value;
-      if (mode === 'local') {
-        codexProfileArea.innerHTML = `
-          <div class="settings-inline-note">
-            当前将直接复用本机 <code>codex</code> 的登录态与 <code>~/.codex/config.toml</code>。这适合你已经在终端里正常使用 Codex 的场景。
-          </div>
-        `;
-        return;
-      }
-
-      if (codexEditingProfiles.length === 0) {
-        codexProfileArea.innerHTML = `
-          <div class="settings-inline-note">
-            自定义模式适合接 OpenAI 兼容服务，例如你提到的第三方 API 入口。这里仅覆盖 <strong>API Key</strong> 和 <strong>API Base URL</strong>，不会让配置页随意改模型 ID。
-          </div>
-          <div class="settings-actions" style="margin-top:0">
-            <button class="btn-test" id="codex-profile-add-first">+ 新建 Profile</button>
-          </div>
-        `;
-        panel.querySelector('#codex-profile-add-first').addEventListener('click', () => openCodexProfileModal());
-        return;
-      }
-
-      const options = codexEditingProfiles.map((profile) =>
-        `<option value="${escapeHtml(profile.name)}" ${profile.name === codexActiveProfile ? 'selected' : ''}>${escapeHtml(profile.name)}</option>`
-      ).join('');
-      const currentProfile = codexEditingProfiles.find((profile) => profile.name === codexActiveProfile) || codexEditingProfiles[0];
-      if (currentProfile && !codexActiveProfile) codexActiveProfile = currentProfile.name;
-      const summaryBase = currentProfile?.apiBase ? escapeHtml(currentProfile.apiBase) : '未设置 API Base URL';
-
-      codexProfileArea.innerHTML = `
-        <div class="settings-inline-note">
-          自定义模式会为 cc-web 生成独立的 Codex 运行配置，只覆盖当前激活 Profile 的 <strong>API Key</strong> 与 <strong>API Base URL</strong>，不去碰你平时终端里用的全局登录态。
-        </div>
-        <div class="settings-field">
-          <label>激活 Profile</label>
-          <div style="display:flex;gap:6px;align-items:center">
-            <select class="settings-select" id="codex-profile-select" style="flex:1">
-              ${options}
-              <option value="__new__">+ 新建 Profile</option>
-            </select>
-            <button class="btn-test" id="codex-profile-edit" style="padding:4px 10px">编辑</button>
-            <button class="btn-test" id="codex-profile-del" title="删除" style="padding:4px 8px">删除</button>
-          </div>
-        </div>
-        <div class="settings-inline-note">
-          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong><br>
-          API Base URL：<code>${summaryBase}</code>
-        </div>
-      `;
-
-      panel.querySelector('#codex-profile-select').addEventListener('change', (e) => {
-        if (e.target.value === '__new__') {
-          openCodexProfileModal();
-          return;
-        }
-        codexActiveProfile = e.target.value;
-        renderCodexProfileArea();
-      });
-
-      panel.querySelector('#codex-profile-edit').addEventListener('click', () => {
-        openCodexProfileModal(codexActiveProfile);
-      });
-
-      panel.querySelector('#codex-profile-del').addEventListener('click', () => {
-        if (!codexActiveProfile) return;
-        if (!confirm(`确认删除 Codex Profile「${codexActiveProfile}」?`)) return;
-        codexEditingProfiles = codexEditingProfiles.filter((profile) => profile.name !== codexActiveProfile);
-        codexActiveProfile = codexEditingProfiles[0]?.name || '';
-        renderCodexProfileArea();
-      });
-    }
-
-    function openCodexProfileModal(profileName = '') {
-      const current = profileName
-        ? codexEditingProfiles.find((profile) => profile.name === profileName)
-        : null;
-      const draft = current || { name: '', apiKey: '', apiBase: '' };
-
-      const modalOverlay = document.createElement('div');
-      modalOverlay.className = 'settings-overlay';
-      modalOverlay.style.zIndex = '10001';
-      const modal = document.createElement('div');
-      modal.className = 'settings-panel';
-      modal.style.maxWidth = '460px';
-      modal.innerHTML = `
-        <div class="settings-header">
-          <h3>${current ? `编辑 Profile: ${escapeHtml(current.name)}` : '新建 Codex Profile'}</h3>
-          <button class="settings-close" id="codex-profile-modal-close">&times;</button>
-        </div>
-        <div class="settings-field">
-          <label>Profile 名称</label>
-          <input type="text" id="codex-profile-name" placeholder="例如 OpenRouter Work" value="${escapeHtml(draft.name || '')}">
-        </div>
-        <div class="settings-field">
-          <label>API Key</label>
-          <input type="text" id="codex-profile-apikey" placeholder="sk-..." value="${escapeHtml(draft.apiKey || '')}">
-        </div>
-        <div class="settings-field">
-          <label>API Base URL</label>
-          <input type="text" id="codex-profile-apibase" placeholder="https://api.openai.com/v1" value="${escapeHtml(draft.apiBase || '')}">
-        </div>
-        <div class="settings-inline-note">
-          这里不开放模型 ID 编辑。Codex 仍使用上方“默认模型”以及会话内的模型切换逻辑，只把 API 入口和密钥切换到当前 Profile。
-        </div>
-        <div class="settings-actions">
-          <button class="btn-save" id="codex-profile-ok">确定</button>
-        </div>
-      `;
-      modalOverlay.appendChild(modal);
-      document.body.appendChild(modalOverlay);
-
-      const closeModal = () => document.body.removeChild(modalOverlay);
-      modal.querySelector('#codex-profile-modal-close').addEventListener('click', closeModal);
-      modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-
-      modal.querySelector('#codex-profile-ok').addEventListener('click', () => {
-        const name = modal.querySelector('#codex-profile-name').value.trim();
-        const apiKey = modal.querySelector('#codex-profile-apikey').value.trim();
-        const apiBase = modal.querySelector('#codex-profile-apibase').value.trim();
-        if (!name) {
-          alert('请填写 Profile 名称');
-          return;
-        }
-        if (!apiKey) {
-          alert('请填写 API Key');
-          return;
-        }
-        if (!apiBase) {
-          alert('请填写 API Base URL');
-          return;
-        }
-        const existing = codexEditingProfiles.find((profile) => profile.name === name);
-        if (existing && existing !== current) {
-          alert('Profile 名称已存在');
-          return;
-        }
-        if (current) {
-          current.name = name;
-          current.apiKey = apiKey;
-          current.apiBase = apiBase;
-        } else {
-          codexEditingProfiles.push({ name, apiKey, apiBase });
-        }
-        codexActiveProfile = name;
-        closeModal();
-        renderCodexProfileArea();
-      });
-    }
-
-    _onCodexConfig = (config) => {
-      currentCodexConfig = config || {};
-      codexModeSelect.value = currentCodexConfig.mode || 'local';
-      codexEditingProfiles = (currentCodexConfig.profiles || []).map((profile) => ({ ...profile }));
-      codexActiveProfile = currentCodexConfig.activeProfile || (codexEditingProfiles[0]?.name || '');
-      renderCodexProfileArea();
-    };
-
-    _onNotifyConfig = (config) => {
-      currentNotifyConfig = config;
-      providerSelect.value = config.provider || 'off';
-      renderFields(config.provider || 'off');
-    };
-
-    _onNotifyTestResult = (msg) => {
-      showNotifyStatus(msg.message, msg.success ? 'success' : 'error');
-    };
-
-    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
-    codexModeSelect.addEventListener('change', renderCodexProfileArea);
-
-    codexSaveBtn.addEventListener('click', () => {
-      if (codexModeSelect.value === 'custom' && codexEditingProfiles.length === 0) {
-        showCodexStatus('自定义模式至少需要一个 Codex Profile', 'error');
-        return;
-      }
-      const config = {
-        mode: codexModeSelect.value,
-        activeProfile: codexActiveProfile,
-        profiles: codexEditingProfiles,
-        enableSearch: false,
-      };
-      send({ type: 'save_codex_config', config });
-      showCodexStatus('已保存', 'success');
-    });
-
-    testBtn.addEventListener('click', () => {
-      const config = collectNotifyConfig();
-      send({ type: 'save_notify_config', config });
-      showNotifyStatus('正在发送测试消息...', '');
-      send({ type: 'test_notify' });
-    });
-
-    saveBtn.addEventListener('click', () => {
-      const config = collectNotifyConfig();
-      send({ type: 'save_notify_config', config });
-      showNotifyStatus('已保存', 'success');
-    });
-
-    pwOpenModalBtn.addEventListener('click', openPasswordModal);
-
-    checkUpdateBtn.addEventListener('click', () => {
-      updateStatusEl.textContent = '正在检查...';
-      updateStatusEl.className = 'settings-status';
-      _onUpdateInfo = (info) => {
-        _onUpdateInfo = null;
-        if (info.error) {
-          updateStatusEl.textContent = '检查失败: ' + info.error;
-          updateStatusEl.className = 'settings-status error';
-          return;
-        }
-        if (info.hasUpdate) {
-          updateStatusEl.innerHTML = `有新版本 <strong>v${escapeHtml(info.latestVersion)}</strong>（当前 v${escapeHtml(info.localVersion)}）&nbsp;<a href="${escapeHtml(info.releaseUrl)}" target="_blank" style="color:var(--accent)">查看更新</a>`;
-          updateStatusEl.className = 'settings-status success';
-        } else {
-          updateStatusEl.textContent = `已是最新版本 v${info.localVersion}`;
-          updateStatusEl.className = 'settings-status success';
-        }
-      };
-      send({ type: 'check_update' });
-    });
-
-    window._ccOnUpdateInfo = (info) => { if (_onUpdateInfo) _onUpdateInfo(info); };
-
-    closeBtn.addEventListener('click', hideSettingsPanel);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) hideSettingsPanel(); });
-    document.addEventListener('keydown', _settingsEscape);
+    newPwIn.focus();
   }
 
   function showSettingsPanel() {
-    if (selectedAgent === 'codex') {
-      showCodexSettingsPanel();
-      return;
-    }
-    // Request current configs
-    send({ type: 'get_notify_config' });
-    send({ type: 'get_model_config' });
-
-    const overlay = document.createElement('div');
-    overlay.className = 'settings-overlay';
-    overlay.id = 'settings-overlay';
-
-    const panel = document.createElement('div');
-    panel.className = 'settings-panel';
-
-    panel.innerHTML = `
-      <h3>
-        ⚙ Claude 设置
-        <button class="settings-close" title="关闭">&times;</button>
-      </h3>
-
-      <div class="settings-section-title">Claude 配置</div>
-      <div class="settings-field">
-        <label>配置模式</label>
-        <select class="settings-select" id="model-mode">
-          <option value="local">读取本地配置文件 (~/.claude.json)</option>
-          <option value="custom">自定义配置</option>
-        </select>
-      </div>
-      <div id="model-custom-area"></div>
-      <div class="settings-actions" id="model-actions" style="display:none">
-        <button class="btn-save" id="model-save-btn">保存模型配置</button>
-      </div>
-      <div class="settings-status" id="model-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">通知设置</div>
-      <div class="settings-field">
-        <label>通知方式</label>
-        <select class="settings-select" id="notify-provider">
-          ${PROVIDER_OPTIONS.map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div id="notify-fields"></div>
-      <div class="settings-actions">
-        <button class="btn-test" id="notify-test-btn">测试</button>
-        <button class="btn-save" id="notify-save-btn">保存</button>
-      </div>
-      <div class="settings-status" id="notify-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">系统</div>
-
-      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
-        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
-        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
-      </div>
-      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
-    `;
-
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
-
-    // === Model Config UI ===
-    const modelModeSelect = panel.querySelector('#model-mode');
-    const modelCustomArea = panel.querySelector('#model-custom-area');
-    const modelActionsDiv = panel.querySelector('#model-actions');
-    const modelSaveBtn = panel.querySelector('#model-save-btn');
-    const modelStatusDiv = panel.querySelector('#model-status');
-
-    let modelCurrentConfig = null;
-    let modelEditingTemplates = [];
-    let modelActiveTemplate = '';
-
-    function showModelStatus(msg, type) {
-      modelStatusDiv.textContent = msg;
-      modelStatusDiv.className = 'settings-status ' + (type || '');
-    }
-
-    function renderModelCustomArea() {
-      if (modelModeSelect.value === 'local') {
-        modelCustomArea.innerHTML = `<div class="settings-field" style="color:var(--text-warning, #e8a838);font-size:0.85em">⚠ 使用自定义模板会覆盖本地 API 配置，请提前做好备份。</div>`;
-        modelActionsDiv.style.display = 'flex';
-      } else {
-        renderModelTemplateEditor();
-        modelActionsDiv.style.display = 'flex';
-      }
-    }
-
-    function renderModelTemplateEditor() {
-      const activeName = modelActiveTemplate;
-      const tpl = modelEditingTemplates.find(t => t.name === activeName) || null;
-      const tplOptions = modelEditingTemplates.map(t =>
-        `<option value="${escapeHtml(t.name)}" ${t.name === activeName ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
-      ).join('');
-
-      if (modelEditingTemplates.length === 0) {
-        modelCustomArea.innerHTML = `
-          <div class="settings-field" style="color:var(--text-secondary);font-size:0.85em">尚无模板，点击下方按钮新建。</div>
-          <div class="settings-actions" style="margin-top:0">
-            <button class="btn-test" id="model-tpl-add-first">+ 新建模板</button>
-          </div>
-        `;
-        panel.querySelector('#model-tpl-add-first').addEventListener('click', () => {
-          const newName = prompt('输入新模板名称:');
-          if (!newName || !newName.trim()) return;
-          const n = newName.trim();
-          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
-          modelActiveTemplate = n;
-          renderModelTemplateEditor();
-        });
-        return;
-      }
-
-      modelCustomArea.innerHTML = `
-        <div class="settings-field">
-          <label>激活模板</label>
-          <div style="display:flex;gap:6px;align-items:center">
-            <select class="settings-select" id="model-tpl-select" style="flex:1">
-              ${tplOptions}
-              <option value="__new__">+ 新建模板</option>
-            </select>
-            <button class="btn-test" id="model-tpl-edit" style="padding:4px 10px">编辑</button>
-            <button class="btn-test" id="model-tpl-del" title="删除" style="padding:4px 8px">删除</button>
-          </div>
-        </div>
-      `;
-
-      panel.querySelector('#model-tpl-select').addEventListener('change', (e) => {
-        if (e.target.value === '__new__') {
-          const newName = prompt('输入新模板名称:');
-          if (!newName || !newName.trim()) { e.target.value = modelActiveTemplate; return; }
-          const n = newName.trim();
-          if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = modelActiveTemplate; return; }
-          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
-          modelActiveTemplate = n;
-          renderModelTemplateEditor();
-          openTplEditModal();
-        } else {
-          modelActiveTemplate = e.target.value;
-          renderModelTemplateEditor();
-        }
-      });
-
-      panel.querySelector('#model-tpl-edit').addEventListener('click', () => {
-        openTplEditModal();
-      });
-
-      const delBtn = panel.querySelector('#model-tpl-del');
-      if (delBtn) {
-        delBtn.addEventListener('click', () => {
-          if (!modelActiveTemplate) return;
-          if (!confirm(`确认删除模板「${modelActiveTemplate}」?`)) return;
-          modelEditingTemplates = modelEditingTemplates.filter(t => t.name !== modelActiveTemplate);
-          modelActiveTemplate = modelEditingTemplates[0]?.name || '';
-          renderModelTemplateEditor();
-        });
-      }
-    }
-
-    function openTplEditModal() {
-      const tpl = modelEditingTemplates.find(t => t.name === modelActiveTemplate);
-      if (!tpl) return;
-
-      const modalOverlay = document.createElement('div');
-      modalOverlay.className = 'settings-overlay';
-      modalOverlay.style.zIndex = '10001';
-      const modal = document.createElement('div');
-      modal.className = 'settings-panel';
-      modal.style.maxWidth = '460px';
-      modal.innerHTML = `
-        <div class="settings-header">
-          <h3>编辑模板: ${escapeHtml(tpl.name)}</h3>
-          <button class="settings-close" id="tpl-modal-close">&times;</button>
-        </div>
-        <div class="settings-field">
-          <label>模板名称</label>
-          <input type="text" id="tpl-ed-name" value="${escapeHtml(tpl.name)}">
-        </div>
-        <div class="settings-field">
-          <label>API Key</label>
-          <input type="text" id="tpl-ed-apikey" placeholder="sk-ant-..." value="${escapeHtml(tpl.apiKey || '')}">
-        </div>
-        <div class="settings-field">
-          <label>API Base URL</label>
-          <input type="text" id="tpl-ed-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
-        </div>
-
-        <div class="settings-divider" style="margin:12px 0"></div>
-
-        <div class="settings-field">
-          <label style="display:flex;align-items:center;gap:8px;font-weight:600">
-            获取上游模型列表
-          </label>
-          <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-            <label style="font-size:0.85em;display:flex;align-items:center;gap:4px;cursor:pointer">
-              <input type="checkbox" id="tpl-ed-custom-endpoint"> 端点
-            </label>
-            <input type="text" id="tpl-ed-models-endpoint" placeholder="/v1/models" style="flex:1;display:none" value="">
-          </div>
-          <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
-            <button class="btn-test" id="tpl-ed-fetch-models" style="padding:4px 12px;white-space:nowrap">获取模型</button>
-            <span id="tpl-ed-fetch-status" style="font-size:0.85em;color:var(--text-secondary)"></span>
-          </div>
-        </div>
-
-        <div class="settings-divider" style="margin:12px 0"></div>
-
-        <div class="settings-field">
-          <label>默认模型 (ANTHROPIC_MODEL)</label>
-          <input type="text" id="tpl-ed-default" list="tpl-dl-models" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.defaultModel || '')}" autocomplete="off">
-        </div>
-        <div class="settings-field">
-          <label>Opus 模型名</label>
-          <input type="text" id="tpl-ed-opus" list="tpl-dl-models" placeholder="claude-opus-4-6" value="${escapeHtml(tpl.opusModel || '')}" autocomplete="off">
-        </div>
-        <div class="settings-field">
-          <label>Sonnet 模型名</label>
-          <input type="text" id="tpl-ed-sonnet" list="tpl-dl-models" placeholder="claude-sonnet-4-6" value="${escapeHtml(tpl.sonnetModel || '')}" autocomplete="off">
-        </div>
-        <div class="settings-field">
-          <label>Haiku 模型名</label>
-          <input type="text" id="tpl-ed-haiku" list="tpl-dl-models" placeholder="claude-haiku-4-5" value="${escapeHtml(tpl.haikuModel || '')}" autocomplete="off">
-        </div>
-        <datalist id="tpl-dl-models"></datalist>
-        <div class="settings-actions">
-          <button class="btn-save" id="tpl-ed-ok">确定</button>
-        </div>
-      `;
-      modalOverlay.appendChild(modal);
-      document.body.appendChild(modalOverlay);
-
-      // Custom endpoint checkbox toggle
-      const customEndpointCb = modal.querySelector('#tpl-ed-custom-endpoint');
-      const endpointInput = modal.querySelector('#tpl-ed-models-endpoint');
-      customEndpointCb.addEventListener('change', () => {
-        endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
-      });
-
-      // Fetch models
-      const fetchBtn = modal.querySelector('#tpl-ed-fetch-models');
-      const fetchStatus = modal.querySelector('#tpl-ed-fetch-status');
-      const datalist = modal.querySelector('#tpl-dl-models');
-
-      fetchBtn.addEventListener('click', () => {
-        const apiBase = modal.querySelector('#tpl-ed-apibase').value.trim();
-        const apiKey = modal.querySelector('#tpl-ed-apikey').value.trim();
-        if (!apiBase || !apiKey) {
-          fetchStatus.textContent = '请先填写 API Base 和 API Key';
-          fetchStatus.style.color = 'var(--text-error, #e85d5d)';
-          return;
-        }
-        const modelsEndpoint = customEndpointCb.checked ? endpointInput.value.trim() : '';
-        fetchBtn.disabled = true;
-        fetchStatus.textContent = '正在获取...';
-        fetchStatus.style.color = 'var(--text-secondary)';
-
-        _onFetchModelsResult = (result) => {
-          _onFetchModelsResult = null;
-          fetchBtn.disabled = false;
-          if (result.success) {
-            datalist.innerHTML = result.models.map(m => `<option value="${escapeHtml(m)}">`).join('');
-            fetchStatus.textContent = `获取到 ${result.models.length} 个模型`;
-            fetchStatus.style.color = 'var(--text-success, #5dbe5d)';
-          } else {
-            fetchStatus.textContent = result.message || '获取失败';
-            fetchStatus.style.color = 'var(--text-error, #e85d5d)';
-          }
-        };
-
-        send({ type: 'fetch_models', apiBase, apiKey, modelsEndpoint: modelsEndpoint || undefined, templateName: tpl.name });
-      });
-
-      const closeModal = () => {
-        _onFetchModelsResult = null;
-        document.body.removeChild(modalOverlay);
-      };
-      modal.querySelector('#tpl-modal-close').addEventListener('click', closeModal);
-      modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-
-      modal.querySelector('#tpl-ed-ok').addEventListener('click', () => {
-        const newName = modal.querySelector('#tpl-ed-name').value.trim();
-        if (newName && newName !== tpl.name) {
-          if (modelEditingTemplates.find(t => t.name === newName && t !== tpl)) { alert('模板名称已存在'); return; }
-          tpl.name = newName;
-          modelActiveTemplate = newName;
-        }
-        tpl.apiKey = modal.querySelector('#tpl-ed-apikey').value.trim();
-        tpl.apiBase = modal.querySelector('#tpl-ed-apibase').value.trim();
-        tpl.defaultModel = modal.querySelector('#tpl-ed-default').value.trim();
-        tpl.opusModel = modal.querySelector('#tpl-ed-opus').value.trim();
-        tpl.sonnetModel = modal.querySelector('#tpl-ed-sonnet').value.trim();
-        tpl.haikuModel = modal.querySelector('#tpl-ed-haiku').value.trim();
-        closeModal();
-        renderModelTemplateEditor();
-      });
-    }
-
-    function saveTplFields() {
-      // Fields are now saved via modal, no inline fields to read
-    }
-
-    modelModeSelect.addEventListener('change', renderModelCustomArea);
-
-    modelSaveBtn.addEventListener('click', () => {
-      if (modelModeSelect.value === 'custom') saveTplFields();
-      const config = {
-        mode: modelModeSelect.value,
-        activeTemplate: modelActiveTemplate,
-        templates: modelEditingTemplates,
-      };
-      send({ type: 'save_model_config', config });
-      showModelStatus('已保存', 'success');
-    });
-
-    _onModelConfig = (config) => {
-      modelCurrentConfig = config;
-      modelEditingTemplates = (config.templates || []).map(t => Object.assign({}, t));
-      modelActiveTemplate = config.activeTemplate || (modelEditingTemplates[0]?.name || '');
-      modelModeSelect.value = config.mode || 'local';
-      renderModelCustomArea();
-    };
-
-    // === Notify Config UI ===
-    const providerSelect = panel.querySelector('#notify-provider');
-    const fieldsDiv = panel.querySelector('#notify-fields');
-    const statusDiv = panel.querySelector('#notify-status');
-    const closeBtn = panel.querySelector('.settings-close');
-    const testBtn = panel.querySelector('#notify-test-btn');
-    const saveBtn = panel.querySelector('#notify-save-btn');
-
-    let currentConfig = null;
-
-    function renderFields(provider) {
-      renderNotifyFields(fieldsDiv, currentConfig, provider);
-    }
-
-    providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
-
-    function collectConfig() {
-      return collectNotifyConfigFromPanel(panel, currentConfig, providerSelect.value);
-    }
-
-    function showStatus(msg, type) {
-      statusDiv.textContent = msg;
-      statusDiv.className = 'settings-status ' + type;
-    }
-
-    _onNotifyConfig = (config) => {
-      currentConfig = config;
-      providerSelect.value = config.provider || 'off';
-      renderFields(config.provider || 'off');
-    };
-
-    _onNotifyTestResult = (msg) => {
-      showStatus(msg.message, msg.success ? 'success' : 'error');
-    };
-
-    closeBtn.addEventListener('click', hideSettingsPanel);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) hideSettingsPanel(); });
-
-    testBtn.addEventListener('click', () => {
-      // Save first then test
-      const config = collectConfig();
-      send({ type: 'save_notify_config', config });
-      showStatus('正在发送测试消息...', '');
-      send({ type: 'test_notify' });
-    });
-
-    saveBtn.addEventListener('click', () => {
-      const config = collectConfig();
-      send({ type: 'save_notify_config', config });
-      showStatus('已保存', 'success');
-    });
-
-    // Password change button -> opens modal
-    const pwOpenModalBtn = panel.querySelector('#pw-open-modal-btn');
-    pwOpenModalBtn.addEventListener('click', openPasswordModal);
-
-    // Check update button
-    const checkUpdateBtn = panel.querySelector('#check-update-btn');
-    const updateStatusEl = panel.querySelector('#update-status');
-    let _onUpdateInfo = null;
-    checkUpdateBtn.addEventListener('click', () => {
-      updateStatusEl.textContent = '正在检查...';
-      updateStatusEl.className = 'settings-status';
-      _onUpdateInfo = (info) => {
-        _onUpdateInfo = null;
-        if (info.error) {
-          updateStatusEl.textContent = '检查失败: ' + info.error;
-          updateStatusEl.className = 'settings-status error';
-          return;
-        }
-        if (info.hasUpdate) {
-          updateStatusEl.innerHTML = `有新版本 <strong>v${escapeHtml(info.latestVersion)}</strong>（当前 v${escapeHtml(info.localVersion)}）&nbsp;<a href="${escapeHtml(info.releaseUrl)}" target="_blank" style="color:var(--accent)">查看更新</a>`;
-          updateStatusEl.className = 'settings-status success';
-        } else {
-          updateStatusEl.textContent = `已是最新版本 v${info.localVersion}`;
-          updateStatusEl.className = 'settings-status success';
-        }
-      };
-      send({ type: 'check_update' });
-    });
-
-    // Wire _onUpdateInfo into WS handler via closure
-    const _origOnUpdateInfo = window._ccOnUpdateInfo;
-    window._ccOnUpdateInfo = (info) => { if (_onUpdateInfo) _onUpdateInfo(info); };
-
-    document.addEventListener('keydown', _settingsEscape);
+    showUnifiedSettingsPanel();
   }
 
   function hideSettingsPanel() {
     const overlay = document.getElementById('settings-overlay');
     if (overlay) overlay.remove();
     document.querySelectorAll('.settings-subpage-overlay').forEach((node) => node.remove());
-    _onNotifyConfig = null;
-    _onNotifyTestResult = null;
-    _onModelConfig = null;
-    _onCodexConfig = null;
-    _onFetchModelsResult = null;
+    clearSettingsPanelSubscriptions();
     window._ccOnUpdateInfo = null;
     document.removeEventListener('keydown', _settingsEscape);
   }
@@ -4643,7 +4947,7 @@
 
     function checkStrength() {
       const pw = newPwInput.value;
-      const confirm = confirmPwInput.value;
+      const confirmPw = confirmPwInput.value;
       if (!pw) {
         hintEl.textContent = '至少 8 位，包含大写/小写/数字/特殊字符中的 2 种';
         hintEl.className = 'password-hint';
@@ -4659,7 +4963,7 @@
       }
       hintEl.textContent = '密码强度符合要求';
       hintEl.className = 'password-hint success';
-      submitBtn.disabled = !confirm || confirm !== pw;
+      submitBtn.disabled = !confirmPw || confirmPw !== pw;
     }
 
     newPwInput.addEventListener('input', checkStrength);
@@ -4676,7 +4980,7 @@
       submitBtn.disabled = true;
       statusEl.textContent = '正在修改...';
       statusEl.className = 'fc-status';
-      send({ type: 'change_password', currentPassword: loginPasswordValue || localStorage.getItem('cc-web-pw') || '', newPassword: newPw });
+      send({ type: 'change_password', newPassword: newPw });
     });
 
     newPwInput.focus();
@@ -4710,12 +5014,6 @@
       // Update token
       authToken = msg.token;
       localStorage.setItem('cc-web-token', msg.token);
-      // Update remembered password
-      if (localStorage.getItem('cc-web-pw')) {
-        // Clear old remembered password since it's changed
-        localStorage.removeItem('cc-web-pw');
-      }
-
       // If force-change overlay is open, close it and load sessions
       const fcOverlay = document.getElementById('force-change-overlay');
       if (fcOverlay) {
@@ -4747,28 +5045,31 @@
     }
   }
 
+  function handleForcedLogout(msg) {
+    authToken = null;
+    localStorage.removeItem('cc-web-token');
+    document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
+    if (isGenerating) finishGenerating();
+    hideForceChangePassword();
+    loginOverlay.hidden = false;
+    app.hidden = true;
+    loginPassword.value = '';
+    loginError.textContent = msg?.message || '登录状态已失效，请重新登录';
+    loginError.hidden = false;
+  }
+
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
   let _onDirectoryListing = null;
 
-  function showNewSessionModal() {
-    const targetAgent = selectedAgent;
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.id = 'new-session-overlay';
-
-    let currentBrowsePath = null;
-    let showHidden = false;
-    let addProjectMode = false; // true = save as project after selecting dir
-
-    overlay.innerHTML = `
+  function buildNewSessionModalHtml() {
+    return `
       <div class="modal-panel modal-panel-wide modal-panel-project">
         <div class="modal-header">
           <span class="modal-title">新建 / 打开项目</span>
           <button class="modal-close-btn" id="ns-close-btn">\u2715</button>
         </div>
         <div class="modal-body modal-body-project">
-          <!-- Step 1: Project Picker -->
           <div class="modal-stack project-flow-shell" id="ns-step-projects">
             <div class="project-picker-head">
               <div class="project-picker-head-copy">
@@ -4785,7 +5086,6 @@
             <div class="project-picker-helper">点击项目后会直接定位到左侧项目卡片；真正的新会话仍然在左侧项目卡片里创建。</div>
           </div>
 
-          <!-- Step 2: Directory Browser -->
           <div class="modal-stack dir-browser-shell" id="ns-step-browser" style="display:none">
             <div class="dir-browser-current">
               <div class="dir-browser-current-label">当前目录</div>
@@ -4822,6 +5122,210 @@
         </div>
       </div>
     `;
+  }
+
+  function createProjectPickerItemElement(project, sessionCount, onClick) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'project-picker-item';
+    card.innerHTML = `
+      <span class="project-picker-item-top">
+        <span class="project-picker-item-tag">项目</span>
+        <span class="project-picker-item-count">${sessionCount > 0 ? `${sessionCount} 个会话` : '暂无会话'}</span>
+      </span>
+      <span class="project-picker-item-name">${escapeHtml(project.name)}</span>
+      <span class="project-picker-item-path">${escapeHtml(project.path)}</span>
+      <span class="project-picker-item-note">定位到左侧项目卡片后，可直接点右侧“+”继续新建会话。</span>
+      <span class="project-picker-item-arrow" aria-hidden="true">\u203A</span>
+    `;
+    card.addEventListener('click', onClick);
+    return card;
+  }
+
+  function createDirBrowserItemElement(name, note, onClick, extraClass = '') {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `dir-browser-item${extraClass ? ` ${extraClass}` : ''}`;
+
+    const icon = document.createElement('span');
+    icon.className = 'dir-browser-item-icon';
+
+    const copy = document.createElement('span');
+    copy.className = 'dir-browser-item-copy';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'dir-browser-item-name';
+    nameSpan.textContent = name;
+
+    const noteSpan = document.createElement('span');
+    noteSpan.className = 'dir-browser-item-note';
+    noteSpan.textContent = note;
+
+    const arrow = document.createElement('span');
+    arrow.className = 'dir-browser-item-arrow';
+    arrow.textContent = '\u203A';
+
+    copy.appendChild(nameSpan);
+    copy.appendChild(noteSpan);
+    item.appendChild(icon);
+    item.appendChild(copy);
+    item.appendChild(arrow);
+    item.addEventListener('click', onClick);
+    return item;
+  }
+
+  function createDirBrowserMessageElement(className, text) {
+    const div = document.createElement('div');
+    div.className = className;
+    div.textContent = text;
+    return div;
+  }
+
+  function setManualPathMode(enabled, manualRow, pathbar, manualInput, currentBrowsePath) {
+    manualRow.style.display = enabled ? 'flex' : 'none';
+    pathbar.style.display = enabled ? 'none' : 'flex';
+    if (enabled) {
+      manualInput.value = currentBrowsePath || '';
+      manualInput.focus();
+    }
+  }
+
+  function updateNewSessionBrowserChrome(selectionHintEl, selectBtn, addProjectMode) {
+    const isSavingProject = Boolean(addProjectMode);
+    selectionHintEl.textContent = isSavingProject
+      ? '确认后会把当前目录加入左侧项目列表。'
+      : '确认后会立刻用当前目录创建一次临时会话。';
+    selectBtn.textContent = isSavingProject ? '保存为项目' : '创建临时会话';
+  }
+
+  function updateNewSessionPathCard(currentNameEl, currentPathEl, pathValue, hasError = false) {
+    if (!pathValue) {
+      currentNameEl.textContent = '正在定位…';
+      currentPathEl.textContent = '载入后会在这里显示你当前选中的完整路径。';
+      return;
+    }
+    currentNameEl.textContent = getPathLeaf(pathValue);
+    currentPathEl.textContent = hasError
+      ? `${pathValue}（当前不可用，请换一个目录）`
+      : pathValue;
+  }
+
+  function switchNewSessionModalStep({
+    stepProjects,
+    stepBrowser,
+    selectBtn,
+    backBtn,
+    showBrowser,
+    canGoBack = false,
+  }) {
+    stepProjects.style.display = showBrowser ? 'none' : '';
+    stepBrowser.style.display = showBrowser ? '' : 'none';
+    selectBtn.style.display = showBrowser ? '' : 'none';
+    backBtn.style.display = showBrowser && canGoBack ? '' : 'none';
+  }
+
+  function renderNewSessionProjectPickerList({
+    projectListEl,
+    projectSummaryEl,
+    projectCountEl,
+    projectsList,
+    getSessionCount,
+    onProjectSelect,
+  }) {
+    projectListEl.innerHTML = '';
+    projectCountEl.textContent = `${projectsList.length} 个项目`;
+    projectSummaryEl.textContent = projectsList.length > 0
+      ? '点击任意项目会直接定位到左侧对应项目卡片。'
+      : '还没有保存项目，先选一个目录加入左侧列表。';
+
+    for (const project of projectsList) {
+      const card = createProjectPickerItemElement(project, getSessionCount(project), () => onProjectSelect(project));
+      projectListEl.appendChild(card);
+    }
+  }
+
+  function renderNewSessionCrumbs(crumbsEl, fullPath, onNavigate) {
+    crumbsEl.innerHTML = '';
+    if (!fullPath) return;
+    const parts = fullPath.split('/').filter(Boolean);
+    const rootSpan = document.createElement(parts.length > 0 ? 'button' : 'span');
+    if (parts.length > 0) rootSpan.type = 'button';
+    rootSpan.className = parts.length > 0 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
+    rootSpan.textContent = '/';
+    if (parts.length > 0) {
+      rootSpan.addEventListener('click', () => onNavigate('/'));
+    }
+    crumbsEl.appendChild(rootSpan);
+
+    parts.forEach((seg, i) => {
+      const sep = document.createElement('span');
+      sep.className = 'dir-browser-crumb-sep';
+      sep.textContent = '\u203A';
+      crumbsEl.appendChild(sep);
+
+      const isLast = i === parts.length - 1;
+      const span = document.createElement(isLast ? 'span' : 'button');
+      if (!isLast) span.type = 'button';
+      span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
+      span.textContent = seg;
+      if (!isLast) {
+        span.addEventListener('click', () => onNavigate('/' + parts.slice(0, i + 1).join('/')));
+      }
+      crumbsEl.appendChild(span);
+    });
+
+    crumbsEl.scrollLeft = crumbsEl.scrollWidth;
+  }
+
+  function renderNewSessionDirList({
+    dirListEl,
+    dirs,
+    parentPath,
+    error,
+    currentBrowsePath,
+    onNavigate,
+  }) {
+    dirListEl.innerHTML = '';
+    if (error) {
+      const errDiv = createDirBrowserMessageElement('dir-browser-error', error);
+      if (parentPath) {
+        const backLink = document.createElement('button');
+        backLink.type = 'button';
+        backLink.className = 'dir-browser-error-back';
+        backLink.textContent = '返回上级目录';
+        backLink.addEventListener('click', () => onNavigate(parentPath));
+        errDiv.appendChild(backLink);
+      }
+      dirListEl.appendChild(errDiv);
+      return;
+    }
+    if (parentPath) {
+      dirListEl.appendChild(createDirBrowserItemElement('..', '返回上一级目录', () => onNavigate(parentPath), 'is-parent'));
+    }
+    if (!dirs || dirs.length === 0) {
+      dirListEl.appendChild(createDirBrowserMessageElement('dir-browser-empty', '此目录下没有子目录'));
+      return;
+    }
+    for (const name of dirs) {
+      const item = createDirBrowserItemElement(name, '进入这个目录继续浏览', () => {
+        const childPath = currentBrowsePath === '/' ? '/' + name : currentBrowsePath + '/' + name;
+        onNavigate(childPath);
+      });
+      dirListEl.appendChild(item);
+    }
+  }
+
+  function showNewSessionModal() {
+    const targetAgent = selectedAgent;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'new-session-overlay';
+
+    let currentBrowsePath = null;
+    let showHidden = false;
+    let addProjectMode = false; // true = save as project after selecting dir
+
+    overlay.innerHTML = buildNewSessionModalHtml();
 
     document.body.appendChild(overlay);
 
@@ -4841,202 +5345,72 @@
     const currentPathEl = overlay.querySelector('#ns-current-path');
     const selectionHintEl = overlay.querySelector('#ns-selection-hint');
 
-    function getPathLeaf(pathValue) {
-      const normalized = String(pathValue || '').trim();
-      if (!normalized || normalized === '/') return '/';
-      const parts = normalized.split('/').filter(Boolean);
-      return parts[parts.length - 1] || normalized;
-    }
-
-    function updateBrowserChrome() {
-      const isSavingProject = Boolean(addProjectMode);
-      selectionHintEl.textContent = isSavingProject
-        ? '确认后会把当前目录加入左侧项目列表。'
-        : '确认后会立刻用当前目录创建一次临时会话。';
-      selectBtn.textContent = isSavingProject ? '保存为项目' : '创建临时会话';
-    }
-
-    function updateCurrentPathCard(pathValue, hasError = false) {
-      if (!pathValue) {
-        currentNameEl.textContent = '正在定位…';
-        currentPathEl.textContent = '载入后会在这里显示你当前选中的完整路径。';
-        return;
-      }
-      currentNameEl.textContent = getPathLeaf(pathValue);
-      currentPathEl.textContent = hasError
-        ? `${pathValue}（当前不可用，请换一个目录）`
-        : pathValue;
-    }
-
     // --- Step 1: Render project list ---
     function renderProjectPicker() {
-      projectListEl.innerHTML = '';
-      projectCountEl.textContent = `${projects.length} 个项目`;
-      projectSummaryEl.textContent = projects.length > 0
-        ? '点击任意项目会直接定位到左侧对应项目卡片。'
-        : '还没有保存项目，先选一个目录加入左侧列表。';
+      renderNewSessionProjectPickerList({
+        projectListEl,
+        projectSummaryEl,
+        projectCountEl,
+        projectsList: projects,
+        getSessionCount: (project) => getCurrentProjectSessionCount(project),
+        onProjectSelect: (project) => {
+          close();
+          focusProjectGroup(project.id, { toast: '已定位到项目，点击项目右侧“新建会话”即可继续。' });
+        },
+      });
       if (projects.length === 0) {
         addProjectMode = true;
         showBrowserStep(false);
         return;
       }
-      for (const p of projects) {
-        const sessionCount = getCurrentProjectSessionCount(p);
-        const card = document.createElement('button');
-        card.type = 'button';
-        card.className = 'project-picker-item';
-        card.innerHTML = `
-          <span class="project-picker-item-top">
-            <span class="project-picker-item-tag">项目</span>
-            <span class="project-picker-item-count">${sessionCount > 0 ? `${sessionCount} 个会话` : '暂无会话'}</span>
-          </span>
-          <span class="project-picker-item-name">${escapeHtml(p.name)}</span>
-          <span class="project-picker-item-path">${escapeHtml(p.path)}</span>
-          <span class="project-picker-item-note">定位到左侧项目卡片后，可直接点右侧“+”继续新建会话。</span>
-          <span class="project-picker-item-arrow" aria-hidden="true">\u203A</span>
-        `;
-        card.addEventListener('click', () => {
-          close();
-          focusProjectGroup(p.id, { toast: '已定位到项目，点击项目右侧“新建会话”即可继续。' });
-        });
-        projectListEl.appendChild(card);
-      }
     }
 
     // --- Step 2: Directory browser (reused from original) ---
     function showBrowserStep(canGoBack) {
-      stepProjects.style.display = 'none';
-      stepBrowser.style.display = '';
-      selectBtn.style.display = '';
-      backBtn.style.display = canGoBack ? '' : 'none';
+      switchNewSessionModalStep({
+        stepProjects,
+        stepBrowser,
+        selectBtn,
+        backBtn,
+        showBrowser: true,
+        canGoBack,
+      });
       selectBtn.disabled = true;
-      updateBrowserChrome();
-      updateCurrentPathCard(currentBrowsePath);
+      updateNewSessionBrowserChrome(selectionHintEl, selectBtn, addProjectMode);
+      updateNewSessionPathCard(currentNameEl, currentPathEl, currentBrowsePath);
       navigateTo(currentBrowsePath);
     }
 
     function showProjectStep() {
-      stepBrowser.style.display = 'none';
-      stepProjects.style.display = '';
-      selectBtn.style.display = 'none';
-      backBtn.style.display = 'none';
+      switchNewSessionModalStep({
+        stepProjects,
+        stepBrowser,
+        selectBtn,
+        backBtn,
+        showBrowser: false,
+      });
       addProjectMode = false;
     }
 
     function navigateTo(dirPath) {
       selectBtn.disabled = true;
-      updateCurrentPathCard(dirPath || currentBrowsePath);
+      updateNewSessionPathCard(currentNameEl, currentPathEl, dirPath || currentBrowsePath);
       dirListEl.innerHTML = '<div class="dir-browser-empty">正在加载…</div>';
       send({ type: 'browse_directory', path: dirPath, showHidden });
     }
 
-    function renderCrumbs(fullPath) {
-      crumbsEl.innerHTML = '';
-      if (!fullPath) return;
-      const parts = fullPath.split('/').filter(Boolean);
-      const rootSpan = document.createElement(parts.length > 0 ? 'button' : 'span');
-      if (parts.length > 0) rootSpan.type = 'button';
-      rootSpan.className = parts.length > 0 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
-      rootSpan.textContent = '/';
-      if (parts.length > 0) {
-        rootSpan.addEventListener('click', () => navigateTo('/'));
-      }
-      crumbsEl.appendChild(rootSpan);
-
-      parts.forEach((seg, i) => {
-        const sep = document.createElement('span');
-        sep.className = 'dir-browser-crumb-sep';
-        sep.textContent = '\u203A';
-        crumbsEl.appendChild(sep);
-
-        const isLast = i === parts.length - 1;
-        const span = document.createElement(isLast ? 'span' : 'button');
-        if (!isLast) span.type = 'button';
-        span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
-        span.textContent = seg;
-        if (!isLast) {
-          const segPath = '/' + parts.slice(0, i + 1).join('/');
-          span.addEventListener('click', () => navigateTo(segPath));
-        }
-        crumbsEl.appendChild(span);
-      });
-
-      crumbsEl.scrollLeft = crumbsEl.scrollWidth;
-    }
-
-    function createDirItem(name, note, onClick, extraClass = '') {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = `dir-browser-item${extraClass ? ` ${extraClass}` : ''}`;
-
-      const icon = document.createElement('span');
-      icon.className = 'dir-browser-item-icon';
-
-      const copy = document.createElement('span');
-      copy.className = 'dir-browser-item-copy';
-
-      const nameSpan = document.createElement('span');
-      nameSpan.className = 'dir-browser-item-name';
-      nameSpan.textContent = name;
-
-      const noteSpan = document.createElement('span');
-      noteSpan.className = 'dir-browser-item-note';
-      noteSpan.textContent = note;
-
-      const arrow = document.createElement('span');
-      arrow.className = 'dir-browser-item-arrow';
-      arrow.textContent = '\u203A';
-
-      copy.appendChild(nameSpan);
-      copy.appendChild(noteSpan);
-      item.appendChild(icon);
-      item.appendChild(copy);
-      item.appendChild(arrow);
-      item.addEventListener('click', onClick);
-      return item;
-    }
-
-    function renderDirList(dirs, parentPath, error) {
-      dirListEl.innerHTML = '';
-      if (error) {
-        const errDiv = document.createElement('div');
-        errDiv.className = 'dir-browser-error';
-        errDiv.textContent = error;
-        if (parentPath) {
-          const backLink = document.createElement('button');
-          backLink.type = 'button';
-          backLink.className = 'dir-browser-error-back';
-          backLink.textContent = '返回上级目录';
-          backLink.addEventListener('click', () => navigateTo(parentPath));
-          errDiv.appendChild(backLink);
-        }
-        dirListEl.appendChild(errDiv);
-        return;
-      }
-      if (parentPath) {
-        dirListEl.appendChild(createDirItem('..', '返回上一级目录', () => navigateTo(parentPath), 'is-parent'));
-      }
-      if (!dirs || dirs.length === 0) {
-        const emptyDiv = document.createElement('div');
-        emptyDiv.className = 'dir-browser-empty';
-        emptyDiv.textContent = '此目录下没有子目录';
-        dirListEl.appendChild(emptyDiv);
-        return;
-      }
-      for (const name of dirs) {
-        const item = createDirItem(name, '进入这个目录继续浏览', () => {
-          const childPath = currentBrowsePath === '/' ? '/' + name : currentBrowsePath + '/' + name;
-          navigateTo(childPath);
-        });
-        dirListEl.appendChild(item);
-      }
-    }
-
     _onDirectoryListing = (msg) => {
       currentBrowsePath = msg.path || '/';
-      renderCrumbs(currentBrowsePath);
-      renderDirList(msg.dirs || [], msg.parent, msg.error);
-      updateCurrentPathCard(currentBrowsePath, Boolean(msg.error));
+      renderNewSessionCrumbs(crumbsEl, currentBrowsePath, navigateTo);
+      renderNewSessionDirList({
+        dirListEl,
+        dirs: msg.dirs || [],
+        parentPath: msg.parent,
+        error: msg.error,
+        currentBrowsePath,
+        onNavigate: navigateTo,
+      });
+      updateNewSessionPathCard(currentNameEl, currentPathEl, currentBrowsePath, Boolean(msg.error));
       selectBtn.disabled = Boolean(msg.error);
     };
 
@@ -5044,23 +5418,14 @@
     let manualMode = false;
     overlay.querySelector('#ns-edit-path-btn').addEventListener('click', () => {
       manualMode = !manualMode;
-      if (manualMode) {
-        manualRow.style.display = 'flex';
-        pathbar.style.display = 'none';
-        manualInput.value = currentBrowsePath || '';
-        manualInput.focus();
-      } else {
-        manualRow.style.display = 'none';
-        pathbar.style.display = 'flex';
-      }
+      setManualPathMode(manualMode, manualRow, pathbar, manualInput, currentBrowsePath);
     });
 
     function goToManualPath() {
       const val = manualInput.value.trim();
       if (val) {
         manualMode = false;
-        manualRow.style.display = 'none';
-        pathbar.style.display = 'flex';
+        setManualPathMode(false, manualRow, pathbar, manualInput, currentBrowsePath);
         navigateTo(val);
       }
     }
@@ -5069,8 +5434,7 @@
       if (e.key === 'Enter') goToManualPath();
       if (e.key === 'Escape') {
         manualMode = false;
-        manualRow.style.display = 'none';
-        pathbar.style.display = 'flex';
+        setManualPathMode(false, manualRow, pathbar, manualInput, currentBrowsePath);
       }
     });
 
@@ -5130,51 +5494,34 @@
 
   function showImportSessionModal() {
     if (selectedAgent !== 'claude') return;
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.id = 'import-session-overlay';
-
-    overlay.innerHTML = `
-      <div class="modal-panel modal-panel-wide">
-        <div class="modal-header">
-          <span class="modal-title">导入本地 CLI 会话</span>
-          <button class="modal-close-btn" id="is-close-btn">✕</button>
-        </div>
-        <div class="modal-body" id="is-body">
-          ${buildAgentContextCard('claude', '从 Claude 原生历史导入', '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。')}
-          <div class="modal-loading">正在加载…</div>
-        </div>
-      </div>
-    `;
-
-    document.body.appendChild(overlay);
-
-    function close() {
-      overlay.remove();
-      _onNativeSessions = null;
-    }
-
-    overlay.querySelector('#is-close-btn').addEventListener('click', close);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    const modal = createImportSessionsModal({
+      overlayId: 'import-session-overlay',
+      title: '导入本地 CLI 会话',
+      closeBtnId: 'is-close-btn',
+      bodyId: 'is-body',
+      agent: 'claude',
+      cardTitle: '从 Claude 原生历史导入',
+      cardCopy: '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。',
+      loadingText: '正在加载…',
+      onClose: () => {
+        _onNativeSessions = null;
+      },
+    });
 
     _onNativeSessions = (groups) => {
-      const body = overlay.querySelector('#is-body');
+      const body = modal.body;
       if (!body) return;
       if (!groups || groups.length === 0) {
-        body.innerHTML = `${buildAgentContextCard('claude', '从 Claude 原生历史导入', '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。')}<div class="modal-empty">未找到本地 CLI 会话</div>`;
+        modal.renderEmpty('未找到本地 CLI 会话');
         return;
       }
-      body.innerHTML = buildAgentContextCard('claude', '从 Claude 原生历史导入', '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。');
+      modal.renderBody();
       for (const group of groups) {
         const groupEl = document.createElement('div');
         groupEl.className = 'import-group';
-        // Convert slug dir to readable path
-        let readablePath = group.dir.replace(/-/g, '/');
-        if (!readablePath.startsWith('/')) readablePath = '/' + readablePath;
-        readablePath = readablePath.replace(/\/+/g, '/');
         const groupTitle = document.createElement('div');
         groupTitle.className = 'import-group-title';
-        groupTitle.textContent = readablePath;
+        groupTitle.textContent = formatClaudeImportGroupPath(group.dir);
         groupEl.appendChild(groupTitle);
         for (const sess of group.sessions) {
           const item = document.createElement('div');
@@ -5200,7 +5547,7 @@
             } else {
               if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
             }
-            close();
+            modal.close();
             send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
           });
           item.appendChild(info);
@@ -5216,42 +5563,29 @@
 
   function showImportCodexSessionModal() {
     if (selectedAgent !== 'codex') return;
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.id = 'import-codex-session-overlay';
-
-    overlay.innerHTML = `
-      <div class="modal-panel modal-panel-wide">
-        <div class="modal-header">
-          <span class="modal-title">导入本地 Codex 会话</span>
-          <button class="modal-close-btn" id="ics-close-btn">✕</button>
-        </div>
-        <div class="modal-body" id="ics-body">
-          ${buildAgentContextCard('codex', '从 Codex rollout 历史导入', '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。')}
-          <div class="modal-loading">正在加载 Codex 本地历史…</div>
-        </div>
-      </div>
-    `;
-
-    document.body.appendChild(overlay);
-
-    function close() {
-      overlay.remove();
-      _onCodexSessions = null;
-    }
-
-    overlay.querySelector('#ics-close-btn').addEventListener('click', close);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    const modal = createImportSessionsModal({
+      overlayId: 'import-codex-session-overlay',
+      title: '导入本地 Codex 会话',
+      closeBtnId: 'ics-close-btn',
+      bodyId: 'ics-body',
+      agent: 'codex',
+      cardTitle: '从 Codex rollout 历史导入',
+      cardCopy: '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。',
+      loadingText: '正在加载 Codex 本地历史…',
+      onClose: () => {
+        _onCodexSessions = null;
+      },
+    });
 
     _onCodexSessions = (items) => {
-      const body = overlay.querySelector('#ics-body');
+      const body = modal.body;
       if (!body) return;
       if (!items || items.length === 0) {
-        body.innerHTML = `${buildAgentContextCard('codex', '从 Codex rollout 历史导入', '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。')}<div class="modal-empty">未找到本地 Codex 会话</div>`;
+        modal.renderEmpty('未找到本地 Codex 会话');
         return;
       }
 
-      body.innerHTML = buildAgentContextCard('codex', '从 Codex rollout 历史导入', '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。');
+      modal.renderBody();
       items.forEach((sess) => {
         const item = document.createElement('div');
         item.className = 'import-item';
@@ -5298,7 +5632,7 @@
             ? confirm('已导入过此 Codex 会话，重新导入将覆盖已有内容。确认继续？')
             : confirm('将解析本地 Codex rollout 历史并导入当前 Web 视图。确认继续？');
           if (!confirmed) return;
-          close();
+          modal.close();
           send({ type: 'import_codex_session', threadId: sess.threadId, rolloutPath: sess.rolloutPath });
         });
 
@@ -5317,9 +5651,49 @@
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  function normalizeSafeHref(rawHref, options = {}) {
+    const href = String(rawHref || '').trim();
+    if (!href) return '';
+    const externalOnly = options.externalOnly === true;
+    const allowRelative = options.allowRelative !== false;
+    const allowDataImage = options.allowDataImage === true;
+    const lower = href.toLowerCase();
+    if (lower.startsWith('javascript:') || lower.startsWith('vbscript:')) return '';
+    if (lower.startsWith('data:')) {
+      if (allowDataImage && /^data:image\/[a-z0-9.+-]+;base64,/i.test(href)) return href;
+      return '';
+    }
+    if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(href)) {
+      try {
+        const parsed = new URL(href);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.toString();
+        if (!externalOnly && (parsed.protocol === 'mailto:' || parsed.protocol === 'tel:')) return parsed.toString();
+        return '';
+      } catch {
+        return '';
+      }
+    }
+    if (externalOnly || !allowRelative || href.startsWith('//')) return '';
+    if (/^(#|\/|\.\.?\/|\?)/.test(href)) return href;
+    return '';
+  }
+
+  function buildUpdateStatusHtml(info) {
+    const latestVersion = escapeHtml(info?.latestVersion || '');
+    const localVersion = escapeHtml(info?.localVersion || '');
+    const safeReleaseUrl = normalizeSafeHref(info?.releaseUrl, { externalOnly: true, allowRelative: false });
+    if (!safeReleaseUrl) {
+      return `有新版本 <strong>v${latestVersion}</strong>（当前 v${localVersion}）`;
+    }
+    return `有新版本 <strong>v${latestVersion}</strong>（当前 v${localVersion}）&nbsp;<a href="${escapeHtml(safeReleaseUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">查看更新</a>`;
+  }
+
   function timeAgo(dateStr) {
     if (!dateStr) return '';
-    const diff = Date.now() - new Date(dateStr).getTime();
+    const date = new Date(dateStr);
+    const timestamp = date.getTime();
+    if (Number.isNaN(timestamp)) return '';
+    const diff = Date.now() - timestamp;
     const mins = Math.floor(diff / 60000);
     if (mins < 1) return '刚刚';
     if (mins < 60) return `${mins}分钟前`;
@@ -5327,7 +5701,7 @@
     if (hours < 24) return `${hours}小时前`;
     const days = Math.floor(hours / 24);
     if (days < 30) return `${days}天前`;
-    return new Date(dateStr).toLocaleDateString('zh-CN');
+    return date.toLocaleDateString('zh-CN');
   }
 
   // --- Init ---
@@ -5335,36 +5709,47 @@
   resetChatView(selectedAgent);
   connect();
   window.addEventListener('resize', updateCwdBadge);
+  window.addEventListener('online', () => {
+    connectionState.reconnectAttempts = 0;
+    if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) connect();
+  });
 
   // Register Service Worker for mobile push notifications
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    navigator.serviceWorker.register('/sw.js').catch((error) => {
+      console.warn('[CC-SW]', 'service worker register failed', error);
+    });
   }
 
-  // Restore remembered password
-  const savedPw = localStorage.getItem('cc-web-pw');
-  if (savedPw) {
-    loginPassword.value = savedPw;
-    rememberPw.checked = true;
+  // Security hardening: remove legacy plain-text password cache
+  localStorage.removeItem('cc-web-pw');
+  if (rememberPw) {
+    rememberPw.checked = false;
+    rememberPw.disabled = true;
+    const rememberPwLabel = rememberPw.closest('.remember-label');
+    if (rememberPwLabel) rememberPwLabel.hidden = true;
   }
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
-    if (!ws || ws.readyState > 1) {
+    const now = Date.now();
+    if (now - lastVisibilityResyncAt < VISIBILITY_RESYNC_THROTTLE_MS) return;
+    lastVisibilityResyncAt = now;
+    if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) {
       // WS is dead, force reconnect
       connect();
-    } else if (ws.readyState === 1 && currentSessionId) {
+    } else if (connectionState.ws.readyState === WebSocket.OPEN && sessionState.currentSessionId) {
       // Preserve active streaming UI when returning to foreground.
-      if (isGenerating || currentSessionRunning) {
-        send({ type: 'load_session', sessionId: currentSessionId });
+      if (composeState.isGenerating || sessionState.currentSessionRunning) {
+        send({ type: 'load_session', sessionId: sessionState.currentSessionId });
       } else {
-        beginSessionSwitch(currentSessionId, { blocking: false, force: true });
+        beginSessionSwitch(sessionState.currentSessionId, { blocking: false, force: true });
       }
     }
   });
 
-  if (!authToken) {
+  if (!connectionState.authToken) {
     loginOverlay.hidden = false;
     app.hidden = true;
   } else {

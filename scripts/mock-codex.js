@@ -14,6 +14,10 @@ function readStdin() {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 (async function main() {
   const args = process.argv.slice(2);
   const isResume = args[0] === 'exec' && args[1] === 'resume';
@@ -73,6 +77,47 @@ function readStdin() {
       error: { message: 'Context window exceeded. Please use /compact and retry.' },
     })}\n`);
     process.exit(1);
+  }
+
+  if (input === 'trigger codex auth error') {
+    process.stderr.write('authentication failed: invalid api key\n');
+    process.exit(1);
+  }
+
+  const slowStreamMatch = input.match(/^trigger codex slow stream(?:\s+(.+))?$/i);
+  if (slowStreamMatch) {
+    const label = String(slowStreamMatch[1] || 'default').trim() || 'default';
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: `item_msg_start_${label}`,
+        type: 'agent_message',
+        text: `slow-start:${label} `,
+      },
+    })}\n`);
+    await sleep(1500);
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: `item_msg_mid_${label}`,
+        type: 'agent_message',
+        text: `slow-mid:${label} `,
+      },
+    })}\n`);
+    await sleep(1500);
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: `item_msg_end_${label}`,
+        type: 'agent_message',
+        text: `slow-end:${label}`,
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
+    })}\n`);
+    return;
   }
 
   const responseText = input === '/compact'
