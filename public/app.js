@@ -1812,7 +1812,6 @@
       inner.appendChild(details);
     });
 
-    if (toolItems.some((tool) => tool?.name === 'AskUserQuestion')) group.open = true;
     refreshToolGroupSummary(group);
     return group;
   }
@@ -2154,7 +2153,6 @@
       details.dataset.toolKind = toolKind(tool);
       details.classList.add(`codex-${toolKind(tool).replace(/_/g, '-')}`);
     }
-    if (tool.name === 'AskUserQuestion' || (!done && toolKind(tool) === 'command_execution')) details.open = true;
 
     const summary = document.createElement('summary');
     applyToolSummary(summary, tool, done);
@@ -2187,7 +2185,6 @@
     if (trailingGroup) {
       const inner = trailingGroup.querySelector('.tool-group-inner');
       inner.appendChild(details);
-      if (tool.name === 'AskUserQuestion') trailingGroup.open = true;
       refreshToolGroupSummary(trailingGroup);
     } else if (trailingCluster.length + 1 > TOOL_GROUP_THRESHOLD) {
       const group = createToolGroupElement([]);
@@ -2196,7 +2193,6 @@
       const inner = group.querySelector('.tool-group-inner');
       trailingCluster.forEach((child) => inner.appendChild(child));
       inner.appendChild(details);
-      if (tool.name === 'AskUserQuestion') group.open = true;
       refreshToolGroupSummary(group);
     } else {
       bubble.appendChild(details);
