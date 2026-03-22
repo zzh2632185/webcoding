@@ -201,8 +201,19 @@ else
       info "启动 Webcoding..."
       mkdir -p "$INSTALL_DIR/logs"
       nohup node "$INSTALL_DIR/server.js" >> "$INSTALL_DIR/logs/server.log" 2>&1 &
-      success "Webcoding 已在后台启动 (PID: $!)，访问 http://localhost:${PORT:-8001}"
-      info "停止服务: kill $!"
+      _BG_PID=$!
+      success "Webcoding 已在后台启动 (PID: $_BG_PID)，访问 http://localhost:${PORT:-8001}"
+      info "停止服务: kill $_BG_PID"
+      sleep 2
+      _INIT_PW=$(grep '自动生成初始密码' "$INSTALL_DIR/logs/server.log" 2>/dev/null | tail -1 | sed 's/.*自动生成初始密码:[[:space:]]*//')
+      if [ -n "$_INIT_PW" ]; then
+        echo ""
+        success "================================================"
+        success "  初始登录密码: $_INIT_PW"
+        success "  首次登录后将要求修改密码"
+        success "================================================"
+        echo ""
+      fi
       exit 0
       ;;
     3)
@@ -319,8 +330,20 @@ if ask_yn "现在立即启动 Webcoding?" "y"; then
   else
     mkdir -p "$INSTALL_DIR/logs"
     nohup node "$INSTALL_DIR/server.js" >> "$INSTALL_DIR/logs/server.log" 2>&1 &
-    success "Webcoding 已在后台启动 (PID: $!)，访问 http://localhost:$_PORT"
-    info "停止服务: kill $!"
+    _BG_PID=$!
+    success "Webcoding 已在后台启动 (PID: $_BG_PID)，访问 http://localhost:$_PORT"
+    info "停止服务: kill $_BG_PID"
+    # 等待服务初始化，提取初始密码
+    sleep 2
+    _INIT_PW=$(grep '自动生成初始密码' "$INSTALL_DIR/logs/server.log" 2>/dev/null | tail -1 | sed 's/.*自动生成初始密码:[[:space:]]*//')
+    if [ -n "$_INIT_PW" ]; then
+      echo ""
+      success "================================================"
+      success "  初始登录密码: $_INIT_PW"
+      success "  首次登录后将要求修改密码"
+      success "================================================"
+      echo ""
+    fi
   fi
 else
   info "稍后运行 'webcoding' 启动。"

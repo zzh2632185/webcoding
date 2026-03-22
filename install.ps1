@@ -170,10 +170,26 @@ switch ($choice) {
         $srv = Join-Path $INSTALL_DIR 'server.js'
         if (-not (Test-Path $srv)) { Write-Err '未找到 server.js，请先安装（选项 1）。' }
         Write-Info '启动 Webcoding...'
-        $p = Start-Process -FilePath 'node' -ArgumentList $srv -WindowStyle Hidden -PassThru
+        $logDir = Join-Path $INSTALL_DIR 'logs'
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+        $logFile = Join-Path $logDir 'server.log'
+        $p = Start-Process -FilePath 'node' -ArgumentList $srv -WindowStyle Hidden -RedirectStandardOutput $logFile -RedirectStandardError $logFile -PassThru
         $_port = if ($env:PORT) { $env:PORT } else { '8001' }
         Write-Success "Webcoding 已在后台启动 (PID: $($p.Id))，访问 http://localhost:$_port"
         Write-Info "停止服务: Stop-Process -Id $($p.Id)"
+        Start-Sleep -Seconds 2
+        if (Test-Path $logFile) {
+            $initPw = Get-Content $logFile | Select-String '自动生成初始密码' | Select-Object -Last 1
+            if ($initPw) {
+                $pw = ($initPw.Line -replace '.*自动生成初始密码:[\s]*', '').Trim()
+                Write-Host ''
+                Write-Success '================================================'
+                Write-Success "  初始登录密码: $pw"
+                Write-Success '  首次登录后将要求修改密码'
+                Write-Success '================================================'
+                Write-Host ''
+            }
+        }
         Pause-IfNeeded
         exit 0
     }
@@ -264,9 +280,26 @@ if ($startNow -notmatch '^[Nn]') {
             Write-Info "请先释放端口，或使用其他端口: `$env:PORT=<端口号>; node '$INSTALL_DIR\server.js'"
         }
     } else {
-        $p = Start-Process -FilePath 'node' -ArgumentList "$INSTALL_DIR\server.js" -WindowStyle Hidden -PassThru
+        $logDir = Join-Path $INSTALL_DIR 'logs'
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+        $logFile = Join-Path $logDir 'server.log'
+        $p = Start-Process -FilePath 'node' -ArgumentList "$INSTALL_DIR\server.js" -WindowStyle Hidden -RedirectStandardOutput $logFile -RedirectStandardError $logFile -PassThru
         Write-Success "Webcoding 已在后台启动 (PID: $($p.Id))，访问 http://localhost:$_port"
         Write-Info "停止服务: Stop-Process -Id $($p.Id)"
+        # 等待服务初始化，提取初始密码
+        Start-Sleep -Seconds 2
+        if (Test-Path $logFile) {
+            $initPw = Get-Content $logFile | Select-String '自动生成初始密码' | Select-Object -Last 1
+            if ($initPw) {
+                $pw = ($initPw.Line -replace '.*自动生成初始密码:[\s]*', '').Trim()
+                Write-Host ''
+                Write-Success '================================================'
+                Write-Success "  初始登录密码: $pw"
+                Write-Success '  首次登录后将要求修改密码'
+                Write-Success '================================================'
+                Write-Host ''
+            }
+        }
     }
 } else {
     Write-Info "稍后运行 'webcoding' 或双击 webcoding.cmd 启动。"
