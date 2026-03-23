@@ -2102,7 +2102,7 @@ function canAdoptLegacyRuntimeForCurrentChannel(agent, currentDescriptor, legacy
   return currentDescriptor?.mode === 'local';
 }
 
-function buildLegacyRuntimeChannelDescriptor(session, agent, currentDescriptor, legacy) {
+function buildLegacyRuntimeChannelDescriptor(session, agent, _currentDescriptor, legacy) {
   return {
     mode: 'legacy',
     legacy: true,
@@ -4015,8 +4015,6 @@ const server = http.createServer((req, res) => {
       const ext = path.extname(absPath).toLowerCase();
       if (ext === '.md' || ext === '.markdown') {
         // Render markdown to HTML
-        const body = data
-          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${path.basename(absPath).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>body{font-family:system-ui,sans-serif;font-size:15px;line-height:1.7;max-width:860px;margin:0 auto;padding:32px 24px;color:#222}pre{background:#f5f5f5;padding:12px;border-radius:4px;overflow-x:auto}code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:0.9em}pre code{background:none;padding:0}img{max-width:100%}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px 10px}th{background:#f5f5f5}blockquote{border-left:3px solid #ccc;margin:0;padding-left:14px;color:#666}a{color:#0066cc}hr{border:none;border-top:1px solid #ddd}</style>
@@ -5525,8 +5523,6 @@ function sanitizeToolInput(toolName, input) {
 const {
   buildClaudeSpawnSpec,
   buildCodexSpawnSpec,
-  processClaudeEvent,
-  processCodexEvent,
   processRuntimeEvent,
 } = createAgentRuntime({
   processEnv: process.env,
@@ -5704,7 +5700,6 @@ function parseJsonlToMessages(lines) {
 }
 
 const {
-  parseCodexRolloutLines,
   getCodexRolloutFiles,
   getImportedCodexThreadIds,
   parseCodexRolloutFile,
@@ -5747,7 +5742,7 @@ function readFileSliceUtf8(filePath, start, length) {
   try {
     const buffer = Buffer.alloc(safeLength);
     const bytesRead = fs.readSync(fd, buffer, 0, safeLength, safeStart);
-    return buffer.slice(0, bytesRead).toString('utf8');
+    return buffer.subarray(0, bytesRead).toString('utf8');
   } finally {
     fs.closeSync(fd);
   }
