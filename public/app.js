@@ -5920,42 +5920,64 @@
       modal.renderBody();
       for (const group of groups) {
         const groupEl = document.createElement('div');
-        groupEl.className = 'import-group';
+        groupEl.className = 'import-group import-group-collapsed';
+
         const groupTitle = document.createElement('div');
-        groupTitle.className = 'import-group-title';
+        groupTitle.className = 'import-group-title import-group-title-toggle';
         groupTitle.textContent = formatClaudeImportGroupPath(group.dir);
+        const arrow = document.createElement('span');
+        arrow.className = 'import-group-arrow';
+        arrow.textContent = '▶';
+        groupTitle.prepend(arrow);
+
+        const sessionList = document.createElement('div');
+        sessionList.className = 'import-group-sessions';
+
+        let sessionsRendered = false;
+        const renderSessions = () => {
+          if (sessionsRendered) return;
+          sessionsRendered = true;
+          for (const sess of group.sessions) {
+            const item = document.createElement('div');
+            item.className = 'import-item';
+            const info = document.createElement('div');
+            info.className = 'import-item-info';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'import-item-title';
+            titleEl.textContent = sess.title;
+            const meta = document.createElement('div');
+            meta.className = 'import-item-meta';
+            const cwdText = sess.cwd ? sess.cwd : '';
+            const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
+            meta.textContent = [cwdText, timeText].filter(Boolean).join(' · ');
+            info.appendChild(titleEl);
+            info.appendChild(meta);
+            const btn = document.createElement('button');
+            btn.className = 'import-item-btn';
+            btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
+            btn.addEventListener('click', () => {
+              if (sess.alreadyImported) {
+                if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
+              } else {
+                if (!confirm('由于 webcoding 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
+              }
+              modal.close();
+              send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
+            });
+            item.appendChild(info);
+            item.appendChild(btn);
+            sessionList.appendChild(item);
+          }
+        };
+
+        groupTitle.addEventListener('click', () => {
+          const collapsed = groupEl.classList.toggle('import-group-collapsed');
+          arrow.textContent = collapsed ? '▶' : '▼';
+          if (!collapsed) renderSessions();
+        });
+
         groupEl.appendChild(groupTitle);
-        for (const sess of group.sessions) {
-          const item = document.createElement('div');
-          item.className = 'import-item';
-          const info = document.createElement('div');
-          info.className = 'import-item-info';
-          const titleEl = document.createElement('div');
-          titleEl.className = 'import-item-title';
-          titleEl.textContent = sess.title;
-          const meta = document.createElement('div');
-          meta.className = 'import-item-meta';
-          const cwdText = sess.cwd ? sess.cwd : '';
-          const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
-          meta.textContent = [cwdText, timeText].filter(Boolean).join(' · ');
-          info.appendChild(titleEl);
-          info.appendChild(meta);
-          const btn = document.createElement('button');
-          btn.className = 'import-item-btn';
-          btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
-          btn.addEventListener('click', () => {
-            if (sess.alreadyImported) {
-              if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
-            } else {
-              if (!confirm('由于 webcoding 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
-            }
-            modal.close();
-            send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
-          });
-          item.appendChild(info);
-          item.appendChild(btn);
-          groupEl.appendChild(item);
-        }
+        groupEl.appendChild(sessionList);
         body.appendChild(groupEl);
       }
     };

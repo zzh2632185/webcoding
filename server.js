@@ -5799,9 +5799,16 @@ function handleListNativeSessions(ws) {
     const imported = getImportedSessionIds();
     const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR, { withFileTypes: true })
       .filter((entry) => entry.isDirectory());
+    // Decode dir name to real path and merge duplicates
+    const mergedMap = new Map(); // decodedKey -> { dir, sessions[] }
     for (const dirEntry of dirs) {
       const dir = dirEntry.name;
       const dirPath = path.join(CLAUDE_PROJECTS_DIR, dir);
+      // Decode: Claude encodes /a/b/c as -a-b-c
+      let decodedKey = dir;
+      if (dir.startsWith('-') && !dir.includes('/') && !dir.includes('\\')) {
+        decodedKey = '/' + dir.split('-').filter(Boolean).join('/');
+      }
       const sessionItems = [];
       try {
         const files = fs.readdirSync(dirPath, { withFileTypes: true })
@@ -5825,13 +5832,20 @@ function handleListNativeSessions(ws) {
         }
       } catch {}
       if (sessionItems.length > 0) {
-        sessionItems.sort((a, b) => {
-          if (!a.updatedAt) return 1;
-          if (!b.updatedAt) return -1;
-          return new Date(b.updatedAt) - new Date(a.updatedAt);
-        });
-        groups.push({ dir, sessions: sessionItems });
+        if (mergedMap.has(decodedKey)) {
+          mergedMap.get(decodedKey).sessions.push(...sessionItems);
+        } else {
+          mergedMap.set(decodedKey, { dir, sessions: sessionItems });
+        }
       }
+    }
+    for (const { dir, sessions } of mergedMap.values()) {
+      sessions.sort((a, b) => {
+        if (!a.updatedAt) return 1;
+        if (!b.updatedAt) return -1;
+        return new Date(b.updatedAt) - new Date(a.updatedAt);
+      });
+      groups.push({ dir, sessions });
     }
   } catch {}
   wsSend(ws, { type: 'native_sessions', groups });
