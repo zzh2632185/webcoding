@@ -1060,6 +1060,20 @@ html[data-theme="localhost"] .project-picker-item {
   background: #ffffff;
   color: var(--text-secondary);
 }
+html[data-theme="localhost"] .new-chat-btn:hover {
+  background: var(--cta-primary-hover-background);
+  border-color: rgba(15, 138, 167, 0.24);
+  color: var(--cta-button-color);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  transform: translateY(-1px);
+}
+html[data-theme="localhost"] .new-chat-arrow:hover {
+  background: rgba(15, 138, 167, 0.08);
+  border-color: rgba(15, 138, 167, 0.18);
+  color: var(--accent);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+  transform: translateY(-1px);
+}
 html[data-theme="localhost"] .new-chat-arrow,
 html[data-theme="localhost"] .modal-btn-secondary,
 html[data-theme="localhost"] .settings-actions .btn-test,
@@ -1268,12 +1282,25 @@ html[data-theme="localhost"] .new-chat-dropdown button {
 html[data-theme="localhost"] .new-chat-dropdown button:last-child {
   margin-bottom: 0;
 }
+html[data-theme="localhost"] .new-chat-dropdown button:hover {
+  background: rgba(15, 138, 167, 0.08);
+  border-color: rgba(15, 138, 167, 0.18);
+}
 html[data-theme="localhost"] .dropdown-divider {
   border-top: 1px solid var(--border-color);
   margin: 4px 0;
 }
 html[data-theme="localhost"] #import-session-btn {
   border-top: none !important;
+}
+html[data-theme="localhost"] #import-session-btn:hover {
+  color: var(--accent);
+  background: rgba(15, 138, 167, 0.08);
+  border-color: rgba(15, 138, 167, 0.18);
+}
+html[data-theme="localhost"] #import-session-btn:hover::before {
+  opacity: 0.8;
+  color: currentColor;
 }
 html[data-theme="localhost"] .project-group {
   border-radius: 14px;
