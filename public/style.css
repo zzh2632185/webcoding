@@ -1223,7 +1223,7 @@ html[data-theme="localhost"] .msg {
 html[data-theme="localhost"] .msg-avatar {
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: 50%;
   background: #f8fafc;
 }
 html[data-theme="localhost"] .msg.user .msg-avatar,
@@ -2546,17 +2546,16 @@ html[data-theme="localhost"] .localfile-pre {
   width: 32px;
   height: 32px;
   border: 2px solid var(--line);
-  border-radius: 0;
+  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
   flex-shrink: 0;
+  overflow: hidden;
 }
+.msg-avatar svg { display: block; }
 .msg.user .msg-avatar { background: var(--bg-bubble-user); color: var(--surface-strong); }
-.msg.assistant .msg-avatar { background: var(--blue); color: var(--text-primary); }
+.msg.assistant .msg-avatar { background: var(--blue); color: #fff; }
 
 .msg-bubble {
   padding: 12px 16px;
@@ -3655,7 +3654,8 @@ html[data-theme="localhost"] .localfile-pre {
 }
 
 @media (max-width: 480px) {
-  .msg-avatar { width: 28px; height: 28px; font-size: 11px; }
+  .msg-avatar { width: 28px; height: 28px; }
+  .msg-avatar svg { width: 15px; height: 15px; }
   .msg-bubble { padding: 10px 12px; font-size: 14px; }
   .msg-segment-text.msg-segment-process { font-size: 12px; }
   .msg-segment-text.msg-segment-final { font-size: 14px; }
