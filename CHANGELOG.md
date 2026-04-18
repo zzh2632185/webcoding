@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.4.3
+
+### 修复
+
+- **Codex 会话导入无响应** — 导入 Codex 会话后弹窗关闭但侧边栏和聊天区无变化：为服务端 `session_info` 响应增加 `imported` 标记，前端据此跳过 stale-response guard，确保导入结果始终立即呈现；同时清理可能残留的 loading overlay 状态，避免输入区被锁定
+- **Claude 原生会话导入同样受 stale guard 影响** — `handleImportNativeSession` 一并添加 `imported: true` 标记，与 Codex 导入保持一致
+- **Runtime-home 会话不可见** — 导入列表和导入操作现在同时扫描 `~/.codex/sessions/` 和 `./config/codex-runtime-home/sessions/` 两个目录，自定义 API 配置下的会话也能被导入；删除本地会话时同样支持 runtime-home 路径
+- **子 agent 会话 source 字段显示为 [object Object]** — source 为对象时（子 agent 会话）提取可读标签（`name` / `type`），避免原始 JSON 暴露在 UI 中
+
+### 改进
+
+- **常量统一** — `CODEX_RUNTIME_SESSIONS_DIR` 提升为模块级常量，消除三处重复计算
+
 ## v1.4.2
 
 ### 改进

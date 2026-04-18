@@ -5137,7 +5137,7 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   let removedFiles = 0;
   for (const filePath of rolloutPaths) {
     try {
-      if (filePath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(filePath)) {
+      if ((filePath.startsWith(CODEX_SESSIONS_DIR) || filePath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
         removedFiles++;
       }
@@ -5732,6 +5732,7 @@ function handleCheckUpdate(ws) {
 
 const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
 const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'sessions');
+const CODEX_RUNTIME_SESSIONS_DIR = path.join(CODEX_RUNTIME_HOME, 'sessions');
 const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
 const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
 
@@ -5832,6 +5833,7 @@ const {
   parseCodexRolloutFile,
 } = createCodexRolloutStore({
   codexSessionsDir: CODEX_SESSIONS_DIR,
+  codexRuntimeSessionsDir: CODEX_RUNTIME_SESSIONS_DIR,
   sessionsDir: SESSIONS_DIR,
   normalizeSession,
   sanitizeToolInput,
@@ -6063,6 +6065,7 @@ function handleImportNativeSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    imported: true,
     ...buildSessionRuntimeMeta(session),
   });
   sendSessionList(ws);
@@ -6086,7 +6089,12 @@ function handleListCodexSessions(ws) {
       cwd: parsed.meta.cwd || null,
       updatedAt: parsed.meta.updatedAt || null,
       cliVersion: parsed.meta.cliVersion || '',
-      source: parsed.meta.source || '',
+      source: (() => {
+        const s = parsed.meta.source;
+        if (typeof s === 'string') return s;
+        if (s && typeof s === 'object') return s.name || s.type || JSON.stringify(s);
+        return '';
+      })(),
       rolloutPath: filePath,
       alreadyImported: imported.has(parsed.meta.threadId),
     });
@@ -6111,7 +6119,7 @@ function handleImportCodexSession(ws, msg) {
 
   let parsed = null;
   const requestedPath = msg?.rolloutPath ? path.resolve(String(msg.rolloutPath)) : '';
-  if (requestedPath && requestedPath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(requestedPath)) {
+  if (requestedPath && (requestedPath.startsWith(CODEX_SESSIONS_DIR) || requestedPath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(requestedPath)) {
     parsed = parseCodexRolloutFile(requestedPath);
   }
   if (!parsed) {
@@ -6178,6 +6186,7 @@ function handleImportCodexSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    imported: true,
     ...buildSessionRuntimeMeta(session),
   });
   sendSessionList(ws);

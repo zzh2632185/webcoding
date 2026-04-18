@@ -2582,17 +2582,32 @@
 
   function handleSessionInfoMessage(msg) {
     const snapshot = normalizeSessionSnapshot(msg);
-    
+
+    // Imported sessions bypass the stale-response guard so the user always
+    // sees the result of a deliberate import action, regardless of whether
+    // another session is still loading.
+    if (msg.imported === true) {
+      // Clear any in-progress load for a different session so the
+      // loading overlay does not remain visible.
+      if (sessionState.activeSessionLoad && sessionState.activeSessionLoad.sessionId !== msg.sessionId) {
+        setSessionLoading(null);
+      }
+      applySessionSnapshot(snapshot, { immediate: true, suppressUnreadToast: false });
+      cacheSessionSnapshot(snapshot);
+      finishSessionSwitch(msg.sessionId);
+      return;
+    }
+
     // Guard against stale responses from previous session loads
     // Only apply if this is the expected session or if no load is in progress
     const expectedSessionId = sessionState.activeSessionLoad?.sessionId;
     const isExpectedResponse = !expectedSessionId || expectedSessionId === msg.sessionId;
-    
+
     // If we're waiting for a different session, ignore this stale response
     if (!isExpectedResponse && sessionState.activeSessionLoad?.blocking) {
       return;
     }
-    
+
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
       sessionState.activeSessionLoad.snapshot = snapshot;
     }
