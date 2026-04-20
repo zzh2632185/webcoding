@@ -5567,81 +5567,149 @@
   function buildUnifiedSettingsPanelHtml(providerOptions) {
     return `
       <h3>
-        ⚙ 系统设置
+        设置
         <button class="settings-close" title="关闭">&times;</button>
       </h3>
 
-      <div class="settings-section-title">代理渠道</div>
-      <div class="settings-field">
-        <label>Claude 渠道</label>
-        <select class="settings-select" id="unified-claude-mode"></select>
+      <div class="settings-nav-list" id="settings-nav-list">
+        <button class="settings-nav-card" data-settings-page="agent">
+          <div class="settings-nav-card-main">
+            <div class="settings-nav-card-title">代理渠道</div>
+            <div class="settings-nav-card-meta">Claude / Codex 渠道与 AI 提供商</div>
+          </div>
+          <span class="settings-nav-card-arrow">›</span>
+        </button>
+        <button class="settings-nav-card" data-settings-page="notify">
+          <div class="settings-nav-card-main">
+            <div class="settings-nav-card-title">通知设置</div>
+            <div class="settings-nav-card-meta">任务完成推送通知</div>
+          </div>
+          <span class="settings-nav-card-arrow">›</span>
+        </button>
+        <button class="settings-nav-card" data-settings-page="appearance">
+          <div class="settings-nav-card-main">
+            <div class="settings-nav-card-title">界面主题</div>
+            <div class="settings-nav-card-meta">切换工作台外观</div>
+          </div>
+          <span class="settings-nav-card-arrow">›</span>
+        </button>
+        <button class="settings-nav-card" data-settings-page="system">
+          <div class="settings-nav-card-main">
+            <div class="settings-nav-card-title">系统</div>
+            <div class="settings-nav-card-meta">密码、版本更新</div>
+          </div>
+          <span class="settings-nav-card-arrow">›</span>
+        </button>
+        <button class="settings-nav-card" data-settings-page="tunnel">
+          <div class="settings-nav-card-main">
+            <div class="settings-nav-card-title">远程访问</div>
+            <div class="settings-nav-card-meta">Cloudflare Tunnel</div>
+          </div>
+          <span class="settings-nav-card-arrow">›</span>
+        </button>
       </div>
-      <div class="settings-field">
-        <label>Codex 渠道</label>
-        <select class="settings-select" id="unified-codex-mode"></select>
-      </div>
 
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">AI 提供商</div>
-      <div id="unified-template-area"></div>
-      <div class="settings-actions">
-        <button class="btn-save" id="unified-save-btn">保存渠道配置</button>
-      </div>
-      <div class="settings-status" id="unified-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">通知设置</div>
-      <div class="settings-field">
-        <label>通知方式</label>
-        <select class="settings-select" id="notify-provider">
-          ${providerOptions.map((o) => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div id="notify-fields"></div>
-      <div class="settings-actions">
-        <button class="btn-test" id="notify-test-btn">测试</button>
-        <button class="btn-save" id="notify-save-btn">保存</button>
-      </div>
-      <div class="settings-status" id="notify-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">界面主题</div>
-      <div class="settings-field">
-        <label>配色方案</label>
-        <select class="settings-select" id="theme-select">
-          <option value="default">默认主题</option>
-          <option value="localhost">极简主题</option>
-        </select>
-      </div>
-      <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。</div>
-      <div class="settings-status" id="theme-status"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">系统</div>
-      <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:10px">
-        <button class="btn-test" id="pw-open-modal-btn" style="padding:6px 16px">修改密码</button>
-        <button class="btn-test" id="check-update-btn" style="padding:6px 16px">检查更新</button>
-      </div>
-      <div class="settings-status" id="update-status" style="margin-top:8px"></div>
-
-      <div class="settings-divider"></div>
-
-      <div class="settings-section-title">远程访问 (Cloudflare Tunnel)</div>
-      <div id="tunnel-panel-content">
-        <div class="settings-status" id="tunnel-install-status" style="margin-bottom:8px"></div>
-        <div class="settings-actions" style="margin-top:0;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="btn-save" id="tunnel-install-btn" style="padding:6px 16px;display:none">一键安装 cloudflared</button>
-          <button class="btn-save" id="tunnel-start-btn" style="padding:6px 16px;display:none">开启 Tunnel</button>
-          <button class="btn-test" id="tunnel-stop-btn" style="padding:6px 16px;display:none">关闭 Tunnel</button>
+      <div class="settings-subpage" id="settings-page-agent" hidden>
+        <div class="settings-header settings-subpage-header">
+          <button class="settings-back" id="settings-back-agent" title="返回">←</button>
+          <div class="settings-subpage-copy">
+            <div class="settings-subpage-kicker">代理</div>
+            <h3>渠道与提供商</h3>
+          </div>
         </div>
-        <div class="settings-status" id="tunnel-status" style="margin-top:8px"></div>
-        <div id="tunnel-qr-area" style="margin-top:12px;display:none;text-align:center">
-          <div id="tunnel-qr-canvas" style="display:inline-block;padding:10px;background:#fff;border-radius:8px"></div>
-          <div style="font-size:11px;color:var(--text-secondary,#888);margin-top:6px">扫码访问</div>
+        <div class="settings-field">
+          <label>Claude 渠道</label>
+          <select class="settings-select" id="unified-claude-mode"></select>
+        </div>
+        <div class="settings-field">
+          <label>Codex 渠道</label>
+          <select class="settings-select" id="unified-codex-mode"></select>
+        </div>
+        <div class="settings-divider-light"></div>
+        <div class="settings-section-title">AI 提供商</div>
+        <div id="unified-template-area"></div>
+        <div class="settings-actions">
+          <button class="btn-save" id="unified-save-btn">保存渠道配置</button>
+        </div>
+        <div class="settings-status" id="unified-status"></div>
+      </div>
+
+      <div class="settings-subpage" id="settings-page-notify" hidden>
+        <div class="settings-header settings-subpage-header">
+          <button class="settings-back" id="settings-back-notify" title="返回">←</button>
+          <div class="settings-subpage-copy">
+            <div class="settings-subpage-kicker">通知</div>
+            <h3>推送通知</h3>
+          </div>
+        </div>
+        <div class="settings-field">
+          <label>通知方式</label>
+          <select class="settings-select" id="notify-provider">
+            ${providerOptions.map((o) => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('')}
+          </select>
+        </div>
+        <div id="notify-fields"></div>
+        <div class="settings-actions">
+          <button class="btn-test" id="notify-test-btn">测试</button>
+          <button class="btn-save" id="notify-save-btn">保存</button>
+        </div>
+        <div class="settings-status" id="notify-status"></div>
+      </div>
+
+      <div class="settings-subpage" id="settings-page-appearance" hidden>
+        <div class="settings-header settings-subpage-header">
+          <button class="settings-back" id="settings-back-appearance" title="返回">←</button>
+          <div class="settings-subpage-copy">
+            <div class="settings-subpage-kicker">外观</div>
+            <h3>界面主题</h3>
+          </div>
+        </div>
+        <div class="settings-field">
+          <label>配色方案</label>
+          <select class="settings-select" id="theme-select">
+            <option value="default">默认主题</option>
+            <option value="localhost">极简主题</option>
+          </select>
+        </div>
+        <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。</div>
+        <div class="settings-status" id="theme-status"></div>
+      </div>
+
+      <div class="settings-subpage" id="settings-page-system" hidden>
+        <div class="settings-header settings-subpage-header">
+          <button class="settings-back" id="settings-back-system" title="返回">←</button>
+          <div class="settings-subpage-copy">
+            <div class="settings-subpage-kicker">系统</div>
+            <h3>系统管理</h3>
+          </div>
+        </div>
+        <div class="settings-actions" style="margin-top:0;flex-wrap:wrap;gap:8px">
+          <button class="btn-test" id="pw-open-modal-btn">修改密码</button>
+          <button class="btn-test" id="check-update-btn">检查更新</button>
+        </div>
+        <div class="settings-status" id="update-status" style="margin-top:8px"></div>
+      </div>
+
+      <div class="settings-subpage" id="settings-page-tunnel" hidden>
+        <div class="settings-header settings-subpage-header">
+          <button class="settings-back" id="settings-back-tunnel" title="返回">←</button>
+          <div class="settings-subpage-copy">
+            <div class="settings-subpage-kicker">远程</div>
+            <h3>Cloudflare Tunnel</h3>
+          </div>
+        </div>
+        <div id="tunnel-panel-content">
+          <div class="settings-status" id="tunnel-install-status" style="margin-bottom:8px"></div>
+          <div class="settings-actions" style="margin-top:0;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn-save" id="tunnel-install-btn" style="display:none">一键安装 cloudflared</button>
+            <button class="btn-save" id="tunnel-start-btn" style="display:none">开启 Tunnel</button>
+            <button class="btn-test" id="tunnel-stop-btn" style="display:none">关闭 Tunnel</button>
+          </div>
+          <div class="settings-status" id="tunnel-status" style="margin-top:8px"></div>
+          <div id="tunnel-qr-area" style="margin-top:12px;display:none;text-align:center">
+            <div id="tunnel-qr-canvas" style="display:inline-block;padding:10px;background:#fff;border-radius:8px"></div>
+            <div style="font-size:11px;color:var(--text-secondary,#888);margin-top:6px">扫码访问</div>
+          </div>
         </div>
       </div>
     `;
@@ -5771,6 +5839,36 @@
     const tunnelInstallStatusEl = panel.querySelector('#tunnel-install-status');
     const tunnelQrArea = panel.querySelector('#tunnel-qr-area');
     const tunnelQrCanvas = panel.querySelector('#tunnel-qr-canvas');
+
+    // --- Settings sub-page navigation ---
+    const navList = panel.querySelector('#settings-nav-list');
+    const subpages = panel.querySelectorAll('.settings-subpage');
+
+    function showSettingsPage(pageId) {
+      if (navList) navList.hidden = true;
+      subpages.forEach((sp) => { sp.hidden = sp.id !== pageId; });
+      // Scroll subpage to top
+      const target = panel.querySelector('#' + pageId);
+      if (target) target.scrollTop = 0;
+    }
+
+    function showSettingsNav() {
+      if (navList) navList.hidden = false;
+      subpages.forEach((sp) => { sp.hidden = true; });
+    }
+
+    if (navList) {
+      navList.addEventListener('click', (e) => {
+        const card = e.target.closest('[data-settings-page]');
+        if (!card) return;
+        const page = card.dataset.settingsPage;
+        showSettingsPage('settings-page-' + page);
+      });
+    }
+
+    panel.querySelectorAll('.settings-back').forEach((btn) => {
+      btn.addEventListener('click', showSettingsNav);
+    });
 
     function drawQrCode(url) {
       tunnelQrCanvas.innerHTML = '';
