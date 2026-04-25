@@ -19,6 +19,7 @@
     { cmd: '/clear', desc: '清除当前会话' },
     { cmd: '/model', desc: '查看/切换模型' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
+    { cmd: '/reasoning', desc: '查看/切换 Codex 思考级别' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/help', desc: '显示帮助' },
@@ -61,6 +62,7 @@
   const FILE_REF_TRANSFER_TYPE = 'application/x-webcoding-file-ref';
   const MAX_PENDING_FILE_REFS = 8;
   const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
+  const MAX_QUEUED_MESSAGES = 10;
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
   const DEFAULT_THEME = 'default';
@@ -74,6 +76,19 @@
     { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
     { value: 'default', label: '默认', desc: '标准权限审批' },
   ];
+  const CODEX_REASONING_EFFORT_OPTIONS = [
+    { value: '', label: '默认', desc: '不传覆盖参数，沿用 Codex 配置文件或模型默认' },
+    { value: 'xhigh', label: 'XHigh', desc: '最深思考，延迟和消耗最高' },
+    { value: 'high', label: 'High', desc: '复杂调试、长规划和高价值任务' },
+    { value: 'medium', label: 'Medium', desc: '质量和速度均衡' },
+    { value: 'low', label: 'Low', desc: '更快，适合日常执行和简单规划' },
+    { value: 'minimal', label: 'Minimal', desc: '极轻量思考' },
+    { value: 'none', label: 'None', desc: '最低延迟，不适合复杂工具链任务' },
+  ];
+  const CODEX_REASONING_EFFORT_LABELS = CODEX_REASONING_EFFORT_OPTIONS.reduce((acc, item) => {
+    acc[item.value] = item.label;
+    return acc;
+  }, {});
 
 
   // --- State ---
@@ -95,6 +110,7 @@
   let cmdMenuDelegated = false;
   let currentMode = 'yolo';
   let currentModel = '';
+  let currentReasoningEffort = '';
   let currentActiveRuntime = null;
   let currentRuntimeCount = 0;
   const savedAgent = localStorage.getItem('webcoding-agent');
@@ -108,6 +124,7 @@
   let pendingAttachments = [];
   let uploadingAttachments = [];
   let pendingFileRefs = [];
+  let queuedMessages = [];
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
@@ -167,6 +184,8 @@
     set currentMode(value) { currentMode = value; },
     get currentModel() { return currentModel; },
     set currentModel(value) { currentModel = value; },
+    get currentReasoningEffort() { return currentReasoningEffort; },
+    set currentReasoningEffort(value) { currentReasoningEffort = value; },
     get currentActiveRuntime() { return currentActiveRuntime; },
     set currentActiveRuntime(value) { currentActiveRuntime = value; },
     get currentRuntimeCount() { return currentRuntimeCount; },
@@ -198,6 +217,8 @@
     set uploadingAttachments(value) { uploadingAttachments = value; },
     get pendingFileRefs() { return pendingFileRefs; },
     set pendingFileRefs(value) { pendingFileRefs = value; },
+    get queuedMessages() { return queuedMessages; },
+    set queuedMessages(value) { queuedMessages = value; },
   };
 
   // --- DOM ---
@@ -247,10 +268,12 @@
   const chatCwd = $('#topbar-chat-cwd');
   const costDisplay = $('#topbar-cost-display');
   const attachmentTray = $('#attachment-tray');
+  const queuedMessageList = $('#queued-message-list');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
   const messagesDiv = $('#messages');
   const msgInput = $('#msg-input');
+  const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
@@ -578,6 +601,7 @@
     const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
     const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '默认模型' : 'Default');
+    const reasoningLabel = sessionState.currentAgent === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '不适用';
     const channelLabel = sessionState.currentActiveRuntime?.channelLabel || '当前渠道未建立';
     const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
@@ -588,6 +612,7 @@
       { action: 'new-session', label: '新建会话', primary: true },
       { action: 'import-session', label: '导入历史' },
       { action: 'switch-model', label: '切换模型' },
+      ...(sessionState.currentAgent === 'codex' ? [{ action: 'switch-reasoning', label: '切换思考' }] : []),
       { action: 'switch-mode', label: '切换模式' },
       ...(activeProject ? [{ action: 'focus-project', label: '定位项目', projectId: activeProject.id }] : []),
       { action: 'open-settings', label: '打开设置' },
@@ -624,6 +649,7 @@
             <div class="insights-detail-item"><span>当前代理</span><strong>${escapeHtml(currentAgentLabel)}</strong></div>
             <div class="insights-detail-item"><span>当前渠道</span><strong>${escapeHtml(channelLabel)}</strong></div>
             <div class="insights-detail-item"><span>模型</span><strong>${escapeHtml(modelLabel)}</strong></div>
+            <div class="insights-detail-item"><span>思考</span><strong>${escapeHtml(reasoningLabel)}</strong></div>
             <div class="insights-detail-item"><span>模式</span><strong>${escapeHtml(modeLabel)}</strong></div>
             <div class="insights-detail-item"><span>子线程</span><strong>${escapeHtml(runtimeCountLabel)}</strong></div>
             <div class="insights-detail-item"><span>消息数</span><strong>${currentMessageCount > 0 ? `${currentMessageCount} 条` : '暂无'}</strong></div>
@@ -1465,6 +1491,7 @@
     const label = AGENT_LABELS[agent] || AGENT_LABELS.claude;
     const sessionCount = typeof getVisibleSessions === 'function' ? getVisibleSessions().length : 0;
     const projectCount = Array.isArray(projects) ? projects.length : 0;
+    const reasoningLabel = normalizeAgent(agent) === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '';
     return `
       <div class="welcome-msg">
         <div class="welcome-header">
@@ -1484,12 +1511,19 @@
             <strong>${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode}</strong>
             <span>模式</span>
           </div>
+          ${normalizeAgent(agent) === 'codex' ? `
+          <div class="welcome-stat">
+            <strong>${escapeHtml(reasoningLabel)}</strong>
+            <span>思考</span>
+          </div>
+          ` : ''}
         </div>
         <div class="welcome-actions">
           ${buildWorkspaceActionButtons([
             { action: 'new-session', label: '新建会话', primary: true },
             { action: 'import-session', label: '导入历史' },
             { action: 'switch-model', label: '切换模型' },
+            ...(normalizeAgent(agent) === 'codex' ? [{ action: 'switch-reasoning', label: '切换思考' }] : []),
           ], { compact: true })}
         </div>
         <div class="welcome-panels">
@@ -1497,6 +1531,7 @@
             <div class="welcome-panel-kicker">常用指令</div>
             <ul class="welcome-list">
               <li><code>/model</code> 查看或切换模型</li>
+              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li>' : ''}
               <li><code>/mode</code> 切换权限模式</li>
               <li><code>/compact</code> 压缩上下文</li>
             </ul>
@@ -1522,6 +1557,10 @@
 
   function getAgentModeStorageKey(agent) {
     return `webcoding-mode-${normalizeAgent(agent)}`;
+  }
+
+  function getAgentReasoningEffortStorageKey(agent) {
+    return `webcoding-reasoning-effort-${normalizeAgent(agent)}`;
   }
 
   function getLastSessionForAgent(agent) {
@@ -1632,6 +1671,7 @@
     const base = JSON.stringify({
       title: snapshot.title || '',
       mode: snapshot.mode || '',
+      reasoningEffort: snapshot.reasoningEffort || '',
       model: snapshot.model || '',
       agent: snapshot.agent || '',
       activeRuntime: snapshot.activeRuntime || null,
@@ -1668,6 +1708,7 @@
       messages: cloneMessages(payload.messages || []),
       title: payload.title || '新会话',
       mode: payload.mode || 'yolo',
+      reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort),
       model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
       activeRuntime: normalizedRuntime,
       activeChannelKey: payload.activeChannelKey || normalizedRuntime?.channelKey || null,
@@ -1680,6 +1721,9 @@
       projectId: payload.projectId || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
       totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
+      currentUsage: payload.currentUsage ? deepClone(payload.currentUsage) : null,
+      lastUsage: payload.lastUsage ? deepClone(payload.lastUsage) : null,
+      contextWindowTokens: Number(payload.contextWindowTokens || payload.modelContextWindow || 0) || null,
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       historyPending: !!payload.historyPending,
@@ -1776,6 +1820,7 @@
     if (meta) {
       snapshot.title = meta.title || snapshot.title;
       snapshot.agent = normalizeAgent(meta.agent || snapshot.agent);
+      snapshot.reasoningEffort = normalizeCodexReasoningEffort(meta.reasoningEffort || snapshot.reasoningEffort);
       snapshot.hasUnread = !!meta.hasUnread;
       snapshot.updated = meta.updated || snapshot.updated;
       snapshot.isRunning = !!meta.isRunning;
@@ -1967,11 +2012,102 @@
     syncAttachmentActions();
   }
 
-  function formatTokenCount(tokens) {
+  function formatTokenCount(tokens, options = {}) {
     const value = Math.max(0, Number(tokens) || 0);
-    if (value >= 1000000) return `${(value / 1000000).toFixed(value >= 10000000 ? 0 : 1)}M`;
-    if (value >= 1000) return `${Math.round(value / 1000)}K`;
+    const trimTrailingZero = options.trimTrailingZero === true;
+    if (value >= 1000000) {
+      const formatted = (value / 1000000).toFixed(value >= 10000000 ? 0 : 1);
+      return `${trimTrailingZero ? formatted.replace(/\.0$/, '') : formatted}M`;
+    }
+    if (value >= 1000) {
+      if (trimTrailingZero) {
+        const formatted = (value / 1000).toFixed(1).replace(/\.0$/, '');
+        return `${formatted}K`;
+      }
+      return `${Math.round(value / 1000)}K`;
+    }
     return String(Math.round(value));
+  }
+
+  function getUsageTotalTokens(usage) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return 0;
+    if (normalized.totalTokens > 0) return normalized.totalTokens;
+    return (Number(normalized.inputTokens) || 0)
+      + (Number(normalized.outputTokens) || 0)
+      + (Number(normalized.reasoningOutputTokens) || 0);
+  }
+
+  function getContextUsageMetrics() {
+    // Context window usage must describe the current runtime request / latest turn,
+    // not the lifetime token spend accumulated by the whole chat session.
+    const currentUsage = normalizeUsageShape(contextRuntimeUsage.currentUsage);
+    const used = getUsageTotalTokens(currentUsage);
+    const limit = Number(contextRuntimeUsage.contextWindowTokens || inferContextWindowTokens() || 0) || 0;
+    if (!limit) return null;
+    if (!used) {
+      return {
+        used: 0,
+        limit,
+        percentage: 0,
+        pending: true,
+        displayUsed: '暂无',
+        displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
+      };
+    }
+    // Provider events that exceed the model window by a large margin are almost
+    // certainly cumulative totals accidentally shaped like current usage. Keep
+    // the ring visible, but do not show impossible percentages such as 2359.9%.
+    if (used > limit * 1.5) {
+      return {
+        used: 0,
+        limit,
+        percentage: 0,
+        pending: true,
+        ignoredAnomalousUsage: true,
+        displayUsed: '暂无',
+        displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
+      };
+    }
+    const percentage = Math.max(0, used / limit * 100);
+    return {
+      used,
+      limit,
+      percentage,
+      pending: false,
+      displayUsed: formatTokenCount(used, { trimTrailingZero: true }),
+      displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
+    };
+  }
+
+  function renderContextUsageIndicator() {
+    if (!contextUsageIndicator) return;
+    const metrics = getContextUsageMetrics();
+    if (!metrics) {
+      contextUsageIndicator.hidden = true;
+      contextUsageIndicator.innerHTML = '';
+      contextUsageIndicator.removeAttribute('title');
+      return;
+    }
+    const size = 24;
+    const stroke = 2.5;
+    const radius = (size - stroke) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const dashOffset = circumference - Math.min(100, metrics.percentage) / 100 * circumference;
+    const level = metrics.pending ? 'pending' : (metrics.percentage > 90 ? 'danger' : (metrics.percentage > 70 ? 'warning' : 'normal'));
+    const popoverText = metrics.pending
+      ? `${metrics.ignoredAnomalousUsage ? '已忽略异常累计 token' : '等待本轮 token 数据'} · 上限 ${metrics.displayLimit}`
+      : `${metrics.percentage.toFixed(1)}% · ${metrics.displayUsed} / ${metrics.displayLimit} 上下文已使用`;
+    contextUsageIndicator.hidden = false;
+    contextUsageIndicator.dataset.level = level;
+    contextUsageIndicator.title = popoverText;
+    contextUsageIndicator.innerHTML = `
+      <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true">
+        <circle class="context-usage-track" cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke-width="${stroke}"></circle>
+        <circle class="context-usage-progress" cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${circumference.toFixed(3)}" stroke-dashoffset="${dashOffset.toFixed(3)}"></circle>
+      </svg>
+      <div class="context-usage-popover" role="tooltip">${escapeHtml(popoverText)}</div>
+    `;
   }
 
   function estimateTokensFromText(text) {
@@ -2015,7 +2151,7 @@
       reasoningOutputTokens: Math.max(0, next.reasoningOutputTokens - prev.reasoningOutputTokens),
       totalTokens: Math.max(0, next.totalTokens - prev.totalTokens),
     };
-    return (delta.inputTokens || delta.outputTokens || delta.cachedInputTokens) ? delta : null;
+    return (delta.inputTokens || delta.outputTokens || delta.cachedInputTokens || delta.reasoningOutputTokens || delta.totalTokens) ? delta : null;
   }
 
   function inferContextWindowTokens() {
@@ -2038,6 +2174,7 @@
       contextWindowTokens: Number(snapshot?.contextWindowTokens || snapshot?.modelContextWindow || 0) || null,
     };
     renderContextBar();
+    renderContextUsageIndicator();
   }
 
   function renderContextBar() {
@@ -2667,6 +2804,9 @@
   function updateAgentScopedUI() {
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = sessionState.currentSessionId ? (AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent) : '未开始';
+    if (sessionState.currentAgent !== 'codex' && selectedAgent !== 'codex' && sessionState.currentReasoningEffort) {
+      sessionState.currentReasoningEffort = '';
+    }
     // Sync agent tabs
     document.querySelectorAll('.agent-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.agent === selectedAgent);
@@ -2678,8 +2818,13 @@
     // Sync mobile selects
     const mas = document.getElementById('mobile-agent-select');
     const mms = document.getElementById('mobile-mode-select');
+    const mrs = document.getElementById('mobile-reasoning-select');
     if (mas) mas.value = selectedAgent;
     if (mms) mms.value = sessionState.currentMode;
+    if (mrs) {
+      mrs.value = sessionState.currentReasoningEffort;
+      mrs.hidden = selectedAgent !== 'codex';
+    }
     if (importSessionBtn) {
       importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
     }
@@ -2692,11 +2837,28 @@
     return localStorage.getItem(getAgentModeStorageKey(agent)) || 'yolo';
   }
 
+  function normalizeCodexReasoningEffort(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(CODEX_REASONING_EFFORT_LABELS, raw) ? raw : '';
+  }
+
+  function getReasoningEffortLabel(value) {
+    const normalized = normalizeCodexReasoningEffort(value);
+    return CODEX_REASONING_EFFORT_LABELS[normalized] || CODEX_REASONING_EFFORT_LABELS[''];
+  }
+
+  function getSavedReasoningEffortForAgent(agent) {
+    return normalizeAgent(agent) === 'codex'
+      ? normalizeCodexReasoningEffort(localStorage.getItem(getAgentReasoningEffortStorageKey(agent)))
+      : '';
+  }
+
   function setSelectedAgent(agent, options = {}) {
     selectedAgent = normalizeAgent(agent);
     localStorage.setItem('webcoding-agent', selectedAgent);
     if (options.syncMode) {
       sessionState.currentMode = getSavedModeForAgent(selectedAgent);
+      sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(selectedAgent);
       modeSelect.value = sessionState.currentMode;
     }
     updateAgentScopedUI();
@@ -2762,13 +2924,14 @@
     composeState.uploadingAttachments = [];
     composeState.pendingFileRefs = [];
     contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
+    renderContextUsageIndicator();
     clearFileTree();
     composeState.activeToolCalls.clear();
     _previewCodeMap.clear();
     _previewCodeId = 0;
-    sendBtn.hidden = false;
-    abortBtn.hidden = true;
+    updateComposerActionButtons();
     sessionState.currentMode = getSavedModeForAgent(baseAgent);
+    sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(baseAgent);
     modeSelect.value = sessionState.currentMode;
     updateAgentScopedUI();
     chatTitle.textContent = '新会话';
@@ -2776,21 +2939,28 @@
     messagesDiv.innerHTML = buildWelcomeMarkup(baseAgent);
     setStatsDisplay(null);
     renderPendingAttachments();
+    renderQueuedMessages();
     highlightActiveSession();
     renderWorkspaceInsights();
   }
 
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
-    const preserveStreaming = !!(options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning);
+    const preserveStreaming = !!(
+      (options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning) ||
+      (composeState.isGenerating && !sessionState.currentSessionId && snapshot.sessionId && !options.immediate)
+    );
     if (composeState.isGenerating && !preserveStreaming) {
       composeState.isGenerating = false;
-      sendBtn.hidden = false;
-      abortBtn.hidden = true;
+      updateComposerActionButtons();
       composeState.pendingText = '';
       composeState.activeToolCalls.clear();
     }
+    const previousSessionId = sessionState.currentSessionId;
     sessionState.currentSessionId = snapshot.sessionId;
+    if ((!previousSessionId || composeState.isGenerating) && snapshot.sessionId) {
+      bindUnassignedQueuedMessagesToSession(snapshot.sessionId);
+    }
     sessionState.loadedHistorySessionId = snapshot.sessionId;
     setLastSessionForAgent(snapshot.agent, sessionState.currentSessionId);
     chatTitle.textContent = snapshot.title || '新会话';
@@ -2816,6 +2986,8 @@
       modeSelect.value = sessionState.currentMode;
       localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
     }
+    sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(snapshot.reasoningEffort);
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
     updateAgentScopedUI();
     sessionState.currentModel = snapshot.model || '';
     sessionState.currentActiveRuntime = snapshot.activeRuntime ? deepClone(snapshot.activeRuntime) : null;
@@ -2830,6 +3002,8 @@
       showToast('后台任务已完成', snapshot.sessionId);
     }
     renderWorkspaceInsights();
+    renderContextUsageIndicator();
+    renderQueuedMessages();
     if (nextGitCwd && (gitCwdChanged || !gitState.status)) {
       requestGitStatus({ silent: true });
     }
@@ -2965,6 +3139,28 @@
       .forEach((s) => addOption(s.model, s.model, s.id === sessionState.currentSessionId ? '当前会话已保存模型' : '其他 Codex 会话模型'));
 
     return options;
+  }
+
+  function sendCoreMessage(text) {
+    send({
+      type: 'message',
+      text,
+      sessionId: sessionState.currentSessionId,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      agent: sessionState.currentAgent,
+    });
+  }
+
+  function sendUserMessage(payload = {}) {
+    send({
+      type: 'message',
+      sessionId: sessionState.currentSessionId,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      agent: sessionState.currentAgent,
+      ...payload,
+    });
   }
 
   // --- marked config ---
@@ -3280,7 +3476,10 @@
   }
 
   function handleSessionListMessage(msg) {
-    sessionState.sessions = msg.sessions || [];
+    sessionState.sessions = (msg.sessions || []).map((session) => ({
+      ...session,
+      reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
+    }));
     reconcileSessionCacheWithSessions();
     renderSessionList();
     if (sessionState.currentSessionId) {
@@ -3428,16 +3627,19 @@
         contextWindowTokens: Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null,
       };
       renderContextBar();
-      if (sessionState.currentSessionId && msg.totalUsage) {
+      renderContextUsageIndicator();
+      if (sessionState.currentSessionId && (msg.totalUsage || currentUsage || msg.contextWindowTokens || msg.modelContextWindow)) {
         updateCachedSession(sessionState.currentSessionId, (snapshot) => {
-          snapshot.totalUsage = deepClone(msg.totalUsage);
+          if (msg.totalUsage) snapshot.totalUsage = deepClone(msg.totalUsage);
+          if (currentUsage) snapshot.lastUsage = deepClone(currentUsage);
+          const contextWindowTokens = Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null;
+          if (contextWindowTokens) snapshot.contextWindowTokens = contextWindowTokens;
           delete snapshot.currentUsage;
-          delete snapshot.lastUsage;
-          delete snapshot.contextWindowTokens;
         });
       }
     }
     renderWorkspaceInsights();
+    renderContextUsageIndicator();
   }
 
   function handleModeChangedMessage(msg) {
@@ -3452,10 +3654,26 @@
     renderWorkspaceInsights();
   }
 
+  function handleReasoningEffortChangedMessage(msg) {
+    const effort = normalizeCodexReasoningEffort(msg.reasoningEffort);
+    sessionState.currentReasoningEffort = effort;
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.reasoningEffort = effort; });
+    }
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
   function handleModelChangedMessage(msg) {
     if (msg.model === undefined) return;
     const normalizedRuntime = normalizeActiveRuntime(msg.activeRuntime, sessionState.currentAgent, msg.model || '');
     sessionState.currentModel = msg.model || '';
+    if (Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) {
+      sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
+      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
+    }
     sessionState.currentActiveRuntime = normalizedRuntime;
     sessionState.currentRuntimeCount = Number.isFinite(msg.runtimeCount)
       ? msg.runtimeCount
@@ -3463,6 +3681,7 @@
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => {
         snapshot.model = msg.model || '';
+        if (Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) snapshot.reasoningEffort = sessionState.currentReasoningEffort;
         snapshot.activeRuntime = normalizedRuntime ? deepClone(normalizedRuntime) : null;
         snapshot.activeChannelKey = msg.activeChannelKey || normalizedRuntime?.channelKey || null;
         snapshot.runtimeCount = Number.isFinite(msg.runtimeCount)
@@ -3471,6 +3690,7 @@
       });
     }
     renderWorkspaceInsights();
+    renderContextUsageIndicator();
   }
 
   function handleModelListMessage(msg) {
@@ -3478,7 +3698,7 @@
       const options = Array.isArray(msg.entries) && msg.entries.length > 0 ? msg.entries : getCodexModelOptions();
       const activeValue = msg.currentFull || sessionState.currentModel || 'default';
       showOptionPicker('选择 Codex 模型', options, activeValue, (value) => {
-        send({ type: 'message', text: `/model ${value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: 'codex' });
+        sendCoreMessage(`/model ${value}`);
       });
       return;
     }
@@ -3493,8 +3713,7 @@
     if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
       startGenerating();
     } else {
-      sendBtn.hidden = true;
-      abortBtn.hidden = false;
+      updateComposerActionButtons();
       composeState.activeToolCalls.clear();
       const bubble = document.querySelector('#streaming-msg .msg-bubble');
       if (bubble) bubble.innerHTML = '';
@@ -3631,6 +3850,7 @@
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     mode_changed: handleModeChangedMessage,
+    reasoning_effort_changed: handleReasoningEffortChangedMessage,
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
     resume_generating: handleResumeGeneratingMessage,
@@ -3684,14 +3904,20 @@
   }
 
   // --- Generating State ---
+  function updateComposerActionButtons() {
+    sendBtn.hidden = false;
+    abortBtn.hidden = !composeState.isGenerating;
+    sendBtn.title = composeState.isGenerating ? '加入发送队列' : '发送';
+    sendBtn.setAttribute('aria-label', composeState.isGenerating ? '加入发送队列' : '发送');
+  }
+
   function startGenerating() {
     composeState.isGenerating = true;
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
-    sendBtn.hidden = true;
-    abortBtn.hidden = false;
-    // 不禁用输入框，允许用户继续输入（但无法发送）
+    updateComposerActionButtons();
+    // 不禁用输入框：生成中继续输入会进入本地发送队列，可在发送前撤销。
 
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
@@ -3707,8 +3933,7 @@
 
   function finishGenerating(sessionId) {
     composeState.isGenerating = false;
-    sendBtn.hidden = false;
-    abortBtn.hidden = true;
+    updateComposerActionButtons();
     setCurrentSessionRunningState(false);
     msgInput.focus();
 
@@ -3719,9 +3944,11 @@
 
     if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
       sessionState.currentSessionId = sessionId;
+      bindUnassignedQueuedMessagesToSession(sessionId);
     }
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
+    setTimeout(dispatchNextQueuedMessage, 0);
   }
 
   // --- Rendering ---
@@ -5099,20 +5326,36 @@
     pathLine.textContent = parentPath;
     if (project.path) pathLine.title = project.path;
 
-    const countBadge = document.createElement('span');
-    countBadge.className = 'project-group-count';
-    countBadge.textContent = String(groupSessions.length);
-    countBadge.title = `${groupSessions.length} 个会话`;
-
     copy.appendChild(nameSpan);
     if (parentPath) copy.appendChild(pathLine);
 
     main.appendChild(chevron);
     main.appendChild(copy);
-    main.appendChild(countBadge);
 
     const actions = document.createElement('div');
     actions.className = 'project-group-actions';
+
+    const createProjectSession = () => {
+      const nextMode = getSavedModeForAgent(selectedAgent);
+      const nextReasoningEffort = getSavedReasoningEffortForAgent(selectedAgent);
+      send(isVirtualCwd
+        ? { type: 'new_session', cwd: project.path, agent: selectedAgent, mode: nextMode, reasoningEffort: nextReasoningEffort }
+        : { type: 'new_session', projectId: project.id, agent: selectedAgent, mode: nextMode, reasoningEffort: nextReasoningEffort });
+    };
+
+    /* --- Quick new chat button --- */
+    const newChatBtn = document.createElement('button');
+    newChatBtn.className = 'project-group-new-btn';
+    newChatBtn.title = '新建会话';
+    newChatBtn.type = 'button';
+    newChatBtn.setAttribute('aria-label', `在 ${project.name} 中新建会话`);
+    newChatBtn.textContent = '+';
+    newChatBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeOpenProjectMenus();
+      createProjectSession();
+    });
+    actions.appendChild(newChatBtn);
 
     /* --- "..." trigger button --- */
     const moreBtn = document.createElement('button');
@@ -5127,20 +5370,6 @@
     const menu = document.createElement('div');
     menu.className = 'project-group-menu';
     menu.hidden = true;
-
-    const menuCreate = document.createElement('button');
-    menuCreate.type = 'button';
-    menuCreate.className = 'project-group-menu-item';
-    menuCreate.textContent = '新建会话';
-    menuCreate.addEventListener('click', (e) => {
-      e.stopPropagation();
-      closeMenu();
-      const nextMode = getSavedModeForAgent(selectedAgent);
-      send(isVirtualCwd
-        ? { type: 'new_session', cwd: project.path, agent: selectedAgent, mode: nextMode }
-        : { type: 'new_session', projectId: project.id, agent: selectedAgent, mode: nextMode });
-    });
-    menu.appendChild(menuCreate);
 
     const menuRename = document.createElement('button');
     menuRename.type = 'button';
@@ -5165,6 +5394,33 @@
     });
     menu.appendChild(menuRename);
 
+    const cleanupProjectSessionsForRemoval = () => {
+      const removedSessionIds = new Set(groupSessions.map((session) => session.id).filter(Boolean));
+      for (const session of groupSessions) {
+        if (!session?.id) continue;
+        const sessionAgent = normalizeAgent(session.agent);
+        if (getLastSessionForAgent(sessionAgent) === session.id) {
+          localStorage.removeItem(getAgentSessionStorageKey(sessionAgent));
+        }
+        if (localStorage.getItem('webcoding-session') === session.id) {
+          localStorage.removeItem('webcoding-session');
+        }
+        invalidateSessionCache(session.id);
+      }
+      if (removedSessionIds.has(sessionState.currentSessionId)) {
+        resetChatView(selectedAgent);
+      }
+    };
+
+    const confirmProjectRemoval = (label) => {
+      const sessionCount = groupSessions.length;
+      return confirm(
+        `确定移除${label}「${project.name}」？\n`
+        + `将先删除下面的 ${sessionCount} 个对话，然后移除${label}记录。\n`
+        + '此操作不可撤销。'
+      );
+    };
+
     const menuDelete = document.createElement('button');
     menuDelete.type = 'button';
     menuDelete.className = 'project-group-menu-item project-group-menu-item--danger';
@@ -5173,17 +5429,19 @@
       e.stopPropagation();
       closeMenu();
       if (isVirtualCwd) {
-        if (confirm(`确定移除「${project.name}」分组？\n（会话将变为独立显示）`)) {
+        if (confirmProjectRemoval('分组')) {
           pendingProjectSaveCallback = (updatedProjects) => {
             const saved = updatedProjects.find((p) => p.path === project.path);
-            if (saved) send({ type: 'delete_project', projectId: saved.id });
+            if (saved) {
+              cleanupProjectSessionsForRemoval();
+              send({ type: 'delete_project', projectId: saved.id });
+            }
           };
           send({ type: 'save_project', path: project.path, name: project.name });
         }
-      } else {
-        if (confirm(`确定移除项目「${project.name}」？\n（不会删除会话，会话仍会保留）`)) {
-          send({ type: 'delete_project', projectId: project.id });
-        }
+      } else if (confirmProjectRemoval('项目')) {
+        cleanupProjectSessionsForRemoval();
+        send({ type: 'delete_project', projectId: project.id });
       }
     });
     menu.appendChild(menuDelete);
@@ -5221,16 +5479,19 @@
       moreBtn.classList.remove('active');
     }
 
+    function closeOpenProjectMenus() {
+      document.querySelectorAll('.project-group-menu:not([hidden])').forEach((m) => {
+        m.hidden = true;
+        m.style.top = '';
+        m.style.left = '';
+        m._triggerBtn?.classList.remove('active');
+      });
+    }
+
     function toggleMenu(e) {
       e.stopPropagation();
       if (menu.hidden) {
-        // Close any other open project menus
-        document.querySelectorAll('.project-group-menu:not([hidden])').forEach((m) => {
-          m.hidden = true;
-          m.style.top = '';
-          m.style.left = '';
-          m._triggerBtn?.classList.remove('active');
-        });
+        closeOpenProjectMenus();
         moreBtn.classList.add('active');
         menu._triggerBtn = moreBtn;
         // Position immediately
@@ -5699,6 +5960,12 @@
       showModePicker();
       return;
     }
+    if (cmd === '/reasoning' || cmd === '/effort') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showReasoningEffortPicker();
+      return;
+    }
     // For non-core commands (CLI-native/skills), just insert the command text
     // so it gets sent as a regular message to the CLI process
     msgInput.value = `${cmd} `;
@@ -5829,11 +6096,11 @@
 
   function showModelPicker() {
     if (sessionState.currentAgent === 'codex') {
-      send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+      sendCoreMessage('/model');
       return;
     }
     // Request real model list from server — server responds with model_list event
-    send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+    sendCoreMessage('/model');
   }
 
   function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
@@ -5927,7 +6194,7 @@
     // Click & hover on items
     picker.querySelectorAll('.option-picker-item').forEach(el => {
       el.addEventListener('click', () => {
-        send({ type: 'message', text: `/model ${el.dataset.value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+        sendCoreMessage(`/model ${el.dataset.value}`);
         hideOptionPicker();
       });
       el.addEventListener('mouseenter', () => updateFocus(parseInt(el.dataset.index)));
@@ -5941,7 +6208,7 @@
           e.preventDefault();
           const val = customInput.value.trim();
           if (val) {
-            send({ type: 'message', text: `/model ${val}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+            sendCoreMessage(`/model ${val}`);
             hideOptionPicker();
           }
         } else if (e.key === 'Escape') {
@@ -5957,7 +6224,7 @@
         updateFocus((focusIdx - 1 + entries.length) % entries.length);
       } else if (e.key === 'Enter') {
         e.preventDefault();
-        send({ type: 'message', text: `/model ${entries[focusIdx].value || entries[focusIdx].alias}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+        sendCoreMessage(`/model ${entries[focusIdx].value || entries[focusIdx].alias}`);
         hideOptionPicker();
       } else if (e.key === 'Escape') {
         hideOptionPicker();
@@ -5995,12 +6262,209 @@
     });
   }
 
+  function showReasoningEffortPicker() {
+    if (sessionState.currentAgent !== 'codex') {
+      appendSystemMessage('思考级别仅对 Codex 会话生效。');
+      return;
+    }
+    showOptionPicker('选择 Codex 思考级别', CODEX_REASONING_EFFORT_OPTIONS, sessionState.currentReasoningEffort, (value) => {
+      const effort = normalizeCodexReasoningEffort(value);
+      sessionState.currentReasoningEffort = effort;
+      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+      if (sessionState.currentSessionId) {
+        send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
+      }
+      renderWorkspaceInsights();
+      const welcome = messagesDiv.querySelector('.welcome-msg');
+      if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+    });
+  }
+
+  // --- Queued Messages ---
+  function queueSessionMatchesCurrent(item) {
+    if (!item) return false;
+    if (!item.sessionId) return !sessionState.currentSessionId;
+    return item.sessionId === sessionState.currentSessionId;
+  }
+
+  function getVisibleQueuedMessages() {
+    return composeState.queuedMessages.filter(queueSessionMatchesCurrent);
+  }
+
+  function bindUnassignedQueuedMessagesToSession(sessionId) {
+    if (!sessionId) return;
+    let changed = false;
+    for (const item of composeState.queuedMessages) {
+      if (!item.sessionId) {
+        item.sessionId = sessionId;
+        changed = true;
+      }
+    }
+    if (changed) renderQueuedMessages();
+  }
+
+  function formatQueuedMessageSummary(item) {
+    const parts = [];
+    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+    if (text) parts.push(text);
+    const attachmentCount = Array.isArray(item?.attachments) ? item.attachments.length : 0;
+    const fileRefCount = Array.isArray(item?.fileRefs) ? item.fileRefs.length : 0;
+    if (attachmentCount > 0) parts.push(`${attachmentCount} 张图片`);
+    if (fileRefCount > 0) parts.push(`${fileRefCount} 个文件引用`);
+    return parts.join(' · ') || '空消息';
+  }
+
+  function renderQueuedMessages() {
+    if (!queuedMessageList) return;
+    const visible = getVisibleQueuedMessages();
+    queuedMessageList.innerHTML = '';
+    queuedMessageList.hidden = visible.length === 0;
+    if (visible.length === 0) return;
+
+    visible.forEach((item, index) => {
+      const row = document.createElement('div');
+      row.className = 'queued-message-item';
+      row.dataset.queuedMessageId = item.id;
+
+      const lead = document.createElement('div');
+      lead.className = 'queued-message-lead';
+      lead.textContent = index === 0 ? '↳' : String(index + 1);
+
+      const body = document.createElement('div');
+      body.className = 'queued-message-body';
+      const label = document.createElement('div');
+      label.className = 'queued-message-label';
+      label.textContent = index === 0 ? '当前回复结束后发送' : '队列中等待发送';
+      const text = document.createElement('div');
+      text.className = 'queued-message-text';
+      text.textContent = formatQueuedMessageSummary(item);
+      body.appendChild(label);
+      body.appendChild(text);
+
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'queued-message-cancel';
+      cancel.title = '撤销这条队列消息';
+      cancel.setAttribute('aria-label', '撤销这条队列消息');
+      cancel.dataset.queuedMessageCancel = item.id;
+      cancel.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></svg>';
+
+      row.appendChild(lead);
+      row.appendChild(body);
+      row.appendChild(cancel);
+      queuedMessageList.appendChild(row);
+    });
+  }
+
+  function removeQueuedMessage(id) {
+    const before = composeState.queuedMessages.length;
+    composeState.queuedMessages = composeState.queuedMessages.filter((item) => item.id !== id);
+    if (composeState.queuedMessages.length !== before) {
+      renderQueuedMessages();
+      showToast('已撤销队列消息');
+    }
+  }
+
+  function enqueueCurrentDraft() {
+    const text = msgInput.value.trim();
+    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) return false;
+    if (composeState.queuedMessages.length >= MAX_QUEUED_MESSAGES) {
+      showToast(`最多排队 ${MAX_QUEUED_MESSAGES} 条消息，请先撤销一部分`);
+      return false;
+    }
+    if (text.startsWith('/') && (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0)) {
+      appendError('命令消息暂不支持附带图片或文件引用，请先移除后再发送命令。');
+      return false;
+    }
+
+    const item = {
+      id: nextLocalId('queued'),
+      sessionId: sessionState.currentSessionId || null,
+      text,
+      attachments: composeState.pendingAttachments.map((attachment) => ({ ...attachment })),
+      fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      agent: sessionState.currentAgent,
+      createdAt: Date.now(),
+    };
+    composeState.queuedMessages = [...composeState.queuedMessages, item];
+    msgInput.value = '';
+    composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
+    renderPendingAttachments();
+    renderContextBar();
+    renderQueuedMessages();
+    autoResize();
+    hideCmdMenu();
+    hideOptionPicker();
+    showToast('已加入发送队列，可在输入框上方撤销');
+    return true;
+  }
+
+  function sendQueuedCoreMessage(item, targetSessionId) {
+    send({
+      type: 'message',
+      text: item.text,
+      sessionId: targetSessionId,
+      mode: item.mode || sessionState.currentMode,
+      reasoningEffort: item.reasoningEffort || '',
+      agent: item.agent || sessionState.currentAgent,
+    });
+  }
+
+  function sendQueuedUserMessage(item, targetSessionId) {
+    send({
+      type: 'message',
+      sessionId: targetSessionId,
+      mode: item.mode || sessionState.currentMode,
+      reasoningEffort: item.reasoningEffort || '',
+      agent: item.agent || sessionState.currentAgent,
+      text: item.text || '',
+      attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
+      fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
+    });
+  }
+
+  function dispatchNextQueuedMessage() {
+    if (composeState.isGenerating || isBlockingSessionLoad()) return false;
+    const index = composeState.queuedMessages.findIndex(queueSessionMatchesCurrent);
+    if (index < 0) {
+      renderQueuedMessages();
+      return false;
+    }
+
+    const [item] = composeState.queuedMessages.splice(index, 1);
+    composeState.queuedMessages = [...composeState.queuedMessages];
+    renderQueuedMessages();
+
+    const targetSessionId = item.sessionId || sessionState.currentSessionId || null;
+    const text = String(item.text || '').trim();
+    if (text.startsWith('/')) {
+      sendQueuedCoreMessage(item, targetSessionId);
+      return true;
+    }
+
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    const attachments = Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [];
+    const fileRefs = Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [];
+    messagesDiv.appendChild(createMsgElement('user', item.text || '', attachments, fileRefs));
+    scrollToBottom();
+    sendQueuedUserMessage(item, targetSessionId);
+    if (!composeState.isGenerating) startGenerating();
+    return true;
+  }
+
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
     const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
     if ((!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) || isBlockingSessionLoad()) return;
-    if (composeState.isGenerating && !isPlanModeActive) return;
+    if (composeState.isGenerating && !isPlanModeActive) {
+      enqueueCurrentDraft();
+      return;
+    }
     hideCmdMenu();
     hideOptionPicker();
 
@@ -6024,7 +6488,13 @@
         autoResize();
         return;
       }
-      send({ type: 'message', text, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+      if (text === '/reasoning' || text === '/reasoning ' || text === '/effort' || text === '/effort ') {
+        showReasoningEffortPicker();
+        msgInput.value = '';
+        autoResize();
+        return;
+      }
+      sendCoreMessage(text);
       msgInput.value = '';
       autoResize();
       return;
@@ -6038,7 +6508,7 @@
     messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs));
     scrollToBottom();
 
-    send({ type: 'message', text, attachments, fileRefs, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+    sendUserMessage({ text, attachments, fileRefs });
     msgInput.value = '';
     composeState.pendingAttachments = [];
     composeState.pendingFileRefs = [];
@@ -6122,6 +6592,7 @@
   // Mobile agent select
   const mobileAgentSelect = document.getElementById('mobile-agent-select');
   const mobileModeSelect = document.getElementById('mobile-mode-select');
+  const mobileReasoningSelect = document.getElementById('mobile-reasoning-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -6137,6 +6608,18 @@
       updateAgentScopedUI();
       if (sessionState.currentSessionId) send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       renderWorkspaceInsights();
+    });
+  }
+  if (mobileReasoningSelect) {
+    mobileReasoningSelect.addEventListener('change', () => {
+      const effort = normalizeCodexReasoningEffort(mobileReasoningSelect.value);
+      sessionState.currentReasoningEffort = effort;
+      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+      updateAgentScopedUI();
+      if (sessionState.currentSessionId) send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
+      renderWorkspaceInsights();
+      const welcome = messagesDiv.querySelector('.welcome-msg');
+      if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
     });
   }
 
@@ -6158,6 +6641,10 @@
     }
     if (action === 'switch-model') {
       showModelPicker();
+      return;
+    }
+    if (action === 'switch-reasoning') {
+      showReasoningEffortPicker();
       return;
     }
     if (action === 'switch-mode') {
@@ -6299,6 +6786,14 @@
   });
   sendBtn.addEventListener('click', sendMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  if (queuedMessageList) {
+    queuedMessageList.addEventListener('click', (event) => {
+      const btn = event.target instanceof Element ? event.target.closest('[data-queued-message-cancel]') : null;
+      if (!btn) return;
+      event.preventDefault();
+      removeQueuedMessage(btn.dataset.queuedMessageCancel || '');
+    });
+  }
   if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
   renderContextBar();
   if (attachBtn && imageUploadInput) {
@@ -8061,7 +8556,7 @@
         getSessionCount: (project) => getCurrentProjectSessionCount(project),
         onProjectSelect: (project) => {
           close();
-          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: getSavedModeForAgent(targetAgent) });
+          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: getSavedModeForAgent(targetAgent), reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
         },
       });
       if (projects.length === 0) {
@@ -8178,7 +8673,7 @@
       send(existingProject
         ? { type: 'save_project', id: projectId, path: cwd }
         : { type: 'save_project', id: projectId, path: cwd, name: getPathLeaf(cwd) || cwd });
-      send({ type: 'new_session', cwd, agent: targetAgent, mode: getSavedModeForAgent(targetAgent) });
+      send({ type: 'new_session', cwd, agent: targetAgent, mode: getSavedModeForAgent(targetAgent), reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
     });
 
     // Initialize — default directly into directory browser

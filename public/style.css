@@ -1012,6 +1012,7 @@ html[data-theme="localhost"] .abort-btn:hover,
 html[data-theme="localhost"] .tpl-fetch-toolbar-btn:hover,
 html[data-theme="localhost"] .project-picker-item:hover,
 html[data-theme="localhost"] .option-picker-item:hover,
+html[data-theme="localhost"] .project-group-new-btn:hover,
 html[data-theme="localhost"] .project-group-more-btn:hover,
 html[data-theme="localhost"] .chat-agent-btn:hover,
 html[data-theme="localhost"] .mode-select:hover {
@@ -1075,6 +1076,7 @@ html[data-theme="localhost"] #tunnel-copy-btn,
 html[data-theme="localhost"] .project-picker-action-btn,
 html[data-theme="localhost"] .modal-btn-danger,
 html[data-theme="localhost"] .settings-actions button,
+html[data-theme="localhost"] .project-group-new-btn,
 html[data-theme="localhost"] .project-group-more-btn,
 html[data-theme="localhost"] .project-group-menu-item,
 html[data-theme="localhost"] .tpl-fetch-toolbar-btn,
@@ -1379,11 +1381,6 @@ html[data-theme="localhost"] .project-group.active-project > .project-group-head
 html[data-theme="localhost"] .project-group-body {
   background: transparent;
   border-left-color: rgba(148, 163, 184, 0.22);
-}
-html[data-theme="localhost"] .project-group-count {
-  background: #f8fafc;
-  color: var(--text-secondary);
-  border-color: rgba(148, 163, 184, 0.24);
 }
 html[data-theme="localhost"] .project-picker-item-tag {
   background: rgba(15, 138, 167, 0.08);
@@ -2045,8 +2042,8 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 8px;
+  padding: 8px 8px 8px 10px;
   cursor: pointer;
   transition: background 140ms, border-color 140ms, box-shadow 140ms, transform 140ms;
   border-bottom: 1px solid rgba(56, 56, 56, 0.18);
@@ -2067,7 +2064,7 @@ html[data-theme="localhost"] .localfile-pre {
   color: var(--text-muted);
   transition: transform 150ms, color 120ms;
   flex-shrink: 0;
-  width: 14px;
+  width: 10px;
   text-align: center;
 }
 .project-group-header:hover .project-group-chevron {
@@ -2079,31 +2076,13 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-main {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex: 1;
   min-width: 0;
 }
 .project-group-copy {
   flex: 1;
   min-width: 0;
-}
-.project-group-count {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  min-width: var(--btn-icon-size);
-  height: var(--btn-icon-size);
-  padding: 0 var(--space-sm);
-  border: 1px solid rgba(56, 56, 56, 0.22);
-  border-radius: var(--button-radius);
-  background: var(--bg-secondary);
-  color: var(--text-secondary);
-  font-family: var(--font-ui);
-  font-size: 9px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  line-height: 1;
 }
 .project-group-name {
   display: block;
@@ -2129,7 +2108,7 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex-shrink: 0;
   transition: opacity 140ms;
 }
@@ -2137,7 +2116,8 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-header:focus-within .project-group-actions {
   /* hover state — always visible anyway now */
 }
-/* --- Project group "⋮" more button --- */
+/* --- Project group quick action buttons --- */
+.project-group-new-btn,
 .project-group-more-btn {
   appearance: none;
   background: var(--surface);
@@ -2145,10 +2125,10 @@ html[data-theme="localhost"] .localfile-pre {
   border: 1px solid rgba(56, 56, 56, 0.22);
   border-radius: var(--button-radius);
   font-family: var(--font-ui);
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
-  width: var(--btn-icon-size);
-  height: var(--btn-icon-size);
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2160,6 +2140,16 @@ html[data-theme="localhost"] .localfile-pre {
   flex-shrink: 0;
   position: relative;
   z-index: 10;
+}
+.project-group-new-btn {
+  font-size: 16px;
+  font-weight: 650;
+}
+.project-group-new-btn:hover,
+.project-group-new-btn:focus-visible {
+  background: var(--yellow);
+  color: var(--text-primary);
+  border-color: var(--yellow);
 }
 .project-group-more-btn:hover,
 .project-group-more-btn.active {
@@ -3426,6 +3416,71 @@ html[data-theme="localhost"] .localfile-pre {
   font-size: 10px;
   line-height: 1.45;
 }
+.queued-message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(920px, 100%);
+  margin: 0 auto 8px;
+}
+.queued-message-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border: 1px solid var(--input-border);
+  border-radius: var(--button-radius);
+  background: var(--input-shell-background);
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+.queued-message-lead {
+  width: 18px;
+  flex: 0 0 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+}
+.queued-message-body {
+  min-width: 0;
+  flex: 1;
+}
+.queued-message-label {
+  margin-bottom: 1px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+}
+.queued-message-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.queued-message-cancel {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: var(--button-radius);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0;
+  transition: background 120ms ease, color 120ms ease;
+}
+.queued-message-cancel:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 .input-wrapper {
   display: flex;
   align-items: flex-end;
@@ -3488,6 +3543,83 @@ html[data-theme="localhost"] .localfile-pre {
   letter-spacing: 0.01em;
 }
 #msg-input::placeholder { color: var(--text-muted); }
+.context-usage-indicator {
+  position: relative;
+  width: var(--btn-icon-size);
+  height: var(--btn-icon-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 999px;
+}
+.context-usage-indicator[hidden] {
+  display: none;
+}
+.context-usage-indicator:hover {
+  background: var(--surface);
+}
+.context-usage-indicator svg {
+  display: block;
+  transform: rotate(-90deg);
+}
+.context-usage-track {
+  stroke: rgba(120, 130, 150, 0.28);
+}
+.context-usage-progress {
+  stroke: var(--blue);
+  transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;
+}
+.context-usage-indicator[data-level="pending"] .context-usage-progress {
+  stroke: rgba(120, 130, 150, 0.55);
+}
+.context-usage-indicator[data-level="warning"] .context-usage-progress {
+  stroke: #f59e0b;
+}
+.context-usage-indicator[data-level="danger"] .context-usage-progress {
+  stroke: var(--danger);
+}
+.context-usage-popover {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 14px);
+  transform: translateX(-50%) translateY(4px);
+  min-width: 210px;
+  padding: 14px 18px;
+  border: 1px solid rgba(56, 56, 56, 0.12);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: center;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, transform 140ms ease;
+  z-index: 30;
+}
+.context-usage-popover::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  transform: translateX(-50%) rotate(45deg);
+  background: var(--bg-primary);
+  border-right: 1px solid rgba(56, 56, 56, 0.12);
+  border-bottom: 1px solid rgba(56, 56, 56, 0.12);
+}
+.context-usage-indicator:hover .context-usage-popover,
+.context-usage-indicator:focus-visible .context-usage-popover {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
 .send-btn, .abort-btn {
   width: var(--btn-icon-size);
   height: var(--btn-icon-size);

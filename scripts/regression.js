@@ -1466,8 +1466,25 @@ async function runConcurrentSessionsRegressionCase({ port, password }) {
     );
     assert(/slow-start:alpha/.test(resumedSessionA.text || ''), 'Second client should receive current stream snapshot for active session');
 
-    await closeWs(connectionA.ws);
-    await connectionC.client.waitForType('done', (msg) => msg.sessionId === sessionA.sessionId, 10000);
+    const cMessageIndexAfterResume = connectionC.messages.length;
+    const cNewSession = await connectionC.client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && msg.sessionId !== sessionA.sessionId,
+      5000,
+    );
+    assert(cNewSession.isRunning === false, 'Second client new chat should not inherit session alpha running state');
+
+    await connectionA.client.waitForType('text_delta', (msg) => (
+      msg.sessionId === sessionA.sessionId && /slow-mid:alpha|slow-end:alpha/.test(msg.text || '')
+    ), 7000);
+    const cLeakedAfterDetach = connectionC.messages.slice(cMessageIndexAfterResume).filter((msg) => (
+      msg.sessionId === sessionA.sessionId
+      && ['text_delta', 'tool_start', 'tool_end', 'done', 'resume_generating', 'usage', 'cost', 'system_message', 'error'].includes(msg.type)
+    ));
+    assert(cLeakedAfterDetach.length === 0, 'Detaching the second client should not keep streaming alpha into its new chat');
+
+    await connectionA.client.waitForType('done', (msg) => msg.sessionId === sessionA.sessionId, 10000);
     await connectionB.client.waitForType('done', (msg) => msg.sessionId === sessionB.sessionId, 10000);
   } finally {
     if (connectionA) await closeWs(connectionA.ws);

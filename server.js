@@ -71,6 +71,7 @@ const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
 const BRIDGE_RUNTIME_PATH = path.join(CONFIG_DIR, 'bridge-runtime.json');
 const BRIDGE_STATE_PATH = path.join(CONFIG_DIR, 'bridge-state.json');
+const BRIDGE_USAGE_PATH = path.join(CONFIG_DIR, 'bridge-usage.jsonl');
 const TUNNEL_STATE_PATH = path.join(CONFIG_DIR, 'tunnel-state.json');
 const TUNNEL_SCRIPT_PATH = path.join(__dirname, 'lib', 'cf-tunnel.js');
 const TUNNEL_START_TIMEOUT_MS = 30000;
@@ -531,6 +532,8 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   clear: '清除当前会话（含上下文）',
   model: '查看/切换模型',
   mode: '查看/切换权限模式',
+  reasoning: '查看/切换 Codex 思考级别',
+  effort: '查看/切换 Codex 思考级别',
   cost: '查看会话费用/统计',
   compact: '压缩上下文',
   help: '显示帮助',
@@ -783,6 +786,78 @@ const activeProcesses = new Map();
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
 
+
+function isWsOpen(ws) {
+  return !!(ws && ws.readyState === 1);
+}
+
+function ensureProcessClients(entry) {
+  if (!entry) return new Set();
+  if (!(entry.clients instanceof Set)) entry.clients = new Set();
+  if (isWsOpen(entry.ws)) entry.clients.add(entry.ws);
+  return entry.clients;
+}
+
+function getConnectedProcessClients(entry) {
+  const clients = ensureProcessClients(entry);
+  const connected = [];
+  for (const client of Array.from(clients)) {
+    if (isWsOpen(client)) connected.push(client);
+    else clients.delete(client);
+  }
+  if (entry && entry.ws && !isWsOpen(entry.ws)) entry.ws = null;
+  return connected;
+}
+
+function getPrimaryProcessWs(entry) {
+  if (!entry) return null;
+  if (isWsOpen(entry.ws)) return entry.ws;
+  const [first] = getConnectedProcessClients(entry);
+  entry.ws = first || null;
+  return entry.ws;
+}
+
+function isProcessRealtimeConnected(entry) {
+  return !!getPrimaryProcessWs(entry);
+}
+
+function attachWebSocketToProcess(entry, ws) {
+  if (!entry || !isWsOpen(ws)) return false;
+  ensureProcessClients(entry).add(ws);
+  if (!isWsOpen(entry.ws)) entry.ws = ws;
+  entry.wsDisconnectTime = null;
+  return true;
+}
+
+function detachWebSocketFromProcess(entry, ws, options = {}) {
+  if (!entry || !ws) return false;
+  const clients = ensureProcessClients(entry);
+  const hadClient = clients.delete(ws);
+  const wasPrimary = entry.ws === ws;
+  if (wasPrimary) entry.ws = null;
+  const nextPrimary = getPrimaryProcessWs(entry);
+  if (!nextPrimary && (hadClient || wasPrimary) && options.markDisconnect === true) {
+    entry.wsDisconnectTime = new Date().toISOString();
+  }
+  return hadClient || wasPrimary;
+}
+
+function sendRuntimeMessage(entry, data) {
+  const clients = getConnectedProcessClients(entry);
+  if (clients.length === 0) {
+    if (entry) entry.ws = null;
+    return false;
+  }
+  for (const client of clients) wsSend(client, data);
+  if (entry && !isWsOpen(entry.ws)) entry.ws = clients[0] || null;
+  return true;
+}
+
+function sendSessionListToProcessClients(entry, options = {}) {
+  const clients = getConnectedProcessClients(entry);
+  for (const client of clients) sendSessionList(client, options);
+}
+
 const sessionListCache = {
   expiresAt: 0,
   sessions: [],
@@ -982,6 +1057,24 @@ const DEFAULT_CODEX_CONFIG = {
   enableSearch: false,
   supportsSearch: false,
 };
+const CODEX_REASONING_EFFORTS = ['xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
+
+function normalizeCodexReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return CODEX_REASONING_EFFORTS.includes(normalized) ? normalized : '';
+}
+
+function codexReasoningEffortLabel(value) {
+  const labels = {
+    none: 'None',
+    minimal: 'Minimal',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    xhigh: 'XHigh',
+  };
+  return labels[value] || '默认';
+}
 
 function normalizeModelTemplate(template) {
   const apiBase = String(template?.apiBase || '').trim();
@@ -1360,7 +1453,7 @@ function prepareCodexCustomRuntime(config) {
 
   let bridge = null;
   try {
-    bridge = ensureBridgeRuntimeForTemplate(source);
+    bridge = ensureBridgeRuntimeForTemplate(source, { forceNewToken: true });
   } catch (error) {
     return { error: error.message || '本地 API 中间件初始化失败' };
   }
@@ -1388,6 +1481,7 @@ function prepareCodexCustomRuntime(config) {
     homeDir: CODEX_RUNTIME_HOME,
     apiKey: bridge.token,
     apiBase: bridge.openaiBaseUrl,
+    bridgeToken: bridge.token,
     profileName: source.name,
     defaultModel: bridge.defaultModel || '',
   };
@@ -2960,14 +3054,15 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeRuntimeFingerprint')) session.claudeRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeFingerprint')) session.codexRuntimeFingerprint = null;
+  session.reasoningEffort = normalizeCodexReasoningEffort(session.reasoningEffort);
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
   }
   delete session.currentUsage;
-  delete session.lastUsage;
-  delete session.contextWindowTokens;
+  if (session.lastUsage && typeof session.lastUsage !== 'object') delete session.lastUsage;
+  if (session.contextWindowTokens) session.contextWindowTokens = Number(session.contextWindowTokens) || null;
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -3950,6 +4045,70 @@ function loadBridgeRuntime(token = '') {
   };
 }
 
+function normalizeBridgeUsageRecordUsage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const usage = {
+    inputTokens: Number(raw.inputTokens ?? raw.input_tokens ?? raw.prompt_tokens) || 0,
+    cachedInputTokens: Number(raw.cachedInputTokens ?? raw.cached_tokens ?? raw.cache_tokens ?? raw.input_tokens_details?.cached_tokens ?? raw.prompt_tokens_details?.cached_tokens) || 0,
+    outputTokens: Number(raw.outputTokens ?? raw.output_tokens ?? raw.completion_tokens) || 0,
+    reasoningOutputTokens: Number(raw.reasoningOutputTokens ?? raw.reasoning_tokens ?? raw.output_tokens_details?.reasoning_tokens ?? raw.completion_tokens_details?.reasoning_tokens) || 0,
+    totalTokens: Number(raw.totalTokens ?? raw.total_tokens) || 0,
+  };
+  const total = usage.totalTokens || usage.inputTokens + usage.outputTokens + usage.reasoningOutputTokens;
+  return total > 0 ? usage : null;
+}
+
+function readLatestBridgeUsageForToken(token, sinceMs = 0) {
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken || !fs.existsSync(BRIDGE_USAGE_PATH)) return null;
+  let content = '';
+  try {
+    content = fs.readFileSync(BRIDGE_USAGE_PATH, 'utf8');
+  } catch {
+    return null;
+  }
+  let latest = null;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let record = null;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (String(record?.token || '').trim() !== normalizedToken) continue;
+    const timestampMs = Date.parse(record.timestamp || '');
+    if (sinceMs && (!Number.isFinite(timestampMs) || timestampMs < sinceMs)) continue;
+    const usage = normalizeBridgeUsageRecordUsage(record.usage);
+    if (!usage) continue;
+    if (!latest || timestampMs >= latest.timestampMs) {
+      latest = { timestampMs, usage, record };
+    }
+  }
+  return latest;
+}
+
+function applyBridgeUsageToEntry(sessionId, entry) {
+  if (!entry || entry.agent !== 'codex' || entry.bridgeUsageApplied) return null;
+  const bridgeToken = String(entry.bridgeToken || '').trim();
+  if (!bridgeToken) return null;
+  const sinceMs = Number(entry.startedAtMs || 0) ? Math.max(0, Number(entry.startedAtMs) - 5000) : 0;
+  const latest = readLatestBridgeUsageForToken(bridgeToken, sinceMs);
+  if (!latest?.usage) return null;
+  entry.bridgeUsageApplied = true;
+  entry.lastUsage = latest.usage;
+  const session = loadSession(sessionId);
+  if (session) {
+    session.lastUsage = latest.usage;
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+  sendRuntimeMessage(entry, {
+    type: 'usage',
+    sessionId,
+    totalUsage: session?.totalUsage || null,
+    currentUsage: latest.usage,
+    contextWindowTokens: session?.contextWindowTokens || null,
+  });
+  return latest.usage;
+}
+
 function listBridgeRuntimeTokens() {
   return Object.keys(loadBridgeRuntimeStore().runtimes);
 }
@@ -4009,6 +4168,7 @@ function ensureLocalBridgeRunning() {
       ...process.env,
       CC_WEB_BRIDGE_RUNTIME_PATH: BRIDGE_RUNTIME_PATH,
       CC_WEB_BRIDGE_STATE_PATH: BRIDGE_STATE_PATH,
+      CC_WEB_BRIDGE_USAGE_PATH: BRIDGE_USAGE_PATH,
     },
   });
   child.unref();
@@ -4022,12 +4182,21 @@ function ensureLocalBridgeRunning() {
   throw new Error('本地 API 桥接服务启动超时');
 }
 
-function ensureBridgeRuntimeForTemplate(tpl) {
+function ensureBridgeRuntimeForTemplate(tpl, options = {}) {
   const defaultModel = String(tpl.defaultModel || '').trim();
   const upstreamType = tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
   const store = loadBridgeRuntimeStore();
-  const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === String(tpl.name || '').trim()) || null;
-  const token = existing?.token || crypto.randomBytes(24).toString('hex');
+  const templateName = String(tpl.name || '').trim();
+  if (options.forceNewToken === true) {
+    const activeBridgeTokens = new Set(Array.from(activeProcesses.values()).map((entry) => String(entry?.bridgeToken || '').trim()).filter(Boolean));
+    for (const [runtimeToken, entry] of Object.entries(store.runtimes || {})) {
+      if (entry?.upstream?.name === templateName && !activeBridgeTokens.has(String(runtimeToken || '').trim())) {
+        delete store.runtimes[runtimeToken];
+      }
+    }
+  }
+  const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === templateName) || null;
+  const token = options.forceNewToken === true || !existing?.token ? crypto.randomBytes(24).toString('hex') : existing.token;
   const updatedAt = new Date().toISOString();
   store.runtimes[token] = {
     token,
@@ -4078,6 +4247,7 @@ function collectSessionListSnapshot() {
         updated: s.updated,
         hasUnread: !!s.hasUnread,
         agent: getSessionAgent(s),
+        reasoningEffort: s.reasoningEffort || '',
         isRunning: activeProcesses.has(s.id),
         projectId: s.projectId || null,
         cwd: s.cwd || localMeta?.cwd || null,
@@ -4295,7 +4465,7 @@ function readProcessStderrSnippet(sessionId) {
 
 function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
   const completeTime = new Date().toISOString();
-  const wsConnected = !!entry.ws;
+  const wsConnected = isProcessRealtimeConnected(entry);
   const disconnectGap = entry.wsDisconnectTime
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
@@ -4353,7 +4523,7 @@ function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
       timestamp: new Date().toISOString(),
     });
     session.updated = new Date().toISOString();
-    if (!entry.ws) session.hasUnread = true;
+    if (!isProcessRealtimeConnected(entry)) session.hasUnread = true;
     saveSession(session);
   }
 
@@ -4377,14 +4547,14 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     if (autoRetryRequested) {
       if (contextLimitExceeded) {
         pendingCompactRetries.delete(sessionId);
-        wsSend(entry.ws, { type: 'system_message', sessionId, message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
+        sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
       } else {
-        wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
-        wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoResumeMessage(entry.agent || 'claude') });
+        sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
+        sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactAutoResumeMessage(entry.agent || 'claude') });
         shouldReturnForFollowup = true;
       }
     } else {
-      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
+      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
     }
   }
 
@@ -4392,7 +4562,7 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
     if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
       pendingCompactRetries.delete(sessionId);
-      wsSend(entry.ws, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
+      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
     } else {
       pendingCompactRetries.set(sessionId, {
         text: pendingRetry?.text || '',
@@ -4400,18 +4570,18 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
         reason: 'auto',
         autoRetryCount: nextRetryCount,
       });
-      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
+      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
       shouldAutoCompact = true;
     }
   }
 
   if (completionError && !entry.errorSent && !shouldAutoCompact) {
     entry.errorSent = true;
-    wsSend(entry.ws, { type: 'error', sessionId, message: completionError });
+    sendRuntimeMessage(entry, { type: 'error', sessionId, message: completionError });
   }
 
-  wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
-  sendSessionList(entry.ws);
+  sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
+  sendSessionListToProcessClients(entry);
   return { shouldReturnForFollowup, shouldAutoCompact };
 }
 
@@ -4444,18 +4614,20 @@ function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, p
     pendingCompactRetries.delete(sessionId);
   }
 
-  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session && pendingSlash?.kind === 'compact') {
+  const followupWs = getPrimaryProcessWs(entry);
+  if (shouldReturnForFollowup && followupWs && session && pendingSlash?.kind === 'compact') {
     const retry = pendingCompactRetries.get(sessionId);
     if (retry?.text) {
       pendingCompactRetries.delete(sessionId);
-      handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+      handleMessage(followupWs, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
     }
     return;
   }
 
-  if (shouldAutoCompact && entry.ws && entry.ws.readyState === 1 && session) {
+  const autoCompactWs = getPrimaryProcessWs(entry);
+  if (shouldAutoCompact && autoCompactWs && session) {
     pendingSlashCommands.set(sessionId, { kind: 'compact' });
-    handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+    handleMessage(autoCompactWs, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
   }
 }
 
@@ -4468,6 +4640,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     entry.tailer.stop();
   }
 
+  applyBridgeUsageToEntry(sessionId, entry);
+
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
   const { pendingRetry, contextLimitExceeded, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
@@ -4476,7 +4650,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   removeActiveProcess(sessionId);
   cleanRunDir(sessionId);
 
-  const { shouldReturnForFollowup, shouldAutoCompact } = entry.ws
+  const { shouldReturnForFollowup, shouldAutoCompact } = isProcessRealtimeConnected(entry)
     ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
     : (handleDisconnectedProcessCompletion(sessionId, entry), { shouldReturnForFollowup: false, shouldAutoCompact: false });
 
@@ -4500,7 +4674,7 @@ setInterval(() => {
       plog('INFO', 'pid_monitor_detected_exit', {
         sessionId: sessionId.slice(0, 8),
         pid: entry.pid,
-        wsConnected: !!entry.ws,
+        wsConnected: isProcessRealtimeConnected(entry),
       });
       handleProcessComplete(sessionId, null, 'unknown (detected by monitor)');
     }
@@ -5025,6 +5199,9 @@ wss.on('connection', (ws, req) => {
       case 'set_mode':
         handleSetMode(ws, msg.sessionId, msg.mode);
         break;
+      case 'set_reasoning_effort':
+        handleSetReasoningEffort(ws, msg.sessionId, msg.reasoningEffort);
+        break;
       case 'list_sessions':
         sendSessionList(ws);
         break;
@@ -5503,11 +5680,14 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           messages: [],
           title: session.title,
           mode: session.permissionMode || 'yolo',
+          reasoningEffort: session.reasoningEffort || '',
           model: sessionModelLabel(session),
           agent: getSessionAgent(session),
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
           totalUsage: session.totalUsage || null,
+          lastUsage: session.lastUsage || null,
+          contextWindowTokens: session.contextWindowTokens || null,
           ...buildSessionRuntimeMeta(session),
         });
       }
@@ -5544,9 +5724,10 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
             saveSession(session);
           }
           wsSend(ws, {
-            type: 'model_changed',
-            model: normalizedInput === 'default' ? '' : modelInput,
-            ...(session ? buildSessionRuntimeMeta(session) : {}),
+          type: 'model_changed',
+          model: normalizedInput === 'default' ? '' : modelInput,
+          reasoningEffort: session?.reasoningEffort || '',
+          ...(session ? buildSessionRuntimeMeta(session) : {}),
           });
           wsSend(ws, {
             type: 'system_message',
@@ -5585,6 +5766,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           wsSend(ws, {
             type: 'model_changed',
             model: '',
+            reasoningEffort: session?.reasoningEffort || '',
             ...(session ? buildSessionRuntimeMeta(session) : {}),
           });
           wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
@@ -5595,11 +5777,13 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           session.model = resolvedModel;
           session.updated = new Date().toISOString();
           saveSession(session);
+          sendSessionList(ws, { forceRefresh: true });
         }
         const displayName = getClaudeModelMenuLabel(resolvedModel) || getClaudeModelMenuLabel(resolvedAlias) || modelShortName(resolvedModel) || resolvedModel;
         wsSend(ws, {
           type: 'model_changed',
           model: resolvedAlias,
+          reasoningEffort: session?.reasoningEffort || '',
           ...(session ? buildSessionRuntimeMeta(session) : {}),
         });
         wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
@@ -5670,6 +5854,50 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
+    case '/reasoning':
+    case '/effort': {
+      if (agent !== 'codex') {
+        wsSend(ws, { type: 'system_message', message: '思考级别仅对 Codex 会话生效。' });
+        break;
+      }
+      const effortInput = parts[1];
+      if (!effortInput) {
+        const currentEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
+        wsSend(ws, {
+          type: 'system_message',
+          message: `当前思考级别: ${currentEffort ? codexReasoningEffortLabel(currentEffort) : '默认（跟随 Codex / 模型默认）'}\n可选: default, ${CODEX_REASONING_EFFORTS.join(', ')}`,
+        });
+      } else {
+        const normalizedInput = effortInput.toLowerCase();
+        const effort = normalizedInput === 'default' || normalizedInput === 'auto'
+          ? ''
+          : normalizeCodexReasoningEffort(normalizedInput);
+        if (effort || normalizedInput === 'default' || normalizedInput === 'auto') {
+          if (session) {
+            session.reasoningEffort = effort;
+            clearRuntimeSessionId(session);
+            session.updated = new Date().toISOString();
+            saveSession(session);
+            sendSessionList(ws, { forceRefresh: true });
+          }
+          wsSend(ws, {
+            type: 'reasoning_effort_changed',
+            reasoningEffort: effort,
+            ...(session ? buildSessionRuntimeMeta(session) : {}),
+          });
+          wsSend(ws, {
+            type: 'system_message',
+            message: effort
+              ? `Codex 思考级别已切换为: ${codexReasoningEffortLabel(effort)}`
+              : 'Codex 思考级别已切换为: 默认（跟随 Codex / 模型默认）',
+          });
+        } else {
+          wsSend(ws, { type: 'system_message', message: `无效思考级别: ${effortInput}\n可选: default, ${CODEX_REASONING_EFFORTS.join(', ')}` });
+        }
+      }
+      break;
+    }
+
     case '/help': {
       const base = '可用指令:\n' +
         '/clear — 清除当前会话（含上下文）\n' +
@@ -5679,7 +5907,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/reasoning [级别] — 查看/切换 Codex 思考级别\n/compact — 执行 Codex /compact 压缩上下文'
           : base + '\n/model [名称] — 查看/切换模型（支持别名或完整模型 ID）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）',
       });
       break;
@@ -5704,6 +5932,7 @@ function handleNewSession(ws, msg) {
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
+  const requestedReasoningEffort = agent === 'codex' ? normalizeCodexReasoningEffort(msg?.reasoningEffort) : '';
   let projectId = msg?.projectId || null;
   let resolvedCwd = cwd;
   if (!resolvedCwd && projectId) {
@@ -5736,6 +5965,7 @@ function handleNewSession(ws, msg) {
     codexRuntimeFingerprint: null,
     runtimeContexts: { claude: {}, codex: {} },
     model: null,
+    reasoningEffort: requestedReasoningEffort,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -5754,12 +5984,15 @@ function handleNewSession(ws, msg) {
     messages: [],
     title: session.title,
     mode: session.permissionMode,
+    reasoningEffort: session.reasoningEffort || '',
     model: sessionModelLabel(session),
     agent,
     cwd: session.cwd,
     projectId: session.projectId,
     totalCost: 0,
     totalUsage: session.totalUsage,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -5816,6 +6049,7 @@ function handleLoadSession(ws, sessionId) {
     messages: recentMessages,
     title: session.title,
     mode: session.permissionMode || 'yolo',
+    reasoningEffort: session.reasoningEffort || '',
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     hasUnread: hadUnread,
@@ -5823,6 +6057,8 @@ function handleLoadSession(ws, sessionId) {
     projectId: session.projectId || null,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
     historyTotal: session.messages.length,
     historyBuffered: recentMessages.length,
     historyPending: olderChunks.length > 0,
@@ -5838,8 +6074,7 @@ function handleLoadSession(ws, sessionId) {
   // Resume streaming if process is still active
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
-    entry.ws = ws;
-    entry.wsDisconnectTime = null; // clear disconnect marker
+    attachWebSocketToProcess(entry, ws); // clear disconnect marker
     plog('INFO', 'ws_resume_attach', {
       sessionId: sessionId.slice(0, 8),
       pid: entry.pid,
@@ -5918,7 +6153,7 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   return { removedFiles, removedDbRows };
 }
 
-function handleDeleteSession(ws, sessionId) {
+function deleteSessionById(sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
@@ -5926,47 +6161,54 @@ function handleDeleteSession(ws, sessionId) {
     try { killProcess(entry.pid); } catch {}
     if (entry.tailer) entry.tailer.stop();
     removeActiveProcess(sessionId);
-    if (entry.ws) wsSend(entry.ws, { type: 'done', sessionId });
+    sendRuntimeMessage(entry, { type: 'done', sessionId });
   }
   cleanRunDir(sessionId);
-  try {
-    const p = sessionPath(sessionId);
-    const session = loadSession(sessionId);
-    const sessionAgent = getSessionAgent(session);
-    for (const attachmentId of collectSessionAttachmentIds(session)) {
-      removeAttachmentById(attachmentId);
-    }
-    if (fs.existsSync(p)) {
-      fs.unlinkSync(p);
-      invalidateImportedSessionIdsCache();
-    }
-    invalidateSessionListCache();
-    if (sessionAgent === 'codex') {
-      const codexThreadIds = getAllRuntimeSessionIds(session, 'codex');
-      Promise.all(codexThreadIds.map((threadId) => deleteCodexLocalSession(
-        threadId,
-        session?.importedRolloutPath || null
-      ).then((result) => ({ threadId, result })))).then((results) => {
-        for (const item of results) {
-          plog('INFO', 'codex_local_session_deleted', {
-            sessionId: sessionId.slice(0, 8),
-            threadId: item.threadId,
-            removedFiles: item.result.removedFiles,
-            removedDbRows: item.result.removedDbRows,
-          });
-        }
-      }).catch((error) => {
-        plog('WARN', 'codex_local_session_delete_failed', {
+  const p = sessionPath(sessionId);
+  const session = loadSession(sessionId);
+  const sessionAgent = getSessionAgent(session);
+  for (const attachmentId of collectSessionAttachmentIds(session)) {
+    removeAttachmentById(attachmentId);
+  }
+  let deleted = false;
+  if (fs.existsSync(p)) {
+    fs.unlinkSync(p);
+    invalidateImportedSessionIdsCache();
+    deleted = true;
+  }
+  invalidateSessionListCache();
+  if (sessionAgent === 'codex') {
+    const codexThreadIds = getAllRuntimeSessionIds(session, 'codex');
+    Promise.all(codexThreadIds.map((threadId) => deleteCodexLocalSession(
+      threadId,
+      session?.importedRolloutPath || null
+    ).then((result) => ({ threadId, result })))).then((results) => {
+      for (const item of results) {
+        plog('INFO', 'codex_local_session_deleted', {
           sessionId: sessionId.slice(0, 8),
-          threadIds: codexThreadIds,
-          error: error?.message || String(error),
+          threadId: item.threadId,
+          removedFiles: item.result.removedFiles,
+          removedDbRows: item.result.removedDbRows,
         });
-      });
-    } else {
-      for (const runtimeId of getAllRuntimeSessionIds(session, 'claude')) {
-        deleteClaudeLocalSession(runtimeId);
       }
+    }).catch((error) => {
+      plog('WARN', 'codex_local_session_delete_failed', {
+        sessionId: sessionId.slice(0, 8),
+        threadIds: codexThreadIds,
+        error: error?.message || String(error),
+      });
+    });
+  } else {
+    for (const runtimeId of getAllRuntimeSessionIds(session, 'claude')) {
+      deleteClaudeLocalSession(runtimeId);
     }
+  }
+  return { deleted, session, sessionAgent };
+}
+
+function handleDeleteSession(ws, sessionId) {
+  try {
+    deleteSessionById(sessionId);
     sendSessionList(ws);
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
@@ -6001,13 +6243,34 @@ function handleSetMode(ws, sessionId, mode) {
   wsSend(ws, { type: 'mode_changed', mode });
 }
 
+function handleSetReasoningEffort(ws, sessionId, rawEffort) {
+  const normalizedInput = String(rawEffort || '').trim().toLowerCase();
+  const effort = normalizedInput === 'default' || normalizedInput === 'auto'
+    ? ''
+    : normalizeCodexReasoningEffort(normalizedInput);
+  if (normalizedInput && !effort && normalizedInput !== 'default' && normalizedInput !== 'auto') return;
+  if (sessionId) {
+    const session = loadSession(sessionId);
+    if (session && getSessionAgent(session) === 'codex') {
+      session.reasoningEffort = effort;
+      clearRuntimeSessionId(session);
+      session.updated = new Date().toISOString();
+      saveSession(session);
+      sendSessionList(ws, { forceRefresh: true });
+    }
+  }
+  wsSend(ws, { type: 'reasoning_effort_changed', reasoningEffort: effort });
+}
+
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];
   for (const [sid, entry] of activeProcesses) {
-    if (entry.ws === ws) {
-      entry.ws = null;
-      entry.wsDisconnectTime = new Date().toISOString();
-      affectedSessions.push({ sessionId: sid.slice(0, 8), pid: entry.pid });
+    if (detachWebSocketFromProcess(entry, ws, { markDisconnect: true })) {
+      affectedSessions.push({
+        sessionId: sid.slice(0, 8),
+        pid: entry.pid,
+        stillConnected: isProcessRealtimeConnected(entry),
+      });
     }
   }
   wsSessionMap.delete(ws);
@@ -6017,10 +6280,7 @@ function handleDisconnect(ws, wsId) {
 function detachWebSocketFromActiveProcesses(ws, options = {}) {
   const markDisconnect = options.markDisconnect === true;
   for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) {
-      entry.ws = null;
-      if (markDisconnect) entry.wsDisconnectTime = new Date().toISOString();
-    }
+    detachWebSocketFromProcess(entry, ws, { markDisconnect });
   }
 }
 
@@ -6088,6 +6348,7 @@ function handleMessage(ws, msg, options = {}) {
   }));
   const savedFileRefs = resolvedFileRefs.map(fileRefHistoryMeta);
   const effectiveInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
+  const messageAgent = normalizeAgent(msg.agent);
 
   if (sessionId && activeProcesses.has(sessionId)) {
     const runningSession = loadSession(sessionId);
@@ -6107,7 +6368,7 @@ function handleMessage(ws, msg, options = {}) {
           runningSession.updated = new Date().toISOString();
           saveSession(runningSession);
           const entry = activeProcesses.get(sessionId);
-          if (entry) entry.ws = ws;
+          if (entry) attachWebSocketToProcess(entry, ws);
         }
       } catch (err) {
         wsSend(ws, { type: 'error', message: '无法写入确认输入：' + err.message });
@@ -6127,7 +6388,7 @@ function handleMessage(ws, msg, options = {}) {
   if (sessionId) session = loadSession(sessionId);
   if (!session) {
     const id = crypto.randomUUID();
-    const agent = normalizeAgent(msg.agent);
+    const agent = messageAgent;
     const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
     session = {
       id,
@@ -6139,6 +6400,7 @@ function handleMessage(ws, msg, options = {}) {
       codexThreadId: null,
       runtimeContexts: { claude: {}, codex: {} },
       model: null,
+      reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(msg.reasoningEffort) : '',
       permissionMode: mode || 'yolo',
       totalCost: 0,
       totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -6154,6 +6416,9 @@ function handleMessage(ws, msg, options = {}) {
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
     session.permissionMode = mode;
+  }
+  if (getSessionAgent(session) === 'codex' && Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) {
+    session.reasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
   }
 
   if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {
@@ -6188,11 +6453,14 @@ function handleMessage(ws, msg, options = {}) {
       messages: session.messages,
       title: session.title,
       mode: session.permissionMode || 'yolo',
+      reasoningEffort: session.reasoningEffort || '',
       model: sessionModelLabel(session),
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
       totalCost: session.totalCost || 0,
       totalUsage: session.totalUsage || null,
+      lastUsage: session.lastUsage || null,
+      contextWindowTokens: session.contextWindowTokens || null,
       updated: session.updated,
       hasUnread: false,
       historyPending: false,
@@ -6335,8 +6603,12 @@ function handleMessage(ws, msg, options = {}) {
   entry = {
     pid: proc.pid,
     ws,
+    clients: new Set([ws]),
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
+    startedAtMs: Date.now(),
+    bridgeToken: spawnSpec.bridgeToken || null,
+    bridgeUsageApplied: false,
     claudeRuntimeFingerprint: isClaudeSession(session) ? (spawnSpec.runtimeFingerprint || null) : null,
     codexRuntimeFingerprint: getSessionAgent(session) === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
     runtimeChannelKey: spawnSpec.channelKey || null,
@@ -6428,6 +6700,7 @@ const {
   prepareCodexCustomRuntime,
   getCodexRuntimeFingerprint,
   wsSend,
+  sendRuntimeMessage,
   truncateObj,
   sanitizeToolInput,
   loadSession,
@@ -6804,6 +7077,7 @@ function handleImportNativeSession(ws, msg) {
     runtimeContexts: existingSession?.runtimeContexts || { claude: {}, codex: {} },
     importedFrom: projectDir,
     model: existingSession?.model || null,
+    reasoningEffort: existingSession?.reasoningEffort || '',
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -6822,11 +7096,14 @@ function handleImportNativeSession(ws, msg) {
     messages: session.messages,
     title: session.title,
     mode: session.permissionMode,
+    reasoningEffort: session.reasoningEffort || '',
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -6925,9 +7202,12 @@ function handleImportCodexSession(ws, msg) {
     importedFrom: 'codex',
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
+    reasoningEffort: existingSession?.reasoningEffort || '',
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+    lastUsage: existingSession?.lastUsage || null,
+    contextWindowTokens: existingSession?.contextWindowTokens || null,
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };
@@ -6943,11 +7223,14 @@ function handleImportCodexSession(ws, msg) {
     messages: session.messages,
     title: session.title,
     mode: session.permissionMode,
+    reasoningEffort: session.reasoningEffort || '',
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -7014,10 +7297,81 @@ function handleSaveProject(ws, msg) {
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 
+function decodeClaudeProjectDirName(projectDir) {
+  const raw = String(projectDir || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('-') && !raw.includes('/') && !raw.includes('\\')) {
+    const parts = raw.split('-').filter(Boolean);
+    if (parts.length > 0) return `/${parts.join('/')}`;
+  }
+  return raw;
+}
+
+function getSessionProjectPath(session) {
+  if (!session) return null;
+  if (session.cwd) return session.cwd;
+  const preferredClaudeRuntimeId = getSessionAgent(session) === 'claude'
+    ? getPreferredRuntimeSessionId(session, 'claude')
+    : null;
+  if (preferredClaudeRuntimeId) {
+    const localMeta = resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId);
+    if (localMeta?.cwd) return localMeta.cwd;
+  }
+  return decodeClaudeProjectDirName(session.importedFrom);
+}
+
+function sessionBelongsToConfiguredProject(session, targetProject, projects) {
+  if (!session || !targetProject?.id) return false;
+  const projectsById = new Map((Array.isArray(projects) ? projects : []).map((project) => [project.id, project]));
+  if (session.projectId && projectsById.has(session.projectId)) {
+    return session.projectId === targetProject.id;
+  }
+  const sessionProjectPath = getSessionProjectPath(session);
+  if (!sessionProjectPath) return false;
+  const matchedProject = findBestProjectForPath(projects, sessionProjectPath);
+  return matchedProject?.id === targetProject.id;
+}
+
+function collectProjectSessionIds(targetProject, projects) {
+  const ids = [];
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
+    for (const file of files) {
+      const sessionId = file.replace(/\.json$/, '');
+      const session = loadSession(sessionId);
+      if (sessionBelongsToConfiguredProject(session, targetProject, projects)) ids.push(session.id || sessionId);
+    }
+  } catch {}
+  return ids;
+}
+
 function handleDeleteProject(ws, msg) {
   const config = loadProjectsConfig();
+  const project = config.projects.find(p => p.id === msg.projectId);
+  if (project) {
+    const sessionIds = collectProjectSessionIds(project, config.projects);
+    let deletedSessions = 0;
+    for (const sessionId of sessionIds) {
+      try {
+        const result = deleteSessionById(sessionId);
+        if (result.deleted) deletedSessions++;
+      } catch (err) {
+        plog('WARN', 'project_session_delete_failed', {
+          projectId: project.id,
+          sessionId: String(sessionId || '').slice(0, 8),
+          error: err?.message || String(err),
+        });
+      }
+    }
+    plog('INFO', 'project_deleted', {
+      projectId: project.id,
+      projectPath: project.path,
+      sessions: deletedSessions,
+    });
+  }
   config.projects = config.projects.filter(p => p.id !== msg.projectId);
   saveProjectsConfig(config);
+  sendSessionList(ws, { forceRefresh: true });
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 
@@ -7510,7 +7864,7 @@ setInterval(() => {
       sessionId: sid.slice(0, 8),
       pid: entry.pid,
       alive,
-      wsConnected: !!entry.ws,
+      wsConnected: isProcessRealtimeConnected(entry),
       wsDisconnectTime: entry.wsDisconnectTime || null,
       responseLen: (entry.fullText || '').length,
     });
