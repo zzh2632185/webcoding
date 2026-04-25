@@ -4377,14 +4377,14 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     if (autoRetryRequested) {
       if (contextLimitExceeded) {
         pendingCompactRetries.delete(sessionId);
-        wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
+        wsSend(entry.ws, { type: 'system_message', sessionId, message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
       } else {
-        wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
-        wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
+        wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
+        wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoResumeMessage(entry.agent || 'claude') });
         shouldReturnForFollowup = true;
       }
     } else {
-      wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
+      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
     }
   }
 
@@ -4392,7 +4392,7 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
     if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
       pendingCompactRetries.delete(sessionId);
-      wsSend(entry.ws, { type: 'system_message', message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
+      wsSend(entry.ws, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
     } else {
       pendingCompactRetries.set(sessionId, {
         text: pendingRetry?.text || '',
@@ -4400,14 +4400,14 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
         reason: 'auto',
         autoRetryCount: nextRetryCount,
       });
-      wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
+      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
       shouldAutoCompact = true;
     }
   }
 
   if (completionError && !entry.errorSent && !shouldAutoCompact) {
     entry.errorSent = true;
-    wsSend(entry.ws, { type: 'error', message: completionError });
+    wsSend(entry.ws, { type: 'error', sessionId, message: completionError });
   }
 
   wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
@@ -5698,6 +5698,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
 // === Session Handlers ===
 function handleNewSession(ws, msg) {
+  // Creating a new session changes what this browser is viewing. Make sure
+  // any previous running process stops streaming to this WebSocket first.
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
@@ -5796,9 +5799,7 @@ function handleLoadSession(ws, sessionId) {
   const effectiveCwd = session.cwd || activeProcesses.get(sessionId)?.cwd || null;
 
   // Detach ws from any previous session's process
-  for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) entry.ws = null;
-  }
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
 
   wsSessionMap.set(ws, sessionId);
 
@@ -6013,13 +6014,18 @@ function handleDisconnect(ws, wsId) {
   plog('INFO', 'ws_disconnect', { wsId, activeProcessesAffected: affectedSessions });
 }
 
-function handleDetachView(ws) {
+function detachWebSocketFromActiveProcesses(ws, options = {}) {
+  const markDisconnect = options.markDisconnect === true;
   for (const [, entry] of activeProcesses) {
     if (entry.ws === ws) {
       entry.ws = null;
-      entry.wsDisconnectTime = new Date().toISOString();
+      if (markDisconnect) entry.wsDisconnectTime = new Date().toISOString();
     }
   }
+}
+
+function handleDetachView(ws) {
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.delete(ws);
 }
 
@@ -6172,9 +6178,7 @@ function handleMessage(ws, msg, options = {}) {
 
   const currentSessionId = session.id;
 
-  for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) entry.ws = null;
-  }
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.set(ws, currentSessionId);
 
   if (!sessionId) {

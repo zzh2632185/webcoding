@@ -1476,6 +1476,42 @@ async function runConcurrentSessionsRegressionCase({ port, password }) {
   }
 }
 
+async function runNewSessionDetachRegressionCase({ port, password, tempRoot }) {
+  let connection = null;
+  try {
+    connection = await connectAuthedClient(port, password);
+    const sessionA = await connection.client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger codex slow stream detach-leak', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'trigger codex slow stream detach-leak',
+    );
+    const firstDelta = await connection.client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === sessionA.sessionId && /slow-start:detach-leak/.test(msg.text || ''),
+      5000,
+    );
+    assert(firstDelta.sessionId === sessionA.sessionId, 'Streaming delta should include the source sessionId');
+
+    const newSession = await connection.client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd: tempRoot, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && msg.sessionId !== sessionA.sessionId,
+      5000,
+    );
+    assert(newSession.isRunning === false, 'Fresh new_session should not inherit running state from the previous session');
+
+    const afterNewSessionIndex = connection.messages.length;
+    await sleep(3600);
+    const leakedMessages = connection.messages.slice(afterNewSessionIndex).filter((msg) => (
+      msg.sessionId === sessionA.sessionId
+      && ['text_delta', 'tool_start', 'tool_end', 'done', 'resume_generating', 'usage', 'cost', 'system_message', 'error'].includes(msg.type)
+    ));
+    assert(leakedMessages.length === 0, 'Previous running session should not stream into a freshly created chat');
+  } finally {
+    if (connection) await closeWs(connection.ws);
+  }
+}
+
 async function runReconnectResumeRegressionCase({ port, password }) {
   let originalConnection = null;
   let resumedConnection = null;
@@ -3522,6 +3558,7 @@ async function main() {
       await runner.run('expired attachment cleanup', () => runExpiredAttachmentCleanupRegressionCase(ctx));
       await runner.run('websocket guard rails', () => runWebSocketGuardRegressionCase(ctx));
       await runner.run('concurrent sessions and multi-client attachment', () => runConcurrentSessionsRegressionCase(ctx));
+      await runner.run('new session detaches previous stream', () => runNewSessionDetachRegressionCase(ctx));
       await runner.run('websocket reconnect resume', () => runReconnectResumeRegressionCase(ctx));
       await runner.run('happy path regression flow', () => runHappyPathRegressionCase(ctx));
       await runner.run('server restart recovery', () => runServerRestartRecoveryRegressionCase(ctx));

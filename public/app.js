@@ -3361,6 +3361,11 @@
     }
   }
 
+  function isMessageForCurrentSession(msg) {
+    if (!msg || !msg.sessionId) return true;
+    return msg.sessionId === sessionState.currentSessionId;
+  }
+
   function handleSessionRenamedMessage(msg) {
     sessionState.sessions = sessionState.sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
     updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
@@ -3371,12 +3376,14 @@
   }
 
   function handleTextDeltaMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     if (!composeState.isGenerating) startGenerating();
     composeState.pendingText += msg.text;
     scheduleRender();
   }
 
   function handleToolStartMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
     markStreamingProcessTextSegments();
@@ -3385,6 +3392,7 @@
   }
 
   function handleToolEndMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     if (composeState.activeToolCalls.has(msg.toolUseId)) {
       composeState.activeToolCalls.get(msg.toolUseId).done = true;
       if (msg.kind) composeState.activeToolCalls.get(msg.toolUseId).kind = msg.kind;
@@ -3395,6 +3403,7 @@
   }
 
   function handleCostMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
@@ -3403,6 +3412,7 @@
   }
 
   function handleUsageMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     if (msg.totalUsage || msg.currentUsage || msg.usage) {
       const totalUsage = normalizeUsageShape(msg.totalUsage) || contextRuntimeUsage.totalUsage;
       const currentUsage = normalizeUsageShape(msg.currentUsage || msg.usage)
@@ -3478,6 +3488,7 @@
   }
 
   function handleResumeGeneratingMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     setCurrentSessionRunningState(true);
     if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
       startGenerating();
@@ -3525,6 +3536,7 @@
   }
 
   function handleErrorMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
     const errorMsg = msg.message || '发生未知错误';
     appendError(errorMsg);
     // Also show toast for critical errors to ensure user notice
@@ -3616,8 +3628,8 @@
     tool_end: handleToolEndMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
-    done: (msg) => finishGenerating(msg.sessionId),
-    system_message: (msg) => appendSystemMessage(msg.message),
+    done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
+    system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     mode_changed: handleModeChangedMessage,
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
