@@ -49,13 +49,20 @@
   const GIT_PANEL_DEFAULT_WIDTH = 360;
   const GIT_PANEL_MIN_WIDTH = 280;
   const GIT_PANEL_MAX_WIDTH = 720;
+  const FILE_VIEWER_WIDTH_STORAGE_KEY = 'webcoding-file-viewer-width';
+  const FILE_VIEWER_DEFAULT_WIDTH = 520;
+  const FILE_VIEWER_MIN_WIDTH = 320;
+  const FILE_VIEWER_MAX_WIDTH = 980;
   const DESKTOP_INSIGHTS_BREAKPOINT = 1280;
   const VISIBILITY_RESYNC_THROTTLE_MS = 2500;
-  const SESSION_LIST_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
   const INPUT_MAX_HEIGHT_FALLBACK = 200;
   const RECONNECT_MAX_ATTEMPTS = 8;
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
+  const FILE_REF_TRANSFER_TYPE = 'application/x-webcoding-file-ref';
+  const MAX_PENDING_FILE_REFS = 8;
+  const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
   const THEME_STORAGE_KEY = 'webcoding-theme';
+  const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
   const DEFAULT_THEME = 'default';
   const THEME_LABELS = {
     default: '默认主题',
@@ -100,14 +107,21 @@
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  let pendingFileRefs = [];
+  let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+  let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+  let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('webcoding-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
   let collapsedProjects = new Set();
+  let selectedProject = { id: null, path: null };
+  let projectDragState = null;
   let sidebarResizeState = null;
   let gitPanelResizeState = null;
+  let fileViewerResizeState = null;
   let lastVisibilityResyncAt = 0;
   let localIdCounter = 0;
   let cachedInputMaxHeight = INPUT_MAX_HEIGHT_FALLBACK;
@@ -182,6 +196,8 @@
     set pendingAttachments(value) { pendingAttachments = value; },
     get uploadingAttachments() { return uploadingAttachments; },
     set uploadingAttachments(value) { uploadingAttachments = value; },
+    get pendingFileRefs() { return pendingFileRefs; },
+    set pendingFileRefs(value) { pendingFileRefs = value; },
   };
 
   // --- DOM ---
@@ -205,12 +221,26 @@
   const gitPanelEl = $('#git-panel');
   const gitPanelContent = $('#git-panel-content');
   const gitPanelBtn = $('#git-panel-btn');
+  const fileViewerPanel = $('#file-viewer-panel');
+  const fileViewerTitle = $('#file-viewer-title');
+  const fileViewerPath = $('#file-viewer-path');
+  const fileViewerMeta = $('#file-viewer-meta');
+  const fileViewerBody = $('#file-viewer-body');
+  const fileViewerSourceTab = $('#file-viewer-source-tab');
+  const fileViewerPreviewTab = $('#file-viewer-preview-tab');
+  const fileViewerDownload = $('#file-viewer-download');
+  const fileViewerClose = $('#file-viewer-close');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
+  const sidebarFilePanel = $('#sidebar-file-panel');
+  const fileTree = $('#file-tree');
+  const filePanelRefresh = $('#file-panel-refresh');
+  const contextBar = $('#context-bar');
+  const contextRefList = $('#context-ref-list');
   const chatTitle = $('#chat-title');
   const chatAgentContext = $('#chat-agent-context');
   const chatRuntimeState = $('#chat-runtime-state');
@@ -276,6 +306,18 @@
       return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
+    }
+  }
+
+  function parseStoredSelectedProject() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '{}');
+      return {
+        id: parsed && typeof parsed.id === 'string' ? parsed.id : null,
+        path: parsed && typeof parsed.path === 'string' ? parsed.path : null,
+      };
+    } catch {
+      return { id: null, path: null };
     }
   }
 
@@ -361,7 +403,54 @@
     resizer.classList.toggle('visible', gitState.panelOpen && canResizeGitPanel());
   }
 
+  function getFileViewerResizer() {
+    return document.getElementById('file-viewer-resizer');
+  }
+
+  function getFileViewerWidthLimit() {
+    const containerWidth = workspaceMain?.getBoundingClientRect().width || window.innerWidth || FILE_VIEWER_DEFAULT_WIDTH;
+    return Math.min(FILE_VIEWER_MAX_WIDTH, Math.max(FILE_VIEWER_MIN_WIDTH, containerWidth - 320));
+  }
+
+  function clampFileViewerWidth(width) {
+    const numericWidth = Number(width);
+    if (!Number.isFinite(numericWidth)) return FILE_VIEWER_DEFAULT_WIDTH;
+    return Math.max(FILE_VIEWER_MIN_WIDTH, Math.min(getFileViewerWidthLimit(), Math.round(numericWidth)));
+  }
+
+  function applyFileViewerWidth(width, options = {}) {
+    const nextWidth = clampFileViewerWidth(width);
+    document.documentElement.style.setProperty('--file-viewer-width', `${nextWidth}px`);
+    if (!options.skipPersist) {
+      localStorage.setItem(FILE_VIEWER_WIDTH_STORAGE_KEY, String(nextWidth));
+    }
+    return nextWidth;
+  }
+
+  function canResizeFileViewer() {
+    return !!fileViewerPanel && !!getFileViewerResizer() && window.matchMedia('(min-width: 769px) and (pointer: fine)').matches;
+  }
+
+  function syncFileViewerResizerVisibility() {
+    const resizer = getFileViewerResizer();
+    if (!resizer) return;
+    resizer.classList.toggle('visible', !!fileViewerState.open && canResizeFileViewer());
+  }
+
+  function syncFileViewerWidthForViewport() {
+    syncFileViewerResizerVisibility();
+    if (!canResizeFileViewer()) {
+      document.body.classList.remove('file-viewer-resizing');
+      fileViewerResizeState = null;
+      document.documentElement.style.setProperty('--file-viewer-width', `${FILE_VIEWER_DEFAULT_WIDTH}px`);
+      return;
+    }
+    const savedWidth = parseInt(localStorage.getItem(FILE_VIEWER_WIDTH_STORAGE_KEY) || `${FILE_VIEWER_DEFAULT_WIDTH}`, 10);
+    applyFileViewerWidth(savedWidth, { skipPersist: true });
+  }
+
   collapsedProjects = new Set(parseStoredCollapsedProjects());
+  selectedProject = parseStoredSelectedProject();
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -424,8 +513,10 @@
   window.addEventListener('orientationchange', () => setTimeout(refreshInputMaxHeightCache, 100));
   syncSidebarWidthForViewport();
   syncGitPanelWidthForViewport();
+  syncFileViewerWidthForViewport();
   window.addEventListener('resize', syncSidebarWidthForViewport);
   window.addEventListener('resize', syncGitPanelWidthForViewport);
+  window.addEventListener('resize', syncFileViewerWidthForViewport);
 
   function buildWorkspaceActionButtons(actions, options = {}) {
     const className = options.compact ? 'workspace-action-row' : 'workspace-action-grid';
@@ -444,6 +535,11 @@
   }
 
   function getCurrentProjectContext() {
+    if (selectedProject?.id) {
+      const saved = projects.find((project) => project.id === selectedProject.id);
+      if (saved) return saved;
+      if (selectedProject.path) return buildVirtualProjectFromCwd(selectedProject.path);
+    }
     const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     if (!currentMeta) return null;
     const projectsById = new Map(projects.map((project) => [project.id, project]));
@@ -1807,6 +1903,16 @@
     });
   }
 
+  function renderFileRefLabels(fileRefs, options = {}) {
+    if (!Array.isArray(fileRefs) || fileRefs.length === 0) return '';
+    const labels = fileRefs.map((ref) => {
+      const name = escapeHtml(ref.relativePath || ref.path || 'file');
+      const size = Number(ref.size) ? ` · ${formatFileSize(ref.size)}` : '';
+      return `<span class="msg-attachment-label file-ref">文件: ${name}${size}</span>`;
+    }).join('');
+    return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+  }
+
   function renderAttachmentLabels(attachments, options = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
     const labels = attachments.map((attachment) => {
@@ -1859,6 +1965,599 @@
       });
     });
     syncAttachmentActions();
+  }
+
+  function formatTokenCount(tokens) {
+    const value = Math.max(0, Number(tokens) || 0);
+    if (value >= 1000000) return `${(value / 1000000).toFixed(value >= 10000000 ? 0 : 1)}M`;
+    if (value >= 1000) return `${Math.round(value / 1000)}K`;
+    return String(Math.round(value));
+  }
+
+  function estimateTokensFromText(text) {
+    const value = String(text || '');
+    if (!value) return 0;
+    let ascii = 0;
+    let nonAscii = 0;
+    for (const ch of value) {
+      if (ch.charCodeAt(0) < 128) ascii += 1;
+      else nonAscii += 1;
+    }
+    return Math.ceil(ascii / 4) + nonAscii;
+  }
+
+  function getTotalUsageTokens(totalUsage) {
+    if (!totalUsage) return 0;
+    return (Number(totalUsage.inputTokens) || 0)
+      + (Number(totalUsage.cachedInputTokens) || 0)
+      + (Number(totalUsage.outputTokens) || 0);
+  }
+
+  function normalizeUsageShape(usage) {
+    if (!usage) return null;
+    return {
+      inputTokens: Number(usage.inputTokens ?? usage.input_tokens) || 0,
+      cachedInputTokens: Number(usage.cachedInputTokens ?? usage.cached_input_tokens) || 0,
+      outputTokens: Number(usage.outputTokens ?? usage.output_tokens) || 0,
+      reasoningOutputTokens: Number(usage.reasoningOutputTokens ?? usage.reasoning_output_tokens) || 0,
+      totalTokens: Number(usage.totalTokens ?? usage.total_tokens) || 0,
+    };
+  }
+
+  function diffUsageTotals(nextTotal, prevTotal) {
+    const next = normalizeUsageShape(nextTotal);
+    const prev = normalizeUsageShape(prevTotal);
+    if (!next || !prev) return null;
+    const delta = {
+      inputTokens: Math.max(0, next.inputTokens - prev.inputTokens),
+      cachedInputTokens: Math.max(0, next.cachedInputTokens - prev.cachedInputTokens),
+      outputTokens: Math.max(0, next.outputTokens - prev.outputTokens),
+      reasoningOutputTokens: Math.max(0, next.reasoningOutputTokens - prev.reasoningOutputTokens),
+      totalTokens: Math.max(0, next.totalTokens - prev.totalTokens),
+    };
+    return (delta.inputTokens || delta.outputTokens || delta.cachedInputTokens) ? delta : null;
+  }
+
+  function inferContextWindowTokens() {
+    const raw = [
+      sessionState.currentModel,
+      sessionState.currentActiveRuntime?.displayModel,
+      sessionState.currentActiveRuntime?.model,
+      sessionState.currentActiveRuntime?.defaultModel,
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (/\b1m\b|\[1m\]|1000k|1,000k|1000000/.test(raw)) return 1000000;
+    if (sessionState.currentAgent === 'codex' || /gpt-5|codex/.test(raw)) return 400000;
+    if (/opus|sonnet|haiku|claude/.test(raw) || sessionState.currentAgent === 'claude') return 200000;
+    return null;
+  }
+
+  function updateContextUsageFromSnapshot(snapshot) {
+    contextRuntimeUsage = {
+      currentUsage: normalizeUsageShape(snapshot?.currentUsage || snapshot?.lastUsage),
+      totalUsage: normalizeUsageShape(snapshot?.totalUsage),
+      contextWindowTokens: Number(snapshot?.contextWindowTokens || snapshot?.modelContextWindow || 0) || null,
+    };
+    renderContextBar();
+  }
+
+  function renderContextBar() {
+    if (!contextBar || !contextRefList) return;
+    if (composeState.pendingFileRefs.length === 0) {
+      contextRefList.innerHTML = '';
+      contextBar.classList.toggle('has-file-refs', false);
+      contextBar.hidden = true;
+      return;
+    }
+    contextBar.hidden = false;
+    contextBar.classList.toggle('has-file-refs', true);
+    contextRefList.innerHTML = composeState.pendingFileRefs.map((ref, index) => `
+      <button class="context-ref-chip" type="button" data-index="${index}" title="${escapeHtml(ref.relativePath || ref.path || '')}">
+        <span>${escapeHtml(ref.relativePath || ref.name || 'file')}</span>
+        <span class="context-ref-size">${formatFileSize(ref.size)}</span>
+        <span class="context-ref-remove">×</span>
+      </button>
+    `).join('');
+    contextRefList.querySelectorAll('.context-ref-chip').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const index = Number(chip.dataset.index);
+        if (Number.isInteger(index)) {
+          composeState.pendingFileRefs.splice(index, 1);
+          renderContextBar();
+        }
+      });
+    });
+  }
+
+  function clearFileTree() {
+    fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+    composeState.pendingFileRefs = [];
+    if (fileViewerState.open) closeFileViewer();
+    renderFileTree();
+    renderContextBar();
+  }
+
+  function renderFileTreeItems(items, level = 0) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    return items.map((item) => {
+      const isDir = item.type === 'directory';
+      const canAttach = !isDir && item.isText && !item.tooLarge;
+      const isActiveFile = !isDir && fileViewerState.activePath && item.path === fileViewerState.activePath;
+      const expanded = isDir && fileTreeState.expandedDirs instanceof Set && fileTreeState.expandedDirs.has(item.path);
+      const classes = ['file-tree-row', isDir ? 'directory' : 'file'];
+      if (expanded) classes.push('expanded');
+      if (!isDir && !canAttach) classes.push('not-context');
+      if (isActiveFile) classes.push('active');
+      const icon = isDir ? (expanded ? '▾' : '▸') : '•';
+      const sizeText = !isDir && Number.isFinite(item.size) ? `<span class="file-tree-size">${formatFileSize(item.size)}</span>` : '';
+      const fileOpenPayload = !isDir ? { path: item.path, relativePath: item.relativePath, name: item.name, size: item.size } : null;
+      const attrs = isDir
+        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"`
+        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${canAttach ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify({ path: item.path, relativePath: item.relativePath, size: item.size }))}"` : ''}`;
+      const children = isDir && expanded ? renderFileTreeItems(item.children || [], level + 1) : '';
+      return `
+        <div class="file-tree-node" style="--level:${level}">
+          <div class="${classes.join(' ')}" ${attrs} title="${escapeHtml(item.relativePath || item.name)}">
+            <span class="file-tree-icon">${icon}</span>
+            <span class="file-tree-name">${escapeHtml(item.name)}</span>
+            ${sizeText}
+          </div>
+          ${children}
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderFileTree() {
+    if (!fileTree) return;
+    if (!getFileTreeCwd()) {
+      fileTree.innerHTML = '<div class="file-tree-empty">选择目录后显示文件。</div>';
+      return;
+    }
+    if (fileTreeState.loading) {
+      fileTree.innerHTML = '<div class="file-tree-empty">正在读取文件…</div>';
+      return;
+    }
+    if (fileTreeState.error) {
+      fileTree.innerHTML = `<div class="file-tree-empty error">${escapeHtml(fileTreeState.error)}</div>`;
+      return;
+    }
+    if (!fileTreeState.items.length) {
+      fileTree.innerHTML = '<div class="file-tree-empty">当前目录没有可显示文件。</div>';
+      return;
+    }
+    fileTree.innerHTML = renderFileTreeItems(fileTreeState.items);
+    fileTree.querySelectorAll('.file-tree-row.directory[data-dir-path]').forEach((row) => {
+      const toggle = () => {
+        const dirPath = row.getAttribute('data-dir-path') || '';
+        if (!dirPath) return;
+        if (!(fileTreeState.expandedDirs instanceof Set)) fileTreeState.expandedDirs = new Set();
+        if (fileTreeState.expandedDirs.has(dirPath)) fileTreeState.expandedDirs.delete(dirPath);
+        else fileTreeState.expandedDirs.add(dirPath);
+        renderFileTree();
+      };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      });
+    });
+    fileTree.querySelectorAll('.file-tree-row.file[data-file-open]').forEach((row) => {
+      const open = () => {
+        const raw = row.getAttribute('data-file-open') || '';
+        try { openFileViewer(JSON.parse(raw)); }
+        catch { appendError('文件打开数据无效。'); }
+      };
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open();
+        }
+      });
+    });
+    fileTree.querySelectorAll('.file-tree-row[draggable="true"]').forEach((row) => {
+      row.addEventListener('dragstart', (e) => {
+        const raw = row.getAttribute('data-file-ref') || '';
+        e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, raw);
+        e.dataTransfer?.setData('text/plain', JSON.parse(raw).relativePath || 'file');
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
+      });
+    });
+  }
+
+  async function loadFileTree(cwd = getFileTreeCwd()) {
+    if (!cwd || !fileTree) {
+      clearFileTree();
+      return;
+    }
+    fileTreeState = { ...fileTreeState, cwd, loading: true, error: '', items: [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    renderFileTree();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, depth: '3' });
+      const response = await fetch(`/api/files?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (cwd !== getFileTreeCwd()) return;
+      fileTreeState = { cwd, loading: false, error: '', items: Array.isArray(data.items) ? data.items : [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    } catch (err) {
+      if (cwd !== getFileTreeCwd()) return;
+      fileTreeState = { cwd, loading: false, error: err.message || '无法读取目录', items: [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    }
+    renderFileTree();
+  }
+
+  function addPendingFileRef(ref) {
+    if (!ref?.path) return;
+    if (composeState.pendingFileRefs.some((item) => item.path === ref.path)) {
+      renderContextBar();
+      return;
+    }
+    if (composeState.pendingFileRefs.length >= MAX_PENDING_FILE_REFS) {
+      appendError(`最多一次引用 ${MAX_PENDING_FILE_REFS} 个文件。`);
+      return;
+    }
+    if ((Number(ref.size) || 0) > MAX_PENDING_FILE_REF_SIZE) {
+      appendError('文件超过 256KB，不能作为上下文引用。');
+      return;
+    }
+    composeState.pendingFileRefs.push({
+      path: ref.path,
+      relativePath: ref.relativePath || ref.path,
+      size: Number(ref.size) || 0,
+    });
+    renderContextBar();
+  }
+
+  function clearFileViewerObjectUrl() {
+    if (fileViewerState.objectUrl) {
+      try { URL.revokeObjectURL(fileViewerState.objectUrl); } catch {}
+      fileViewerState.objectUrl = '';
+    }
+  }
+
+  function closeFileViewer() {
+    handleFileViewerResizeEnd();
+    clearFileViewerObjectUrl();
+    fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.remove('visible');
+    syncFileViewerResizerVisibility();
+    renderFileTree();
+  }
+
+  function setFileViewerTab(tab) {
+    fileViewerState.activeTab = tab === 'source' ? 'source' : 'preview';
+    renderFileViewer();
+  }
+
+  function fileCanPreview(data) {
+    if (!data) return false;
+    if (['markdown', 'csv', 'tsv', 'xlsx', 'docx', 'image', 'pdf', 'json'].includes(data.type)) return true;
+    if (data.type === 'code') return ['html', 'svg'].includes(String(data.language || '').toLowerCase());
+    return false;
+  }
+
+  function fileHasSource(data) {
+    return !!(data && (typeof data.content === 'string' || typeof data.html === 'string'));
+  }
+
+  function fileEditable(data) {
+    return !!(data && typeof data.content === 'string' && ['markdown', 'csv', 'tsv', 'json', 'code', 'text'].includes(data.type));
+  }
+
+  function normalizeFileViewerTab(data, preferred = fileViewerState.activeTab) {
+    const canPreview = fileCanPreview(data);
+    const hasSource = fileHasSource(data);
+    if (preferred === 'source' && hasSource) return 'source';
+    if (canPreview) return 'preview';
+    if (hasSource) return 'source';
+    return 'preview';
+  }
+
+  function buildFileViewerSrcdoc(bodyHtml, extraCss = '') {
+    return `${PREVIEW_SRCDOC_CSP}<style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.65;margin:0;padding:20px;color:#1f2937;background:#fff}pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow:auto}code{background:#eef2f7;padding:1px 5px;border-radius:4px}pre code{background:none;padding:0}img{max-width:100%}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee8;padding:6px 9px;text-align:left;vertical-align:top}th{background:#f8fafc;font-weight:700;position:sticky;top:0}tr:nth-child(even){background:#fbfcfe}blockquote{border-left:3px solid #cbd5e1;margin:0;padding-left:12px;color:#64748b}${extraCss}</style>${bodyHtml}`;
+  }
+
+  function parseDelimitedTable(text, delimiter = ',') {
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let inQuotes = false;
+    const input = String(text || '');
+    for (let i = 0; i < input.length; i += 1) {
+      const ch = input[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (input[i + 1] === '"') { cell += '"'; i += 1; }
+          else inQuotes = false;
+        } else {
+          cell += ch;
+        }
+      } else if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        row.push(cell);
+        cell = '';
+      } else if (ch === '\n') {
+        row.push(cell);
+        rows.push(row);
+        row = [];
+        cell = '';
+      } else if (ch !== '\r') {
+        cell += ch;
+      }
+    }
+    row.push(cell);
+    if (row.length > 1 || row[0] !== '' || rows.length === 0) rows.push(row);
+    return rows;
+  }
+
+  function renderRowsAsTable(rows, options = {}) {
+    const maxRows = Number(options.maxRows || 1000);
+    const maxCols = Number(options.maxCols || 50);
+    const limitedRows = (Array.isArray(rows) ? rows : []).slice(0, maxRows);
+    const colCount = Math.min(maxCols, limitedRows.reduce((max, row) => Math.max(max, Array.isArray(row) ? row.length : 0), 0));
+    if (!limitedRows.length || colCount === 0) return '<div class="file-viewer-empty">没有可显示的数据。</div>';
+    const head = limitedRows[0] || [];
+    const body = limitedRows.slice(1);
+    const th = Array.from({ length: colCount }, (_, i) => `<th>${escapeHtml(head[i] ?? '')}</th>`).join('');
+    const trs = body.map((row) => `<tr>${Array.from({ length: colCount }, (_, i) => `<td>${escapeHtml((row || [])[i] ?? '')}</td>`).join('')}</tr>`).join('');
+    return `<div class="file-viewer-table-wrap"><table class="file-viewer-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>`;
+  }
+
+  function renderFileSource(data) {
+    const raw = typeof data?.content === 'string' ? data.content : (typeof data?.html === 'string' ? data.html : '');
+    const lang = data?.language || (data?.type === 'docx' ? 'html' : 'plaintext');
+    const codeClass = lang ? `language-${escapeHtml(lang)}` : '';
+    if (fileEditable(data)) {
+      return `
+        <div class="file-editor-toolbar">
+          <span class="file-editor-label">文本编辑</span>
+          <span id="file-editor-status" class="file-editor-status"></span>
+          <button id="file-editor-save" class="file-editor-save" type="button">保存</button>
+        </div>
+        <textarea id="file-editor-textarea" class="file-editor-textarea" spellcheck="false">${escapeHtml(raw)}</textarea>
+      `;
+    }
+    return `<pre class="file-viewer-pre"><code class="${codeClass}">${escapeHtml(raw || '暂无内容')}</code></pre>`;
+  }
+
+  function renderJsonPreview(data) {
+    let value = data?.content || '';
+    try { value = JSON.stringify(JSON.parse(value), null, 2); } catch {}
+    return `<pre class="file-viewer-pre"><code class="language-json">${escapeHtml(value)}</code></pre>`;
+  }
+
+  function renderFilePreview(data) {
+    if (!data) return '';
+    if (data.type === 'markdown') {
+      return `<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildMarkdownSrcdoc(data.content || ''))}"></iframe>`;
+    }
+    if (data.type === 'docx') {
+      const warnings = Array.isArray(data.messages) && data.messages.length
+        ? `<div class="file-viewer-warning">${escapeHtml(data.messages[0])}</div>`
+        : '';
+      return `${warnings}<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildFileViewerSrcdoc(data.html || ''))}"></iframe>`;
+    }
+    if (data.type === 'xlsx') {
+      const note = data.truncated ? `<div class="file-viewer-warning">内容较大，仅显示前 ${data.displayedRows || 0} 行、${data.displayedCols || 0} 列。</div>` : '';
+      const sheets = Array.isArray(data.sheets) && data.sheets.length ? `<div class="file-viewer-sheet-list">Sheet：${escapeHtml(data.activeSheet || data.sheets[0])}</div>` : '';
+      return `${sheets}${note}${renderRowsAsTable(data.rows || [])}`;
+    }
+    if (data.type === 'csv' || data.type === 'tsv') {
+      const rows = parseDelimitedTable(data.content || '', data.type === 'tsv' ? '\t' : ',');
+      return renderRowsAsTable(rows);
+    }
+    if (data.type === 'json') {
+      return renderJsonPreview(data);
+    }
+    if (data.type === 'image') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载图片…</div>';
+      return `<div class="file-viewer-image-wrap"><img class="file-viewer-image" src="${escapeHtml(fileViewerState.objectUrl)}" alt="${escapeHtml(data.name || 'image')}"></div>`;
+    }
+    if (data.type === 'pdf') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载 PDF…</div>';
+      return `<iframe class="file-viewer-iframe" src="${escapeHtml(fileViewerState.objectUrl)}" title="${escapeHtml(data.name || 'PDF')}"></iframe>`;
+    }
+    if (data.type === 'code' && ['html', 'svg'].includes(String(data.language || '').toLowerCase())) {
+      return `<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildSafePreviewSrcdoc(data.content || ''))}"></iframe>`;
+    }
+    if (fileHasSource(data)) return renderFileSource(data);
+    return `<div class="file-viewer-empty">该文件类型暂不支持直接预览。<br>${escapeHtml(data.name || '')} · ${formatFileSize(data.size || 0)}</div>`;
+  }
+
+  async function fetchFileViewerBlob(data) {
+    if (!data?.rawUrl || !['image', 'pdf'].includes(data.type)) return;
+    const expectedPath = data.path || fileViewerState.activePath;
+    try {
+      const response = await fetch(data.rawUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
+      if (!response.ok) throw new Error(`读取原始文件失败 (${response.status})`);
+      const blob = await response.blob();
+      if (fileViewerState.activePath !== expectedPath) return;
+      clearFileViewerObjectUrl();
+      fileViewerState.objectUrl = URL.createObjectURL(blob);
+      renderFileViewer();
+    } catch (err) {
+      if (fileViewerState.activePath === expectedPath) {
+        fileViewerState.error = err.message || '读取原始文件失败';
+        renderFileViewer();
+      }
+    }
+  }
+
+  function renderFileViewer() {
+    if (!fileViewerPanel || !fileViewerBody) return;
+    fileViewerPanel.classList.toggle('visible', !!fileViewerState.open);
+    syncFileViewerResizerVisibility();
+    const data = fileViewerState.data;
+    if (fileViewerTitle) fileViewerTitle.textContent = data?.name || (fileViewerState.loading ? '正在打开文件' : '文件');
+    if (fileViewerPath) fileViewerPath.textContent = data?.relativePath || '';
+    if (fileViewerMeta) fileViewerMeta.textContent = data?.size ? formatFileSize(data.size) : '';
+    const canPreview = fileCanPreview(data);
+    const hasSource = fileHasSource(data);
+    fileViewerState.activeTab = normalizeFileViewerTab(data, fileViewerState.activeTab);
+    if (fileViewerPreviewTab) {
+      fileViewerPreviewTab.hidden = !canPreview;
+      fileViewerPreviewTab.classList.toggle('active', fileViewerState.activeTab === 'preview');
+    }
+    if (fileViewerSourceTab) {
+      fileViewerSourceTab.hidden = !hasSource;
+      fileViewerSourceTab.classList.toggle('active', fileViewerState.activeTab === 'source');
+    }
+    if (fileViewerDownload) fileViewerDownload.hidden = !data;
+    if (fileViewerState.loading) {
+      fileViewerBody.innerHTML = '<div class="file-viewer-empty">正在读取文件…</div>';
+      return;
+    }
+    if (fileViewerState.error) {
+      fileViewerBody.innerHTML = `<div class="file-viewer-empty error">${escapeHtml(fileViewerState.error)}</div>`;
+      return;
+    }
+    if (!data) {
+      fileViewerBody.innerHTML = '<div class="file-viewer-empty">从左侧文件树点击文件后显示内容。</div>';
+      return;
+    }
+    fileViewerBody.innerHTML = fileViewerState.activeTab === 'source' ? renderFileSource(data) : renderFilePreview(data);
+    fileViewerBody.querySelectorAll('pre code').forEach((codeEl) => {
+      if (window.hljs) {
+        try { window.hljs.highlightElement(codeEl); } catch {}
+      }
+    });
+    bindFileEditorEvents();
+  }
+
+  function bindFileEditorEvents() {
+    const textarea = document.getElementById('file-editor-textarea');
+    const saveBtn = document.getElementById('file-editor-save');
+    const status = document.getElementById('file-editor-status');
+    if (!textarea || !saveBtn || !fileEditable(fileViewerState.data)) return;
+    const original = String(fileViewerState.data.content || '');
+    const updateDirtyState = () => {
+      const dirty = textarea.value !== original;
+      saveBtn.disabled = !dirty || !!fileViewerState.saving;
+      if (status && dirty) status.textContent = '未保存';
+      if (status && !dirty && !fileViewerState.saving) status.textContent = '';
+    };
+    textarea.addEventListener('input', updateDirtyState);
+    saveBtn.addEventListener('click', () => saveFileViewerEdits(textarea.value));
+    updateDirtyState();
+  }
+
+  async function saveFileViewerEdits(content) {
+    const data = fileViewerState.data;
+    const cwd = getFileTreeCwd();
+    if (!fileEditable(data) || !cwd || !data.path) return;
+    const saveBtn = document.getElementById('file-editor-save');
+    const status = document.getElementById('file-editor-status');
+    fileViewerState.saving = true;
+    if (saveBtn) saveBtn.disabled = true;
+    if (status) status.textContent = '保存中…';
+    try {
+      await ensureAuthenticatedWs();
+      const response = await fetch('/api/file-view', {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${connectionState.authToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ cwd, path: data.path, content }),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.ok) throw new Error(result?.message || `保存失败 (${response.status})`);
+      if (fileViewerState.activePath !== data.path) return;
+      fileViewerState.data = { ...data, ...result, content };
+      fileViewerState.saving = false;
+      if (fileViewerMeta) fileViewerMeta.textContent = result.size ? formatFileSize(result.size) : '';
+      showToast('文件已保存');
+      renderFileViewer();
+      loadFileTree(cwd);
+    } catch (err) {
+      fileViewerState.saving = false;
+      if (saveBtn) saveBtn.disabled = false;
+      if (status) status.textContent = err.message || '保存失败';
+      appendError(err.message || '保存失败');
+    }
+  }
+
+  async function downloadFileViewerFile() {
+    const data = fileViewerState.data;
+    if (!data) return;
+    const filename = data.name || 'file';
+    try {
+      await ensureAuthenticatedWs();
+      let blob;
+      if (data.rawUrl) {
+        const response = await fetch(data.rawUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
+        if (!response.ok) throw new Error(`下载失败 (${response.status})`);
+        blob = await response.blob();
+      } else if (typeof data.content === 'string') {
+        blob = new Blob([data.content], { type: data.mime || 'text/plain;charset=utf-8' });
+      } else if (typeof data.html === 'string') {
+        blob = new Blob([data.html], { type: 'text/html;charset=utf-8' });
+      } else {
+        throw new Error('该文件不能下载');
+      }
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 1000);
+    } catch (err) {
+      appendError(err.message || '下载失败');
+    }
+  }
+
+  async function openFileViewer(file) {
+    const cwd = getFileTreeCwd();
+    if (!file?.path || !cwd) return;
+    clearFileViewerObjectUrl();
+    fileViewerState = { open: true, loading: true, error: '', data: null, activePath: file.path, activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    syncFileViewerWidthForViewport();
+    renderFileTree();
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: file.path });
+      const response = await fetch(`/api/file-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== file.path) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, 'preview');
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+    } catch (err) {
+      if (fileViewerState.activePath !== file.path) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '无法打开文件';
+      fileViewerState.data = null;
+      renderFileViewer();
+    }
+  }
+
+  function handleDroppedFileRef(dataTransfer) {
+    const raw = dataTransfer?.getData(FILE_REF_TRANSFER_TYPE);
+    if (!raw) return false;
+    try {
+      addPendingFileRef(JSON.parse(raw));
+      return true;
+    } catch {
+      appendError('文件引用数据无效。');
+      return true;
+    }
   }
 
   async function uploadImageFile(file) {
@@ -2061,6 +2760,9 @@
     composeState.pendingText = '';
     composeState.pendingAttachments = [];
     composeState.uploadingAttachments = [];
+    composeState.pendingFileRefs = [];
+    contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
+    clearFileTree();
     composeState.activeToolCalls.clear();
     _previewCodeMap.clear();
     _previewCodeId = 0;
@@ -2099,8 +2801,16 @@
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
     sessionState.currentCwd = nextGitCwd;
-    if (gitCwdChanged) resetGitState(nextGitCwd ? { cwd: nextGitCwd } : {});
+    if (nextGitCwd) {
+      selectProjectForCwd(nextGitCwd, { render: false, loadFiles: false });
+    }
+    if (gitCwdChanged) {
+      resetGitState(nextGitCwd ? { cwd: nextGitCwd } : {});
+      if (nextGitCwd) loadFileTree(nextGitCwd);
+      else clearFileTree();
+    }
     updateCwdBadge();
+    updateContextUsageFromSnapshot(snapshot);
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       sessionState.currentMode = snapshot.mode;
       modeSelect.value = sessionState.currentMode;
@@ -2693,11 +3403,28 @@
   }
 
   function handleUsageMessage(msg) {
-    if (msg.totalUsage) {
-      const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-      costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
-      if (sessionState.currentSessionId) {
-        updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
+    if (msg.totalUsage || msg.currentUsage || msg.usage) {
+      const totalUsage = normalizeUsageShape(msg.totalUsage) || contextRuntimeUsage.totalUsage;
+      const currentUsage = normalizeUsageShape(msg.currentUsage || msg.usage)
+        || diffUsageTotals(totalUsage, contextRuntimeUsage.totalUsage)
+        || contextRuntimeUsage.currentUsage;
+      if (msg.totalUsage) {
+        const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
+        costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+      }
+      contextRuntimeUsage = {
+        currentUsage,
+        totalUsage,
+        contextWindowTokens: Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null,
+      };
+      renderContextBar();
+      if (sessionState.currentSessionId && msg.totalUsage) {
+        updateCachedSession(sessionState.currentSessionId, (snapshot) => {
+          snapshot.totalUsage = deepClone(msg.totalUsage);
+          delete snapshot.currentUsage;
+          delete snapshot.lastUsage;
+          delete snapshot.contextWindowTokens;
+        });
       }
     }
     renderWorkspaceInsights();
@@ -2833,6 +3560,7 @@
 
   function handleProjectsConfigMessage(msg) {
     projects = msg.projects || [];
+    reconcileSelectedProjectWithSavedProjects();
     renderSessionList();
     if (pendingProjectSaveCallback) {
       const cb = pendingProjectSaveCallback;
@@ -3032,6 +3760,11 @@
     bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
   }
 
+  function appendMessageFileRefs(bubble, fileRefs = []) {
+    if (!bubble || !Array.isArray(fileRefs) || fileRefs.length === 0) return;
+    bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
+  }
+
   function getStreamingBubble() {
     return document.querySelector('#streaming-msg .msg-bubble');
   }
@@ -3052,7 +3785,7 @@
     return textDiv;
   }
 
-  function createMsgElement(role, content, attachments = []) {
+  function createMsgElement(role, content, attachments = [], fileRefs = []) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
 
@@ -3088,10 +3821,16 @@
       if (attachments.length > 0) {
         bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
       }
+      if (fileRefs.length > 0) {
+        bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
+      }
     } else {
       bubble.innerHTML = content ? renderMarkdown(content) : '';
       if (attachments.length > 0) {
         bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
+      }
+      if (fileRefs.length > 0) {
+        bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
       }
     }
 
@@ -3352,6 +4091,7 @@
       if (segmentEl) bubble.appendChild(segmentEl);
     });
     appendMessageAttachments(bubble, message?.attachments || []);
+    appendMessageFileRefs(bubble, message?.fileRefs || []);
   }
 
   function renderStreamingSegments(segments) {
@@ -3375,7 +4115,7 @@
   }
 
   function buildMsgElement(m) {
-    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || []);
+    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || []);
     const el = createMsgElement('assistant', '');
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
@@ -4152,16 +4892,164 @@
     localStorage.setItem('webcoding-collapsed-projects', JSON.stringify([...collapsedProjects]));
   }
 
+  function saveSelectedProject() {
+    if (!selectedProject?.id) {
+      localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify({
+      id: selectedProject.id,
+      path: selectedProject.path || null,
+    }));
+  }
+
+  function getFileTreeCwd() {
+    return selectedProject?.path || sessionState.currentCwd || null;
+  }
+
+  function collapseProjectsExcept(projectId) {
+    const ids = new Set(projects.map((project) => project.id).filter(Boolean));
+    sessionList.querySelectorAll('.project-group[data-project-id]').forEach((group) => {
+      if (group.dataset.projectId) ids.add(group.dataset.projectId);
+    });
+    for (const id of ids) {
+      if (id === projectId) collapsedProjects.delete(id);
+      else collapsedProjects.add(id);
+    }
+    saveCollapsedProjects();
+  }
+
+  function selectProjectGroup(project, options = {}) {
+    if (!project?.id) return;
+    selectedProject = { id: project.id, path: project.path || null };
+    saveSelectedProject();
+    if (options.collapseOthers !== false) {
+      collapseProjectsExcept(project.id);
+    } else {
+      collapsedProjects.delete(project.id);
+      saveCollapsedProjects();
+    }
+    if (options.loadFiles !== false) {
+      if (project.path) loadFileTree(project.path);
+      else clearFileTree();
+    }
+    if (options.render !== false) renderSessionList();
+    renderWorkspaceInsights();
+  }
+
+  function selectProjectForCwd(cwd, options = {}) {
+    if (!cwd) return;
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    const project = findBestProjectForSession({ cwd }, projectsById) || buildVirtualProjectFromCwd(cwd);
+    selectProjectGroup(project, options);
+  }
+
+  function reconcileSelectedProjectWithSavedProjects() {
+    if (!selectedProject?.id) return;
+    const saved = projects.find((project) => project.id === selectedProject.id);
+    if (saved && saved.path !== selectedProject.path) {
+      selectedProject = { id: saved.id, path: saved.path || null };
+      saveSelectedProject();
+      return;
+    }
+    if (!saved && selectedProject.path) {
+      const pathMatched = projects.find((project) => normalizeComparablePath(project.path) === normalizeComparablePath(selectedProject.path));
+      if (pathMatched) {
+        selectedProject = { id: pathMatched.id, path: pathMatched.path || null };
+        saveSelectedProject();
+      }
+    }
+  }
+
+  function clearProjectDragClasses() {
+    sessionList.querySelectorAll('.project-group.dragging, .project-group.drag-over-before, .project-group.drag-over-after')
+      .forEach((group) => group.classList.remove('dragging', 'drag-over-before', 'drag-over-after'));
+  }
+
+  function reorderProjectsLocally(draggedId, targetId, placeAfter) {
+    if (!draggedId || !targetId || draggedId === targetId) return false;
+    const fromIndex = projects.findIndex((project) => project.id === draggedId);
+    const targetIndex = projects.findIndex((project) => project.id === targetId);
+    if (fromIndex < 0 || targetIndex < 0) return false;
+    const nextProjects = [...projects];
+    const [draggedProject] = nextProjects.splice(fromIndex, 1);
+    let insertIndex = nextProjects.findIndex((project) => project.id === targetId);
+    if (insertIndex < 0) return false;
+    if (placeAfter) insertIndex += 1;
+    nextProjects.splice(insertIndex, 0, draggedProject);
+    projects = nextProjects;
+    return true;
+  }
+
+  function persistProjectOrder() {
+    send({ type: 'reorder_projects', projectIds: projects.map((project) => project.id) });
+  }
+
+  function bindProjectDragHandlers(group, project, isVirtualCwd) {
+    if (isVirtualCwd || !project?.id) return;
+    group.draggable = true;
+    group.classList.add('project-group-draggable');
+
+    group.addEventListener('dragstart', (e) => {
+      if (e.target instanceof Element && e.target.closest('.project-group-actions, .project-group-menu, .session-item')) {
+        e.preventDefault();
+        return;
+      }
+      projectDragState = { projectId: project.id };
+      group.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', project.id);
+      }
+    });
+
+    group.addEventListener('dragover', (e) => {
+      const draggedId = projectDragState?.projectId || e.dataTransfer?.getData('text/plain');
+      if (!draggedId || draggedId === project.id) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      const rect = group.getBoundingClientRect();
+      const placeAfter = e.clientY > rect.top + rect.height / 2;
+      group.classList.toggle('drag-over-before', !placeAfter);
+      group.classList.toggle('drag-over-after', placeAfter);
+    });
+
+    group.addEventListener('dragleave', (e) => {
+      if (e.relatedTarget instanceof Node && group.contains(e.relatedTarget)) return;
+      group.classList.remove('drag-over-before', 'drag-over-after');
+    });
+
+    group.addEventListener('drop', (e) => {
+      const draggedId = projectDragState?.projectId || e.dataTransfer?.getData('text/plain');
+      if (!draggedId || draggedId === project.id) return;
+      e.preventDefault();
+      const rect = group.getBoundingClientRect();
+      const placeAfter = e.clientY > rect.top + rect.height / 2;
+      clearProjectDragClasses();
+      projectDragState = null;
+      if (reorderProjectsLocally(draggedId, project.id, placeAfter)) {
+        persistProjectOrder();
+        renderSessionList();
+      }
+    });
+
+    group.addEventListener('dragend', () => {
+      projectDragState = null;
+      clearProjectDragClasses();
+    });
+  }
+
   function renderProjectGroup(project, groupSessions, container, timestampCache) {
     const isVirtualCwd = Boolean(project.isVirtualCwd);
-    const containsCurrentSession = groupSessions.some((session) => session.id === sessionState.currentSessionId);
-    const isCollapsed = collapsedProjects.has(project.id);
+    const isSelectedProject = selectedProject?.id === project.id
+      || (!!selectedProject?.path && !!project.path && normalizeComparablePath(selectedProject.path) === normalizeComparablePath(project.path));
+    const isCollapsed = !isSelectedProject && collapsedProjects.has(project.id);
     const runningCount = groupSessions.reduce((count, session) => count + (session.isRunning ? 1 : 0), 0);
     const unreadCount = groupSessions.reduce((count, session) => count + (session.hasUnread ? 1 : 0), 0);
 
     const group = document.createElement('section');
     group.className = 'project-group'
-      + (containsCurrentSession ? ' active-project' : '')
+      + (isSelectedProject ? ' active-project' : '')
       + (groupSessions.length === 0 ? ' empty-project' : '')
       + (runningCount ? ' has-running' : '')
       + (unreadCount ? ' has-unread' : '');
@@ -4169,11 +5057,13 @@
     group.dataset.sessionCount = String(groupSessions.length);
     if (runningCount) group.dataset.runningCount = String(runningCount);
     if (unreadCount) group.dataset.unreadCount = String(unreadCount);
+    bindProjectDragHandlers(group, project, isVirtualCwd);
 
     const header = document.createElement('div');
     header.className = 'project-group-header' + (isCollapsed ? ' collapsed' : '');
     header.dataset.projectId = project.id;
     header.setAttribute('aria-expanded', String(!isCollapsed));
+    header.setAttribute('aria-selected', String(isSelectedProject));
     header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话`);
 
     const main = document.createElement('div');
@@ -4356,13 +5246,7 @@
     header.addEventListener('click', (e) => {
       // Ignore clicks on the actions area (more btn / menu)
       if (actions.contains(e.target)) return;
-      if (isCollapsed) {
-        collapsedProjects.delete(project.id);
-      } else {
-        collapsedProjects.add(project.id);
-      }
-      saveCollapsedProjects();
-      renderSessionList();
+      selectProjectGroup(project);
     });
     group.appendChild(header);
 
@@ -4473,7 +5357,6 @@
     const groupEntries = projects.map((project) => ({
       project,
       groupSessions: grouped.get(project.id) || [],
-      containsCurrentSession: (grouped.get(project.id) || []).some((session) => session.id === sessionState.currentSessionId),
       isVirtual: false,
       latestTimestamp: getLatestSessionTimestamp(grouped.get(project.id) || [], sessionTimestampCache),
     }));
@@ -4483,25 +5366,10 @@
       groupEntries.push({
         project,
         groupSessions,
-        containsCurrentSession: groupSessions.some((session) => session.id === sessionState.currentSessionId),
         isVirtual: true,
         latestTimestamp: getLatestSessionTimestamp(groupSessions, sessionTimestampCache),
       });
     }
-
-    groupEntries.sort((a, b) => {
-      if (a.containsCurrentSession !== b.containsCurrentSession) {
-        return a.containsCurrentSession ? -1 : 1;
-      }
-      const aHasSessions = a.groupSessions.length > 0;
-      const bHasSessions = b.groupSessions.length > 0;
-      if (aHasSessions !== bHasSessions) {
-        return aHasSessions ? -1 : 1;
-      }
-      const latestDiff = b.latestTimestamp - a.latestTimestamp;
-      if (latestDiff !== 0) return latestDiff;
-      return SESSION_LIST_COLLATOR.compare(a.project.name || '', b.project.name || '');
-    });
 
     for (const entry of groupEntries) {
       renderProjectGroup(entry.project, entry.groupSessions, listFragment, sessionTimestampCache);
@@ -4766,6 +5634,42 @@
     applyGitPanelWidth(currentWidth);
     gitPanelResizeState = null;
     document.body.classList.remove('git-panel-resizing');
+  }
+
+  function handleFileViewerResizeStart(e) {
+    if (!fileViewerState.open || !canResizeFileViewer()) return;
+    if (typeof e.button === 'number' && e.button !== 0) return;
+    fileViewerResizeState = {
+      startX: e.clientX,
+      startWidth: fileViewerPanel.getBoundingClientRect().width,
+    };
+    document.body.classList.add('file-viewer-resizing');
+    const resizer = getFileViewerResizer();
+    if (typeof resizer?.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      resizer.setPointerCapture(e.pointerId);
+    }
+    e.preventDefault();
+  }
+
+  function handleFileViewerResizeMove(e) {
+    if (!fileViewerResizeState) return;
+    const deltaX = fileViewerResizeState.startX - e.clientX;
+    applyFileViewerWidth(fileViewerResizeState.startWidth + deltaX, { skipPersist: true });
+  }
+
+  function handleFileViewerResizeEnd(e) {
+    if (!fileViewerResizeState) return;
+    const releasedPointerId = e?.pointerId;
+    const resizer = getFileViewerResizer();
+    if (typeof resizer?.releasePointerCapture === 'function' && releasedPointerId !== undefined) {
+      try { resizer.releasePointerCapture(releasedPointerId); } catch {}
+    }
+    const currentWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--file-viewer-width'), 10)
+      || fileViewerPanel?.getBoundingClientRect().width
+      || FILE_VIEWER_DEFAULT_WIDTH;
+    applyFileViewerWidth(currentWidth);
+    fileViewerResizeState = null;
+    document.body.classList.remove('file-viewer-resizing');
   }
 
   // --- Slash Command Menu ---
@@ -5083,15 +5987,15 @@
   function sendMessage() {
     const text = msgInput.value.trim();
     const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
-    if ((!text && composeState.pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
+    if ((!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) || isBlockingSessionLoad()) return;
     if (composeState.isGenerating && !isPlanModeActive) return;
     hideCmdMenu();
     hideOptionPicker();
 
     // Slash commands: don't show as user bubble
     if (text.startsWith('/')) {
-      if (composeState.pendingAttachments.length > 0) {
-        appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
+      if (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0) {
+        appendError('命令消息暂不支持附带图片或文件引用，请先移除后再发送命令。');
         return;
       }
       // /model without argument → show interactive picker
@@ -5118,13 +6022,16 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
+    messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs));
     scrollToBottom();
 
-    send({ type: 'message', text, attachments, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+    send({ type: 'message', text, attachments, fileRefs, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
     msgInput.value = '';
     composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
     renderPendingAttachments();
+    renderContextBar();
     autoResize();
     if (!composeState.isGenerating) startGenerating();
   }
@@ -5175,6 +6082,18 @@
     window.addEventListener('pointerup', handleGitPanelResizeEnd);
     window.addEventListener('pointercancel', handleGitPanelResizeEnd);
   }
+  const fileViewerResizer = getFileViewerResizer();
+  if (fileViewerResizer) {
+    fileViewerResizer.addEventListener('pointerdown', handleFileViewerResizeStart);
+    fileViewerResizer.addEventListener('dblclick', () => applyFileViewerWidth(FILE_VIEWER_DEFAULT_WIDTH));
+    window.addEventListener('pointermove', handleFileViewerResizeMove);
+    window.addEventListener('pointerup', handleFileViewerResizeEnd);
+    window.addEventListener('pointercancel', handleFileViewerResizeEnd);
+  }
+  if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
+  if (fileViewerPreviewTab) fileViewerPreviewTab.addEventListener('click', () => setFileViewerTab('preview'));
+  if (fileViewerSourceTab) fileViewerSourceTab.addEventListener('click', () => setFileViewerTab('source'));
+  if (fileViewerDownload) fileViewerDownload.addEventListener('click', downloadFileViewerFile);
   document.addEventListener('touchstart', handleSidebarSwipeStart, { passive: true });
   document.addEventListener('touchmove', handleSidebarSwipeMove, { passive: false });
   document.addEventListener('touchend', handleSidebarSwipeEnd, { passive: true });
@@ -5368,6 +6287,8 @@
   });
   sendBtn.addEventListener('click', sendMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
+  renderContextBar();
   if (attachBtn && imageUploadInput) {
     attachBtn.addEventListener('click', () => imageUploadInput.click());
     imageUploadInput.addEventListener('change', () => {
@@ -5376,8 +6297,10 @@
   }
   if (inputWrapper) {
     inputWrapper.addEventListener('dragover', (e) => {
-      if (!e.dataTransfer?.types?.includes('Files')) return;
+      const types = Array.from(e.dataTransfer?.types || []);
+      if (!types.includes('Files') && !types.includes(FILE_REF_TRANSFER_TYPE)) return;
       e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
       inputWrapper.classList.add('drag-active');
     });
     inputWrapper.addEventListener('dragleave', (e) => {
@@ -5386,6 +6309,7 @@
     inputWrapper.addEventListener('drop', (e) => {
       e.preventDefault();
       inputWrapper.classList.remove('drag-active');
+      if (handleDroppedFileRef(e.dataTransfer)) return;
       handleSelectedImageFiles(e.dataTransfer?.files);
     });
   }
@@ -5419,6 +6343,7 @@
   });
 
   msgInput.addEventListener('input', () => {
+    renderContextBar();
     autoResize();
     const val = msgInput.value;
     // Show slash command menu

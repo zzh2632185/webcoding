@@ -87,7 +87,21 @@
             <button id="import-session-btn">导入本地 CLI 会话</button>
           </div>
         </div>
-        <div id="session-list" class="session-list"></div>
+        <section id="sidebar-file-panel" class="sidebar-file-panel">
+          <div class="sidebar-section-header">
+            <div class="sidebar-section-title">当前目录文件</div>
+            <button id="file-panel-refresh" class="sidebar-section-action" type="button" title="刷新文件列表">刷新</button>
+          </div>
+          <div id="file-tree" class="file-tree">
+            <div class="file-tree-empty">打开项目后显示文件。</div>
+          </div>
+        </section>
+        <section id="sidebar-session-panel" class="sidebar-session-panel">
+          <div class="sidebar-section-header sidebar-section-header--sessions">
+            <div class="sidebar-section-title">聊天记录</div>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
       </aside>
 
       <div id="sidebar-resizer" class="sidebar-resizer" aria-hidden="true"></div>
@@ -134,6 +148,9 @@
             <div id="cmd-menu" class="cmd-menu" hidden></div>
 
             <div class="input-area">
+              <div id="context-bar" class="context-bar" hidden>
+                <div id="context-ref-list" class="context-ref-list"></div>
+              </div>
               <div id="attachment-tray" class="attachment-tray" hidden></div>
               <div class="input-wrapper">
                 <input id="image-upload-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
@@ -157,6 +174,24 @@
             </div>
           </div>
         </main>
+
+        <div id="file-viewer-resizer" class="file-viewer-resizer" aria-hidden="true"></div>
+        <aside id="file-viewer-panel" class="file-viewer-panel" aria-label="文件查看器">
+          <div class="file-viewer-header">
+            <div class="file-viewer-title-wrap">
+              <span id="file-viewer-title" class="file-viewer-title">文件</span>
+              <span id="file-viewer-path" class="file-viewer-path"></span>
+              <span id="file-viewer-meta" class="file-viewer-meta"></span>
+            </div>
+            <div class="file-viewer-actions">
+              <button id="file-viewer-preview-tab" class="file-viewer-tab active" type="button">Preview</button>
+              <button id="file-viewer-source-tab" class="file-viewer-tab" type="button">Source</button>
+              <button id="file-viewer-download" class="file-viewer-tab" type="button">Download</button>
+              <button id="file-viewer-close" class="file-viewer-close" type="button" title="关闭">✕</button>
+            </div>
+          </div>
+          <div id="file-viewer-body" class="file-viewer-body"></div>
+        </aside>
 
         <aside id="workspace-insights" class="workspace-insights" aria-label="工作台摘要">
           <div class="workspace-insights-scroll">

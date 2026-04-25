@@ -6,6 +6,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
+const XLSX = require('xlsx');
+const mammoth = require('mammoth');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 
@@ -38,7 +40,30 @@ const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_MESSAGE_ATTACHMENTS = 4;
+const MAX_CONTEXT_FILE_REFS = 8;
+const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
+const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
+const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
+const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
+const FILE_VIEW_TABLE_MAX_ROWS = 1000;
+const FILE_VIEW_TABLE_MAX_COLS = 50;
+const FILE_TREE_MAX_DEPTH = 3;
+const FILE_TREE_MAX_ENTRIES = 800;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const FILE_TREE_IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.venv', 'venv', '__pycache__', '.pytest_cache', '.cache']);
+const TEXT_CONTEXT_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.json', '.jsonl', '.css', '.scss', '.sass',
+  '.html', '.htm', '.xml', '.svg', '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.example', '.sh', '.bash', '.zsh',
+  '.py', '.java', '.kt', '.kts', '.go', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.rb', '.swift', '.sql',
+  '.dockerfile', '.gitignore', '.gitattributes', '.editorconfig', '.csv', '.tsv', '.log'
+]);
+const FILE_VIEW_CODE_EXTENSIONS = new Set([
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.css', '.scss', '.sass', '.html', '.htm', '.xml', '.svg',
+  '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.example', '.sh', '.bash', '.zsh', '.py', '.java', '.kt', '.kts',
+  '.go', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.rb', '.swift', '.sql', '.dockerfile'
+]);
+const FILE_VIEW_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.avif']);
+const FILE_VIEW_BINARY_EXTENSIONS = new Set(['.pdf', '.xlsx', '.xls', '.docx']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
@@ -1979,6 +2004,297 @@ function isPathInside(filePath, rootDir) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+function normalizeWorkspaceCwd(cwd) {
+  const raw = String(cwd || '').trim();
+  if (!raw || !path.isAbsolute(raw)) return null;
+  const resolved = path.resolve(raw);
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return resolved;
+}
+
+function resolvePathWithinCwd(cwd, targetPath = '') {
+  const root = normalizeWorkspaceCwd(cwd);
+  if (!root) throw new Error('当前目录无效');
+  const raw = String(targetPath || '').trim();
+  const resolved = path.resolve(path.isAbsolute(raw) ? raw : path.join(root, raw));
+  if (!isPathInside(resolved, root)) throw new Error('文件不在当前目录内');
+  return { root, resolved };
+}
+
+function isLikelyTextFile(filePath, size = 0) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (TEXT_CONTEXT_EXTENSIONS.has(ext) || TEXT_CONTEXT_EXTENSIONS.has(base)) return true;
+  if (size > MAX_CONTEXT_FILE_SIZE) return false;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(Math.min(4096, Math.max(1, size || 4096)));
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      for (let i = 0; i < bytes; i += 1) {
+        if (buffer[i] === 0) return false;
+      }
+      return true;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function getFileMime(filePath) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'text/markdown; charset=utf-8';
+  if (ext === '.txt' || ext === '.log' || ext === '.gitignore' || ext === '.env') return 'text/plain; charset=utf-8';
+  if (ext === '.csv') return 'text/csv; charset=utf-8';
+  if (ext === '.tsv') return 'text/tab-separated-values; charset=utf-8';
+  if (ext === '.json' || ext === '.jsonl') return 'application/json; charset=utf-8';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === '.xls') return 'application/vnd.ms-excel';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.bmp') return 'image/bmp';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.avif') return 'image/avif';
+  return MIME_TYPES[ext] || 'application/octet-stream';
+}
+
+function getFileViewType(filePath, stat) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'markdown';
+  if (ext === '.csv') return 'csv';
+  if (ext === '.tsv') return 'tsv';
+  if (ext === '.xlsx' || ext === '.xls') return 'xlsx';
+  if (ext === '.docx') return 'docx';
+  if (ext === '.pdf') return 'pdf';
+  if (FILE_VIEW_IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (ext === '.json') return 'json';
+  if (FILE_VIEW_CODE_EXTENSIONS.has(ext) || FILE_VIEW_CODE_EXTENSIONS.has(base)) return 'code';
+  if (isLikelyTextFile(filePath, stat?.size || 0)) return 'text';
+  return 'binary';
+}
+
+function fileViewLanguage(filePath, viewType) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase().replace(/^\./, '');
+  if (viewType === 'markdown') return 'markdown';
+  if (viewType === 'json') return 'json';
+  if (viewType === 'csv') return 'csv';
+  if (viewType === 'tsv') return 'tsv';
+  if (base === 'dockerfile' || ext === 'dockerfile') return 'dockerfile';
+  if (ext === 'mjs' || ext === 'cjs') return 'javascript';
+  if (ext === 'jsx') return 'javascript';
+  if (ext === 'tsx') return 'typescript';
+  if (ext === 'htm') return 'html';
+  if (ext === 'yml') return 'yaml';
+  if (ext === 'sh' || ext === 'bash' || ext === 'zsh') return 'bash';
+  if (ext === 'cc' || ext === 'cpp' || ext === 'hpp') return 'cpp';
+  if (ext === 'py') return 'python';
+  if (ext === 'rb') return 'ruby';
+  if (ext === 'rs') return 'rust';
+  if (ext === 'go') return 'go';
+  if (ext === 'kt' || ext === 'kts') return 'kotlin';
+  return ext || 'plaintext';
+}
+
+function buildFileIdentity(root, filePath, stat, viewType) {
+  return {
+    ok: true,
+    type: viewType,
+    name: path.basename(filePath),
+    path: filePath,
+    relativePath: path.relative(root, filePath) || path.basename(filePath),
+    size: stat.size,
+    mime: getFileMime(filePath),
+    language: fileViewLanguage(filePath, viewType),
+  };
+}
+
+function readTextFileForView(filePath, stat) {
+  if (stat.size > FILE_VIEW_TEXT_MAX_SIZE) {
+    const err = new Error('文本文件超过 1MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function normalizeWorkbookCell(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function buildWorkbookView(filePath, stat) {
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+    const err = new Error('表格文件超过 20MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const workbook = XLSX.readFile(filePath, { cellDates: true });
+  const sheetNames = Array.isArray(workbook.SheetNames) ? workbook.SheetNames : [];
+  const activeSheet = sheetNames[0] || '';
+  const sheet = activeSheet ? workbook.Sheets[activeSheet] : null;
+  let rows = [];
+  let totalRows = 0;
+  let totalCols = 0;
+  if (sheet && sheet['!ref']) {
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    totalRows = Math.max(0, range.e.r - range.s.r + 1);
+    totalCols = Math.max(0, range.e.c - range.s.c + 1);
+    const limitedRange = {
+      s: range.s,
+      e: {
+        r: Math.min(range.e.r, range.s.r + FILE_VIEW_TABLE_MAX_ROWS - 1),
+        c: Math.min(range.e.c, range.s.c + FILE_VIEW_TABLE_MAX_COLS - 1),
+      },
+    };
+    rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      defval: '',
+      blankrows: false,
+      raw: false,
+      range: XLSX.utils.encode_range(limitedRange),
+    }).map((row) => Array.isArray(row) ? row.slice(0, FILE_VIEW_TABLE_MAX_COLS).map(normalizeWorkbookCell) : []);
+  }
+  return {
+    sheets: sheetNames,
+    activeSheet,
+    rows,
+    truncated: totalRows > FILE_VIEW_TABLE_MAX_ROWS || totalCols > FILE_VIEW_TABLE_MAX_COLS,
+    totalRows,
+    totalCols,
+    displayedRows: rows.length,
+    displayedCols: rows.reduce((max, row) => Math.max(max, row.length), 0),
+  };
+}
+
+async function buildDocxView(filePath, stat) {
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+    const err = new Error('Word 文件超过 20MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const buffer = fs.readFileSync(filePath);
+  const result = await mammoth.convertToHtml({ buffer });
+  return {
+    html: result?.value || '',
+    messages: Array.isArray(result?.messages) ? result.messages.map((m) => String(m.message || '')).filter(Boolean) : [],
+  };
+}
+
+function jsonErrorResponse(res, err, fallbackMessage = '请求失败') {
+  return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err?.message || fallbackMessage });
+}
+
+function buildFileTree(root, currentPath, depth, state) {
+  if (state.count >= FILE_TREE_MAX_ENTRIES) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(currentPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  entries.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+  });
+  const items = [];
+  for (const entry of entries) {
+    if (state.count >= FILE_TREE_MAX_ENTRIES) break;
+    if (FILE_TREE_IGNORED_NAMES.has(entry.name)) continue;
+    if (entry.name.startsWith('.') && entry.name !== '.env' && entry.name !== '.gitignore') continue;
+    const abs = path.join(currentPath, entry.name);
+    let lst;
+    try { lst = fs.lstatSync(abs); } catch { continue; }
+    if (lst.isSymbolicLink()) continue;
+    const rel = path.relative(root, abs) || entry.name;
+    const item = {
+      name: entry.name,
+      path: abs,
+      relativePath: rel,
+      type: entry.isDirectory() ? 'directory' : 'file',
+    };
+    if (entry.isDirectory()) {
+      item.children = depth > 1 ? buildFileTree(root, abs, depth - 1, state) : [];
+    } else if (entry.isFile()) {
+      item.size = lst.size;
+      item.isText = isLikelyTextFile(abs, lst.size);
+      item.tooLarge = lst.size > MAX_CONTEXT_FILE_SIZE;
+    } else {
+      continue;
+    }
+    state.count += 1;
+    items.push(item);
+  }
+  return items;
+}
+
+function normalizeContextFileRefs(fileRefs, cwd) {
+  const refs = Array.isArray(fileRefs) ? fileRefs.slice(0, MAX_CONTEXT_FILE_REFS) : [];
+  if (refs.length === 0) return { refs: [], error: '' };
+  const seen = new Set();
+  const normalized = [];
+  let totalSize = 0;
+  for (const ref of refs) {
+    const rawPath = String(ref?.path || ref?.relativePath || '').trim();
+    if (!rawPath) continue;
+    let root;
+    let resolved;
+    try { ({ root, resolved } = resolvePathWithinCwd(cwd, rawPath)); }
+    catch (err) { return { refs: [], error: err.message || '文件路径无效' }; }
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    let stat;
+    try { stat = fs.statSync(resolved); }
+    catch { return { refs: [], error: `无法读取文件: ${path.basename(resolved)}` }; }
+    if (!stat.isFile()) return { refs: [], error: `只能引用文件: ${path.relative(root, resolved)}` };
+    if (stat.size > MAX_CONTEXT_FILE_SIZE) return { refs: [], error: `文件超过 256KB: ${path.relative(root, resolved)}` };
+    if (!isLikelyTextFile(resolved, stat.size)) return { refs: [], error: `只能引用文本文件: ${path.relative(root, resolved)}` };
+    totalSize += stat.size;
+    if (totalSize > MAX_CONTEXT_FILES_TOTAL_SIZE) return { refs: [], error: '引用文件总大小不能超过 1MB' };
+    let content;
+    try { content = fs.readFileSync(resolved, 'utf8'); }
+    catch { return { refs: [], error: `读取失败: ${path.relative(root, resolved)}` }; }
+    normalized.push({
+      path: resolved,
+      relativePath: path.relative(root, resolved) || path.basename(resolved),
+      size: stat.size,
+      content,
+    });
+  }
+  return { refs: normalized, error: '' };
+}
+
+function buildContextFilePrompt(text, fileRefs) {
+  const normalizedText = String(text || '');
+  if (!Array.isArray(fileRefs) || fileRefs.length === 0) return normalizedText;
+  const blocks = fileRefs.map((ref) => [
+    `<file path="${ref.relativePath.replace(/"/g, '&quot;')}">`,
+    ref.content,
+    '</file>',
+  ].join('\n')).join('\n\n');
+  return `下面是用户从当前工作目录引用的文件：\n\n${blocks}\n\n用户问题：\n${normalizedText}`;
+}
+
+function fileRefHistoryMeta(ref) {
+  return {
+    path: ref.path,
+    relativePath: ref.relativePath,
+    size: ref.size,
+  };
+}
+
 function sanitizeId(id) {
   return String(id).replace(/[^a-zA-Z0-9\-]/g, '');
 }
@@ -2647,8 +2963,11 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
-    session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
   }
+  delete session.currentUsage;
+  delete session.lastUsage;
+  delete session.contextWindowTokens;
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -2893,6 +3212,16 @@ function messageTextForCarryover(message) {
       .filter(Boolean)
       .slice(0, 4);
     parts.push(`附件: ${names.join(', ')}${attachments.length > names.length ? ` 等 ${attachments.length} 项` : ''}`);
+  }
+  const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
+  if (fileRefs.length > 0) {
+    const names = fileRefs
+      .map((ref) => String(ref?.relativePath || ref?.path || '').trim())
+      .filter(Boolean)
+      .slice(0, 6);
+    if (names.length > 0) {
+      parts.push(`引用文件: ${names.join(', ')}${fileRefs.length > names.length ? ` 等 ${fileRefs.length} 项` : ''}`);
+    }
   }
   const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
   if (toolCalls.length > 0) {
@@ -4342,6 +4671,152 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/files') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || cwd;
+      const depthRaw = Number.parseInt(url.searchParams.get('depth') || '2', 10);
+      const depth = Math.max(1, Math.min(FILE_TREE_MAX_DEPTH, Number.isFinite(depthRaw) ? depthRaw : 2));
+      const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isDirectory()) {
+        return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+      }
+      const state = { count: 0 };
+      return jsonResponse(res, 200, {
+        ok: true,
+        cwd: root,
+        path: resolved,
+        truncated: state.count >= FILE_TREE_MAX_ENTRIES,
+        items: buildFileTree(root, resolved, depth, state),
+      });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: err.message || '无法读取目录' });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    (async () => {
+      try {
+        const cwd = url.searchParams.get('cwd') || '';
+        const requestedPath = url.searchParams.get('path') || '';
+        const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) {
+          return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+        }
+        const viewType = getFileViewType(resolved, stat);
+        const base = buildFileIdentity(root, resolved, stat, viewType);
+        const rawParams = new URLSearchParams({ cwd: root, path: path.relative(root, resolved) || path.basename(resolved) });
+        const rawUrl = `/api/file-raw?${rawParams.toString()}`;
+        if (viewType === 'xlsx') {
+          return jsonResponse(res, 200, { ...base, ...buildWorkbookView(resolved, stat), rawUrl });
+        }
+        if (viewType === 'docx') {
+          return jsonResponse(res, 200, { ...base, ...(await buildDocxView(resolved, stat)), rawUrl });
+        }
+        if (viewType === 'image' || viewType === 'pdf' || viewType === 'binary') {
+          return jsonResponse(res, 200, { ...base, rawUrl });
+        }
+        const content = readTextFileForView(resolved, stat);
+        return jsonResponse(res, 200, { ...base, content, rawUrl });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '无法读取文件');
+      }
+    })();
+    return;
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/file-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+      if (Buffer.byteLength(body, 'utf8') > FILE_VIEW_TEXT_MAX_SIZE + 4096) {
+        tooLarge = true;
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      try {
+        if (tooLarge) return jsonResponse(res, 413, { ok: false, message: '保存内容超过 1MB' });
+        const payload = body ? JSON.parse(body) : {};
+        const cwd = String(payload.cwd || '');
+        const requestedPath = String(payload.path || '');
+        const content = String(payload.content ?? '');
+        if (Buffer.byteLength(content, 'utf8') > FILE_VIEW_TEXT_MAX_SIZE) {
+          return jsonResponse(res, 413, { ok: false, message: '保存内容超过 1MB' });
+        }
+        const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+        const viewType = getFileViewType(resolved, stat);
+        if (!['markdown', 'csv', 'tsv', 'json', 'code', 'text'].includes(viewType)) {
+          return jsonResponse(res, 400, { ok: false, message: '该文件类型不能文本编辑保存' });
+        }
+        fs.writeFileSync(resolved, content, 'utf8');
+        const nextStat = fs.statSync(resolved);
+        return jsonResponse(res, 200, {
+          ...buildFileIdentity(root, resolved, nextStat, getFileViewType(resolved, nextStat)),
+          content,
+          saved: true,
+        });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '保存失败');
+      }
+    });
+    req.on('error', () => {
+      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '保存请求中断' });
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-raw') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || '';
+      const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) {
+        writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Target is not a file');
+      }
+      if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+        writeHeadWithSecurity(res, 413, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('File is too large');
+      }
+      const asciiFilename = path.basename(resolved).replace(/[^A-Za-z0-9._-]+/g, '_') || 'file';
+      writeHeadWithSecurity(res, 200, {
+        'Content-Type': getFileMime(resolved),
+        'Content-Length': String(stat.size),
+        'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(path.basename(resolved))}`,
+        'Cache-Control': 'no-cache',
+      });
+      fs.createReadStream(resolved).pipe(res);
+    } catch (err) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(err?.message || 'Unable to read file');
+    }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/localfile') {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {
@@ -4650,6 +5125,9 @@ wss.on('connection', (ws, req) => {
         break;
       case 'rename_project':
         handleRenameProject(ws, msg);
+        break;
+      case 'reorder_projects':
+        handleReorderProjects(ws, msg);
         break;
       case 'git_command':
         handleGitCommand(ws, msg);
@@ -5257,7 +5735,7 @@ function handleNewSession(ws, msg) {
     model: null,
     permissionMode: requestedMode,
     totalCost: 0,
-    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
     messages: [],
     cwd: resolvedCwd,
     projectId,
@@ -5583,7 +6061,14 @@ function handleMessage(ws, msg, options = {}) {
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
     return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
   }
-  if (!normalizedText && resolvedAttachments.length === 0) return;
+  const pendingSession = sessionId ? loadSession(sessionId) : null;
+  const cwdForFileRefs = pendingSession?.cwd || process.cwd();
+  const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
+  if (resolvedFileRefResult.error) {
+    return wsSend(ws, { type: 'error', message: resolvedFileRefResult.error });
+  }
+  const resolvedFileRefs = resolvedFileRefResult.refs;
+  if (!normalizedText && resolvedAttachments.length === 0 && resolvedFileRefs.length === 0) return;
 
   const savedAttachments = resolvedAttachments.map((attachment) => ({
     id: attachment.id,
@@ -5595,6 +6080,8 @@ function handleMessage(ws, msg, options = {}) {
     expiresAt: attachment.expiresAt,
     storageState: attachment.storageState,
   }));
+  const savedFileRefs = resolvedFileRefs.map(fileRefHistoryMeta);
+  const effectiveInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
 
   if (sessionId && activeProcesses.has(sessionId)) {
     const runningSession = loadSession(sessionId);
@@ -5602,15 +6089,15 @@ function handleMessage(ws, msg, options = {}) {
       runningSession &&
       isClaudeSession(runningSession) &&
       runningSession.permissionMode === 'plan' &&
-      normalizedText &&
+      (normalizedText || resolvedFileRefs.length > 0) &&
       resolvedAttachments.length === 0
     ) {
       // Plan mode: forward user input to the waiting process via stdin (input.txt append)
       const inputPath = path.join(runDir(sessionId), 'input.txt');
       try {
-        fs.appendFileSync(inputPath, normalizedText + '\n');
+        fs.appendFileSync(inputPath, effectiveInputText + '\n');
         if (!hideInHistory) {
-          runningSession.messages.push({ role: 'user', content: textValue, attachments: [], timestamp: new Date().toISOString() });
+          runningSession.messages.push({ role: 'user', content: textValue, attachments: [], fileRefs: savedFileRefs, timestamp: new Date().toISOString() });
           runningSession.updated = new Date().toISOString();
           saveSession(runningSession);
           const entry = activeProcesses.get(sessionId);
@@ -5626,7 +6113,9 @@ function handleMessage(ws, msg, options = {}) {
 
   const derivedTitle = normalizedText
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
-    : `图片: ${savedAttachments[0]?.filename || 'image'}`;
+    : (savedFileRefs.length > 0
+      ? `引用文件: ${savedFileRefs[0]?.relativePath || 'file'}`
+      : `图片: ${savedAttachments[0]?.filename || 'image'}`);
 
   let session;
   if (sessionId) session = loadSession(sessionId);
@@ -5646,15 +6135,15 @@ function handleMessage(ws, msg, options = {}) {
       model: null,
       permissionMode: mode || 'yolo',
       totalCost: 0,
-      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
       messages: [],
       cwd: resolvedCwd,
     };
   }
   normalizeSession(session);
 
-  if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
+  if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
+    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' });
   }
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
@@ -5674,6 +6163,7 @@ function handleMessage(ws, msg, options = {}) {
       role: 'user',
       content: textValue,
       attachments: savedAttachments,
+      fileRefs: savedFileRefs,
       timestamp: new Date().toISOString(),
     });
   }
@@ -5719,7 +6209,7 @@ function handleMessage(ws, msg, options = {}) {
     ? (Array.isArray(session.messages) ? session.messages.slice(0, -1) : [])
     : [];
   const threadCarryover = shouldInjectCarryover
-    ? buildThreadCarryoverPayload(session, textValue, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
+    ? buildThreadCarryoverPayload(session, effectiveInputText, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
     : null;
   if (spawnSpec?.warningMessage) {
     wsSend(ws, { type: 'system_message', message: spawnSpec.warningMessage });
@@ -5727,7 +6217,7 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.threadReset) {
     wsSend(ws, { type: 'system_message', message: buildThreadCarryoverNotice(threadCarryover) });
   }
-  const runtimeInputText = threadCarryover?.prompt || textValue;
+  const runtimeInputText = threadCarryover?.prompt || effectiveInputText;
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -6433,7 +6923,7 @@ function handleImportCodexSession(ws, msg) {
     model: existingSession?.model || null,
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
-    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };
@@ -6534,6 +7024,29 @@ function handleRenameProject(ws, msg) {
     project.name = String(msg.name).trim();
     saveProjectsConfig(config);
   }
+  wsSend(ws, { type: 'projects_config', projects: config.projects });
+}
+
+function handleReorderProjects(ws, msg) {
+  const config = loadProjectsConfig();
+  const projectIds = Array.isArray(msg.projectIds) ? msg.projectIds.map((id) => String(id || '')).filter(Boolean) : [];
+  if (projectIds.length === 0) {
+    return wsSend(ws, { type: 'projects_config', projects: config.projects });
+  }
+  const byId = new Map(config.projects.map((project) => [project.id, project]));
+  const seen = new Set();
+  const reordered = [];
+  for (const id of projectIds) {
+    const project = byId.get(id);
+    if (!project || seen.has(id)) continue;
+    seen.add(id);
+    reordered.push(project);
+  }
+  for (const project of config.projects) {
+    if (!seen.has(project.id)) reordered.push(project);
+  }
+  config.projects = reordered;
+  saveProjectsConfig(config);
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 

@@ -7,6 +7,8 @@
     "regression": "node scripts/regression.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "mammoth": "^1.12.0",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
   }
 }
