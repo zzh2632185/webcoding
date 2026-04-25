@@ -3264,6 +3264,37 @@ async function runCodexBridgeProtocolNormalizationRegressionCase({ port, passwor
   });
 }
 
+
+async function runCodexAnomalousUsageRegressionCase({ port, password, sessionsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const cwd = path.join(os.tmpdir(), 'webcoding-codex-usage');
+    mkdirp(cwd);
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.cwd === cwd,
+    );
+
+    client.send(buildAgentMessagePayload({
+      text: 'trigger codex anomalous usage',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+
+    const usageMsg = await client.waitForType(
+      'usage',
+      (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 210000,
+    );
+    assert(usageMsg.contextWindowTokens === 400000, 'Codex usage should preserve reported context window');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+    const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+    assert(stored.lastUsage?.inputTokens === 210000, 'Codex anomalous turn.completed usage should not overwrite last_token_usage');
+    assert(stored.lastUsage?.totalTokens === 210900, 'Codex last usage total should come from last_token_usage');
+  });
+}
+
 async function runCodexMetadataWarningRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ client, messages }) => {
     const warningCwd = path.join(os.tmpdir(), 'webcoding-codex-warning');
@@ -3568,6 +3599,7 @@ async function main() {
       await runner.run('codex config migration', () => runCodexConfigMigrationRegressionCase(ctx));
       await runner.run('codex ignores legacy reasoning effort config', () => runCodexReasoningEffortRegressionCase(ctx));
       await runner.run('codex bridge protocol normalization', () => runCodexBridgeProtocolNormalizationRegressionCase(ctx));
+      await runner.run('codex anomalous usage guard', () => runCodexAnomalousUsageRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));

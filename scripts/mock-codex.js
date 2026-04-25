@@ -143,6 +143,35 @@ function sleep(ms) {
     return;
   }
 
+
+  if (input === 'trigger codex anomalous usage') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_msg_usage',
+        type: 'agent_message',
+        text: 'Codex mock anomalous usage handled.',
+      },
+    })}
+`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'token_count',
+      info: {
+        total_token_usage: { input_tokens: 35000000, cached_input_tokens: 32000000, output_tokens: 90000, total_tokens: 35090000 },
+        last_token_usage: { input_tokens: 210000, cached_input_tokens: 207000, output_tokens: 900, total_tokens: 210900 },
+        model_context_window: 400000,
+      },
+    })}
+`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 35010000, cached_input_tokens: 32005000, output_tokens: 90500, total_tokens: 35100500 },
+      model_context_window: 400000,
+    })}
+`);
+    return;
+  }
+
   const responseText = input === '/compact'
     ? 'Codex compact finished.'
     : `Codex mock handled (${imageCount} image): ${input}`;

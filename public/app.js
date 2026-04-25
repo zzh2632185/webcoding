@@ -2038,33 +2038,34 @@
       + (Number(normalized.reasoningOutputTokens) || 0);
   }
 
+  function usageLooksCumulativeForContext(usage, limit) {
+    const used = getUsageTotalTokens(usage);
+    const windowLimit = Number(limit || 0) || 0;
+    if (!used) return false;
+    if (windowLimit) return used > windowLimit * 1.5;
+    return used > 1500000;
+  }
+
+  function validContextUsage(usage, limit) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return null;
+    if (usageLooksCumulativeForContext(normalized, limit)) return null;
+    return normalized;
+  }
+
   function getContextUsageMetrics() {
     // Context window usage must describe the current runtime request / latest turn,
     // not the lifetime token spend accumulated by the whole chat session.
-    const currentUsage = normalizeUsageShape(contextRuntimeUsage.currentUsage);
-    const used = getUsageTotalTokens(currentUsage);
     const limit = Number(contextRuntimeUsage.contextWindowTokens || inferContextWindowTokens() || 0) || 0;
     if (!limit) return null;
+    const currentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
+    const used = getUsageTotalTokens(currentUsage);
     if (!used) {
       return {
         used: 0,
         limit,
         percentage: 0,
         pending: true,
-        displayUsed: '暂无',
-        displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
-      };
-    }
-    // Provider events that exceed the model window by a large margin are almost
-    // certainly cumulative totals accidentally shaped like current usage. Keep
-    // the ring visible, but do not show impossible percentages such as 2359.9%.
-    if (used > limit * 1.5) {
-      return {
-        used: 0,
-        limit,
-        percentage: 0,
-        pending: true,
-        ignoredAnomalousUsage: true,
         displayUsed: '暂无',
         displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
       };
@@ -2096,7 +2097,7 @@
     const dashOffset = circumference - Math.min(100, metrics.percentage) / 100 * circumference;
     const level = metrics.pending ? 'pending' : (metrics.percentage > 90 ? 'danger' : (metrics.percentage > 70 ? 'warning' : 'normal'));
     const popoverText = metrics.pending
-      ? `${metrics.ignoredAnomalousUsage ? '已忽略异常累计 token' : '等待本轮 token 数据'} · 上限 ${metrics.displayLimit}`
+      ? `等待本轮 token 数据 · 上限 ${metrics.displayLimit}`
       : `${metrics.percentage.toFixed(1)}% · ${metrics.displayUsed} / ${metrics.displayLimit} 上下文已使用`;
     contextUsageIndicator.hidden = false;
     contextUsageIndicator.dataset.level = level;
@@ -2168,10 +2169,11 @@
   }
 
   function updateContextUsageFromSnapshot(snapshot) {
+    const contextWindowTokens = Number(snapshot?.contextWindowTokens || snapshot?.modelContextWindow || 0) || null;
     contextRuntimeUsage = {
-      currentUsage: normalizeUsageShape(snapshot?.currentUsage || snapshot?.lastUsage),
+      currentUsage: validContextUsage(snapshot?.currentUsage || snapshot?.lastUsage, contextWindowTokens || inferContextWindowTokens()),
       totalUsage: normalizeUsageShape(snapshot?.totalUsage),
-      contextWindowTokens: Number(snapshot?.contextWindowTokens || snapshot?.modelContextWindow || 0) || null,
+      contextWindowTokens,
     };
     renderContextBar();
     renderContextUsageIndicator();
@@ -3613,10 +3615,13 @@
   function handleUsageMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
     if (msg.totalUsage || msg.currentUsage || msg.usage) {
+      const contextWindowTokens = Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null;
+      const limit = contextWindowTokens || inferContextWindowTokens();
       const totalUsage = normalizeUsageShape(msg.totalUsage) || contextRuntimeUsage.totalUsage;
-      const currentUsage = normalizeUsageShape(msg.currentUsage || msg.usage)
-        || diffUsageTotals(totalUsage, contextRuntimeUsage.totalUsage)
-        || contextRuntimeUsage.currentUsage;
+      const rawCurrentUsage = validContextUsage(msg.currentUsage || msg.usage, limit);
+      const diffCurrentUsage = validContextUsage(diffUsageTotals(totalUsage, contextRuntimeUsage.totalUsage), limit);
+      const previousCurrentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
+      const currentUsage = rawCurrentUsage || diffCurrentUsage || previousCurrentUsage;
       if (msg.totalUsage) {
         const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
         costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
@@ -3624,7 +3629,7 @@
       contextRuntimeUsage = {
         currentUsage,
         totalUsage,
-        contextWindowTokens: Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null,
+        contextWindowTokens,
       };
       renderContextBar();
       renderContextUsageIndicator();
