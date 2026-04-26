@@ -2073,6 +2073,19 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-header:not(.collapsed) .project-group-chevron {
   transform: rotate(90deg);
 }
+.project-group-running-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 0 3px rgba(111, 194, 255, 0.14);
+  flex: 0 0 8px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+html[data-theme="localhost"] .project-group-running-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(15, 138, 167, 0.12);
+}
 .project-group-main {
   display: flex;
   align-items: center;
