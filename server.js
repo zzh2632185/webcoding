@@ -1349,9 +1349,119 @@ function getModelConfigMasked() {
 }
 
 const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const CODEX_LOCAL_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
+const CODEX_LOCAL_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
+}
+
+function parseTomlStringLiteral(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    try { return JSON.parse(value); } catch { return value.slice(1, -1); }
+  }
+  return value.split(/\s+#/)[0].trim();
+}
+
+function readTopLevelTomlString(text, key) {
+  const beforeSections = String(text || '').split(/^\s*\[/m)[0] || '';
+  const re = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(.+?)\\s*$`, 'm');
+  const match = beforeSections.match(re);
+  return match ? parseTomlStringLiteral(match[1]) : '';
+}
+
+function findTomlSection(text, sectionName) {
+  const source = String(text || '');
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^\\s*\\[${escaped}\\]\\s*$`, 'm');
+  const match = re.exec(source);
+  if (!match) return null;
+  const start = match.index;
+  const bodyStart = match.index + match[0].length;
+  const rest = source.slice(bodyStart);
+  const nextMatch = /^\s*\[/m.exec(rest);
+  const end = nextMatch ? bodyStart + nextMatch.index : source.length;
+  return { start, bodyStart, end, header: match[0] };
+}
+
+function readTomlSectionString(text, sectionName, key) {
+  const section = findTomlSection(text, sectionName);
+  if (!section) return '';
+  const body = String(text || '').slice(section.bodyStart, section.end);
+  const re = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(.+?)\\s*$`, 'm');
+  const match = body.match(re);
+  return match ? parseTomlStringLiteral(match[1]) : '';
+}
+
+function setTomlSectionString(text, sectionName, key, value) {
+  let source = String(text || '');
+  let section = findTomlSection(source, sectionName);
+  if (!section) {
+    source = `${source.replace(/\s*$/, '')}\n\n[${sectionName}]\n`;
+    section = findTomlSection(source, sectionName);
+  }
+  if (!section) return source;
+  const before = source.slice(0, section.bodyStart);
+  let body = source.slice(section.bodyStart, section.end);
+  const after = source.slice(section.end);
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldRe = new RegExp(`(^\\s*${escapedKey}\\s*=).*$`, 'm');
+  const nextLine = `\n${key} = ${tomlString(value)}`;
+  if (fieldRe.test(body)) {
+    body = body.replace(fieldRe, `$1 ${tomlString(value)}`);
+  } else {
+    body = body.endsWith('\n') ? `${body}${key} = ${tomlString(value)}\n` : `${body}${nextLine}\n`;
+  }
+  return before + body + after;
+}
+
+function readCodexLocalAuthKey(envKey = 'OPENAI_API_KEY') {
+  const keyName = String(envKey || 'OPENAI_API_KEY').trim() || 'OPENAI_API_KEY';
+  try {
+    const auth = JSON.parse(fs.readFileSync(CODEX_LOCAL_AUTH_PATH, 'utf8'));
+    const fileKey = String(auth?.[keyName] || auth?.OPENAI_API_KEY || auth?.api_key || '').trim();
+    if (fileKey) return fileKey;
+  } catch {}
+  return String(process.env[keyName] || '').trim();
+}
+
+function resolveCodexLocalBridgeSource() {
+  let configText = '';
+  try { configText = fs.readFileSync(CODEX_LOCAL_CONFIG_PATH, 'utf8'); } catch { return { mode: 'local' }; }
+  const provider = readTopLevelTomlString(configText, 'model_provider');
+  const model = readTopLevelTomlString(configText, 'model');
+  if (!provider) return { mode: 'local' };
+  const sectionName = `model_providers.${provider}`;
+  const apiBase = readTomlSectionString(configText, sectionName, 'base_url');
+  const envKey = readTomlSectionString(configText, sectionName, 'env_key') || 'OPENAI_API_KEY';
+  const apiKey = readCodexLocalAuthKey(envKey);
+  if (!apiBase || !apiKey) return { mode: 'local' };
+  return {
+    mode: 'local_bridge',
+    name: `本地 Codex: ${provider}`,
+    provider,
+    apiKey,
+    apiBase,
+    upstreamType: 'openai',
+    defaultModel: model || '',
+    configText,
+  };
+}
+
+function writeCodexLocalBridgeConfig(source, bridge) {
+  fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
+  let configToml = String(source.configText || '');
+  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'base_url', bridge.openaiBaseUrl);
+  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'env_key', 'OPENAI_API_KEY');
+  configToml = `${configToml.replace(/\s*$/, '')}\n\n# webcoding_bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}\n`;
+  fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  const localInstruction = path.join(path.dirname(CODEX_LOCAL_CONFIG_PATH), 'instruction.md');
+  const runtimeInstruction = path.join(CODEX_RUNTIME_HOME, 'instruction.md');
+  try {
+    if (fs.existsSync(localInstruction)) fs.copyFileSync(localInstruction, runtimeInstruction);
+  } catch {}
 }
 
 function resolveCodexCustomProfile(config) {
@@ -1427,18 +1537,19 @@ function resolveCodexActiveSource(config) {
 function getCodexRuntimeFingerprint(config) {
   const source = resolveCodexActiveSource(config || loadCodexConfig());
   if (!source || source.mode === 'local') {
-    const codexLocalConfigPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml');
-    const codexLocalAuthPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'auth.json');
+    const localBridgeSource = resolveCodexLocalBridgeSource();
     return JSON.stringify({
-      runtimeVersion: 5,
-      mode: 'local',
-      configFingerprint: fileContentFingerprint(codexLocalConfigPath),
-      authFingerprint: fileContentFingerprint(codexLocalAuthPath),
+      runtimeVersion: 6,
+      mode: localBridgeSource?.mode === 'local_bridge' ? 'local_bridge' : 'local',
+      sourceName: localBridgeSource?.mode === 'local_bridge' ? String(localBridgeSource.name || '').trim() : '',
+      apiBase: localBridgeSource?.mode === 'local_bridge' ? String(localBridgeSource.apiBase || '').trim().replace(/\/+$/, '') : '',
+      configFingerprint: fileContentFingerprint(CODEX_LOCAL_CONFIG_PATH),
+      authFingerprint: fileContentFingerprint(CODEX_LOCAL_AUTH_PATH),
     });
   }
   if (source.error) return `error:${source.error}`;
   return JSON.stringify({
-    runtimeVersion: 5,
+    runtimeVersion: 6,
     mode: 'remote',
     sourceName: String(source.name || '').trim(),
     apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
@@ -1446,10 +1557,32 @@ function getCodexRuntimeFingerprint(config) {
   });
 }
 
+function buildCodexRuntimeResult(source, bridge) {
+  return {
+    mode: 'custom',
+    homeDir: CODEX_RUNTIME_HOME,
+    apiKey: bridge.token,
+    apiBase: bridge.openaiBaseUrl,
+    bridgeToken: bridge.token,
+    profileName: source.name,
+    defaultModel: bridge.defaultModel || source.defaultModel || '',
+  };
+}
+
 function prepareCodexCustomRuntime(config) {
-  const source = resolveCodexActiveSource(config);
+  let source = resolveCodexActiveSource(config);
   if (source?.error) return source;
-  if (!source || source.mode === 'local') return { mode: 'local' };
+  if (!source || source.mode === 'local') {
+    source = resolveCodexLocalBridgeSource();
+    if (!source || source.mode !== 'local_bridge') return { mode: 'local' };
+    try {
+      const bridge = ensureBridgeRuntimeForTemplate(source, { forceNewToken: true });
+      writeCodexLocalBridgeConfig(source, bridge);
+      return buildCodexRuntimeResult(source, bridge);
+    } catch (error) {
+      return { error: error.message || '本地 Codex API 桥接初始化失败' };
+    }
+  }
 
   let bridge = null;
   try {
@@ -1476,15 +1609,7 @@ function prepareCodexCustomRuntime(config) {
   ].filter((line) => line !== null).join('\n');
   fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
 
-  return {
-    mode: 'custom',
-    homeDir: CODEX_RUNTIME_HOME,
-    apiKey: bridge.token,
-    apiBase: bridge.openaiBaseUrl,
-    bridgeToken: bridge.token,
-    profileName: source.name,
-    defaultModel: bridge.defaultModel || '',
-  };
+  return buildCodexRuntimeResult(source, bridge);
 }
 
 function normalizeCodexModelEntries(rawModels) {
@@ -2578,6 +2703,37 @@ const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
+}
+
+const VALID_PERMISSION_MODES = new Set(['default', 'plan', 'yolo']);
+const CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE = '检测到 Webcoding 正以 root 用户运行，Claude 的 YOLO 模式会触发 CLI 报错；已自动降级为默认模式。';
+
+function isRootProcessOnUnix() {
+  return process.platform !== 'win32'
+    && typeof process.getuid === 'function'
+    && process.getuid() === 0;
+}
+
+function normalizePermissionModeInput(mode) {
+  return VALID_PERMISSION_MODES.has(mode) ? mode : 'yolo';
+}
+
+function resolvePermissionModeForAgent(agent, mode) {
+  const requestedMode = normalizePermissionModeInput(mode);
+  if (normalizeAgent(agent) === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
+    return {
+      mode: 'default',
+      requestedMode,
+      downgraded: true,
+      message: CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE,
+    };
+  }
+  return {
+    mode: requestedMode,
+    requestedMode,
+    downgraded: false,
+    message: '',
+  };
 }
 
 function normalizeRuntimeContextEntry(entry) {
@@ -4049,7 +4205,7 @@ function normalizeBridgeUsageRecordUsage(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const usage = {
     inputTokens: Number(raw.inputTokens ?? raw.input_tokens ?? raw.prompt_tokens) || 0,
-    cachedInputTokens: Number(raw.cachedInputTokens ?? raw.cached_tokens ?? raw.cache_tokens ?? raw.input_tokens_details?.cached_tokens ?? raw.prompt_tokens_details?.cached_tokens) || 0,
+    cachedInputTokens: Number(raw.cachedInputTokens ?? raw.cached_input_tokens ?? raw.cached_tokens ?? raw.cache_tokens ?? raw.input_tokens_details?.cached_tokens ?? raw.prompt_tokens_details?.cached_tokens) || 0,
     outputTokens: Number(raw.outputTokens ?? raw.output_tokens ?? raw.completion_tokens) || 0,
     reasoningOutputTokens: Number(raw.reasoningOutputTokens ?? raw.reasoning_tokens ?? raw.output_tokens_details?.reasoning_tokens ?? raw.completion_tokens_details?.reasoning_tokens) || 0,
     totalTokens: Number(raw.totalTokens ?? raw.total_tokens) || 0,
@@ -5197,7 +5353,7 @@ wss.on('connection', (ws, req) => {
         handleRenameSession(ws, msg.sessionId, msg.title);
         break;
       case 'set_mode':
-        handleSetMode(ws, msg.sessionId, msg.mode);
+        handleSetMode(ws, msg.sessionId, msg.mode, msg.agent);
         break;
       case 'set_reasoning_effort':
         handleSetReasoningEffort(ws, msg.sessionId, msg.reasoningEffort);
@@ -5794,9 +5950,12 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     case '/cost': {
       if (agent === 'codex') {
         const usage = session?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+        const inputTotal = Number(usage.inputTokens || 0) || 0;
+        const cached = Number(usage.cachedInputTokens || 0) || 0;
+        const displayedInput = cached > 0 && inputTotal >= cached ? inputTotal - cached : inputTotal;
         wsSend(ws, {
           type: 'system_message',
-          message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}`,
+          message: `当前会话累计 Token: 输入 ${displayedInput}，缓存 ${cached}，输出 ${usage.outputTokens}`,
         });
       } else {
         const cost = session?.totalCost || 0;
@@ -5839,12 +5998,17 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         const cur = session?.permissionMode || 'yolo';
         wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
       } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
-        const mode = modeInput.toLowerCase();
+        const requested = modeInput.toLowerCase();
+        const resolved = resolvePermissionModeForAgent(agent, requested);
+        const mode = resolved.mode;
         if (session) {
           session.permissionMode = mode;
           clearRuntimeSessionId(session);
           session.updated = new Date().toISOString();
           saveSession(session);
+        }
+        if (resolved.downgraded) {
+          wsSend(ws, { type: 'system_message', message: resolved.message });
         }
         wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
         wsSend(ws, { type: 'mode_changed', mode });
@@ -5931,7 +6095,8 @@ function handleNewSession(ws, msg) {
   detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
-  const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
+  const resolvedMode = resolvePermissionModeForAgent(agent, msg?.mode);
+  const requestedMode = resolvedMode.mode;
   const requestedReasoningEffort = agent === 'codex' ? normalizeCodexReasoningEffort(msg?.reasoningEffort) : '';
   let projectId = msg?.projectId || null;
   let resolvedCwd = cwd;
@@ -5999,6 +6164,10 @@ function handleNewSession(ws, msg) {
     isRunning: false,
     ...buildSessionRuntimeMeta(session),
   });
+  if (resolvedMode.downgraded) {
+    wsSend(ws, { type: 'system_message', message: resolvedMode.message });
+    wsSend(ws, { type: 'mode_changed', mode: resolvedMode.mode });
+  }
   sendSessionList(ws);
 }
 
@@ -6228,19 +6397,23 @@ function handleRenameSession(ws, sessionId, title) {
   }
 }
 
-function handleSetMode(ws, sessionId, mode) {
-  const VALID_MODES = ['default', 'plan', 'yolo'];
-  if (!mode || !VALID_MODES.includes(mode)) return;
+function handleSetMode(ws, sessionId, mode, rawAgent = null) {
+  if (!mode || !VALID_PERMISSION_MODES.has(mode)) return;
+  let resolved = resolvePermissionModeForAgent(rawAgent, mode);
   if (sessionId) {
     const session = loadSession(sessionId);
     if (session) {
-      session.permissionMode = mode;
+      resolved = resolvePermissionModeForAgent(getSessionAgent(session), mode);
+      session.permissionMode = resolved.mode;
       clearRuntimeSessionId(session);
       session.updated = new Date().toISOString();
       saveSession(session);
     }
   }
-  wsSend(ws, { type: 'mode_changed', mode });
+  if (resolved.downgraded) {
+    wsSend(ws, { type: 'system_message', message: resolved.message });
+  }
+  wsSend(ws, { type: 'mode_changed', mode: resolved.mode });
 }
 
 function handleSetReasoningEffort(ws, sessionId, rawEffort) {
@@ -6401,7 +6574,7 @@ function handleMessage(ws, msg, options = {}) {
       runtimeContexts: { claude: {}, codex: {} },
       model: null,
       reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(msg.reasoningEffort) : '',
-      permissionMode: mode || 'yolo',
+      permissionMode: resolvePermissionModeForAgent(agent, mode).mode,
       totalCost: 0,
       totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
       messages: [],
@@ -6414,8 +6587,17 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' });
   }
 
-  if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
-    session.permissionMode = mode;
+  let permissionModeNotice = null;
+  if (mode && VALID_PERMISSION_MODES.has(mode)) {
+    const resolved = resolvePermissionModeForAgent(getSessionAgent(session), mode);
+    session.permissionMode = resolved.mode;
+    if (resolved.downgraded) permissionModeNotice = resolved.message;
+  } else {
+    const resolved = resolvePermissionModeForAgent(getSessionAgent(session), session.permissionMode || 'yolo');
+    if (resolved.downgraded) {
+      session.permissionMode = resolved.mode;
+      permissionModeNotice = resolved.message;
+    }
   }
   if (getSessionAgent(session) === 'codex' && Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) {
     session.reasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
@@ -6483,6 +6665,10 @@ function handleMessage(ws, msg, options = {}) {
   const threadCarryover = shouldInjectCarryover
     ? buildThreadCarryoverPayload(session, effectiveInputText, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
     : null;
+  if (permissionModeNotice) {
+    wsSend(ws, { type: 'system_message', message: permissionModeNotice });
+    wsSend(ws, { type: 'mode_changed', mode: session.permissionMode || 'default' });
+  }
   if (spawnSpec?.warningMessage) {
     wsSend(ws, { type: 'system_message', message: spawnSpec.warningMessage });
   }
@@ -7206,8 +7392,8 @@ function handleImportCodexSession(ws, msg) {
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-    lastUsage: existingSession?.lastUsage || null,
-    contextWindowTokens: existingSession?.contextWindowTokens || null,
+    lastUsage: parsed.lastUsage || existingSession?.lastUsage || null,
+    contextWindowTokens: parsed.contextWindowTokens || existingSession?.contextWindowTokens || null,
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };

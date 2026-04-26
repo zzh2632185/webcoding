@@ -54,6 +54,15 @@
           <button type="button" class="mode-tab" data-mode="default" title="默认模式：执行前确认">默认</button>
           <button type="button" class="mode-tab" data-mode="plan" title="Plan 模式：仅规划不执行">Plan</button>
         </div>
+        <select id="desktop-reasoning-select" class="desktop-reasoning-select" title="Codex 思考级别" hidden>
+          <option value="">默认思考</option>
+          <option value="xhigh">XHigh</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="minimal">Minimal</option>
+          <option value="none">None</option>
+        </select>
         <span id="topbar-cost-display" class="cost-display" hidden></span>
         <select id="mobile-agent-select" class="mobile-topbar-select" title="切换 Agent">
           <option value="claude">Claude</option>

@@ -144,6 +144,35 @@ function sleep(ms) {
   }
 
 
+
+  if (input === 'trigger codex cumulative usage within window') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_msg_cumulative_usage',
+        type: 'agent_message',
+        text: 'Codex mock cumulative usage handled.',
+      },
+    })}
+`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'token_count',
+      info: {
+        total_token_usage: { input_tokens: 28201, cached_input_tokens: 16128, output_tokens: 40, reasoning_output_tokens: 0, total_tokens: 28241 },
+        last_token_usage: { input_tokens: 15351, cached_input_tokens: 12672, output_tokens: 14, reasoning_output_tokens: 0, total_tokens: 15365 },
+        model_context_window: 258400,
+      },
+    })}
+`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 28201, cached_input_tokens: 16128, output_tokens: 40, reasoning_output_tokens: 0 },
+      model_context_window: 258400,
+    })}
+`);
+    return;
+  }
+
   if (input === 'trigger codex anomalous usage') {
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',

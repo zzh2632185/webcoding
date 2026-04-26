@@ -2029,18 +2029,39 @@
     return String(Math.round(value));
   }
 
-  function getUsageTotalTokens(usage) {
+  function getUsageTotalTokens(usage, options = {}) {
     const normalized = normalizeUsageShape(usage);
     if (!normalized) return 0;
     if (normalized.totalTokens > 0) return normalized.totalTokens;
-    return (Number(normalized.inputTokens) || 0)
-      + (Number(normalized.outputTokens) || 0)
-      + (Number(normalized.reasoningOutputTokens) || 0);
+    const inputTotal = Number(normalized.inputTokens) || 0;
+    const cached = Number(normalized.cachedInputTokens) || 0;
+    const output = Number(normalized.outputTokens) || 0;
+    const reasoning = Number(normalized.reasoningOutputTokens) || 0;
+    const contextLimit = Number(options.contextLimit || 0) || 0;
+
+    if (contextLimit && cached > 0 && inputTotal + cached > contextLimit) {
+      const aggregateCalls = Math.max(1, Math.ceil((inputTotal + cached) / contextLimit));
+      const averageCallTokens = (inputTotal + output + reasoning) / aggregateCalls;
+      // Adjacent Codex/CPAP calls are not equal-sized: the latest call is usually
+      // a little larger than the aggregate average because the conversation grew
+      // during the turn. Bias the estimate toward the latest CPAP request.
+      return Math.ceil(Math.min(contextLimit, averageCallTokens * 1.08));
+    }
+
+    let effectiveInput = inputTotal;
+    // Codex CLI can aggregate adjacent CPAP Responses calls into one
+    // last_token_usage. When total_tokens is missing and the cached prefix is
+    // repeated, collapse one duplicated cached prefix so the indicator follows
+    // CPAP's latest-request scale instead of aggregate spend.
+    if (cached > 0 && inputTotal > 0 && cached / inputTotal > 0.5) {
+      effectiveInput = Math.max(0, inputTotal - Math.round(cached / 2));
+    }
+    return effectiveInput + output + reasoning;
   }
 
   function usageLooksCumulativeForContext(usage, limit) {
-    const used = getUsageTotalTokens(usage);
     const windowLimit = Number(limit || 0) || 0;
+    const used = getUsageTotalTokens(usage, { contextLimit: windowLimit });
     if (!used) return false;
     if (windowLimit) return used > windowLimit * 1.5;
     return used > 1500000;
@@ -2050,6 +2071,8 @@
     const normalized = normalizeUsageShape(usage);
     if (!normalized) return null;
     if (usageLooksCumulativeForContext(normalized, limit)) return null;
+    const used = getUsageTotalTokens(normalized, { contextLimit: limit });
+    if (limit && used > limit) return null;
     return normalized;
   }
 
@@ -2059,7 +2082,7 @@
     const limit = Number(contextRuntimeUsage.contextWindowTokens || inferContextWindowTokens() || 0) || 0;
     if (!limit) return null;
     const currentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
-    const used = getUsageTotalTokens(currentUsage);
+    const used = getUsageTotalTokens(currentUsage, { contextLimit: limit });
     if (!used) {
       return {
         used: 0,
@@ -2124,21 +2147,46 @@
   }
 
   function getTotalUsageTokens(totalUsage) {
-    if (!totalUsage) return 0;
-    return (Number(totalUsage.inputTokens) || 0)
-      + (Number(totalUsage.cachedInputTokens) || 0)
-      + (Number(totalUsage.outputTokens) || 0);
+    const normalized = normalizeUsageShape(totalUsage);
+    if (!normalized) return 0;
+    if (normalized.totalTokens > 0) return normalized.totalTokens;
+    return (Number(normalized.inputTokens) || 0)
+      + (Number(normalized.outputTokens) || 0)
+      + (Number(normalized.reasoningOutputTokens) || 0);
   }
 
   function normalizeUsageShape(usage) {
     if (!usage) return null;
     return {
-      inputTokens: Number(usage.inputTokens ?? usage.input_tokens) || 0,
-      cachedInputTokens: Number(usage.cachedInputTokens ?? usage.cached_input_tokens) || 0,
-      outputTokens: Number(usage.outputTokens ?? usage.output_tokens) || 0,
-      reasoningOutputTokens: Number(usage.reasoningOutputTokens ?? usage.reasoning_output_tokens) || 0,
+      inputTokens: Number(usage.inputTokens ?? usage.input_tokens ?? usage.prompt_tokens) || 0,
+      cachedInputTokens: Number(
+        usage.cachedInputTokens
+        ?? usage.cached_input_tokens
+        ?? usage.cached_tokens
+        ?? usage.cache_tokens
+        ?? usage.input_tokens_details?.cached_tokens
+        ?? usage.prompt_tokens_details?.cached_tokens
+      ) || 0,
+      outputTokens: Number(usage.outputTokens ?? usage.output_tokens ?? usage.completion_tokens) || 0,
+      reasoningOutputTokens: Number(
+        usage.reasoningOutputTokens
+        ?? usage.reasoning_output_tokens
+        ?? usage.reasoning_tokens
+        ?? usage.output_tokens_details?.reasoning_tokens
+        ?? usage.completion_tokens_details?.reasoning_tokens
+      ) || 0,
       totalTokens: Number(usage.totalTokens ?? usage.total_tokens) || 0,
     };
+  }
+
+  function formatUsageStatsText(usage) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return '';
+    const inputTotal = Number(normalized.inputTokens) || 0;
+    const cached = Number(normalized.cachedInputTokens) || 0;
+    const displayInput = cached > 0 && inputTotal >= cached ? inputTotal - cached : inputTotal;
+    const cacheText = cached ? ` · cache ${cached}` : '';
+    return `in ${displayInput} · out ${normalized.outputTokens}${cacheText}`;
   }
 
   function diffUsageTotals(nextTotal, prevTotal) {
@@ -2817,15 +2865,20 @@
     document.querySelectorAll('.mode-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.mode === sessionState.currentMode);
     });
-    // Sync mobile selects
+    // Sync topbar selects
     const mas = document.getElementById('mobile-agent-select');
     const mms = document.getElementById('mobile-mode-select');
     const mrs = document.getElementById('mobile-reasoning-select');
+    const drs = document.getElementById('desktop-reasoning-select');
     if (mas) mas.value = selectedAgent;
     if (mms) mms.value = sessionState.currentMode;
     if (mrs) {
       mrs.value = sessionState.currentReasoningEffort;
       mrs.hidden = selectedAgent !== 'codex';
+    }
+    if (drs) {
+      drs.value = sessionState.currentReasoningEffort;
+      drs.hidden = selectedAgent !== 'codex';
     }
     if (importSessionBtn) {
       importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
@@ -3111,8 +3164,7 @@
     if (sessionState.currentAgent === 'codex' && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
-        const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
-        costDisplay.textContent = `in ${usage.inputTokens} · out ${usage.outputTokens}${cacheText}`;
+        costDisplay.textContent = formatUsageStatsText(usage);
         return;
       }
     }
@@ -3623,8 +3675,7 @@
       const previousCurrentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
       const currentUsage = rawCurrentUsage || diffCurrentUsage || previousCurrentUsage;
       if (msg.totalUsage) {
-        const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-        costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+        costDisplay.textContent = formatUsageStatsText(msg.totalUsage);
       }
       contextRuntimeUsage = {
         currentUsage,
@@ -3940,7 +3991,11 @@
     composeState.isGenerating = false;
     updateComposerActionButtons();
     setCurrentSessionRunningState(false);
-    msgInput.focus();
+    // On mobile browsers, programmatic focus can summon the keyboard and trigger
+    // viewport zoom/resize. Keep desktop auto-focus, but leave mobile stable.
+    if (!isMobileInputMode()) {
+      msgInput.focus();
+    }
 
     if (composeState.pendingText) flushRender();
 
@@ -6594,10 +6649,24 @@
     });
   });
 
-  // Mobile agent select
+  function applyReasoningEffortSelection(value) {
+    const effort = normalizeCodexReasoningEffort(value);
+    sessionState.currentReasoningEffort = effort;
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
+    }
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  // Topbar agent/reasoning selectors
   const mobileAgentSelect = document.getElementById('mobile-agent-select');
   const mobileModeSelect = document.getElementById('mobile-mode-select');
   const mobileReasoningSelect = document.getElementById('mobile-reasoning-select');
+  const desktopReasoningSelect = document.getElementById('desktop-reasoning-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -6617,14 +6686,12 @@
   }
   if (mobileReasoningSelect) {
     mobileReasoningSelect.addEventListener('change', () => {
-      const effort = normalizeCodexReasoningEffort(mobileReasoningSelect.value);
-      sessionState.currentReasoningEffort = effort;
-      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
-      updateAgentScopedUI();
-      if (sessionState.currentSessionId) send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
-      renderWorkspaceInsights();
-      const welcome = messagesDiv.querySelector('.welcome-msg');
-      if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+      applyReasoningEffortSelection(mobileReasoningSelect.value);
+    });
+  }
+  if (desktopReasoningSelect) {
+    desktopReasoningSelect.addEventListener('change', () => {
+      applyReasoningEffortSelection(desktopReasoningSelect.value);
     });
   }
 
@@ -6854,6 +6921,28 @@
     renderWorkspaceInsights();
   });
 
+  let msgInputComposing = false;
+  let msgInputCompositionEndedAt = 0;
+
+  function isMsgInputComposing(e) {
+    // IME candidate confirmation (Chinese/Japanese/etc.) can press Enter while
+    // composing. Some browsers report it via isComposing/keyCode 229; others
+    // fire compositionend immediately before the Enter keydown, so keep a tiny
+    // grace window to avoid sending the draft while accepting a candidate.
+    const justEndedComposition = e.key === 'Enter' && msgInputCompositionEndedAt > 0 &&
+      performance.now() - msgInputCompositionEndedAt < 120;
+    return msgInputComposing || e.isComposing || e.keyCode === 229 || e.which === 229 || justEndedComposition;
+  }
+
+  msgInput.addEventListener('compositionstart', () => {
+    msgInputComposing = true;
+  });
+
+  msgInput.addEventListener('compositionend', () => {
+    msgInputComposing = false;
+    msgInputCompositionEndedAt = performance.now();
+  });
+
   msgInput.addEventListener('input', () => {
     renderContextBar();
     autoResize();
@@ -6867,6 +6956,8 @@
   });
 
   msgInput.addEventListener('keydown', (e) => {
+    if (isMsgInputComposing(e)) return;
+
     // Command menu navigation
     if (!cmdMenu.hidden) {
       if (e.key === 'ArrowDown') { e.preventDefault(); navigateCmdMenu(1); return; }
@@ -6887,7 +6978,7 @@
         e.preventDefault();
         // If menu is open and user presses Enter, select the item
         selectCmdMenuItem();
-      } else if (e.ctrlKey) {
+      } else {
         e.preventDefault();
         sendMessage();
       }

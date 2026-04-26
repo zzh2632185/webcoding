@@ -49,3 +49,5 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+config/bridge-usage.jsonl

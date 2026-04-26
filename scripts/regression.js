@@ -1166,7 +1166,11 @@ function writeFakeCodexRollout(homeDir, threadId) {
       type: 'event_msg',
       payload: {
         type: 'token_count',
-        info: { total_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 8 } },
+        info: {
+          total_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 8, total_tokens: 28 },
+          last_token_usage: { input_tokens: 12, cached_input_tokens: 4, output_tokens: 3, total_tokens: 15 },
+          model_context_window: 258400,
+        },
       },
     }),
   ];
@@ -2734,6 +2738,85 @@ async function runCodexLocalConfigFingerprintRegressionCase({ tempRoot }) {
   });
 }
 
+async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
+  const caseRoot = path.join(tempRoot, 'codex-local-bridge-runtime');
+  const configDir = path.join(caseRoot, 'config');
+  const sessionsDir = path.join(caseRoot, 'sessions');
+  const logsDir = path.join(caseRoot, 'logs');
+  const homeDir = path.join(caseRoot, 'home');
+  mkdirp(configDir);
+  mkdirp(sessionsDir);
+  mkdirp(logsDir);
+  mkdirp(homeDir);
+
+  const codexDir = path.join(homeDir, '.codex');
+  mkdirp(codexDir);
+  fs.writeFileSync(path.join(codexDir, 'instruction.md'), 'local instruction should be copied');
+  fs.writeFileSync(path.join(codexDir, 'config.toml'), [
+    'model_provider = "cliproxyapi"',
+    'model = "gpt-5.5"',
+    'model_context_window = 400000',
+    'model_instructions_file = "./instruction.md"',
+    '',
+    '[model_providers.cliproxyapi]',
+    'name = "cliproxyapi"',
+    'wire_api = "responses"',
+    'base_url = "https://cpap.example.test/v1"',
+    '',
+    '[mcp_servers.nocturne_memory]',
+    'url = "http://127.0.0.1:9000/mcp"',
+  ].join('\n'));
+  fs.writeFileSync(path.join(codexDir, 'auth.json'), JSON.stringify({
+    OPENAI_API_KEY: 'local-cpap-key',
+  }, null, 2));
+
+  const port = await getFreePort();
+  const password = 'Regression!234';
+  const serverEnv = {
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  };
+
+  await withServer(serverEnv, async () => {
+    await withAuthedClient(port, password, async ({ client }) => {
+      const session = await client.sendAndWaitType(
+        { type: 'new_session', agent: 'codex', cwd: caseRoot, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === 'codex' && msg.cwd === caseRoot,
+      );
+
+      client.send(buildAgentMessagePayload({ text: 'local bridge codex run', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+      const spawnLine = findProcessLogLine(logsDir, session.sessionId, 'process_spawn');
+      const spawnArgs = spawnLine ? (JSON.parse(spawnLine).args || '') : '';
+      assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Local Codex with API key should be forced through openai_compat bridge');
+      assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Local Codex spawn should point at webcoding bridge base_url');
+      assert(spawnArgs.includes('-c model="gpt-5.5"'), 'Local Codex bridge should keep the local configured model');
+
+      const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
+      assert(runtimeToml.includes('[mcp_servers.nocturne_memory]'), 'Local Codex bridge runtime should preserve local MCP config');
+      assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Local Codex bridge runtime should rewrite active provider base_url to local bridge');
+      assert(runtimeToml.includes('env_key = "OPENAI_API_KEY"'), 'Local Codex bridge runtime should force bridge token env key');
+      assert(fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'instruction.md'), 'utf8') === 'local instruction should be copied', 'Local Codex bridge runtime should copy relative instruction file');
+
+      const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
+      const bridgeEntry = bridgeRuntime?.runtimes
+        ? Object.values(bridgeRuntime.runtimes).find((entry) => entry?.upstream?.name === '本地 Codex: cliproxyapi')
+        : null;
+      assert(bridgeEntry?.upstream?.apiBase === 'https://cpap.example.test/v1', 'Local Codex bridge should forward to original CPAP base URL');
+      assert(bridgeEntry?.upstream?.apiKey === 'local-cpap-key', 'Local Codex bridge should use local Codex auth key upstream');
+    });
+  });
+}
+
+
 async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
   const caseRoot = path.join(tempRoot, 'codex-config-carryover');
   const configDir = path.join(caseRoot, 'config');
@@ -3295,6 +3378,40 @@ async function runCodexAnomalousUsageRegressionCase({ port, password, sessionsDi
   });
 }
 
+async function runCodexCumulativeUsageWithinWindowRegressionCase({ port, password, sessionsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const cwd = path.join(os.tmpdir(), 'webcoding-codex-cumulative-usage');
+    mkdirp(cwd);
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.cwd === cwd,
+    );
+
+    client.send(buildAgentMessagePayload({
+      text: 'trigger codex cumulative usage within window',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+
+    const usageMsg = await client.waitForType(
+      'usage',
+      (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 15351,
+    );
+    assert(usageMsg.currentUsage?.totalTokens === 15365, 'Codex current usage should come from last_token_usage total_tokens');
+    assert(usageMsg.totalUsage?.inputTokens === 28201, 'Codex total usage should still keep cumulative total_token_usage');
+    assert(usageMsg.contextWindowTokens === 258400, 'Codex cumulative usage should preserve reported context window');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+    const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+    assert(stored.lastUsage?.inputTokens === 15351, 'Codex in-window cumulative turn.completed usage should not overwrite last_token_usage');
+    assert(stored.lastUsage?.totalTokens === 15365, 'Codex stored lastUsage total should match CPAP/current request usage');
+    assert(stored.totalUsage?.inputTokens === 28201, 'Codex stored totalUsage should remain cumulative');
+    assert(stored.contextWindowTokens === 258400, 'Codex stored session should keep context window');
+  });
+}
+
 async function runCodexMetadataWarningRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ client, messages }) => {
     const warningCwd = path.join(os.tmpdir(), 'webcoding-codex-warning');
@@ -3505,6 +3622,8 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     );
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+    assert(importedCodex.lastUsage?.inputTokens === 12, 'Codex import should expose last_token_usage separately from total usage');
+    assert(importedCodex.contextWindowTokens === 258400, 'Codex import should preserve model context window');
 
     const importedSessionId = importedCodex.sessionId;
     client.send({ type: 'delete_session', sessionId: importedSessionId });
@@ -3594,12 +3713,14 @@ async function main() {
       await runner.run('claude config switch carryover', () => runClaudeConfigCarryoverRegressionCase(ctx));
       await runner.run('claude sticky resume across channel switch', () => runClaudeStickyResumeRegressionCase(ctx));
       await runner.run('codex local config fingerprint refresh', () => runCodexLocalConfigFingerprintRegressionCase(ctx));
+      await runner.run('codex local bridge runtime', () => runCodexLocalBridgeRuntimeRegressionCase(ctx));
       await runner.run('codex config switch carryover', () => runCodexConfigCarryoverRegressionCase(ctx));
       await runner.run('codex sticky resume inside managed runtime home', () => runCodexStickyUnifiedResumeRegressionCase(ctx));
       await runner.run('codex config migration', () => runCodexConfigMigrationRegressionCase(ctx));
       await runner.run('codex ignores legacy reasoning effort config', () => runCodexReasoningEffortRegressionCase(ctx));
       await runner.run('codex bridge protocol normalization', () => runCodexBridgeProtocolNormalizationRegressionCase(ctx));
       await runner.run('codex anomalous usage guard', () => runCodexAnomalousUsageRegressionCase(ctx));
+      await runner.run('codex in-window cumulative usage guard', () => runCodexCumulativeUsageWithinWindowRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));

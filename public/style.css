@@ -2430,6 +2430,7 @@ html[data-theme="localhost"] .localfile-pre {
 :where(
   .mode-select,
   .mobile-topbar-select,
+  .desktop-reasoning-select,
   .new-chat-dropdown button
 ) {
   color: var(--compact-text-control-color, var(--text-primary));
@@ -3851,6 +3852,26 @@ html[data-theme="localhost"] .localfile-pre {
   display: none;
   flex-shrink: 0;
 }
+.desktop-reasoning-select {
+  --compact-text-control-size: 11px;
+
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  min-height: 34px;
+  padding: 0 28px 0 10px;
+  border: var(--mobile-topbar-select-border);
+  border-radius: var(--mobile-topbar-select-radius);
+  background: var(--mobile-topbar-select-background);
+  color: var(--mobile-topbar-select-color);
+  box-shadow: var(--mobile-topbar-select-shadow);
+  background-image: var(--select-caret-icon);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
 .mobile-topbar-select {
   --compact-text-control-size: 11px;
 
@@ -3887,6 +3908,20 @@ html[data-theme="localhost"] .localfile-pre {
   .menu-btn { display: block; }
   .msg { max-width: 95%; }
   .input-area { padding: var(--space-lg) var(--space-md); padding-bottom: max(var(--space-lg), var(--safe-bottom)); }
+  /* Mobile Safari/Chrome auto-zoom focused form controls below 16px.
+     Keep chat and modal inputs at 16px on phones so tapping them does not
+     suddenly magnify the whole page. */
+  #msg-input,
+  .login-box input,
+  .force-change-form input,
+  .settings-field input,
+  .modal-text-input,
+  .themed-textarea,
+  .session-item-edit-input,
+  .mp-custom-input,
+  .file-editor-textarea {
+    font-size: 16px;
+  }
   .messages { padding: var(--space-lg) var(--space-md); gap: var(--space-lg); }
   .session-item-actions { display: flex; }
   .session-item-btn { opacity: 1; }
@@ -3907,6 +3942,9 @@ html[data-theme="localhost"] .localfile-pre {
     flex-shrink: 0;
   }
   .agent-tabs, .mode-tabs {
+    display: none;
+  }
+  .desktop-reasoning-select {
     display: none;
   }
   .mobile-topbar-bar {
