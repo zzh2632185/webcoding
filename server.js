@@ -33,6 +33,9 @@ const HOST = (_HOST_ENV && _HOST_ENV !== '127.0.0.1' && _HOST_ENV !== 'localhost
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
+const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const GENERATED_IMAGES_ROOT = path.join(CODEX_RUNTIME_HOME, 'generated_images');
+const GENERATED_MESSAGE_IMAGES_ROOT = path.join(CONFIG_DIR, 'generated-message-images');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
 const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
@@ -112,6 +115,7 @@ fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+fs.mkdirSync(GENERATED_MESSAGE_IMAGES_ROOT, { recursive: true });
 
 const jsonConfigCache = new Map();
 const authAttemptByIp = new Map();
@@ -1348,7 +1352,6 @@ function getModelConfigMasked() {
   };
 }
 
-const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
 const CODEX_LOCAL_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
 const CODEX_LOCAL_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
 
@@ -2575,6 +2578,102 @@ function detectMimeFromMagic(buffer) {
     buffer.toString('ascii', 8, 12) === 'WEBP'
   ) return 'image/webp';
   return null;
+}
+
+
+function isGeneratedImageExtension(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
+}
+
+function generatedImageRootEntries() {
+  return [
+    ['codex', GENERATED_IMAGES_ROOT],
+    ['cache', GENERATED_MESSAGE_IMAGES_ROOT],
+  ];
+}
+
+function generatedImageUrlForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!isGeneratedImageExtension(absPath)) return '';
+  for (const [rootKey, rootDir] of generatedImageRootEntries()) {
+    const root = path.resolve(rootDir);
+    if (!isPathInside(absPath, root)) continue;
+    const rel = path.relative(root, absPath).split(path.sep).filter(Boolean);
+    if (!rel.length || rel.some((part) => part === '..' || part.includes('\0'))) return '';
+    return `/api/generated-image/${encodeURIComponent(rootKey)}/${rel.map((part) => encodeURIComponent(part)).join('/')}`;
+  }
+  return '';
+}
+
+function findCodexGeneratedImageByCallId(callId, preferredThreadId = '') {
+  const safeCallId = String(callId || '').trim();
+  if (!safeCallId || !/^[A-Za-z0-9_-]+$/.test(safeCallId)) return null;
+  const root = path.resolve(GENERATED_IMAGES_ROOT);
+  const filename = `${safeCallId}.png`;
+  const preferred = String(preferredThreadId || '').trim();
+  if (preferred && /^[A-Za-z0-9_-]+$/.test(preferred)) {
+    const direct = path.resolve(root, preferred, filename);
+    if (isPathInside(direct, root) && fs.existsSync(direct)) return direct;
+  }
+  try {
+    for (const dirent of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!dirent.isDirectory()) continue;
+      if (!/^[A-Za-z0-9_-]+$/.test(dirent.name)) continue;
+      const candidate = path.resolve(root, dirent.name, filename);
+      if (isPathInside(candidate, root) && fs.existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return null;
+}
+
+function imageBufferFromCodexResult(result) {
+  let raw = typeof result === 'string' ? result.trim() : '';
+  if (!raw) return null;
+  const dataUrlMatch = raw.match(/^data:(image\/[a-z0-9.+-]+);base64,(.*)$/is);
+  if (dataUrlMatch) raw = dataUrlMatch[2].trim();
+  if (!/^[A-Za-z0-9+/=\r\n]+$/.test(raw)) return null;
+  try {
+    const buffer = Buffer.from(raw.replace(/\s+/g, ''), 'base64');
+    return buffer.length > 0 ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistGeneratedImageFromResult(result, sessionId, callId) {
+  const buffer = imageBufferFromCodexResult(result);
+  if (!buffer) return null;
+  const detectedMime = detectMimeFromMagic(buffer);
+  if (!IMAGE_MIME_TYPES.has(detectedMime)) return null;
+  const ext = extFromMime(detectedMime) || '.png';
+  const safeSessionId = sanitizeId(sessionId || 'unknown') || 'unknown';
+  const rawCallId = String(callId || '').trim();
+  const safeCallId = /^[A-Za-z0-9_-]+$/.test(rawCallId) ? rawCallId : crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 24);
+  const dir = path.join(GENERATED_MESSAGE_IMAGES_ROOT, safeSessionId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.resolve(dir, `${safeCallId}${ext}`);
+  const root = path.resolve(GENERATED_MESSAGE_IMAGES_ROOT);
+  if (!isPathInside(filePath, root)) return null;
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+function createGeneratedImageSegmentFromCodexEvent(codexEvent = {}, options = {}) {
+  const callId = String(codexEvent.call_id || '').trim();
+  const preferredThreadId = String(options.threadId || options.runtimeSessionId || '').trim();
+  const existingPath = findCodexGeneratedImageByCallId(callId, preferredThreadId);
+  const filePath = existingPath || persistGeneratedImageFromResult(codexEvent.result, options.sessionId || preferredThreadId || 'unknown', callId);
+  const src = filePath ? generatedImageUrlForFile(filePath) : '';
+  if (!src) return null;
+  const detectedMime = extFromMime('image/png') ? 'image/png' : 'image/png';
+  return {
+    id: callId || null,
+    src,
+    mime: detectedMime,
+    alt: 'Generated image',
+    prompt: codexEvent.revised_prompt || '',
+  };
 }
 
 function loadAttachmentMeta(id) {
@@ -4479,25 +4578,26 @@ class FileTailer {
       const stat = fs.statSync(this.filePath);
       if (stat.size <= this.offset) return;
 
-      const remaining = stat.size - this.offset;
-      const readLen = Math.min(remaining, FILE_TAIL_MAX_READ_BYTES);
-      const buf = Buffer.alloc(readLen);
+      const targetSize = stat.size;
       const fd = fs.openSync(this.filePath, 'r');
-      let bytesRead = 0;
       try {
-        bytesRead = fs.readSync(fd, buf, 0, buf.length, this.offset);
+        while (!this.stopped && this.offset < targetSize) {
+          const remaining = targetSize - this.offset;
+          const readLen = Math.min(remaining, FILE_TAIL_MAX_READ_BYTES);
+          const buf = Buffer.alloc(readLen);
+          const bytesRead = fs.readSync(fd, buf, 0, buf.length, this.offset);
+          if (bytesRead <= 0) break;
+
+          this.offset += bytesRead;
+          this.buffer += buf.toString('utf8', 0, bytesRead);
+          const lines = this.buffer.split('\n');
+          this.buffer = lines.pop();
+          for (const line of lines) {
+            if (line.trim()) this.onLine(line);
+          }
+        }
       } finally {
         fs.closeSync(fd);
-      }
-
-      if (bytesRead <= 0) return;
-
-      this.offset += bytesRead;
-      this.buffer += buf.toString('utf8', 0, bytesRead);
-      const lines = this.buffer.split('\n');
-      this.buffer = lines.pop();
-      for (const line of lines) {
-        if (line.trim()) this.onLine(line);
       }
     } catch (error) {
       plog('WARN', 'tailer_read_error', {
@@ -4670,7 +4770,7 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
 
 function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const session = loadSession(sessionId);
-  if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0))) {
+  if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || (entry.segments && entry.segments.length > 0))) {
     session.messages.push({
       role: 'assistant',
       content: entry.fullText,
@@ -4901,7 +5001,7 @@ function recoverProcesses() {
               processRuntimeEvent(tempEntry, event, sessionId);
             } catch {}
           }
-          if (session && (tempEntry.fullText || (tempEntry.toolCalls && tempEntry.toolCalls.length > 0))) {
+          if (session && (tempEntry.fullText || (tempEntry.toolCalls && tempEntry.toolCalls.length > 0) || (tempEntry.segments && tempEntry.segments.length > 0))) {
             session.messages.push({
               role: 'assistant',
               content: tempEntry.fullText,
@@ -4924,6 +5024,42 @@ function recoverProcesses() {
 // === HTTP Static File Server ===
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/generated-image/')) {
+    const prefix = '/api/generated-image/';
+    const rest = url.pathname.slice(prefix.length);
+    const parts = rest.split('/').filter(Boolean).map((part) => {
+      try { return decodeURIComponent(part); } catch { return ''; }
+    });
+    const rootKey = parts.shift() || '';
+    const roots = Object.fromEntries(generatedImageRootEntries().map(([key, dir]) => [key, path.resolve(dir)]));
+    const rootDir = roots[rootKey] || null;
+    if (!rootDir || parts.length === 0 || parts.some((part) => !part || part === '..' || part.includes('/') || part.includes('\\') || part.includes('\0'))) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Invalid generated image path');
+    }
+    const filePath = path.resolve(rootDir, ...parts);
+    if (!isPathInside(filePath, rootDir) || !isGeneratedImageExtension(filePath)) {
+      writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Forbidden');
+    }
+    fs.stat(filePath, (statErr, stat) => {
+      if (statErr || !stat.isFile()) {
+        writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Not Found');
+      }
+      writeHeadWithSecurity(res, 200, {
+        'Content-Type': getFileMime(filePath),
+        'Content-Length': String(stat.size),
+        'Content-Disposition': `inline; filename="${path.basename(filePath).replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
+        'Cache-Control': 'private, max-age=86400',
+      });
+      fs.createReadStream(filePath).on('error', () => {
+        try { res.destroy(); } catch {}
+      }).pipe(res);
+    });
+    return;
+  }
 
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
@@ -6906,6 +7042,7 @@ const {
   clearRuntimeSessionId,
   runtimeFingerprintsCompatible,
   onSlashCommandsDiscovered,
+  createGeneratedImageSegmentFromCodexEvent,
 });
 
 // === Check Update ===
@@ -7069,6 +7206,7 @@ const {
   sessionsDir: SESSIONS_DIR,
   normalizeSession,
   sanitizeToolInput,
+  createGeneratedImageSegmentFromCodexEvent,
 });
 
 function getImportedSessionIds() {

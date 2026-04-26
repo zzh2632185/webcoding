@@ -3697,6 +3697,30 @@
     updateToolCall(msg.toolUseId, msg.result);
   }
 
+  function appendStreamingImageSegment(image = {}) {
+    const bubble = getStreamingBubble();
+    if (!bubble || !image.src) return;
+    clearStreamingPlaceholder(bubble);
+    const segmentEl = buildMessageSegmentElement({
+      type: 'image',
+      src: image.src,
+      alt: image.alt || 'Generated image',
+      id: image.id || null,
+      prompt: image.prompt || '',
+    });
+    if (segmentEl) bubble.appendChild(segmentEl);
+    scrollToBottom();
+  }
+
+  function handleImageDeltaMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
+    if (!composeState.isGenerating) startGenerating();
+    if (composeState.pendingText) flushRender();
+    markStreamingProcessTextSegments();
+    appendStreamingImageSegment(msg);
+  }
+
   function handleCostMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
     costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
@@ -3945,6 +3969,7 @@
     text_delta: handleTextDeltaMessage,
     tool_start: handleToolStartMessage,
     tool_end: handleToolEndMessage,
+    image_delta: handleImageDeltaMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
@@ -4305,12 +4330,21 @@
             done: segment.done !== false,
           };
         }
+        if (segment.type === 'image') {
+          return {
+            type: 'image',
+            src: typeof segment.src === 'string' ? segment.src : '',
+            alt: typeof segment.alt === 'string' ? segment.alt : 'Generated image',
+            id: segment.id || null,
+            prompt: typeof segment.prompt === 'string' ? segment.prompt : '',
+          };
+        }
         return {
           type: 'text',
           text: typeof segment.text === 'string' ? segment.text : '',
         };
       })
-      .filter((segment) => segment.type === 'tool_call' || segment.text);
+      .filter((segment) => segment.type === 'tool_call' || segment.type === 'image' || segment.text);
     return annotateMessageSegmentPhases(collapseToolSegmentsForDisplay(normalized));
   }
 
@@ -4412,6 +4446,25 @@
     return group;
   }
 
+  function createImageSegmentElement(segment = {}) {
+    if (!segment.src) return null;
+    const wrap = document.createElement('figure');
+    wrap.className = 'msg-image-segment msg-segment';
+    const img = document.createElement('img');
+    img.className = 'msg-generated-image';
+    img.src = segment.src;
+    img.alt = segment.alt || 'Generated image';
+    img.loading = 'lazy';
+    wrap.appendChild(img);
+    if (segment.prompt) {
+      const caption = document.createElement('figcaption');
+      caption.className = 'msg-image-caption';
+      caption.textContent = 'AI 生成图片';
+      wrap.appendChild(caption);
+    }
+    return wrap;
+  }
+
   function buildMessageSegmentElement(segment) {
     if (!segment) return null;
     if (segment.type === 'tool_group') {
@@ -4421,6 +4474,9 @@
       const details = createToolCallElement(segment.id || nextLocalId('saved'), segment, segment.done !== false);
       details.classList.add('msg-segment');
       return details;
+    }
+    if (segment.type === 'image') {
+      return createImageSegmentElement(segment);
     }
     const text = typeof segment.text === 'string' ? segment.text : '';
     if (!text) return null;
