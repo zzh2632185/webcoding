@@ -63,12 +63,20 @@
   const MAX_PENDING_FILE_REFS = 8;
   const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
   const MAX_QUEUED_MESSAGES = 10;
+  const MAX_QUEUED_ATTACHMENTS = 4;
+  const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
   const THEME_STORAGE_KEY = 'webcoding-theme';
+  const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
-  const DEFAULT_THEME = 'default';
+  const DEFAULT_THEME = 'auto';
+  const THEME_AUTO_VALUE = 'auto';
+  const THEME_DAY_VALUE = 'default';
+  const THEME_NIGHT_VALUE = 'night';
   const THEME_LABELS = {
+    auto: '跟随时间',
     default: '默认主题',
     localhost: '极简主题',
+    night: '夜间模式',
   };
 
   const MODE_PICKER_OPTIONS = [
@@ -126,6 +134,8 @@
   let pendingFileRefs = [];
   let queuedMessages = [];
   let queuedDispatchTimer = null;
+  let queuedMessagesRestoredAt = 0;
+  let queuedMessagesRestoredSawRunning = false;
   let generationIdleFinalizeTimer = null;
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
@@ -222,7 +232,10 @@
     get pendingFileRefs() { return pendingFileRefs; },
     set pendingFileRefs(value) { pendingFileRefs = value; },
     get queuedMessages() { return queuedMessages; },
-    set queuedMessages(value) { queuedMessages = value; },
+    set queuedMessages(value) {
+      queuedMessages = normalizeQueuedMessages(value);
+      persistQueuedMessages();
+    },
   };
 
   // --- DOM ---
@@ -246,6 +259,7 @@
   const gitPanelEl = $('#git-panel');
   const gitPanelContent = $('#git-panel-content');
   const gitPanelBtn = $('#git-panel-btn');
+  const themeToggleBtn = $('#theme-toggle-btn');
   const fileViewerPanel = $('#file-viewer-panel');
   const fileViewerTitle = $('#file-viewer-title');
   const fileViewerPath = $('#file-viewer-path');
@@ -314,16 +328,119 @@
     return THEME_LABELS[raw] ? raw : DEFAULT_THEME;
   }
 
+  function isDayThemeValue(theme) {
+    return !!THEME_LABELS[theme] && theme !== THEME_AUTO_VALUE && theme !== THEME_NIGHT_VALUE;
+  }
+
+  function getStoredDayTheme() {
+    const dayTheme = localStorage.getItem(THEME_DAY_STORAGE_KEY);
+    if (isDayThemeValue(dayTheme)) return dayTheme;
+    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    if (isDayThemeValue(storedTheme)) return storedTheme;
+    return THEME_DAY_VALUE;
+  }
+
+  function rememberDayTheme(theme) {
+    if (!isDayThemeValue(theme)) return;
+    localStorage.setItem(THEME_DAY_STORAGE_KEY, theme);
+  }
+
+  function preserveCurrentDayThemeForAuto() {
+    const effectiveTheme = document.documentElement.dataset.theme;
+    if (isDayThemeValue(effectiveTheme)) {
+      rememberDayTheme(effectiveTheme);
+      return;
+    }
+    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    if (isDayThemeValue(storedTheme)) rememberDayTheme(storedTheme);
+  }
+
+  function isNightThemeHour(date = new Date()) {
+    const hour = date.getHours();
+    return hour >= 18 || hour < 6;
+  }
+
+  function resolveEffectiveTheme(theme, date = new Date()) {
+    const preference = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
+    if (preference === THEME_AUTO_VALUE) {
+      return isNightThemeHour(date) ? THEME_NIGHT_VALUE : getStoredDayTheme();
+    }
+    return preference;
+  }
+
+  function getThemePreferenceLabel(theme) {
+    const preference = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
+    if (preference !== THEME_AUTO_VALUE) return THEME_LABELS[preference];
+    const effectiveTheme = resolveEffectiveTheme(preference);
+    if (effectiveTheme === THEME_NIGHT_VALUE) return `跟随时间（当前夜间，白天恢复${THEME_LABELS[getStoredDayTheme()]}）`;
+    return `跟随时间（当前${THEME_LABELS[effectiveTheme]}）`;
+  }
+
+  function getNextAutoThemeRefreshDelay(date = new Date()) {
+    const next = new Date(date.getTime());
+    const hour = next.getHours();
+    if (hour < 6) {
+      next.setHours(6, 0, 1, 0);
+    } else if (hour < 18) {
+      next.setHours(18, 0, 1, 0);
+    } else {
+      next.setDate(next.getDate() + 1);
+      next.setHours(6, 0, 1, 0);
+    }
+    return Math.max(1000, next.getTime() - date.getTime());
+  }
+
+  let themeAutoTimer = null;
+
+  function scheduleAutoThemeRefresh(preference) {
+    if (themeAutoTimer) {
+      clearTimeout(themeAutoTimer);
+      themeAutoTimer = null;
+    }
+    if (preference !== THEME_AUTO_VALUE) return;
+    themeAutoTimer = setTimeout(() => {
+      applyTheme(THEME_AUTO_VALUE, { skipPersist: true });
+    }, getNextAutoThemeRefreshDelay());
+  }
+
+  function updateThemeToggleButton(preference, effectiveTheme) {
+    if (!themeToggleBtn) return;
+    const isNight = effectiveTheme === THEME_NIGHT_VALUE;
+    themeToggleBtn.textContent = isNight ? '☀' : '☾';
+    themeToggleBtn.classList.toggle('active', isNight);
+    themeToggleBtn.title = isNight ? '切换到日间主题' : '切换到夜间模式';
+    themeToggleBtn.setAttribute('aria-label', themeToggleBtn.title);
+    themeToggleBtn.dataset.themePreference = preference;
+    themeToggleBtn.dataset.themeEffective = effectiveTheme;
+  }
+
   function applyTheme(theme, options = {}) {
     const nextTheme = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
-    document.documentElement.dataset.theme = nextTheme;
-    if (document.body) {
-      document.body.dataset.theme = nextTheme;
+    if (nextTheme === THEME_AUTO_VALUE) {
+      preserveCurrentDayThemeForAuto();
+    } else if (isDayThemeValue(nextTheme)) {
+      rememberDayTheme(nextTheme);
     }
+    const effectiveTheme = resolveEffectiveTheme(nextTheme);
+    document.documentElement.dataset.theme = effectiveTheme;
+    document.documentElement.dataset.themePreference = nextTheme;
+    if (document.body) {
+      document.body.dataset.theme = effectiveTheme;
+      document.body.dataset.themePreference = nextTheme;
+    }
+    updateThemeToggleButton(nextTheme, effectiveTheme);
+    scheduleAutoThemeRefresh(nextTheme);
     if (!options.skipPersist) {
       localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
     }
     return nextTheme;
+  }
+
+  function toggleQuickTheme() {
+    const effectiveTheme = document.documentElement.dataset.theme || resolveEffectiveTheme(getStoredTheme());
+    const nextTheme = effectiveTheme === THEME_NIGHT_VALUE ? getStoredDayTheme() : THEME_NIGHT_VALUE;
+    applyTheme(nextTheme);
+    showToast(`已快速切换为 ${THEME_LABELS[nextTheme]}`);
   }
 
   function parseStoredCollapsedProjects() {
@@ -1728,6 +1845,7 @@
       currentUsage: payload.currentUsage ? deepClone(payload.currentUsage) : null,
       lastUsage: payload.lastUsage ? deepClone(payload.lastUsage) : null,
       contextWindowTokens: Number(payload.contextWindowTokens || payload.modelContextWindow || 0) || null,
+      queuedMessages: normalizeQueuedMessages(payload.queuedMessages || []),
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       historyPending: !!payload.historyPending,
@@ -2868,6 +2986,7 @@
       clearAwaitingRuntimeStart();
     }
     const wasRunning = !!sessionState.currentSessionRunning;
+    if (running && queuedMessagesRestoredAt) queuedMessagesRestoredSawRunning = true;
     sessionState.currentSessionRunning = running;
     if (chatRuntimeState) {
       chatRuntimeState.hidden = !running;
@@ -3090,6 +3209,7 @@
       showToast('后台任务已完成', snapshot.sessionId);
     }
     renderWorkspaceInsights();
+    composeState.queuedMessages = snapshot.queuedMessages || [];
     renderContextUsageIndicator();
     renderQueuedMessages();
     if (nextGitCwd && (gitCwdChanged || !gitState.status)) {
@@ -3231,7 +3351,7 @@
 
   function sendCoreMessage(text) {
     markAwaitingRuntimeStart();
-    send({
+    return send({
       type: 'message',
       text,
       sessionId: sessionState.currentSessionId,
@@ -3243,7 +3363,7 @@
 
   function sendUserMessage(payload = {}) {
     markAwaitingRuntimeStart();
-    send({
+    return send({
       type: 'message',
       sessionId: sessionState.currentSessionId,
       mode: sessionState.currentMode,
@@ -3495,11 +3615,16 @@
 
   function send(data) {
     if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN) {
-      connectionState.ws.send(JSON.stringify(data));
-    } else {
-      // Warn user if trying to send while disconnected
-      showToast('连接已断开，正在重连…');
+      try {
+        connectionState.ws.send(JSON.stringify(data));
+        return true;
+      } catch (error) {
+        console.warn('[WEBCODING]', 'websocket send failed', error);
+      }
     }
+    // Warn user if trying to send while disconnected
+    showToast('连接已断开，正在重连…');
+    return false;
   }
 
   function scheduleReconnect() {
@@ -3903,6 +4028,28 @@
     }
   }
 
+
+  function handleQueueUpdateMessage(msg) {
+    if (msg.sessionId !== sessionState.currentSessionId) return;
+    composeState.queuedMessages = normalizeQueuedMessages(msg.queuedMessages || []);
+    queuedMessagesRestoredAt = 0;
+    queuedMessagesRestoredSawRunning = false;
+    renderQueuedMessages();
+  }
+
+  function handleQueuedMessageDispatched(msg) {
+    if (msg.sessionId !== sessionState.currentSessionId) return;
+    const item = normalizeQueuedMessages([msg.message || {}])[0];
+    if (!item) return;
+    composeState.queuedMessages = composeState.queuedMessages.filter((queued) => queued.id !== item.id);
+    renderQueuedMessages();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || [], item.fileRefs || []));
+    scrollToBottom();
+    if (!composeState.isGenerating) startGenerating();
+  }
+
   function handleModelConfigMessage(msg) {
     modelConfigCache = msg.config || null;
     emitWsEvent('model_config', msg.config);
@@ -3979,6 +4126,8 @@
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
     resume_generating: handleResumeGeneratingMessage,
+    queue_update: handleQueueUpdateMessage,
+    queued_message_dispatched: handleQueuedMessageDispatched,
     error: handleErrorMessage,
     notify_config: (msg) => {
       emitWsEvent('notify_config', msg.config);
@@ -4036,6 +4185,51 @@
     sendBtn.setAttribute('aria-label', composeState.isGenerating ? '加入发送队列' : '发送');
   }
 
+  function bubbleHasRenderableContent(bubble) {
+    if (!bubble) return false;
+    const hasText = Array.from(bubble.querySelectorAll('.msg-text, .msg-segment-text'))
+      .some((node) => String(node.dataset.rawText || node.textContent || '').trim());
+    const hasTool = !!bubble.querySelector('.tool-call, .tool-group');
+    const hasImage = !!bubble.querySelector('.msg-image-segment, .msg-generated-image');
+    const hasAttachment = !!bubble.querySelector('.msg-attachment-label');
+    return hasText || hasTool || hasImage || hasAttachment;
+  }
+
+  function isEmptyAssistantPlaceholder(msgEl) {
+    if (!msgEl || !msgEl.classList?.contains('assistant')) return false;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return true;
+    return !bubbleHasRenderableContent(bubble);
+  }
+
+  function findReusableAssistantPlaceholder() {
+    const placeholders = Array.from(messagesDiv.querySelectorAll('.msg.assistant'))
+      .filter((msgEl) => msgEl.id !== 'streaming-msg' && isEmptyAssistantPlaceholder(msgEl));
+    return placeholders.length ? placeholders[placeholders.length - 1] : null;
+  }
+
+  function ensurePendingPlaceholder(bubble) {
+    if (!bubble || bubbleHasRenderableContent(bubble) || bubble.querySelector('.msg-segment-pending')) return;
+    bubble.appendChild(createStreamingPlaceholder());
+  }
+
+  function claimStreamingMessageElement() {
+    const existing = document.getElementById('streaming-msg');
+    if (existing) return existing;
+    const reusable = findReusableAssistantPlaceholder();
+    if (!reusable) return null;
+    reusable.id = 'streaming-msg';
+    ensurePendingPlaceholder(reusable.querySelector('.msg-bubble'));
+    return reusable;
+  }
+
+  function removeStaleEmptyAssistantPlaceholders(keepEl = null) {
+    messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
+      if (msgEl === keepEl || msgEl.id === 'streaming-msg') return;
+      if (isEmptyAssistantPlaceholder(msgEl)) msgEl.remove();
+    });
+  }
+
   function startGenerating() {
     composeState.isGenerating = true;
     setCurrentSessionRunningState(true);
@@ -4043,6 +4237,13 @@
     composeState.activeToolCalls.clear();
     updateComposerActionButtons();
     // 不禁用输入框：生成中继续输入会进入本地发送队列，可在发送前撤销。
+
+    const existingStreaming = claimStreamingMessageElement();
+    if (existingStreaming) {
+      ensurePendingPlaceholder(existingStreaming.querySelector('.msg-bubble'));
+      scrollToBottom();
+      return;
+    }
 
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
@@ -4070,7 +4271,14 @@
     if (composeState.pendingText) flushRender();
 
     const streamEl = document.getElementById('streaming-msg');
-    if (streamEl) streamEl.removeAttribute('id');
+    if (streamEl) {
+      if (isEmptyAssistantPlaceholder(streamEl)) {
+        streamEl.remove();
+      } else {
+        streamEl.removeAttribute('id');
+      }
+    }
+    removeStaleEmptyAssistantPlaceholders();
 
     if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
       sessionState.currentSessionId = sessionId;
@@ -4078,6 +4286,8 @@
     }
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
+    queuedMessagesRestoredAt = 0;
+    queuedMessagesRestoredSawRunning = false;
     scheduleQueuedMessageDispatch();
   }
 
@@ -4135,7 +4345,8 @@
   }
 
   function getStreamingBubble() {
-    return document.querySelector('#streaming-msg .msg-bubble');
+    const msgEl = claimStreamingMessageElement();
+    return msgEl ? msgEl.querySelector('.msg-bubble') : null;
   }
 
   function clearStreamingPlaceholder(bubble) {
@@ -4154,9 +4365,109 @@
     return textDiv;
   }
 
+  function copyTextFallback(text) {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-1000px';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function writeClipboardText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(text).catch(() => {
+        if (copyTextFallback(text)) return;
+        throw new Error('clipboard fallback failed');
+      });
+    }
+    if (copyTextFallback(text)) return Promise.resolve();
+    return Promise.reject(new Error('clipboard unavailable'));
+  }
+
+  function getMessageCopyTextFromData(message) {
+    if (!message) return '';
+    if (typeof message.content === 'string' && message.content.trim()) return message.content;
+    if (Array.isArray(message.segments)) {
+      return message.segments
+        .map((segment) => (segment && typeof segment.text === 'string' ? segment.text : ''))
+        .filter((text) => text.trim())
+        .join('\n\n');
+    }
+    return '';
+  }
+
+  function getMessageCopyTextFromElement(msgEl) {
+    if (!msgEl) return '';
+    const stored = msgEl.dataset.copyText || '';
+    if (stored.trim()) return stored;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return '';
+    const textParts = Array.from(bubble.querySelectorAll('.msg-segment-text, .msg-text'))
+      .map((el) => {
+        if (typeof el.dataset.rawText === 'string') return el.dataset.rawText;
+        return el.innerText || el.textContent || '';
+      })
+      .filter((text) => text.trim());
+    if (textParts.length > 0) return textParts.join('\n\n');
+    return bubble.innerText || bubble.textContent || '';
+  }
+
+  function setMessageCopyButtonState(btn, label, copied = false) {
+    if (!btn) return;
+    btn.textContent = label;
+    btn.classList.toggle('copied', !!copied);
+  }
+
+  function handleMessageCopyClick(btn) {
+    const msgEl = btn?.closest('.msg');
+    const text = getMessageCopyTextFromElement(msgEl).trim();
+    if (!text) {
+      showToast('暂无可复制内容');
+      return;
+    }
+    writeClipboardText(text).then(() => {
+      setMessageCopyButtonState(btn, '已复制', true);
+      setTimeout(() => setMessageCopyButtonState(btn, '复制', false), 1400);
+    }).catch(() => {
+      setMessageCopyButtonState(btn, '复制失败', false);
+      showToast('复制失败，请手动选择文本复制');
+      setTimeout(() => setMessageCopyButtonState(btn, '复制', false), 1600);
+    });
+  }
+
+  function createMessageActions() {
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'msg-action-btn msg-copy-btn';
+    copyBtn.textContent = '复制';
+    copyBtn.setAttribute('aria-label', '复制这条消息');
+    copyBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handleMessageCopyClick(copyBtn);
+    });
+    actions.appendChild(copyBtn);
+    return actions;
+  }
+
   function createMsgElement(role, content, attachments = [], fileRefs = []) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
+    if (role === 'user' || role === 'assistant') {
+      div.dataset.copyText = typeof content === 'string' ? content : '';
+    }
 
     if (role === 'system') {
       const bubble = document.createElement('div');
@@ -4203,8 +4514,13 @@
       }
     }
 
+    const contentWrap = document.createElement('div');
+    contentWrap.className = 'msg-content';
+    contentWrap.appendChild(bubble);
+    contentWrap.appendChild(createMessageActions());
+
     div.appendChild(avatar);
-    div.appendChild(bubble);
+    div.appendChild(contentWrap);
     return div;
   }
 
@@ -4485,6 +4801,8 @@
 
   function renderAssistantSegments(bubble, message) {
     if (!bubble) return;
+    const msgEl = bubble.closest('.msg');
+    if (msgEl) msgEl.dataset.copyText = getMessageCopyTextFromData(message);
     bubble.innerHTML = '';
     normalizeMessageSegments(message).forEach((segment) => {
       const segmentEl = buildMessageSegmentElement(segment);
@@ -6468,8 +6786,77 @@
     return item.sessionId === sessionState.currentSessionId;
   }
 
+  function normalizeQueuedMessages(value) {
+    if (!Array.isArray(value)) return [];
+    return value.slice(0, MAX_QUEUED_MESSAGES).map((raw) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const text = typeof raw.text === 'string' ? raw.text : '';
+      const attachments = Array.isArray(raw.attachments)
+        ? raw.attachments.filter(Boolean).map((attachment) => ({ ...attachment })).slice(0, MAX_QUEUED_ATTACHMENTS)
+        : [];
+      const fileRefs = Array.isArray(raw.fileRefs)
+        ? raw.fileRefs.filter(Boolean).map((ref) => ({ ...ref })).slice(0, MAX_PENDING_FILE_REFS)
+        : [];
+      if (!text.trim() && attachments.length === 0 && fileRefs.length === 0) return null;
+      return {
+        id: typeof raw.id === 'string' && raw.id ? raw.id : nextLocalId('queued'),
+        sessionId: typeof raw.sessionId === 'string' && raw.sessionId ? raw.sessionId : null,
+        text,
+        attachments,
+        fileRefs,
+        mode: typeof raw.mode === 'string' ? raw.mode : '',
+        reasoningEffort: typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort : '',
+        agent: normalizeAgent(raw.agent || sessionState.currentAgent || selectedAgent),
+        createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : (Date.parse(raw.createdAt || '') || Date.now()),
+        serverQueued: raw.serverQueued === true,
+        localOnly: raw.localOnly === true,
+      };
+    }).filter(Boolean);
+  }
+
+  function persistQueuedMessages() {
+    try {
+      if (!queuedMessages.length) {
+        localStorage.removeItem(QUEUED_MESSAGES_STORAGE_KEY);
+        return;
+      }
+      localStorage.setItem(QUEUED_MESSAGES_STORAGE_KEY, JSON.stringify(queuedMessages));
+    } catch (error) {
+      console.warn('[WEBCODING]', 'persist queued messages failed', error);
+    }
+  }
+
+  function loadPersistedQueuedMessages() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(QUEUED_MESSAGES_STORAGE_KEY) || '[]');
+      queuedMessages = normalizeQueuedMessages(parsed);
+      queuedMessagesRestoredAt = queuedMessages.length ? Date.now() : 0;
+      queuedMessagesRestoredSawRunning = false;
+      persistQueuedMessages();
+    } catch (error) {
+      console.warn('[WEBCODING]', 'load queued messages failed', error);
+      queuedMessages = [];
+      localStorage.removeItem(QUEUED_MESSAGES_STORAGE_KEY);
+    }
+  }
+
   function getVisibleQueuedMessages() {
     return composeState.queuedMessages.filter(queueSessionMatchesCurrent);
+  }
+
+  function submitQueuedMessageToServer(item, targetSessionId) {
+    if (!item || !targetSessionId) return false;
+    return send({
+      type: 'enqueue_message',
+      id: item.id,
+      sessionId: targetSessionId,
+      text: item.text || '',
+      attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
+      fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
+      mode: item.mode || sessionState.currentMode,
+      reasoningEffort: item.reasoningEffort || sessionState.currentReasoningEffort || '',
+      agent: item.agent || sessionState.currentAgent,
+    });
   }
 
   function bindUnassignedQueuedMessagesToSession(sessionId) {
@@ -6480,8 +6867,16 @@
         item.sessionId = sessionId;
         changed = true;
       }
+      if (item.localOnly && item.sessionId === sessionId && submitQueuedMessageToServer(item, sessionId)) {
+        item.localOnly = false;
+        item.serverQueued = true;
+        changed = true;
+      }
     }
-    if (changed) renderQueuedMessages();
+    if (changed) {
+      persistQueuedMessages();
+      renderQueuedMessages();
+    }
   }
 
   function formatQueuedMessageSummary(item) {
@@ -6508,10 +6903,11 @@
 
   function scheduleQueuedMessageDispatch() {
     if (queuedDispatchTimer) return;
+    const restoredGraceMs = queuedMessagesRestoredAt ? Math.max(0, 1200 - (Date.now() - queuedMessagesRestoredAt)) : 0;
     queuedDispatchTimer = setTimeout(() => {
       queuedDispatchTimer = null;
       dispatchNextQueuedMessage();
-    }, 0);
+    }, restoredGraceMs);
   }
 
   function scheduleQueuedMessageFollowupAfterIdle() {
@@ -6526,6 +6922,12 @@
         finishGenerating(sessionState.currentSessionId || undefined);
         return;
       }
+      if (queuedMessagesRestoredAt && !queuedMessagesRestoredSawRunning) {
+        renderQueuedMessages();
+        return;
+      }
+      queuedMessagesRestoredAt = 0;
+      queuedMessagesRestoredSawRunning = false;
       scheduleQueuedMessageDispatch();
     }, 0);
   }
@@ -6550,7 +6952,7 @@
       body.className = 'queued-message-body';
       const label = document.createElement('div');
       label.className = 'queued-message-label';
-      label.textContent = index === 0 ? '当前回复结束后发送' : '队列中等待发送';
+      label.textContent = index === 0 ? '服务端队列：当前回复结束后发送' : '服务端队列中等待发送';
       const text = document.createElement('div');
       text.className = 'queued-message-text';
       text.textContent = formatQueuedMessageSummary(item);
@@ -6573,8 +6975,12 @@
   }
 
   function removeQueuedMessage(id) {
+    const item = composeState.queuedMessages.find((queued) => queued.id === id);
     const before = composeState.queuedMessages.length;
-    composeState.queuedMessages = composeState.queuedMessages.filter((item) => item.id !== id);
+    composeState.queuedMessages = composeState.queuedMessages.filter((queued) => queued.id !== id);
+    if (item?.serverQueued && item.sessionId) {
+      send({ type: 'cancel_queued_message', sessionId: item.sessionId, id: item.id });
+    }
     if (composeState.queuedMessages.length !== before) {
       renderQueuedMessages();
       showToast('已撤销队列消息');
@@ -6603,7 +7009,16 @@
       reasoningEffort: sessionState.currentReasoningEffort,
       agent: sessionState.currentAgent,
       createdAt: Date.now(),
+      serverQueued: false,
+      localOnly: true,
     };
+
+    if (item.sessionId && submitQueuedMessageToServer(item, item.sessionId)) {
+      item.serverQueued = true;
+      item.localOnly = false;
+    }
+
+    queuedMessagesRestoredAt = 0;
     composeState.queuedMessages = [...composeState.queuedMessages, item];
     msgInput.value = '';
     composeState.pendingAttachments = [];
@@ -6614,65 +7029,28 @@
     autoResize();
     hideCmdMenu();
     hideOptionPicker();
-    showToast('已加入发送队列，可在输入框上方撤销');
+    showToast(item.serverQueued ? '已加入服务端队列，关闭浏览器也会继续执行' : '已暂存队列，拿到会话后会提交到服务端');
     return true;
-  }
-
-  function sendQueuedCoreMessage(item, targetSessionId) {
-    markAwaitingRuntimeStart();
-    send({
-      type: 'message',
-      text: item.text,
-      sessionId: targetSessionId,
-      mode: item.mode || sessionState.currentMode,
-      reasoningEffort: item.reasoningEffort || '',
-      agent: item.agent || sessionState.currentAgent,
-    });
-  }
-
-  function sendQueuedUserMessage(item, targetSessionId) {
-    markAwaitingRuntimeStart();
-    send({
-      type: 'message',
-      sessionId: targetSessionId,
-      mode: item.mode || sessionState.currentMode,
-      reasoningEffort: item.reasoningEffort || '',
-      agent: item.agent || sessionState.currentAgent,
-      text: item.text || '',
-      attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
-      fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
-    });
   }
 
   function dispatchNextQueuedMessage() {
-    if (isCurrentSessionBusyForQueuedDispatch()) return false;
-    if (!connectionState.ws || connectionState.ws.readyState !== WebSocket.OPEN) return false;
-    const index = composeState.queuedMessages.findIndex(queueSessionMatchesCurrent);
-    if (index < 0) {
+    // 队列现在由服务端在当前 run 结束后派发；前端只负责把尚未绑定
+    // session 的极短窗口本地队列补提交到服务端，不再本地续发。
+    if (!sessionState.currentSessionId) {
       renderQueuedMessages();
       return false;
     }
-
-    const [item] = composeState.queuedMessages.splice(index, 1);
-    composeState.queuedMessages = [...composeState.queuedMessages];
-    renderQueuedMessages();
-
-    const targetSessionId = item.sessionId || sessionState.currentSessionId || null;
-    const text = String(item.text || '').trim();
-    if (text.startsWith('/')) {
-      sendQueuedCoreMessage(item, targetSessionId);
-      return true;
+    let changed = false;
+    for (const item of composeState.queuedMessages) {
+      if (item.localOnly && queueSessionMatchesCurrent(item) && submitQueuedMessageToServer(item, sessionState.currentSessionId)) {
+        item.localOnly = false;
+        item.serverQueued = true;
+        changed = true;
+      }
     }
-
-    const welcome = messagesDiv.querySelector('.welcome-msg');
-    if (welcome) welcome.remove();
-    const attachments = Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [];
-    const fileRefs = Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [];
-    messagesDiv.appendChild(createMsgElement('user', item.text || '', attachments, fileRefs));
-    scrollToBottom();
-    sendQueuedUserMessage(item, targetSessionId);
-    if (!composeState.isGenerating) startGenerating();
-    return true;
+    if (changed) persistQueuedMessages();
+    renderQueuedMessages();
+    return false;
   }
 
   // --- Send Message ---
@@ -7354,11 +7732,13 @@
         <div class="settings-field">
           <label>配色方案</label>
           <select class="settings-select" id="theme-select">
+            <option value="auto">跟随时间（18:00-06:00 夜间）</option>
             <option value="default">默认主题</option>
             <option value="localhost">极简主题</option>
+            <option value="night">夜间模式</option>
           </select>
         </div>
-        <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。</div>
+        <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。自动模式按当前设备/浏览器本地时区判断，18:00-06:00 使用夜间模式，其余时间恢复上次选择的日间主题（如极简主题）。</div>
         <div class="settings-status" id="theme-status"></div>
       </div>
 
@@ -7936,7 +8316,7 @@
     themeSelect.addEventListener('change', () => {
       const nextTheme = applyTheme(themeSelect.value);
       themeSelect.value = nextTheme;
-      showThemeStatus(`已切换为 ${THEME_LABELS[nextTheme]}`, 'success');
+      showThemeStatus(`已切换为 ${getThemePreferenceLabel(nextTheme)}`, 'success');
     });
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
 
@@ -8362,6 +8742,10 @@
 
   function _settingsEscape(e) {
     if (e.key === 'Escape') hideSettingsPanel();
+  }
+
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', toggleQuickTheme);
   }
 
   if (settingsBtn) {
@@ -9204,6 +9588,7 @@
   }
 
   // --- Init ---
+  loadPersistedQueuedMessages();
   setSelectedAgent(selectedAgent, { syncMode: true });
   resetChatView(selectedAgent);
   connect();

@@ -783,6 +783,8 @@ function discoverCodexSlashCommands() {
 
 // Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string, autoRetryCount: number }
 const pendingCompactRetries = new Map();
+const MAX_SERVER_QUEUED_MESSAGES = 10;
+
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, segments, lastCost, tailer }
 const activeProcesses = new Map();
@@ -3302,6 +3304,68 @@ function getPreferredRuntimeSessionId(session, agent, options = {}) {
   return fallback?.entry?.runtimeId || null;
 }
 
+
+function normalizeQueuedMessageAttachments(attachments) {
+  return normalizeMessageAttachments(Array.isArray(attachments) ? attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : []);
+}
+
+function normalizeQueuedMessageFileRefs(fileRefs) {
+  if (!Array.isArray(fileRefs)) return [];
+  return fileRefs.slice(0, MAX_CONTEXT_FILE_REFS).map((ref) => {
+    if (!ref || typeof ref !== 'object') return null;
+    const relativePath = String(ref.relativePath || ref.path || '').trim();
+    if (!relativePath) return null;
+    return {
+      path: String(ref.path || relativePath),
+      relativePath,
+      size: Number(ref.size || 0) || 0,
+    };
+  }).filter(Boolean);
+}
+
+function normalizeQueuedMessagesForSession(session, value) {
+  if (!Array.isArray(value)) return [];
+  const queued = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const text = typeof raw.text === 'string' ? raw.text : '';
+    const attachments = normalizeQueuedMessageAttachments(raw.attachments);
+    const fileRefs = normalizeQueuedMessageFileRefs(raw.fileRefs);
+    if (!text.trim() && attachments.length === 0 && fileRefs.length === 0) continue;
+    queued.push({
+      id: sanitizeId(raw.id || '') || crypto.randomUUID(),
+      sessionId: session?.id || (typeof raw.sessionId === 'string' ? sanitizeId(raw.sessionId) : null),
+      text,
+      attachments,
+      fileRefs,
+      mode: typeof raw.mode === 'string' ? raw.mode : (session?.permissionMode || 'yolo'),
+      reasoningEffort: normalizeCodexReasoningEffort(raw.reasoningEffort),
+      agent: normalizeAgent(raw.agent || session?.agent),
+      createdAt: typeof raw.createdAt === 'string'
+        ? raw.createdAt
+        : (Number.isFinite(raw.createdAt) ? new Date(raw.createdAt).toISOString() : new Date().toISOString()),
+    });
+    if (queued.length >= MAX_SERVER_QUEUED_MESSAGES) break;
+  }
+  return queued;
+}
+
+function buildQueuedMessagesPayload(session) {
+  const normalized = normalizeQueuedMessagesForSession(session, session?.queuedMessages || []);
+  return normalized.map((item) => ({
+    id: item.id,
+    sessionId: item.sessionId || session?.id || null,
+    text: item.text || '',
+    attachments: item.attachments || [],
+    fileRefs: item.fileRefs || [],
+    mode: item.mode || session?.permissionMode || 'yolo',
+    reasoningEffort: item.reasoningEffort || '',
+    agent: normalizeAgent(item.agent || session?.agent),
+    createdAt: item.createdAt || new Date().toISOString(),
+    serverQueued: true,
+  }));
+}
+
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
@@ -3318,6 +3382,8 @@ function normalizeSession(session) {
   delete session.currentUsage;
   if (session.lastUsage && typeof session.lastUsage !== 'object') delete session.lastUsage;
   if (session.contextWindowTokens) session.contextWindowTokens = Number(session.contextWindowTokens) || null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'queuedMessages')) session.queuedMessages = [];
+  session.queuedMessages = normalizeQueuedMessagesForSession(session, session.queuedMessages);
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -4503,6 +4569,7 @@ function collectSessionListSnapshot() {
         hasUnread: !!s.hasUnread,
         agent: getSessionAgent(s),
         reasoningEffort: s.reasoningEffort || '',
+        queuedCount: Array.isArray(s.queuedMessages) ? s.queuedMessages.length : 0,
         isRunning: activeProcesses.has(s.id),
         projectId: s.projectId || null,
         cwd: s.cwd || localMeta?.cwd || null,
@@ -4536,6 +4603,38 @@ function sendSessionList(ws, options = {}) {
     wsSend(ws, { type: 'session_list', sessions: [] });
   }
 }
+
+
+function getSessionViewerClients(sessionId) {
+  const viewers = [];
+  for (const client of wss.clients) {
+    if (client.readyState !== WebSocket.OPEN || client.isAuthenticated !== true) continue;
+    if (wsSessionMap.get(client) === sessionId) viewers.push(client);
+  }
+  return viewers;
+}
+
+function broadcastToSessionViewers(sessionId, data) {
+  for (const client of getSessionViewerClients(sessionId)) wsSend(client, data);
+}
+
+function sendQueueUpdateForSession(sessionId) {
+  const session = loadSession(sessionId);
+  if (!session) return;
+  const payload = {
+    type: 'queue_update',
+    sessionId,
+    queuedMessages: buildQueuedMessagesPayload(session),
+  };
+  broadcastToSessionViewers(sessionId, payload);
+  const sessions = getSessionListSnapshot({ forceRefresh: true });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated === true) {
+      sendSessionList(client, { sessions });
+    }
+  }
+}
+
 
 // === File Tailer ===
 // Tails a file and calls onLine for each new complete line.
@@ -4927,6 +5026,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     shouldReturnForFollowup,
     shouldAutoCompact
   );
+  setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
 }
 
 // Global PID monitor: detect process completion (especially after server restart)
@@ -5014,6 +5114,7 @@ function recoverProcesses() {
           }
         }
         try { fs.rmSync(dir, { recursive: true }); } catch {}
+        setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
       }
     }
   } catch (err) {
@@ -5479,6 +5580,12 @@ wss.on('connection', (ws, req) => {
         } else {
           handleMessage(ws, msg);
         }
+        break;
+      case 'enqueue_message':
+        handleEnqueueMessage(ws, msg);
+        break;
+      case 'cancel_queued_message':
+        handleCancelQueuedMessage(ws, msg);
         break;
       case 'abort':
         handleAbort(ws);
@@ -5987,6 +6094,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           totalUsage: session.totalUsage || null,
           lastUsage: session.lastUsage || null,
           contextWindowTokens: session.contextWindowTokens || null,
+          queuedMessages: buildQueuedMessagesPayload(session),
           ...buildSessionRuntimeMeta(session),
         });
       }
@@ -6301,6 +6409,7 @@ function handleNewSession(ws, msg) {
     totalUsage: session.totalUsage,
     lastUsage: session.lastUsage || null,
     contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -6371,6 +6480,7 @@ function handleLoadSession(ws, sessionId) {
     totalUsage: session.totalUsage || null,
     lastUsage: session.lastUsage || null,
     contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     historyTotal: session.messages.length,
     historyBuffered: recentMessages.length,
     historyPending: olderChunks.length > 0,
@@ -6632,6 +6742,137 @@ function handleAbort(ws) {
   // handleProcessComplete will be triggered by the PID monitor
 }
 
+
+function buildQueueItemFromClientMessage(session, msg) {
+  const textValue = typeof msg.text === 'string' ? msg.text : '';
+  const normalizedText = textValue.trim();
+  const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
+  const resolvedAttachments = resolveMessageAttachments(attachments);
+  if (attachments.length > 0 && resolvedAttachments.length === 0) {
+    return { error: '图片附件已过期或不可用，请重新上传后再发送。' };
+  }
+  const cwdForFileRefs = session?.cwd || process.cwd();
+  const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
+  if (resolvedFileRefResult.error) return { error: resolvedFileRefResult.error };
+  const resolvedFileRefs = resolvedFileRefResult.refs;
+  if (!normalizedText && resolvedAttachments.length === 0 && resolvedFileRefs.length === 0) return { error: '消息内容为空。' };
+  if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
+    return { error: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' };
+  }
+  const savedAttachments = resolvedAttachments.map((attachment) => ({
+    id: attachment.id,
+    kind: 'image',
+    filename: attachment.filename,
+    mime: attachment.mime,
+    size: attachment.size,
+    createdAt: attachment.createdAt,
+    expiresAt: attachment.expiresAt,
+    storageState: attachment.storageState,
+  }));
+  return {
+    item: {
+      id: sanitizeId(msg.id || '') || crypto.randomUUID(),
+      sessionId: session.id,
+      text: textValue,
+      attachments: savedAttachments,
+      fileRefs: resolvedFileRefs.map(fileRefHistoryMeta),
+      mode: typeof msg.mode === 'string' ? msg.mode : (session.permissionMode || 'yolo'),
+      reasoningEffort: normalizeCodexReasoningEffort(msg.reasoningEffort),
+      agent: normalizeAgent(msg.agent || session.agent),
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function handleEnqueueMessage(ws, msg) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  const session = sessionId ? loadSession(sessionId) : null;
+  if (!session) return wsSend(ws, { type: 'error', message: '当前会话尚未建立，无法加入服务端队列。' });
+  if (!Array.isArray(session.queuedMessages)) session.queuedMessages = [];
+  if (session.queuedMessages.length >= MAX_SERVER_QUEUED_MESSAGES) {
+    return wsSend(ws, { type: 'error', message: `最多排队 ${MAX_SERVER_QUEUED_MESSAGES} 条消息，请先撤销一部分。` });
+  }
+  const built = buildQueueItemFromClientMessage(session, msg);
+  if (built.error) return wsSend(ws, { type: 'error', message: built.error });
+  session.queuedMessages.push(built.item);
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sendQueueUpdateForSession(session.id);
+  wsSend(ws, { type: 'queue_update', sessionId: session.id, queuedMessages: buildQueuedMessagesPayload(session) });
+  plog('INFO', 'server_queue_enqueue', { sessionId: session.id.slice(0, 8), queueLen: session.queuedMessages.length });
+  if (!activeProcesses.has(session.id)) {
+    setTimeout(() => dispatchNextServerQueuedMessage(session.id), 20);
+  }
+}
+
+function handleCancelQueuedMessage(ws, msg) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  const id = sanitizeId(msg.id || '');
+  const session = sessionId ? loadSession(sessionId) : null;
+  if (!session || !id) return;
+  const before = Array.isArray(session.queuedMessages) ? session.queuedMessages.length : 0;
+  session.queuedMessages = (session.queuedMessages || []).filter((item) => item.id !== id);
+  if (session.queuedMessages.length !== before) {
+    session.updated = new Date().toISOString();
+    saveSession(session);
+    sendQueueUpdateForSession(session.id);
+    wsSend(ws, { type: 'queue_update', sessionId: session.id, queuedMessages: buildQueuedMessagesPayload(session) });
+    plog('INFO', 'server_queue_cancel', { sessionId: session.id.slice(0, 8), queueLen: session.queuedMessages.length });
+  }
+}
+
+function createClosedQueueWs() {
+  return {
+    readyState: 0,
+    isAuthenticated: true,
+    isServerQueueClient: true,
+    send() {},
+  };
+}
+
+function dispatchNextServerQueuedMessage(sessionId) {
+  if (!sessionId || activeProcesses.has(sessionId)) return false;
+  const session = loadSession(sessionId);
+  if (!session || !Array.isArray(session.queuedMessages) || session.queuedMessages.length === 0) return false;
+  const [item] = session.queuedMessages;
+  session.queuedMessages = session.queuedMessages.slice(1);
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sendQueueUpdateForSession(sessionId);
+
+  const viewers = getSessionViewerClients(sessionId);
+  const dispatchWs = viewers[0] || createClosedQueueWs();
+  const payload = {
+    ...item,
+    sessionId,
+    type: 'message',
+    mode: item.mode || session.permissionMode || 'yolo',
+    reasoningEffort: item.reasoningEffort || session.reasoningEffort || '',
+    agent: normalizeAgent(item.agent || session.agent),
+  };
+  const text = String(payload.text || '').trim();
+  if (!text.startsWith('/')) {
+    broadcastToSessionViewers(sessionId, { type: 'queued_message_dispatched', sessionId, message: buildQueuedMessagesPayload({ ...session, queuedMessages: [item] })[0] });
+  }
+  plog('INFO', 'server_queue_dispatch', { sessionId: sessionId.slice(0, 8), remaining: session.queuedMessages.length });
+  try {
+    if (text.startsWith('/')) handleSlashCommand(dispatchWs, text, sessionId, payload.agent);
+    else handleMessage(dispatchWs, payload);
+  } finally {
+    if (dispatchWs.isServerQueueClient) wsSessionMap.delete(dispatchWs);
+  }
+  const sessions = getSessionListSnapshot({ forceRefresh: true });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated === true) {
+      sendSessionList(client, { sessions });
+    }
+  }
+  setTimeout(() => {
+    if (!activeProcesses.has(sessionId)) dispatchNextServerQueuedMessage(sessionId);
+  }, 200);
+  return true;
+}
+
 // === Runtime Message Handler ===
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
@@ -6691,7 +6932,7 @@ function handleMessage(ws, msg, options = {}) {
       }
       return;
     }
-    return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
+    return handleEnqueueMessage(ws, { ...msg, sessionId });
   }
 
   const derivedTitle = normalizedText
@@ -6786,6 +7027,7 @@ function handleMessage(ws, msg, options = {}) {
       totalUsage: session.totalUsage || null,
       lastUsage: session.lastUsage || null,
       contextWindowTokens: session.contextWindowTokens || null,
+      queuedMessages: buildQueuedMessagesPayload(session),
       updated: session.updated,
       hasUnread: false,
       historyPending: false,
@@ -7435,6 +7677,7 @@ function handleImportNativeSession(ws, msg) {
     totalUsage: session.totalUsage || null,
     lastUsage: session.lastUsage || null,
     contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -7562,6 +7805,7 @@ function handleImportCodexSession(ws, msg) {
     totalUsage: session.totalUsage || null,
     lastUsage: session.lastUsage || null,
     contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     updated: session.updated,
     hasUnread: false,
     historyPending: false,

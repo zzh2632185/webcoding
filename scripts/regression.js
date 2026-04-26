@@ -1423,6 +1423,61 @@ async function runExpiredAttachmentCleanupRegressionCase({ port, password, expir
   });
 }
 
+
+async function runServerQueuedMessagesRegressionCase({ port, password, sessionsDir }) {
+  const connection = await connectAuthedClient(port, password);
+  let sessionId = null;
+  try {
+    const session = await connection.client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger codex slow stream serverqueue', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'trigger codex slow stream serverqueue',
+    );
+    sessionId = session.sessionId;
+    await connection.client.waitForType('text_delta', (msg) => /slow-start:serverqueue/.test(msg.text || ''), 5000);
+
+    connection.client.send({
+      type: 'enqueue_message',
+      id: 'queued-server-regression',
+      sessionId,
+      text: 'queued after browser close',
+      mode: 'yolo',
+      agent: 'codex',
+    });
+    const queued = await connection.client.waitForType(
+      'queue_update',
+      (msg) => msg.sessionId === sessionId && (msg.queuedMessages || []).some((item) => item.text === 'queued after browser close'),
+      5000,
+    );
+    assert(queued.queuedMessages.length === 1, 'Server queue should contain the queued message');
+  } finally {
+    await closeWs(connection.ws);
+  }
+
+  const sessionPath = path.join(sessionsDir, `${sessionId}.json`);
+  await waitForCondition(() => {
+    if (!fs.existsSync(sessionPath)) return false;
+    const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const contents = (session.messages || []).map((msg) => msg.content || '').join('\n');
+    return /queued after browser close/.test(contents)
+      && /Codex mock handled \(0 image\): queued after browser close/.test(contents)
+      && Array.isArray(session.queuedMessages)
+      && session.queuedMessages.length === 0;
+  }, { timeoutMs: 12000, intervalMs: 120, label: 'server queued message dispatch after disconnect' });
+
+  const resumed = await connectAuthedClient(port, password);
+  try {
+    resumed.client.send({ type: 'load_session', sessionId });
+    const loaded = await resumed.client.waitForType('session_info', (msg) => msg.sessionId === sessionId, 5000);
+    const contents = (loaded.messages || []).map((msg) => msg.content || '').join('\n');
+    assert(/queued after browser close/.test(contents), 'Reloaded session should include the queued user message');
+    assert(/Codex mock handled \(0 image\): queued after browser close/.test(contents), 'Reloaded session should include queued assistant response');
+    assert(!loaded.queuedMessages || loaded.queuedMessages.length === 0, 'Server queue should be empty after dispatch');
+  } finally {
+    await closeWs(resumed.ws);
+  }
+}
+
 async function runConcurrentSessionsRegressionCase({ port, password }) {
   let connectionA = null;
   let connectionB = null;
@@ -3732,6 +3787,7 @@ async function main() {
       await runner.run('attachment boundary handling', () => runAttachmentBoundaryRegressionCase(ctx));
       await runner.run('expired attachment cleanup', () => runExpiredAttachmentCleanupRegressionCase(ctx));
       await runner.run('websocket guard rails', () => runWebSocketGuardRegressionCase(ctx));
+      await runner.run('server queued messages after disconnect', () => runServerQueuedMessagesRegressionCase(ctx));
       await runner.run('concurrent sessions and multi-client attachment', () => runConcurrentSessionsRegressionCase(ctx));
       await runner.run('new session detaches previous stream', () => runNewSessionDetachRegressionCase(ctx));
       await runner.run('websocket reconnect resume', () => runReconnectResumeRegressionCase(ctx));
