@@ -125,6 +125,10 @@
   let uploadingAttachments = [];
   let pendingFileRefs = [];
   let queuedMessages = [];
+  let queuedDispatchTimer = null;
+  let generationIdleFinalizeTimer = null;
+  let awaitingRuntimeStart = false;
+  let awaitingRuntimeStartAt = 0;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
@@ -2840,8 +2844,30 @@
     chatCwd.hidden = !sessionState.currentCwd || (sessionState.currentSessionRunning && shouldOverlayRuntimeBadge());
   }
 
+  function markAwaitingRuntimeStart() {
+    awaitingRuntimeStart = true;
+    awaitingRuntimeStartAt = Date.now();
+  }
+
+  function clearAwaitingRuntimeStart() {
+    awaitingRuntimeStart = false;
+    awaitingRuntimeStartAt = 0;
+  }
+
+  function shouldHoldOptimisticRunningState(nextRunning) {
+    if (nextRunning) return false;
+    if (!awaitingRuntimeStart || !composeState.isGenerating) return false;
+    return Date.now() - awaitingRuntimeStartAt < 5000;
+  }
+
   function setCurrentSessionRunningState(isRunning) {
-    const running = !!isRunning;
+    let running = !!isRunning;
+    if (shouldHoldOptimisticRunningState(running)) {
+      running = true;
+    } else if (running) {
+      clearAwaitingRuntimeStart();
+    }
+    const wasRunning = !!sessionState.currentSessionRunning;
     sessionState.currentSessionRunning = running;
     if (chatRuntimeState) {
       chatRuntimeState.hidden = !running;
@@ -2849,6 +2875,9 @@
     }
     updateCwdBadge();
     renderWorkspaceInsights();
+    if (wasRunning && !running) {
+      scheduleQueuedMessageFollowupAfterIdle();
+    }
   }
 
   function updateAgentScopedUI() {
@@ -3021,7 +3050,11 @@
     chatTitle.textContent = snapshot.title || '新会话';
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
-    setCurrentSessionRunningState(snapshot.isRunning);
+    const snapshotRunning = !!snapshot.isRunning;
+    const effectiveSnapshotRunning = preserveStreaming && composeState.isGenerating
+      ? (snapshotRunning || sessionState.currentSessionRunning)
+      : snapshotRunning;
+    setCurrentSessionRunningState(effectiveSnapshotRunning);
     setStatsDisplay(snapshot);
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
@@ -3091,6 +3124,7 @@
   function clearSessionLoading(sessionId) {
     if (sessionId && sessionState.activeSessionLoad && sessionState.activeSessionLoad.sessionId !== sessionId) return;
     setSessionLoading(null, { blocking: false });
+    scheduleQueuedMessageFollowupAfterIdle();
   }
 
   function isBlockingSessionLoad(sessionId) {
@@ -3196,6 +3230,7 @@
   }
 
   function sendCoreMessage(text) {
+    markAwaitingRuntimeStart();
     send({
       type: 'message',
       text,
@@ -3207,6 +3242,7 @@
   }
 
   function sendUserMessage(payload = {}) {
+    markAwaitingRuntimeStart();
     send({
       type: 'message',
       sessionId: sessionState.currentSessionId,
@@ -3537,7 +3573,11 @@
     reconcileSessionCacheWithSessions();
     renderSessionList();
     if (sessionState.currentSessionId) {
-      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+      const currentMetaRunning = !!getSessionMeta(sessionState.currentSessionId)?.isRunning;
+      setCurrentSessionRunningState(currentMetaRunning);
+      if (!shouldHoldOptimisticRunningState(currentMetaRunning)) {
+        scheduleQueuedMessageFollowupAfterIdle();
+      }
     }
     if (connectionState.pendingInitialSessionLoad) {
       connectionState.pendingInitialSessionLoad = false;
@@ -3630,6 +3670,7 @@
 
   function handleTextDeltaMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     composeState.pendingText += msg.text;
     scheduleRender();
@@ -3637,6 +3678,7 @@
 
   function handleToolStartMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
     markStreamingProcessTextSegments();
@@ -3765,6 +3807,7 @@
 
   function handleResumeGeneratingMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     setCurrentSessionRunningState(true);
     if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
       startGenerating();
@@ -3812,6 +3855,7 @@
 
   function handleErrorMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     const errorMsg = msg.message || '发生未知错误';
     appendError(errorMsg);
     // Also show toast for critical errors to ensure user notice
@@ -3988,6 +4032,7 @@
   }
 
   function finishGenerating(sessionId) {
+    clearAwaitingRuntimeStart();
     composeState.isGenerating = false;
     updateComposerActionButtons();
     setCurrentSessionRunningState(false);
@@ -4008,7 +4053,7 @@
     }
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
-    setTimeout(dispatchNextQueuedMessage, 0);
+    scheduleQueuedMessageDispatch();
   }
 
   // --- Rendering ---
@@ -5363,7 +5408,7 @@
     header.dataset.projectId = project.id;
     header.setAttribute('aria-expanded', String(!isCollapsed));
     header.setAttribute('aria-selected', String(isSelectedProject));
-    header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话`);
+    header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话${runningCount ? `，${runningCount} 个运行中` : ''}`);
 
     const main = document.createElement('div');
     main.className = 'project-group-main';
@@ -5374,6 +5419,14 @@
 
     const copy = document.createElement('div');
     copy.className = 'project-group-copy';
+
+    if (runningCount) {
+      const runningDot = document.createElement('span');
+      runningDot.className = 'project-group-running-dot';
+      runningDot.title = `${runningCount} 个运行中的聊天`;
+      runningDot.setAttribute('aria-hidden', 'true');
+      main.appendChild(runningDot);
+    }
 
     const nameSpan = document.createElement('span');
     nameSpan.className = 'project-group-name';
@@ -6374,6 +6427,41 @@
     return parts.join(' · ') || '空消息';
   }
 
+  function isCurrentSessionBusyForQueuedDispatch() {
+    if (composeState.isGenerating) return true;
+    // A blocking or non-blocking session reload can replace the message DOM with
+    // the freshly loaded snapshot. Wait until it finishes so the queued user
+    // bubble is not immediately overwritten and the session id is settled.
+    if (sessionState.activeSessionLoad) return true;
+    if (sessionState.currentSessionRunning) return true;
+    const meta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+    return !!meta?.isRunning;
+  }
+
+  function scheduleQueuedMessageDispatch() {
+    if (queuedDispatchTimer) return;
+    queuedDispatchTimer = setTimeout(() => {
+      queuedDispatchTimer = null;
+      dispatchNextQueuedMessage();
+    }, 0);
+  }
+
+  function scheduleQueuedMessageFollowupAfterIdle() {
+    if (generationIdleFinalizeTimer) return;
+    generationIdleFinalizeTimer = setTimeout(() => {
+      generationIdleFinalizeTimer = null;
+      if (sessionState.currentSessionRunning) return;
+      const meta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+      if (meta?.isRunning) return;
+      if (sessionState.activeSessionLoad) return;
+      if (composeState.isGenerating) {
+        finishGenerating(sessionState.currentSessionId || undefined);
+        return;
+      }
+      scheduleQueuedMessageDispatch();
+    }, 0);
+  }
+
   function renderQueuedMessages() {
     if (!queuedMessageList) return;
     const visible = getVisibleQueuedMessages();
@@ -6463,6 +6551,7 @@
   }
 
   function sendQueuedCoreMessage(item, targetSessionId) {
+    markAwaitingRuntimeStart();
     send({
       type: 'message',
       text: item.text,
@@ -6474,6 +6563,7 @@
   }
 
   function sendQueuedUserMessage(item, targetSessionId) {
+    markAwaitingRuntimeStart();
     send({
       type: 'message',
       sessionId: targetSessionId,
@@ -6487,7 +6577,8 @@
   }
 
   function dispatchNextQueuedMessage() {
-    if (composeState.isGenerating || isBlockingSessionLoad()) return false;
+    if (isCurrentSessionBusyForQueuedDispatch()) return false;
+    if (!connectionState.ws || connectionState.ws.readyState !== WebSocket.OPEN) return false;
     const index = composeState.queuedMessages.findIndex(queueSessionMatchesCurrent);
     if (index < 0) {
       renderQueuedMessages();
