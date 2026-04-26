@@ -5443,7 +5443,7 @@
     const isVirtualCwd = Boolean(project.isVirtualCwd);
     const isSelectedProject = selectedProject?.id === project.id
       || (!!selectedProject?.path && !!project.path && normalizeComparablePath(selectedProject.path) === normalizeComparablePath(project.path));
-    const isCollapsed = !isSelectedProject && collapsedProjects.has(project.id);
+    const isCollapsed = collapsedProjects.has(project.id);
     const runningCount = groupSessions.reduce((count, session) => count + (session.isRunning ? 1 : 0), 0);
     const unreadCount = groupSessions.reduce((count, session) => count + (session.hasUnread ? 1 : 0), 0);
 
@@ -5686,8 +5686,20 @@
     header.appendChild(actions);
 
     header.addEventListener('click', (e) => {
-      // Ignore clicks on the actions area (more btn / menu)
+      // Ignore clicks on the actions area (new chat / more btn / menu)
       if (actions.contains(e.target)) return;
+
+      if (isSelectedProject) {
+        if (collapsedProjects.has(project.id)) {
+          collapsedProjects.delete(project.id);
+        } else {
+          collapsedProjects.add(project.id);
+        }
+        saveCollapsedProjects();
+        renderSessionList();
+        return;
+      }
+
       selectProjectGroup(project);
     });
     group.appendChild(header);
