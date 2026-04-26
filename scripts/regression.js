@@ -3437,7 +3437,7 @@ async function runCodexMetadataWarningRegressionCase({ port, password }) {
 }
 
 async function runHappyPathRegressionCase({ port, password, tempRoot, configDir, sessionsDir, logsDir, homeDir, codexFixture, tinyPng }) {
-  await withAuthedClient(port, password, async ({ client, token }) => {
+  await withAuthedClient(port, password, async ({ client, token, messages }) => {
     const modelConfigMsg = await saveConfigAndWait(
       client,
       'save_model_config',
@@ -3529,24 +3529,29 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     const compactDoneMsg = await client.waitForType('system_message', (msg) => /已执行 Codex \/compact/.test(msg.message || ''));
     assert(/已执行 Codex \/compact/.test(compactDoneMsg.message || ''), 'Codex /compact should complete with Codex-specific status message');
 
-    const autoCompactCwd = path.join(tempRoot, 'codex-auto-compact');
-    mkdirp(autoCompactCwd);
-    const autoCompactSession = await client.sendAndWaitType(
-      { type: 'new_session', agent: 'codex', cwd: autoCompactCwd, mode: 'yolo' },
+    const contextLimitCwd = path.join(tempRoot, 'codex-context-limit-no-auto-compact');
+    mkdirp(contextLimitCwd);
+    const contextLimitSession = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd: contextLimitCwd, mode: 'yolo' },
       'session_info',
-      (msg) => msg.agent === 'codex' && msg.cwd === autoCompactCwd,
+      (msg) => msg.agent === 'codex' && msg.cwd === contextLimitCwd,
     );
-    client.send(buildAgentMessagePayload({ text: 'warm up auto compact', sessionId: autoCompactSession.sessionId, mode: 'yolo', agent: 'codex' }));
-    await client.waitForType('done', (msg) => msg.sessionId === autoCompactSession.sessionId);
-    client.send(buildAgentMessagePayload({ text: 'trigger codex context limit', sessionId: autoCompactSession.sessionId, mode: 'yolo', agent: 'codex' }));
-    const autoCompactStart = await client.waitForType('system_message', (msg) => /正在按 Codex \/compact 自动压缩/.test(msg.message || ''));
-    assert(/Codex \/compact/.test(autoCompactStart.message || ''), 'Codex auto /compact should announce auto compact start');
-    const autoCompactDone = await client.waitForType('system_message', (msg) => /已执行 Codex \/compact/.test(msg.message || ''));
-    assert(/已执行 Codex \/compact/.test(autoCompactDone.message || ''), 'Codex auto /compact should finish compact step');
-    const autoCompactResume = await client.waitForType('system_message', (msg) => /按 Codex 压缩计划继续执行/.test(msg.message || ''));
-    assert(/继续执行/.test(autoCompactResume.message || ''), 'Codex auto /compact should announce retry');
-    const autoCompactRetryText = await client.waitForType('text_delta', (msg) => /trigger codex context limit/.test(msg.text || ''), 8000);
-    assert(/trigger codex context limit/.test(autoCompactRetryText.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
+    client.send(buildAgentMessagePayload({ text: 'warm up no auto compact', sessionId: contextLimitSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await client.waitForType('done', (msg) => msg.sessionId === contextLimitSession.sessionId);
+    const contextLimitStartIndex = messages.length;
+    client.send(buildAgentMessagePayload({ text: 'trigger codex context limit', sessionId: contextLimitSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const contextLimitError = await client.waitForType(
+      'error',
+      (msg) => msg.sessionId === contextLimitSession.sessionId && /Context window exceeded|Codex 任务失败/.test(msg.message || ''),
+    );
+    assert(/Context window exceeded/.test(contextLimitError.message || ''), 'Codex context-limit errors should be surfaced instead of auto-compacted');
+    await client.waitForType('done', (msg) => msg.sessionId === contextLimitSession.sessionId);
+    assertNoSystemMessageSince(
+      messages,
+      contextLimitStartIndex,
+      /正在按 Codex \/compact 自动压缩|已执行 Codex \/compact|按 Codex 压缩计划继续执行/,
+      'Codex context-limit handling should not run automatic /compact',
+    );
 
     const claudeOneMCwd = path.join(tempRoot, 'claude-1m-space');
     mkdirp(claudeOneMCwd);
