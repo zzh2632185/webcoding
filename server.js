@@ -4714,22 +4714,28 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     }
   }
 
-  if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
-    const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
-    if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
-      pendingCompactRetries.delete(sessionId);
-      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
-    } else {
-      pendingCompactRetries.set(sessionId, {
-        text: pendingRetry?.text || '',
-        mode: pendingRetry?.mode || session.permissionMode || 'yolo',
-        reason: 'auto',
-        autoRetryCount: nextRetryCount,
-      });
-      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
-      shouldAutoCompact = true;
-    }
-  }
+  // Webcoding-level auto /compact is intentionally disabled.
+  // Codex has its own context compaction policy; when Codex/upstream returns a
+  // context-limit error, Webcoding should surface the error instead of sending a
+  // hidden `/compact` on the user's behalf. Manual `/compact` still works via
+  // the pendingSlash branch above.
+  //
+  // if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
+  //   const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
+  //   if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
+  //     pendingCompactRetries.delete(sessionId);
+  //     sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
+  //   } else {
+  //     pendingCompactRetries.set(sessionId, {
+  //       text: pendingRetry?.text || '',
+  //       mode: pendingRetry?.mode || session.permissionMode || 'yolo',
+  //       reason: 'auto',
+  //       autoRetryCount: nextRetryCount,
+  //     });
+  //     sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
+  //     shouldAutoCompact = true;
+  //   }
+  // }
 
   if (completionError && !entry.errorSent && !shouldAutoCompact) {
     entry.errorSent = true;
@@ -4780,11 +4786,12 @@ function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, p
     return;
   }
 
-  const autoCompactWs = getPrimaryProcessWs(entry);
-  if (shouldAutoCompact && autoCompactWs && session) {
-    pendingSlashCommands.set(sessionId, { kind: 'compact' });
-    handleMessage(autoCompactWs, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
-  }
+  // Webcoding-level auto /compact is disabled; do not send hidden `/compact`.
+  // const autoCompactWs = getPrimaryProcessWs(entry);
+  // if (shouldAutoCompact && autoCompactWs && session) {
+  //   pendingSlashCommands.set(sessionId, { kind: 'compact' });
+  //   handleMessage(autoCompactWs, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+  // }
 }
 
 function handleProcessComplete(sessionId, exitCode, signal) {
