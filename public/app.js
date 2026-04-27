@@ -140,6 +140,7 @@
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+  let fileRefPickerExpandedDirs = new Set();
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
@@ -289,6 +290,9 @@
   const queuedMessageList = $('#queued-message-list');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
+  const attachMenu = $('#attach-menu');
+  const attachUploadImage = $('#attach-upload-image');
+  const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
   const msgInput = $('#msg-input');
   const contextUsageIndicator = $('#context-usage-indicator');
@@ -2073,9 +2077,10 @@
   function renderFileRefLabels(fileRefs, options = {}) {
     if (!Array.isArray(fileRefs) || fileRefs.length === 0) return '';
     const labels = fileRefs.map((ref) => {
-      const name = escapeHtml(ref.relativePath || ref.path || 'file');
-      const size = Number(ref.size) ? ` · ${formatFileSize(ref.size)}` : '';
-      return `<span class="msg-attachment-label file-ref">文件: ${name}${size}</span>`;
+      const isDir = ref?.type === 'directory';
+      const name = escapeHtml(ref.relativePath || ref.path || (isDir ? 'directory' : 'file'));
+      const size = !isDir && Number(ref.size) ? ` · ${formatFileSize(ref.size)}` : '';
+      return `<span class="msg-attachment-label file-ref">${isDir ? '目录' : '文件'}: ${name}${size}</span>`;
     }).join('');
     return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
   }
@@ -2361,8 +2366,8 @@
     contextBar.classList.toggle('has-file-refs', true);
     contextRefList.innerHTML = composeState.pendingFileRefs.map((ref, index) => `
       <button class="context-ref-chip" type="button" data-index="${index}" title="${escapeHtml(ref.relativePath || ref.path || '')}">
-        <span>${escapeHtml(ref.relativePath || ref.name || 'file')}</span>
-        <span class="context-ref-size">${formatFileSize(ref.size)}</span>
+        <span>${escapeHtml(ref.relativePath || ref.name || (ref.type === 'directory' ? 'directory' : 'file'))}</span>
+        <span class="context-ref-size">${ref.type === 'directory' ? '目录' : formatFileSize(ref.size)}</span>
         <span class="context-ref-remove">×</span>
       </button>
     `).join('');
@@ -2502,24 +2507,214 @@
 
   function addPendingFileRef(ref) {
     if (!ref?.path) return;
+    const isDir = ref.type === 'directory';
     if (composeState.pendingFileRefs.some((item) => item.path === ref.path)) {
       renderContextBar();
       return;
     }
     if (composeState.pendingFileRefs.length >= MAX_PENDING_FILE_REFS) {
-      appendError(`最多一次引用 ${MAX_PENDING_FILE_REFS} 个文件。`);
+      appendError(`最多一次引用 ${MAX_PENDING_FILE_REFS} 个项目。`);
       return;
     }
-    if ((Number(ref.size) || 0) > MAX_PENDING_FILE_REF_SIZE) {
+    if (!isDir && (Number(ref.size) || 0) > MAX_PENDING_FILE_REF_SIZE) {
       appendError('文件超过 256KB，不能作为上下文引用。');
       return;
     }
     composeState.pendingFileRefs.push({
+      type: isDir ? 'directory' : 'file',
       path: ref.path,
       relativePath: ref.relativePath || ref.path,
-      size: Number(ref.size) || 0,
+      size: isDir ? 0 : Number(ref.size) || 0,
     });
     renderContextBar();
+  }
+
+
+  function toAttachableFileRef(item) {
+    if (!item || item.type === 'directory') return null;
+    if (!item.isText || item.tooLarge || (Number(item.size) || 0) > MAX_PENDING_FILE_REF_SIZE) return null;
+    return {
+      type: 'file',
+      path: item.path,
+      relativePath: item.relativePath || item.name || item.path,
+      name: item.name || item.relativePath || item.path,
+      size: Number(item.size) || 0,
+    };
+  }
+
+  function toAttachableDirectoryRef(item) {
+    if (!item || item.type !== 'directory') return null;
+    return {
+      type: 'directory',
+      path: item.path,
+      relativePath: item.relativePath || item.name || item.path,
+      name: item.name || item.relativePath || item.path,
+      size: 0,
+    };
+  }
+
+  function countAttachableFileRefs(items) {
+    if (!Array.isArray(items)) return 0;
+    return items.reduce((count, item) => {
+      if (!item) return count;
+      if (item.type === 'directory') return count + countAttachableFileRefs(item.children || []);
+      return count + (toAttachableFileRef(item) ? 1 : 0);
+    }, 0);
+  }
+
+  function collectDefaultExpandedFileRefDirs(items, level = 0, dirs = new Set()) {
+    if (!Array.isArray(items)) return dirs;
+    for (const item of items) {
+      if (!item || item.type !== 'directory') continue;
+      if (countAttachableFileRefs(item.children || []) === 0) continue;
+      if (level === 0) dirs.add(item.path);
+      collectDefaultExpandedFileRefDirs(item.children || [], level + 1, dirs);
+    }
+    return dirs;
+  }
+
+  function renderFileRefPickerTree(items, level = 0) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    const selectedPaths = new Set(composeState.pendingFileRefs.map((ref) => ref.path));
+    return items.map((item) => {
+      if (!item) return '';
+      const isDir = item.type === 'directory';
+      if (isDir) {
+        const dirRef = toAttachableDirectoryRef(item);
+        const selected = selectedPaths.has(item.path);
+        const expanded = fileRefPickerExpandedDirs.has(item.path);
+        const childCount = countAttachableFileRefs(item.children || []);
+        const children = expanded ? renderFileRefPickerTree(item.children || [], level + 1) : '';
+        return `
+          <div class="file-ref-picker-node">
+            <div class="file-ref-picker-row directory${expanded ? ' expanded' : ''}${selected ? ' selected' : ''}" data-dir-path="${escapeHtml(item.path)}" style="--level:${level}">
+              <button class="file-ref-picker-main" type="button" data-dir-toggle="${escapeHtml(item.path)}">
+                <span class="file-ref-picker-icon">${expanded ? '▾' : '▸'}</span>
+                <span class="file-ref-picker-name">${escapeHtml(item.name || item.relativePath || item.path)}</span>
+                <span class="file-ref-picker-size">${childCount > 0 ? `${childCount} 个文件` : '目录'}</span>
+              </button>
+              <button class="file-ref-picker-action" type="button" data-dir-ref="${escapeHtml(JSON.stringify(dirRef))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>
+            </div>
+            ${children}
+          </div>
+        `;
+      }
+      const ref = toAttachableFileRef(item);
+      if (!ref) return '';
+      const selected = selectedPaths.has(ref.path);
+      return `
+        <div class="file-ref-picker-node">
+          <div class="file-ref-picker-row file${selected ? ' selected' : ''}" style="--level:${level}">
+            <span class="file-ref-picker-icon">•</span>
+            <span class="file-ref-picker-name">${escapeHtml(item.name || ref.relativePath || ref.path)}</span>
+            <span class="file-ref-picker-size">${formatFileSize(ref.size)}</span>
+            <button class="file-ref-picker-action" type="button" data-file-ref="${escapeHtml(JSON.stringify(ref))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function closeFileRefPicker() {
+    document.getElementById('file-ref-picker-overlay')?.remove();
+  }
+
+  function closeAttachMenu() {
+    if (!attachMenu) return;
+    attachMenu.hidden = true;
+    if (attachBtn) attachBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleAttachMenu() {
+    if (!attachMenu) {
+      imageUploadInput?.click();
+      return;
+    }
+    const nextHidden = !attachMenu.hidden;
+    attachMenu.hidden = nextHidden;
+    if (attachBtn) attachBtn.setAttribute('aria-expanded', nextHidden ? 'false' : 'true');
+  }
+
+  function bindFileRefPickerTreeEvents(overlay, items) {
+    overlay.querySelectorAll('[data-dir-toggle]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const dirPath = btn.getAttribute('data-dir-toggle') || '';
+        if (!dirPath) return;
+        if (fileRefPickerExpandedDirs.has(dirPath)) fileRefPickerExpandedDirs.delete(dirPath);
+        else fileRefPickerExpandedDirs.add(dirPath);
+        renderFileRefPicker(items);
+      });
+    });
+    overlay.querySelectorAll('[data-dir-ref]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const raw = btn.getAttribute('data-dir-ref') || '';
+        try {
+          const ref = JSON.parse(raw);
+          addPendingFileRef(ref);
+          showToast(`已引用目录 ${ref.relativePath || ref.name || '目录'}`);
+          renderFileRefPicker(items);
+        } catch {
+          appendError('目录引用数据无效。');
+        }
+      });
+    });
+    overlay.querySelectorAll('[data-file-ref]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const raw = btn.getAttribute('data-file-ref') || '';
+        try {
+          const ref = JSON.parse(raw);
+          addPendingFileRef(ref);
+          showToast(`已引用 ${ref.relativePath || ref.name || '文件'}`);
+          renderFileRefPicker(items);
+        } catch {
+          appendError('文件引用数据无效。');
+        }
+      });
+    });
+  }
+
+  function renderFileRefPicker(items) {
+    closeFileRefPicker();
+    const overlay = document.createElement('div');
+    overlay.id = 'file-ref-picker-overlay';
+    overlay.className = 'file-ref-picker-overlay';
+    const treeHtml = renderFileRefPickerTree(items || []);
+    overlay.innerHTML = `
+      <div class="file-ref-picker-card" role="dialog" aria-modal="true" aria-label="引用附件">
+        <div class="file-ref-picker-header">
+          <div>
+            <div class="file-ref-picker-title">引用附件</div>
+            <div class="file-ref-picker-subtitle">按目录展开当前项目，目录和文件都可以作为独立引用。</div>
+          </div>
+          <button class="file-ref-picker-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="file-ref-picker-list">
+          ${treeHtml || '<div class="file-ref-picker-empty">当前目录没有可引用的文件或目录。</div>'}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay || event.target.closest('.file-ref-picker-close')) {
+        closeFileRefPicker();
+      }
+    });
+    bindFileRefPickerTreeEvents(overlay, items || []);
+  }
+
+  async function openFileRefPicker() {
+    const cwd = getFileTreeCwd();
+    if (!cwd) {
+      appendError('请先打开项目目录，再引用附件。');
+      return;
+    }
+    try {
+      await loadFileTree(cwd);
+      fileRefPickerExpandedDirs = collectDefaultExpandedFileRefDirs(fileTreeState.items || []);
+      renderFileRefPicker(fileTreeState.items || []);
+    } catch (err) {
+      appendError(err.message || '读取可引用文件失败');
+    }
   }
 
   function clearFileViewerObjectUrl() {
@@ -7405,12 +7600,40 @@
   }
   if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
   renderContextBar();
-  if (attachBtn && imageUploadInput) {
-    attachBtn.addEventListener('click', () => imageUploadInput.click());
+  if (attachBtn) {
+    attachBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleAttachMenu();
+    });
+  }
+  if (attachUploadImage && imageUploadInput) {
+    attachUploadImage.addEventListener('click', () => {
+      closeAttachMenu();
+      imageUploadInput.click();
+    });
+  }
+  if (attachReferenceFile) {
+    attachReferenceFile.addEventListener('click', () => {
+      closeAttachMenu();
+      openFileRefPicker();
+    });
+  }
+  if (imageUploadInput) {
     imageUploadInput.addEventListener('change', () => {
       handleSelectedImageFiles(imageUploadInput.files);
     });
   }
+  document.addEventListener('click', (event) => {
+    if (!attachMenu || attachMenu.hidden) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target && (attachMenu.contains(target) || attachBtn?.contains(target))) return;
+    closeAttachMenu();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeAttachMenu();
+    closeFileRefPicker();
+  });
   if (inputWrapper) {
     inputWrapper.addEventListener('dragover', (e) => {
       const types = Array.from(e.dataTransfer?.types || []);

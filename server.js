@@ -2476,23 +2476,34 @@ function normalizeContextFileRefs(fileRefs, cwd) {
     let root;
     let resolved;
     try { ({ root, resolved } = resolvePathWithinCwd(cwd, rawPath)); }
-    catch (err) { return { refs: [], error: err.message || '文件路径无效' }; }
+    catch (err) { return { refs: [], error: err.message || '引用路径无效' }; }
     if (seen.has(resolved)) continue;
     seen.add(resolved);
     let stat;
     try { stat = fs.statSync(resolved); }
-    catch { return { refs: [], error: `无法读取文件: ${path.basename(resolved)}` }; }
-    if (!stat.isFile()) return { refs: [], error: `只能引用文件: ${path.relative(root, resolved)}` };
-    if (stat.size > MAX_CONTEXT_FILE_SIZE) return { refs: [], error: `文件超过 256KB: ${path.relative(root, resolved)}` };
-    if (!isLikelyTextFile(resolved, stat.size)) return { refs: [], error: `只能引用文本文件: ${path.relative(root, resolved)}` };
+    catch { return { refs: [], error: `无法读取引用: ${path.basename(resolved)}` }; }
+    const relativePath = path.relative(root, resolved) || path.basename(resolved);
+    if (stat.isDirectory()) {
+      normalized.push({
+        type: 'directory',
+        path: resolved,
+        relativePath,
+        size: 0,
+      });
+      continue;
+    }
+    if (!stat.isFile()) return { refs: [], error: `只能引用文件或目录: ${relativePath}` };
+    if (stat.size > MAX_CONTEXT_FILE_SIZE) return { refs: [], error: `文件超过 256KB: ${relativePath}` };
+    if (!isLikelyTextFile(resolved, stat.size)) return { refs: [], error: `只能引用文本文件: ${relativePath}` };
     totalSize += stat.size;
     if (totalSize > MAX_CONTEXT_FILES_TOTAL_SIZE) return { refs: [], error: '引用文件总大小不能超过 1MB' };
     let content;
     try { content = fs.readFileSync(resolved, 'utf8'); }
-    catch { return { refs: [], error: `读取失败: ${path.relative(root, resolved)}` }; }
+    catch { return { refs: [], error: `读取失败: ${relativePath}` }; }
     normalized.push({
+      type: 'file',
       path: resolved,
-      relativePath: path.relative(root, resolved) || path.basename(resolved),
+      relativePath,
       size: stat.size,
       content,
     });
@@ -2503,19 +2514,31 @@ function normalizeContextFileRefs(fileRefs, cwd) {
 function buildContextFilePrompt(text, fileRefs) {
   const normalizedText = String(text || '');
   if (!Array.isArray(fileRefs) || fileRefs.length === 0) return normalizedText;
-  const blocks = fileRefs.map((ref) => [
-    `<file path="${ref.relativePath.replace(/"/g, '&quot;')}">`,
-    ref.content,
-    '</file>',
-  ].join('\n')).join('\n\n');
-  return `下面是用户从当前工作目录引用的文件：\n\n${blocks}\n\n用户问题：\n${normalizedText}`;
+  const blocks = fileRefs.map((ref) => {
+    const safePath = String(ref.relativePath || ref.path || '').replace(/"/g, '&quot;');
+    if (ref.type === 'directory') {
+      return `<directory path="${safePath}" />`;
+    }
+    return [
+      `<file path="${safePath}">`,
+      ref.content,
+      '</file>',
+    ].join('\n');
+  }).join('\n\n');
+  return `下面是用户从当前工作目录引用的文件和目录。目录引用表示用户选中了整个目录本身；不要把它理解为已经展开了目录下所有文件内容，如需查看请基于路径自行读取。
+
+${blocks}
+
+用户问题：
+${normalizedText}`;
 }
 
 function fileRefHistoryMeta(ref) {
   return {
+    type: ref.type === 'directory' ? 'directory' : 'file',
     path: ref.path,
     relativePath: ref.relativePath,
-    size: ref.size,
+    size: ref.type === 'directory' ? 0 : ref.size,
   };
 }
 
@@ -3315,10 +3338,12 @@ function normalizeQueuedMessageFileRefs(fileRefs) {
     if (!ref || typeof ref !== 'object') return null;
     const relativePath = String(ref.relativePath || ref.path || '').trim();
     if (!relativePath) return null;
+    const type = ref.type === 'directory' ? 'directory' : 'file';
     return {
+      type,
       path: String(ref.path || relativePath),
       relativePath,
-      size: Number(ref.size || 0) || 0,
+      size: type === 'directory' ? 0 : Number(ref.size || 0) || 0,
     };
   }).filter(Boolean);
 }
