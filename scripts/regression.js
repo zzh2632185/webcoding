@@ -43,6 +43,28 @@ function assert(condition, message) {
   }
 }
 
+function readRepoText(...parts) {
+  return fs.readFileSync(path.join(REPO_DIR, ...parts), 'utf8');
+}
+
+function extractFunctionSource(source, functionName) {
+  const signatureRe = new RegExp(`function\\s+${functionName}\\s*\\([^)]*\\)\\s*\\{`);
+  const match = signatureRe.exec(source);
+  assert(match, `Missing function ${functionName}`);
+
+  let depth = 0;
+  const bodyStart = match.index + match[0].length - 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const ch = source[index];
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(match.index, index + 1);
+    }
+  }
+  throw new Error(`Could not parse function ${functionName}`);
+}
+
 function runSqliteScript(dbPath, script) {
   const result = spawnSync('sqlite3', [dbPath, script], { encoding: 'utf8' });
   if (result.status !== 0) {
@@ -830,6 +852,61 @@ async function saveConfigAndWait(client, saveType, config, responseType) {
   return client.sendAndWaitType(
     { type: saveType, config },
     responseType,
+  );
+}
+
+function runFrontendStreamingPlaceholderSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const styleSource = readRepoText('public', 'style.css');
+  const findReusableSource = extractFunctionSource(appSource, 'findReusableAssistantPlaceholder');
+  const startGeneratingSource = extractFunctionSource(appSource, 'startGenerating');
+  const getStreamingBubbleSource = extractFunctionSource(appSource, 'getStreamingBubble');
+  const resumeGeneratingSource = extractFunctionSource(appSource, 'handleResumeGeneratingMessage');
+  const applySnapshotSource = extractFunctionSource(appSource, 'applySessionSnapshot');
+  const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
+  const sessionListSource = extractFunctionSource(appSource, 'handleSessionListMessage');
+
+  assert(
+    findReusableSource.includes('getLastMessageElement()'),
+    'Streaming placeholder reuse must be limited to the tail message',
+  );
+  assert(
+    !findReusableSource.includes("querySelectorAll('.msg.assistant')")
+      && !findReusableSource.includes('querySelectorAll(".msg.assistant")'),
+    'Streaming placeholder reuse must not globally scan old assistant placeholders',
+  );
+  assert(
+    startGeneratingSource.includes('createIfMissing: true')
+      && startGeneratingSource.includes('cleanupStale: true')
+      && startGeneratingSource.includes('requireAfterLatestUser: true'),
+    'startGenerating must create a fresh latest-user placeholder and clean stale empty assistants',
+  );
+  assert(
+    getStreamingBubbleSource.includes('createIfMissing: true'),
+    'Streaming deltas must recreate the placeholder if the DOM id is missing',
+  );
+  assert(
+    resumeGeneratingSource.includes('ensurePendingPlaceholder(bubble)')
+      && resumeGeneratingSource.includes("ensurePendingPlaceholder(document.querySelector('#streaming-msg .msg-bubble'))"),
+    'resume_generating without text/segments must keep the three-dot placeholder visible',
+  );
+  assert(
+    applySnapshotSource.includes('options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId')
+      && !applySnapshotSource.includes('snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning'),
+    'Early session_info snapshots must not wipe optimistic streaming placeholders',
+  );
+  assert(
+    sessionInfoSource.includes('msg.isRunning || composeState.isGenerating || sessionState.currentSessionRunning'),
+    'session_info must preserve optimistic running UI while the backend is starting',
+  );
+  assert(
+    sessionListSource.includes("currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))")
+      && sessionListSource.includes('startGenerating();'),
+    'session_list running=true must restore the local placeholder/abort UI if a snapshot wiped it',
+  );
+  assert(
+    /#streaming-msg\s+\.msg-actions\s*\{[^}]*display:\s*none;/.test(styleSource),
+    'Streaming placeholder must hide message actions/copy button while loading',
   );
 }
 
@@ -3703,6 +3780,10 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
 }
 
 async function main() {
+  const sourceRunner = createTestRunner();
+  await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  sourceRunner.finish();
+
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));
   try {
     const configDir = path.join(tempRoot, 'config');

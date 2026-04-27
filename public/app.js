@@ -68,6 +68,8 @@
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
+  const OPEN_CHAT_TABS_STORAGE_KEY = 'webcoding-open-chat-tabs-v1';
+  const OPEN_CHAT_TABS_LIMIT = 18;
   const DEFAULT_THEME = 'auto';
   const THEME_AUTO_VALUE = 'auto';
   const THEME_DAY_VALUE = 'default';
@@ -150,6 +152,7 @@
   let projects = [];
   let collapsedProjects = new Set();
   let selectedProject = { id: null, path: null };
+  let openChatTabs = loadPersistedOpenChatTabs();
   let projectDragState = null;
   let sidebarResizeState = null;
   let gitPanelResizeState = null;
@@ -285,6 +288,7 @@
   const chatAgentContext = $('#chat-agent-context');
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#topbar-chat-cwd');
+  const chatTabs = $('#chat-tabs');
   const costDisplay = $('#topbar-cost-display');
   const attachmentTray = $('#attachment-tray');
   const queuedMessageList = $('#queued-message-list');
@@ -1699,6 +1703,255 @@
 
   function getSessionMeta(sessionId) {
     return sessionState.sessions.find((s) => s.id === sessionId) || null;
+  }
+
+
+  function normalizeOpenChatTabId(entry) {
+    const raw = typeof entry === 'string' ? entry : (entry?.sessionId || entry?.id);
+    return String(raw || '').trim();
+  }
+
+  function loadPersistedOpenChatTabs() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(OPEN_CHAT_TABS_STORAGE_KEY) || '[]');
+      const source = Array.isArray(raw) ? raw : [];
+      const seen = new Set();
+      const tabs = [];
+      for (const entry of source) {
+        const sessionId = normalizeOpenChatTabId(entry);
+        if (!sessionId || seen.has(sessionId)) continue;
+        seen.add(sessionId);
+        tabs.push({ sessionId });
+        if (tabs.length >= OPEN_CHAT_TABS_LIMIT) break;
+      }
+      return tabs;
+    } catch {
+      return [];
+    }
+  }
+
+  function persistOpenChatTabs() {
+    const payload = openChatTabs
+      .map((tab) => ({ sessionId: normalizeOpenChatTabId(tab) }))
+      .filter((tab) => tab.sessionId);
+    if (payload.length === 0) {
+      localStorage.removeItem(OPEN_CHAT_TABS_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(OPEN_CHAT_TABS_STORAGE_KEY, JSON.stringify(payload));
+  }
+
+  function enforceOpenChatTabsLimit(preferredSessionId = sessionState.currentSessionId) {
+    while (openChatTabs.length > OPEN_CHAT_TABS_LIMIT) {
+      const removableIndex = openChatTabs.findIndex((tab) => tab.sessionId !== preferredSessionId);
+      openChatTabs.splice(removableIndex >= 0 ? removableIndex : 0, 1);
+    }
+  }
+
+  function getSessionLikeForTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return null;
+    const meta = getSessionMeta(id);
+    if (meta) return meta;
+    const cacheEntry = sessionState.sessionCache.get(id);
+    if (cacheEntry?.meta) return cacheEntry.meta;
+    if (cacheEntry?.snapshot) return cacheEntry.snapshot;
+    if (id === sessionState.currentSessionId) {
+      return {
+        id,
+        sessionId: id,
+        title: chatTitle?.textContent || '新会话',
+        agent: sessionState.currentAgent,
+        cwd: sessionState.currentCwd,
+        projectId: selectedProject?.id || null,
+        isRunning: !!sessionState.currentSessionRunning,
+      };
+    }
+    return null;
+  }
+
+  function getProjectForSessionLike(sessionLike) {
+    if (!sessionLike) return null;
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    return findBestProjectForSession(sessionLike, projectsById) || buildVirtualProjectFromSession(sessionLike);
+  }
+
+  function selectProjectForSessionLike(sessionLike, options = {}) {
+    const project = getProjectForSessionLike(sessionLike);
+    if (!project?.id) return false;
+    selectProjectGroup(project, {
+      collapseOthers: options.collapseOthers,
+      loadFiles: options.loadFiles,
+      render: options.render,
+    });
+    if (options.focus) {
+      focusProjectGroup(project.id, { instant: !!options.instant });
+    }
+    return true;
+  }
+
+  function selectProjectForSessionId(sessionId, options = {}) {
+    return selectProjectForSessionLike(getSessionLikeForTab(sessionId), options);
+  }
+
+  function ensureOpenChatTab(sessionId, options = {}) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    if (!openChatTabs.some((tab) => tab.sessionId === id)) {
+      openChatTabs.push({ sessionId: id });
+    }
+    enforceOpenChatTabsLimit(id);
+    persistOpenChatTabs();
+    if (options.render !== false) renderChatTabs();
+  }
+
+  function forgetOpenChatTabs(sessionIds, options = {}) {
+    const ids = new Set((Array.isArray(sessionIds) ? sessionIds : [sessionIds])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean));
+    if (ids.size === 0) return;
+    const before = openChatTabs.length;
+    openChatTabs = openChatTabs.filter((tab) => !ids.has(tab.sessionId));
+    if (openChatTabs.length === before) return;
+    persistOpenChatTabs();
+    if (options.render !== false) renderChatTabs();
+  }
+
+  function reconcileOpenChatTabsWithSessions() {
+    const knownIds = new Set(sessionState.sessions.map((session) => session.id));
+    const before = openChatTabs.length;
+    openChatTabs = openChatTabs.filter((tab) => {
+      const sessionId = tab.sessionId;
+      if (!sessionId) return false;
+      return knownIds.has(sessionId) || sessionId === sessionState.currentSessionId || sessionState.sessionCache.has(sessionId);
+    });
+    if (openChatTabs.length !== before) persistOpenChatTabs();
+  }
+
+  function getChatTabTitle(sessionLike) {
+    return sessionLike?.title || 'Untitled';
+  }
+
+  function getChatTabTooltip(sessionLike, title) {
+    const lines = [title];
+    const project = getProjectForSessionLike(sessionLike);
+    if (project?.name) lines.push(`目录：${project.name}`);
+    if (project?.path) lines.push(project.path);
+    const agentLabel = AGENT_LABELS[normalizeAgent(sessionLike?.agent)] || 'Agent';
+    lines.push(`Agent：${agentLabel}`);
+    return lines.filter(Boolean).join('\n');
+  }
+
+  function highlightActiveChatTab() {
+    if (!chatTabs) return;
+    chatTabs.querySelectorAll('.chat-tab').forEach((tab) => {
+      const active = tab.dataset.sessionId === sessionState.currentSessionId;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+    });
+  }
+
+  function closeOpenChatTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    const index = openChatTabs.findIndex((tab) => tab.sessionId === id);
+    if (index < 0) return;
+    const wasActive = id === sessionState.currentSessionId || id === sessionState.activeSessionLoad?.sessionId;
+    const meta = getSessionLikeForTab(id);
+    openChatTabs.splice(index, 1);
+    persistOpenChatTabs();
+
+    if (!wasActive) {
+      renderChatTabs();
+      return;
+    }
+
+    const fallback = openChatTabs[index] || openChatTabs[index - 1] || null;
+    if (fallback?.sessionId) {
+      renderChatTabs();
+      selectProjectForSessionId(fallback.sessionId, { focus: true, instant: true });
+      openSession(fallback.sessionId);
+      return;
+    }
+
+    if (localStorage.getItem('webcoding-session') === id) {
+      localStorage.removeItem('webcoding-session');
+    }
+    const sessionAgent = normalizeAgent(meta?.agent || sessionState.currentAgent);
+    if (getLastSessionForAgent(sessionAgent) === id) {
+      localStorage.removeItem(getAgentSessionStorageKey(sessionAgent));
+    }
+    if (connectionState.ws?.readyState === WebSocket.OPEN) {
+      send({ type: 'detach_view' });
+    }
+    resetChatView(selectedAgent);
+  }
+
+  function activateOpenChatTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    ensureOpenChatTab(id, { render: false });
+    selectProjectForSessionId(id, { focus: true, instant: true });
+    openSession(id);
+    renderChatTabs();
+  }
+
+  function renderChatTabs() {
+    if (!chatTabs) return;
+    chatTabs.innerHTML = '';
+    chatTabs.hidden = openChatTabs.length === 0;
+    if (openChatTabs.length === 0) return;
+
+    for (const tab of openChatTabs) {
+      const sessionId = tab.sessionId;
+      if (!sessionId) continue;
+      const sessionLike = getSessionLikeForTab(sessionId) || { id: sessionId, sessionId, title: 'Untitled', agent: selectedAgent };
+      const title = getChatTabTitle(sessionLike);
+      const active = sessionId === sessionState.currentSessionId;
+      const tabEl = document.createElement('div');
+      tabEl.className = `chat-tab${active ? ' active' : ''}${sessionLike?.isRunning ? ' is-running' : ''}${sessionLike?.hasUnread ? ' has-unread' : ''}`;
+      tabEl.dataset.sessionId = sessionId;
+      tabEl.setAttribute('role', 'button');
+      tabEl.setAttribute('tabindex', '0');
+      tabEl.setAttribute('aria-selected', String(active));
+      tabEl.title = getChatTabTooltip(sessionLike, title);
+
+      const status = document.createElement('span');
+      status.className = 'chat-tab-status';
+      status.setAttribute('aria-hidden', 'true');
+      tabEl.appendChild(status);
+
+      const titleEl = document.createElement('span');
+      titleEl.className = 'chat-tab-title';
+      titleEl.textContent = title;
+      tabEl.appendChild(titleEl);
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'chat-tab-close';
+      closeBtn.type = 'button';
+      closeBtn.title = '关闭快捷标签';
+      closeBtn.setAttribute('aria-label', `关闭 ${title}`);
+      closeBtn.textContent = '×';
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeOpenChatTab(sessionId);
+      });
+      tabEl.appendChild(closeBtn);
+
+      tabEl.addEventListener('click', () => activateOpenChatTab(sessionId));
+      tabEl.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        activateOpenChatTab(sessionId);
+      });
+
+      chatTabs.appendChild(tabEl);
+    }
+
+    const activeTab = chatTabs.querySelector('.chat-tab.active');
+    if (activeTab) {
+      requestAnimationFrame(() => activeTab.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
+    }
   }
 
   function deepClone(value) {
@@ -3334,6 +3587,7 @@
     updateAgentScopedUI();
     chatTitle.textContent = '新会话';
     updateCwdBadge();
+    renderChatTabs();
     messagesDiv.innerHTML = buildWelcomeMarkup(baseAgent);
     setStatsDisplay(null);
     renderPendingAttachments();
@@ -3345,7 +3599,7 @@
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
     const preserveStreaming = !!(
-      (options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning) ||
+      (options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId) ||
       (composeState.isGenerating && !sessionState.currentSessionId && snapshot.sessionId && !options.immediate)
     );
     if (composeState.isGenerating && !preserveStreaming) {
@@ -3362,20 +3616,19 @@
     sessionState.loadedHistorySessionId = snapshot.sessionId;
     setLastSessionForAgent(snapshot.agent, sessionState.currentSessionId);
     chatTitle.textContent = snapshot.title || '新会话';
+    ensureOpenChatTab(snapshot.sessionId, { render: false });
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
     const snapshotRunning = !!snapshot.isRunning;
     const effectiveSnapshotRunning = preserveStreaming && composeState.isGenerating
-      ? (snapshotRunning || sessionState.currentSessionRunning)
+      ? (snapshotRunning || sessionState.currentSessionRunning || composeState.isGenerating)
       : snapshotRunning;
     setCurrentSessionRunningState(effectiveSnapshotRunning);
     setStatsDisplay(snapshot);
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
     sessionState.currentCwd = nextGitCwd;
-    if (nextGitCwd) {
-      selectProjectForCwd(nextGitCwd, { render: false, loadFiles: false });
-    }
+    selectProjectForSessionLike(snapshot, { render: false, loadFiles: false });
     if (gitCwdChanged) {
       resetGitState(nextGitCwd ? { cwd: nextGitCwd } : {});
       if (nextGitCwd) loadFileTree(nextGitCwd);
@@ -3491,6 +3744,7 @@
 
   function openSession(sessionId, options = {}) {
     if (!sessionId) return;
+    ensureOpenChatTab(sessionId);
     if (options.forceSync) {
       beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
       return;
@@ -3891,10 +4145,14 @@
       reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
     }));
     reconcileSessionCacheWithSessions();
+    reconcileOpenChatTabsWithSessions();
     renderSessionList();
     if (sessionState.currentSessionId) {
       const currentMetaRunning = !!getSessionMeta(sessionState.currentSessionId)?.isRunning;
       setCurrentSessionRunningState(currentMetaRunning);
+      if (currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))) {
+        startGenerating();
+      }
       if (!shouldHoldOptimisticRunningState(currentMetaRunning)) {
         scheduleQueuedMessageFollowupAfterIdle();
       }
@@ -3941,7 +4199,8 @@
     applySessionSnapshot(snapshot, {
       immediate: isBlockingSessionLoad(msg.sessionId),
       suppressUnreadToast: false,
-      preserveStreaming: msg.sessionId === sessionState.currentSessionId && msg.isRunning,
+      preserveStreaming: msg.sessionId === sessionState.currentSessionId
+        && (msg.isRunning || composeState.isGenerating || sessionState.currentSessionRunning),
     });
     if (msg.historyPending) return;
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
@@ -3986,6 +4245,7 @@
       chatTitle.textContent = msg.title;
     }
     renderSessionList();
+    renderChatTabs();
   }
 
   function handleTextDeltaMessage(msg) {
@@ -4159,7 +4419,10 @@
       updateComposerActionButtons();
       composeState.activeToolCalls.clear();
       const bubble = document.querySelector('#streaming-msg .msg-bubble');
-      if (bubble) bubble.innerHTML = '';
+      if (bubble) {
+        bubble.innerHTML = '';
+        ensurePendingPlaceholder(bubble);
+      }
     }
     const resumedSegments = Array.isArray(msg.segments) && msg.segments.length > 0 ? msg.segments : null;
     if (resumedSegments) {
@@ -4179,7 +4442,11 @@
       return;
     }
     composeState.pendingText = msg.text || '';
-    flushRender();
+    if (composeState.pendingText) {
+      flushRender();
+    } else if (!(msg.toolCalls && msg.toolCalls.length > 0)) {
+      ensurePendingPlaceholder(document.querySelector('#streaming-msg .msg-bubble'));
+    }
     if (!(msg.toolCalls && msg.toolCalls.length > 0)) return;
     for (const tc of msg.toolCalls) {
       composeState.activeToolCalls.set(tc.id, {
@@ -4397,10 +4664,33 @@
     return !bubbleHasRenderableContent(bubble);
   }
 
+  function getLastMessageElement() {
+    const children = Array.from(messagesDiv.children);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child?.classList?.contains('msg')) return child;
+    }
+    return null;
+  }
+
+  function getLatestUserMessageElement() {
+    const children = Array.from(messagesDiv.children);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child?.classList?.contains('msg') && child.classList.contains('user')) return child;
+    }
+    return null;
+  }
+
+  function isStreamingMessageAfterLatestUser(msgEl) {
+    const latestUser = getLatestUserMessageElement();
+    return !latestUser || msgEl?.previousElementSibling === latestUser;
+  }
+
   function findReusableAssistantPlaceholder() {
-    const placeholders = Array.from(messagesDiv.querySelectorAll('.msg.assistant'))
-      .filter((msgEl) => msgEl.id !== 'streaming-msg' && isEmptyAssistantPlaceholder(msgEl));
-    return placeholders.length ? placeholders[placeholders.length - 1] : null;
+    const lastMsg = getLastMessageElement();
+    if (!lastMsg || lastMsg.id === 'streaming-msg') return null;
+    return isEmptyAssistantPlaceholder(lastMsg) ? lastMsg : null;
   }
 
   function ensurePendingPlaceholder(bubble) {
@@ -4408,21 +4698,52 @@
     bubble.appendChild(createStreamingPlaceholder());
   }
 
-  function claimStreamingMessageElement() {
-    const existing = document.getElementById('streaming-msg');
-    if (existing) return existing;
-    const reusable = findReusableAssistantPlaceholder();
-    if (!reusable) return null;
-    reusable.id = 'streaming-msg';
-    ensurePendingPlaceholder(reusable.querySelector('.msg-bubble'));
-    return reusable;
-  }
-
   function removeStaleEmptyAssistantPlaceholders(keepEl = null) {
     messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
       if (msgEl === keepEl || msgEl.id === 'streaming-msg') return;
       if (isEmptyAssistantPlaceholder(msgEl)) msgEl.remove();
     });
+  }
+
+  function createStreamingMessageElement() {
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+
+    const msgEl = createMsgElement('assistant', '');
+    msgEl.id = 'streaming-msg';
+    const bubble = msgEl.querySelector('.msg-bubble');
+    bubble.innerHTML = '';
+    bubble.appendChild(createStreamingPlaceholder());
+    const latestUser = getLatestUserMessageElement();
+    if (latestUser?.parentElement === messagesDiv) latestUser.insertAdjacentElement('afterend', msgEl);
+    else messagesDiv.appendChild(msgEl);
+    return msgEl;
+  }
+
+  function claimStreamingMessageElement({ createIfMissing = false, cleanupStale = false, requireAfterLatestUser = false } = {}) {
+    const existing = document.getElementById('streaming-msg');
+    if (existing) {
+      if (requireAfterLatestUser && !isStreamingMessageAfterLatestUser(existing)) {
+        if (isEmptyAssistantPlaceholder(existing)) existing.remove();
+        else existing.removeAttribute('id');
+      } else {
+        if (cleanupStale) removeStaleEmptyAssistantPlaceholders(existing);
+        return existing;
+      }
+    }
+
+    const reusable = findReusableAssistantPlaceholder();
+    if (reusable) {
+      reusable.id = 'streaming-msg';
+      ensurePendingPlaceholder(reusable.querySelector('.msg-bubble'));
+      if (cleanupStale) removeStaleEmptyAssistantPlaceholders(reusable);
+      return reusable;
+    }
+
+    if (!createIfMissing) return null;
+    const created = createStreamingMessageElement();
+    if (cleanupStale) removeStaleEmptyAssistantPlaceholders(created);
+    return created;
   }
 
   function startGenerating() {
@@ -4433,23 +4754,11 @@
     updateComposerActionButtons();
     // 不禁用输入框：生成中继续输入会进入本地发送队列，可在发送前撤销。
 
-    const existingStreaming = claimStreamingMessageElement();
-    if (existingStreaming) {
-      ensurePendingPlaceholder(existingStreaming.querySelector('.msg-bubble'));
+    const msgEl = claimStreamingMessageElement({ createIfMissing: true, cleanupStale: true, requireAfterLatestUser: true });
+    if (msgEl) {
+      ensurePendingPlaceholder(msgEl.querySelector('.msg-bubble'));
       scrollToBottom();
-      return;
     }
-
-    const welcome = messagesDiv.querySelector('.welcome-msg');
-    if (welcome) welcome.remove();
-
-    const msgEl = createMsgElement('assistant', '');
-    msgEl.id = 'streaming-msg';
-    const bubble = msgEl.querySelector('.msg-bubble');
-    bubble.innerHTML = '';
-    bubble.appendChild(createStreamingPlaceholder());
-    messagesDiv.appendChild(msgEl);
-    scrollToBottom();
   }
 
   function finishGenerating(sessionId) {
@@ -4540,7 +4849,7 @@
   }
 
   function getStreamingBubble() {
-    const msgEl = claimStreamingMessageElement();
+    const msgEl = claimStreamingMessageElement({ createIfMissing: true, cleanupStale: true });
     return msgEl ? msgEl.querySelector('.msg-bubble') : null;
   }
 
@@ -5771,6 +6080,7 @@
           }
           if (localStorage.getItem('webcoding-session') === s.id) localStorage.removeItem('webcoding-session');
           invalidateSessionCache(s.id);
+          forgetOpenChatTabs(s.id, { render: false });
           send({ type: 'delete_session', sessionId: s.id });
           if (s.id === sessionState.currentSessionId) {
             resetChatView(selectedAgent);
@@ -6089,8 +6399,11 @@
         }
         invalidateSessionCache(session.id);
       }
+      forgetOpenChatTabs([...removedSessionIds], { render: false });
       if (removedSessionIds.has(sessionState.currentSessionId)) {
         resetChatView(selectedAgent);
+      } else {
+        renderChatTabs();
       }
     };
 
@@ -6287,6 +6600,7 @@
       empty.textContent = '暂无会话，点击“新建/打开项目”开始。';
       listFragment.appendChild(empty);
       sessionList.appendChild(listFragment);
+      renderChatTabs();
       renderWorkspaceInsights();
       return;
     }
@@ -6352,6 +6666,7 @@
       }
     }
     sessionList.appendChild(listFragment);
+    renderChatTabs();
     renderWorkspaceInsights();
     sessionList.scrollTop = savedScrollTop;
   }
@@ -6395,6 +6710,7 @@
     document.querySelectorAll('.session-item').forEach((el) => {
       el.classList.toggle('active', el.dataset.id === sessionState.currentSessionId);
     });
+    highlightActiveChatTab();
   }
 
   // --- Header title editing (contenteditable) ---
