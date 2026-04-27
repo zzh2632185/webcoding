@@ -272,6 +272,7 @@
   const fileViewerSourceTab = $('#file-viewer-source-tab');
   const fileViewerPreviewTab = $('#file-viewer-preview-tab');
   const fileViewerDownload = $('#file-viewer-download');
+  const fileViewerRefresh = $('#file-viewer-refresh');
   const fileViewerClose = $('#file-viewer-close');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
@@ -3189,6 +3190,8 @@
       fileViewerSourceTab.hidden = !hasSource;
       fileViewerSourceTab.classList.toggle('active', fileViewerState.activeTab === 'source');
     }
+    if (fileViewerRefresh) fileViewerRefresh.hidden = !fileViewerState.activePath;
+    if (fileViewerRefresh) fileViewerRefresh.disabled = !!fileViewerState.loading;
     if (fileViewerDownload) fileViewerDownload.hidden = !data;
     if (fileViewerState.loading) {
       fileViewerBody.innerHTML = '<div class="file-viewer-empty">正在读取文件…</div>';
@@ -3293,6 +3296,40 @@
       setTimeout(() => URL.revokeObjectURL(href), 1000);
     } catch (err) {
       appendError(err.message || '下载失败');
+    }
+  }
+
+  async function refreshFileViewer() {
+    const activePath = fileViewerState.activePath;
+    const cwd = getFileTreeCwd();
+    if (!activePath || !cwd) return;
+    const preferredTab = fileViewerState.activeTab;
+    clearFileViewerObjectUrl();
+    fileViewerState = { ...fileViewerState, open: true, loading: true, error: '', activePath, objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: activePath });
+      const response = await fetch(`/api/file-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== activePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, preferredTab);
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+      loadFileTree(cwd);
+      showToast('文件已刷新');
+    } catch (err) {
+      if (fileViewerState.activePath !== activePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '刷新文件失败';
+      renderFileViewer();
     }
   }
 
@@ -7711,6 +7748,7 @@
   if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
   if (fileViewerPreviewTab) fileViewerPreviewTab.addEventListener('click', () => setFileViewerTab('preview'));
   if (fileViewerSourceTab) fileViewerSourceTab.addEventListener('click', () => setFileViewerTab('source'));
+  if (fileViewerRefresh) fileViewerRefresh.addEventListener('click', refreshFileViewer);
   if (fileViewerDownload) fileViewerDownload.addEventListener('click', downloadFileViewerFile);
   document.addEventListener('touchstart', handleSidebarSwipeStart, { passive: true });
   document.addEventListener('touchmove', handleSidebarSwipeMove, { passive: false });
