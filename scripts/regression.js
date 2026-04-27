@@ -865,6 +865,7 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const applySnapshotSource = extractFunctionSource(appSource, 'applySessionSnapshot');
   const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
   const sessionListSource = extractFunctionSource(appSource, 'handleSessionListMessage');
+  const markReadSource = extractFunctionSource(appSource, 'markSessionReadLocally');
 
   assert(
     findReusableSource.includes('getLastMessageElement()'),
@@ -903,6 +904,23 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
     sessionListSource.includes("currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))")
       && sessionListSource.includes('startGenerating();'),
     'session_list running=true must restore the local placeholder/abort UI if a snapshot wiped it',
+  );
+  assert(
+    markReadSource.includes('hasUnread: false')
+      && markReadSource.includes('cacheEntry.meta.hasUnread = false')
+      && markReadSource.includes('cacheEntry.snapshot.hasUnread = false'),
+    'Opening a session must clear unread state in session meta and cached snapshots immediately',
+  );
+  assert(
+    applySnapshotSource.includes('const wasUnread = !!snapshot.hasUnread')
+      && applySnapshotSource.includes('markSessionReadLocally(snapshot.sessionId, snapshot)')
+      && applySnapshotSource.includes('snapshot.hasUnread = false')
+      && applySnapshotSource.includes('if (wasUnread && !options.suppressUnreadToast)'),
+    'Viewed session snapshots must preserve unread toast intent but clear unread UI state before rendering tabs',
+  );
+  assert(
+    sessionListSource.includes('session.id === sessionState.currentSessionId ? false : !!session.hasUnread'),
+    'Stale session_list payloads must not re-mark the currently viewed session as unread',
   );
   assert(
     /#streaming-msg\s+\.msg-actions\s*\{[^}]*display:\s*none;/.test(styleSource),

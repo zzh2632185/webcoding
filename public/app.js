@@ -1705,6 +1705,30 @@
     return sessionState.sessions.find((s) => s.id === sessionId) || null;
   }
 
+  function markSessionReadLocally(sessionId, snapshot = null) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    sessionState.sessions = sessionState.sessions.map((session) => {
+      if (session.id !== id) return session;
+      return {
+        ...session,
+        title: snapshot?.title || session.title,
+        agent: snapshot?.agent || session.agent,
+        reasoningEffort: Object.prototype.hasOwnProperty.call(snapshot || {}, 'reasoningEffort')
+          ? normalizeCodexReasoningEffort(snapshot.reasoningEffort)
+          : session.reasoningEffort,
+        cwd: Object.prototype.hasOwnProperty.call(snapshot || {}, 'cwd') ? snapshot.cwd : session.cwd,
+        projectId: Object.prototype.hasOwnProperty.call(snapshot || {}, 'projectId') ? snapshot.projectId : session.projectId,
+        updated: snapshot?.updated || session.updated,
+        isRunning: Object.prototype.hasOwnProperty.call(snapshot || {}, 'isRunning') ? !!snapshot.isRunning : !!session.isRunning,
+        hasUnread: false,
+      };
+    });
+    const cacheEntry = sessionState.sessionCache.get(id);
+    if (cacheEntry?.meta) cacheEntry.meta.hasUnread = false;
+    if (cacheEntry?.snapshot) cacheEntry.snapshot.hasUnread = false;
+  }
+
 
   function normalizeOpenChatTabId(entry) {
     const raw = typeof entry === 'string' ? entry : (entry?.sessionId || entry?.id);
@@ -3617,6 +3641,9 @@
     setLastSessionForAgent(snapshot.agent, sessionState.currentSessionId);
     chatTitle.textContent = snapshot.title || '新会话';
     ensureOpenChatTab(snapshot.sessionId, { render: false });
+    const wasUnread = !!snapshot.hasUnread;
+    markSessionReadLocally(snapshot.sessionId, snapshot);
+    snapshot.hasUnread = false;
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
     const snapshotRunning = !!snapshot.isRunning;
@@ -3653,7 +3680,7 @@
     highlightActiveSession();
     renderSessionList();
     if (!options.skipCloseSidebar) closeSidebar();
-    if (snapshot.hasUnread && !options.suppressUnreadToast) {
+    if (wasUnread && !options.suppressUnreadToast) {
       showToast('后台任务已完成', snapshot.sessionId);
     }
     renderWorkspaceInsights();
@@ -4143,6 +4170,7 @@
     sessionState.sessions = (msg.sessions || []).map((session) => ({
       ...session,
       reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
+      hasUnread: session.id === sessionState.currentSessionId ? false : !!session.hasUnread,
     }));
     reconcileSessionCacheWithSessions();
     reconcileOpenChatTabsWithSessions();
