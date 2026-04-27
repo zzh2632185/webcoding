@@ -797,6 +797,7 @@ html[data-theme="night"] .welcome-icon {
 }
 
 html[data-theme="night"] .send-btn,
+html[data-theme="night"] .handoff-btn,
 html[data-theme="night"] .settings-actions .btn-save,
 html[data-theme="night"] .login-box button,
 html[data-theme="night"] .fc-submit-btn,
@@ -1322,6 +1323,7 @@ html[data-theme="localhost"] #tunnel-copy-btn:hover,
 html[data-theme="localhost"] .settings-actions button:hover,
 html[data-theme="localhost"] .attach-btn:hover,
 html[data-theme="localhost"] .send-btn:hover,
+html[data-theme="localhost"] .handoff-btn:hover,
 html[data-theme="localhost"] .abort-btn:hover,
 html[data-theme="localhost"] .tpl-fetch-toolbar-btn:hover,
 html[data-theme="localhost"] .project-picker-item:hover,
@@ -1630,13 +1632,23 @@ html[data-theme="localhost"] .abort-btn {
   box-shadow: none;
   transform: none;
 }
-html[data-theme="localhost"] .attach-btn {
+html[data-theme="localhost"] .attach-btn,
+html[data-theme="localhost"] .handoff-btn {
   background: #ffffff;
 }
 html[data-theme="localhost"] .send-btn {
   background: var(--btn-primary-bg);
   color: #ffffff;
   border-color: rgba(15, 138, 167, 0.2);
+}
+html[data-theme="localhost"] .handoff-btn {
+  width: auto;
+  min-width: 42px;
+  height: 30px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: none;
+  transform: none;
 }
 html[data-theme="localhost"] .abort-btn {
   background: #ffffff;
@@ -4136,6 +4148,35 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+.handoff-btn {
+  min-width: 42px;
+  height: var(--btn-icon-size);
+  border: 2px solid var(--line);
+  border-radius: var(--button-radius);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0 9px;
+  background: var(--surface);
+  color: var(--text-primary);
+  box-shadow: 2px 2px 0 var(--line);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+}
+.handoff-btn:hover {
+  background: var(--yellow);
+  box-shadow: var(--button-shadow-soft);
+}
+.handoff-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+.handoff-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
 .send-btn, .abort-btn {
   width: var(--btn-icon-size);
   height: var(--btn-icon-size);
@@ -4531,6 +4572,7 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   .attach-btn { width: 36px; height: 36px; }
   .send-btn, .abort-btn { width: 34px;
   height: 34px; }
+  .handoff-btn { min-width: 40px; height: 34px; padding: 0 8px; font-size: 11px; }
   .new-chat-btn,
   .new-chat-arrow { min-height: 40px; }
   .new-chat-arrow { width: 44px; }

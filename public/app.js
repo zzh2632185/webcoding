@@ -302,6 +302,7 @@
   const msgInput = $('#msg-input');
   const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
+  const handoffBtn = $('#handoff-btn');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
@@ -3501,6 +3502,7 @@
       chatRuntimeState.hidden = !running;
       chatRuntimeState.textContent = running ? '运行中' : '';
     }
+    updateComposerActionButtons();
     updateCwdBadge();
     renderWorkspaceInsights();
     if (wasRunning && !running) {
@@ -3747,6 +3749,7 @@
     msgInput.disabled = showOverlay;
     modeSelect.disabled = showOverlay;
     sendBtn.disabled = showOverlay;
+    if (handoffBtn) handoffBtn.disabled = showOverlay;
     abortBtn.disabled = showOverlay;
     if (showOverlay && document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
@@ -3884,6 +3887,54 @@
       agent: sessionState.currentAgent,
       ...payload,
     });
+  }
+
+  function sendHandoffMessage() {
+    const text = msgInput.value.trim();
+    if (isBlockingSessionLoad()) return;
+    if (composeState.uploadingAttachments.length > 0) {
+      appendError('图片还在上传中，请等待上传完成后再接力。');
+      return;
+    }
+    if (composeState.isGenerating || sessionState.currentSessionRunning) {
+      showToast('当前窗口运行中，请等待完成或停止后再接力');
+      return;
+    }
+    if (!sessionState.currentSessionId) {
+      sendMessage();
+      return;
+    }
+    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) {
+      appendError('请输入要在新窗口继续的新任务。');
+      return;
+    }
+    if (text.startsWith('/')) {
+      appendError('接力新窗口暂不支持斜杠命令，请输入普通任务内容。');
+      return;
+    }
+
+    const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
+    hideCmdMenu();
+    hideOptionPicker();
+    markAwaitingRuntimeStart();
+    send({
+      type: 'handoff_session',
+      sourceSessionId: sessionState.currentSessionId,
+      newTask: text,
+      attachments,
+      fileRefs,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      agent: sessionState.currentAgent,
+    });
+    msgInput.value = '';
+    composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
+    renderPendingAttachments();
+    renderContextBar();
+    autoResize();
+    showToast('正在整理当前窗口，并创建接力新窗口…');
   }
 
   // --- marked config ---
@@ -4710,6 +4761,12 @@
     abortBtn.hidden = !composeState.isGenerating;
     sendBtn.title = composeState.isGenerating ? '加入发送队列' : '发送';
     sendBtn.setAttribute('aria-label', composeState.isGenerating ? '加入发送队列' : '发送');
+    if (handoffBtn) {
+      handoffBtn.disabled = isBlockingSessionLoad() || composeState.isGenerating || sessionState.currentSessionRunning;
+      handoffBtn.title = (composeState.isGenerating || sessionState.currentSessionRunning)
+        ? '当前窗口运行中，请等待完成或停止后再接力'
+        : '总结当前窗口并接力到新窗口';
+    }
   }
 
   function bubbleHasRenderableContent(bubble) {
@@ -7971,6 +8028,7 @@
     }
   });
   sendBtn.addEventListener('click', sendMessage);
+  if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
   abortBtn.addEventListener('click', () => send({ type: 'abort' }));
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {

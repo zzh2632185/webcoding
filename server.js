@@ -2824,6 +2824,10 @@ const CONTEXT_REPLAY_MAX_COMPLETED_ITEMS = 3;
 const CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS = 4;
 const CONTEXT_REPLAY_MAX_EXACT_ITEMS = 4;
 const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
+const HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET = 90000;
+const HANDOFF_AI_MESSAGE_CHAR_LIMIT = 2400;
+const HANDOFF_AI_SUMMARY_MAX_CHARS = 12000;
+const HANDOFF_AI_TIMEOUT_MS = 180000;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
@@ -5618,6 +5622,11 @@ wss.on('connection', (ws, req) => {
       case 'new_session':
         handleNewSession(ws, msg);
         break;
+      case 'handoff_session':
+        handleHandoffSession(ws, msg).catch((error) => {
+          wsSend(ws, { type: 'error', sessionId: msg.sessionId || msg.sourceSessionId || undefined, message: `接力失败：${error?.message || String(error)}` });
+        });
+        break;
       case 'load_session':
         handleLoadSession(ws, msg.sessionId);
         break;
@@ -6448,6 +6457,433 @@ function handleNewSession(ws, msg) {
   sendSessionList(ws);
 }
 
+
+
+function handoffRoleLabel(role) {
+  if (role === 'assistant') return '助手';
+  if (role === 'system') return '系统';
+  return '用户';
+}
+
+function messageTextForAiHandoff(message) {
+  if (!message || typeof message !== 'object') return '';
+  const parts = [];
+  if (typeof message.content === 'string' && message.content.trim()) {
+    parts.push(message.content.trim());
+  }
+  if (Array.isArray(message.segments) && message.segments.length > 0) {
+    const segmentText = message.segments
+      .map((segment) => {
+        if (!segment || typeof segment !== 'object') return '';
+        if (typeof segment.text === 'string' && segment.text.trim()) return segment.text.trim();
+        if (segment.type === 'tool_call') {
+          const name = segment.name || 'Tool';
+          const status = segment.done === false ? 'running' : 'done';
+          const result = typeof segment.result === 'string' ? truncateReplayText(segment.result, 500) : '';
+          return `[工具 ${name} ${status}]${result ? ` ${result}` : ''}`;
+        }
+        if (segment.type === 'image') return `[图片] ${segment.prompt || segment.alt || ''}`.trim();
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+    if (segmentText) parts.push(segmentText);
+  }
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (attachments.length > 0) {
+    parts.push(`附件: ${attachments.map((item) => item?.filename || item?.id || 'image').filter(Boolean).join(', ')}`);
+  }
+  const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
+  if (fileRefs.length > 0) {
+    parts.push(`引用文件: ${fileRefs.map((item) => item?.relativePath || item?.path || '').filter(Boolean).join(', ')}`);
+  }
+  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  if (toolCalls.length > 0 && !parts.some((part) => /\[工具 /.test(part))) {
+    parts.push(`工具调用: ${toolCalls.map((tool) => tool?.name || tool?.type || 'tool').filter(Boolean).join(', ')}`);
+  }
+  return truncateReplayText(parts.join('\n'), HANDOFF_AI_MESSAGE_CHAR_LIMIT);
+}
+
+function buildAiHandoffTranscript(messages) {
+  const blocks = (Array.isArray(messages) ? messages : [])
+    .map((message, index) => {
+      const text = messageTextForAiHandoff(message);
+      if (!text) return '';
+      const ts = message.timestamp ? ` @ ${message.timestamp}` : '';
+      return `#${index + 1} [${handoffRoleLabel(message.role)}${ts}]\n${text}`;
+    })
+    .filter(Boolean);
+  const full = blocks.join('\n\n');
+  if (full.length <= HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET) return full;
+
+  const headBudget = Math.min(18000, Math.floor(HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET * 0.25));
+  const tailBudget = HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET - headBudget - 240;
+  const head = [];
+  let headChars = 0;
+  for (const block of blocks) {
+    const next = block.length + 2;
+    if (headChars + next > headBudget) break;
+    head.push(block);
+    headChars += next;
+  }
+  const tail = [];
+  let tailChars = 0;
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    const next = block.length + 2;
+    if (tailChars + next > tailBudget) break;
+    tail.unshift(block);
+    tailChars += next;
+  }
+  const skipped = Math.max(0, blocks.length - head.length - tail.length);
+  return [
+    ...head,
+    `[中间有 ${skipped} 条较早消息因长度限制省略；请主要依据首尾上下文，尤其是最近消息判断当前状态。]`,
+    ...tail,
+  ].join('\n\n');
+}
+
+function buildAiHandoffSummaryPrompt(sourceSession, newTask, attachments = []) {
+  const transcript = buildAiHandoffTranscript(sourceSession?.messages || []);
+  const sourceTitle = sourceSession?.title || '旧窗口';
+  const taskText = formatCurrentInputForCarryover(newTask, attachments);
+  return [
+    '你是 Webcoding 的“新窗口接力分析器”。你的任务不是聊天回复，而是阅读旧窗口记录，并针对用户输入的新任务生成一份交接分析文档。',
+    '',
+    '重要要求：',
+    '- 不要直接复制聊天记录。',
+    '- 必须根据“新任务”判断哪些旧上下文重要、哪些可以忽略。',
+    '- 重点还原当前进度、已确定方案、未完成事项、风险/坑、下一步可执行计划。',
+    '- 如果旧记录里有冲突，以最新消息和新任务为准。',
+    '- 写给即将在新窗口继续工作的 AI，要求它能不问用户就继续干活。',
+    '- 使用中文，结构清晰，尽量精炼但不要遗漏关键事实。',
+    '',
+    '请严格输出以下 Markdown 结构：',
+    '## 接力目标',
+    '## 与新任务最相关的旧窗口结论',
+    '## 当前进度和状态',
+    '## 已修改/涉及的文件、接口或命令',
+    '## 未完成事项和下一步执行计划',
+    '## 风险、坑和不要重复做的事',
+    '## 给新窗口 AI 的执行指令',
+    '',
+    '[来源窗口元信息]',
+    `标题: ${sourceTitle}`,
+    `Agent: ${getSessionAgent(sourceSession)}`,
+    sourceSession?.cwd ? `工作目录: ${sourceSession.cwd}` : '工作目录: 未记录',
+    sourceSession?.projectId ? `项目ID: ${sourceSession.projectId}` : '',
+    '',
+    '[用户输入的新任务]',
+    taskText,
+    '',
+    '[旧窗口聊天记录]',
+    transcript || '旧窗口没有可用聊天记录。',
+  ].filter((line) => line !== '').join('\n');
+}
+
+function runAgentOnceForText(session, inputText, options = {}) {
+  return new Promise((resolve, reject) => {
+    const agent = getSessionAgent(session);
+    const spawnSpec = agent === 'codex'
+      ? buildCodexSpawnSpec(session, { attachments: [] })
+      : buildClaudeSpawnSpec(session, { attachments: [] });
+    if (spawnSpec?.error) return reject(new Error(spawnSpec.error));
+
+    let proc;
+    const entry = {
+      pid: 0,
+      ws: null,
+      clients: new Set(),
+      agent,
+      fullText: '',
+      toolCalls: [],
+      segments: [],
+      lastCost: null,
+      lastUsage: null,
+      lastError: null,
+      errorSent: false,
+      claudeRuntimeFingerprint: agent === 'claude' ? (spawnSpec.runtimeFingerprint || null) : null,
+      codexRuntimeFingerprint: agent === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
+      runtimeChannelKey: spawnSpec.channelKey || null,
+      runtimeChannelDescriptor: spawnSpec.channelDescriptor || null,
+    };
+    let stdoutBuffer = '';
+    let stderr = '';
+    let settled = false;
+    const timeoutMs = Number(options.timeoutMs || HANDOFF_AI_TIMEOUT_MS) || HANDOFF_AI_TIMEOUT_MS;
+
+    function settle(fn, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    }
+
+    function consumeLine(line) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) return;
+      try {
+        const event = JSON.parse(trimmed);
+        processRuntimeEvent(entry, event, session.id);
+      } catch {
+        entry.fullText += `${trimmed}\n`;
+      }
+    }
+
+    const timer = setTimeout(() => {
+      try { if (proc?.pid) killProcess(proc.pid, true); } catch {}
+      settle(reject, new Error('AI 交接分析超时'));
+    }, timeoutMs);
+
+    try {
+      proc = spawn(spawnSpec.command, spawnSpec.args, {
+        env: spawnSpec.env,
+        cwd: spawnSpec.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: false,
+        windowsHide: true,
+        shell: !!spawnSpec.useShell,
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      return reject(error);
+    }
+    entry.pid = proc.pid;
+
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+      for (const line of lines) consumeLine(line);
+    });
+    proc.stderr.setEncoding('utf8');
+    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+    proc.on('error', (error) => settle(reject, error));
+    proc.on('exit', (code, signal) => {
+      if (stdoutBuffer.trim()) consumeLine(stdoutBuffer);
+      const text = normalizeReplayText(entry.fullText);
+      if (code === 0 && text) return settle(resolve, text);
+      if (text) return settle(resolve, text);
+      const reason = entry.lastError || stderr.trim() || `AI 交接分析进程退出：${code ?? signal ?? 'unknown'}`;
+      settle(reject, new Error(reason));
+    });
+    proc.stdin.end(inputText);
+  });
+}
+
+async function generateAiHandoffSummary(sourceSession, newTask, attachments = [], options = {}) {
+  const agent = normalizeAgent(options.agent || sourceSession?.agent);
+  const requestedMode = resolvePermissionModeForAgent(agent, 'plan').mode;
+  const scratchSession = {
+    id: `handoff-ai-${crypto.randomUUID()}`,
+    title: 'handoff-ai-summary',
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    agent,
+    claudeSessionId: null,
+    codexThreadId: null,
+    codexRuntimeFingerprint: null,
+    runtimeContexts: { claude: {}, codex: {} },
+    model: sourceSession?.model || null,
+    reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(sourceSession?.reasoningEffort) : '',
+    permissionMode: requestedMode,
+    totalCost: 0,
+    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+    messages: [],
+    cwd: sourceSession?.cwd || null,
+    projectId: sourceSession?.projectId || null,
+  };
+  const prompt = buildAiHandoffSummaryPrompt(sourceSession, newTask, attachments);
+  const summary = await runAgentOnceForText(scratchSession, prompt, { timeoutMs: HANDOFF_AI_TIMEOUT_MS });
+  const normalized = normalizeReplayText(summary);
+  if (!normalized) throw new Error('AI 没有返回交接分析');
+  return normalized.length > HANDOFF_AI_SUMMARY_MAX_CHARS
+    ? `${normalized.slice(0, HANDOFF_AI_SUMMARY_MAX_CHARS - 16).trimEnd()}\n[AI 交接分析已截断]`
+    : normalized;
+}
+
+function buildHandoffRuntimePrompt(sourceSession, newTask, attachments = []) {
+  const history = Array.isArray(sourceSession?.messages) ? sourceSession.messages.filter(Boolean) : [];
+  const recentBlocks = collectRecentCarryoverMessages(history);
+  const summary = buildCarryoverSummary(sourceSession, history, newTask, attachments);
+  const sourceTitle = sourceSession?.title || '旧窗口';
+  const sourceCwd = sourceSession?.cwd || '';
+  const taskText = formatCurrentInputForCarryover(newTask, attachments);
+  const lines = [
+    '[webcoding 接力新窗口]',
+    '当前会话是从另一个旧窗口自动接力创建的。旧窗口上下文较长，下面是系统整理出的交接内容。',
+    '请先吸收这些内容，不要逐段复述，不要让用户重新整理进度；直接基于交接内容继续完成“新任务”。',
+    '如果交接摘要、最近对话和新任务之间有冲突，以“新任务”和用户最近明确要求为准。',
+    '',
+    '[来源窗口]',
+    `标题: ${sourceTitle}`,
+    sourceCwd ? `工作目录: ${sourceCwd}` : '',
+    `Agent: ${getSessionAgent(sourceSession)}`,
+    '',
+    '[结构化交接摘要]',
+    summary.text,
+  ].filter((line) => line !== '');
+
+  if (recentBlocks.length > 0) {
+    lines.push('', '[最近对话原文]', recentBlocks.join('\n\n'));
+  }
+
+  lines.push('', '[新任务]', taskText);
+  return {
+    prompt: lines.join('\n'),
+    summaryText: summary.text,
+    summaryDetailed: summary.detailed,
+    recentCount: recentBlocks.length,
+    historyCount: history.length,
+  };
+}
+
+function handoffSessionTitle(newTask, sourceSession) {
+  const lead = extractCarryoverLead(newTask) || sourceSession?.title || '继续当前任务';
+  return `接力: ${lead}`.slice(0, 80);
+}
+
+async function handleHandoffSession(ws, msg) {
+  const sourceSessionId = String(msg?.sourceSessionId || msg?.sessionId || '').trim();
+  const sourceSession = loadSession(sourceSessionId);
+  if (!sourceSession) {
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId || undefined, message: '接力失败：找不到来源会话。' });
+  }
+  if (activeProcesses.has(sourceSessionId)) {
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：当前窗口仍在运行，请等待完成或停止后再接力。' });
+  }
+
+  const sourceAgent = getSessionAgent(sourceSession);
+  const requestedAgent = normalizeAgent(msg?.agent || sourceAgent);
+  const agent = requestedAgent || sourceAgent;
+  const resolvedMode = resolvePermissionModeForAgent(agent, msg?.mode || sourceSession.permissionMode || 'yolo');
+  const requestedReasoningEffort = agent === 'codex'
+    ? normalizeCodexReasoningEffort(Object.prototype.hasOwnProperty.call(msg || {}, 'reasoningEffort') ? msg.reasoningEffort : sourceSession.reasoningEffort)
+    : '';
+  const newTask = typeof msg?.newTask === 'string'
+    ? msg.newTask
+    : (typeof msg?.text === 'string' ? msg.text : '');
+  const normalizedTask = normalizeReplayText(newTask);
+  const attachments = Array.isArray(msg?.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
+  const resolvedAttachments = resolveMessageAttachments(attachments);
+  if (attachments.length > 0 && resolvedAttachments.length === 0) {
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：图片附件已过期或不可用，请重新上传后再接力。' });
+  }
+  const cwdForFileRefs = sourceSession.cwd || process.cwd();
+  const resolvedFileRefResult = normalizeContextFileRefs(msg?.fileRefs, cwdForFileRefs);
+  if (resolvedFileRefResult.error) {
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: `接力失败：${resolvedFileRefResult.error}` });
+  }
+  if (!normalizedTask && resolvedAttachments.length === 0 && resolvedFileRefResult.refs.length === 0) {
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：请输入要在新窗口继续的新任务。' });
+  }
+
+  wsSend(ws, {
+    type: 'system_message',
+    sessionId: sourceSessionId,
+    message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+  });
+
+  let aiSummary = '';
+  try {
+    aiSummary = await generateAiHandoffSummary(sourceSession, normalizedTask, resolvedAttachments, { agent });
+  } catch (error) {
+    return wsSend(ws, {
+      type: 'error',
+      sessionId: sourceSessionId,
+      message: `接力失败：AI 交接分析没有完成（${error?.message || String(error)}）`,
+    });
+  }
+
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const sourceTitle = sourceSession.title || '旧窗口';
+  const taskText = formatCurrentInputForCarryover(normalizedTask, resolvedAttachments);
+  const handoff = {
+    prompt: [
+      '[webcoding 接力新窗口]',
+      '这是 AI 已经根据旧窗口聊天记录和用户新任务分析出的交接文档。',
+      '请不要再要求用户重新整理进度；直接基于交接文档和新任务继续执行。',
+      '',
+      '[来源窗口]',
+      `标题: ${sourceTitle}`,
+      sourceSession.cwd ? `工作目录: ${sourceSession.cwd}` : '',
+      `Agent: ${getSessionAgent(sourceSession)}`,
+      '',
+      '[AI 交接分析文档]',
+      aiSummary,
+      '',
+      '[新任务]',
+      taskText,
+    ].filter((line) => line !== '').join('\n'),
+    summaryText: aiSummary,
+    summaryDetailed: true,
+    recentCount: 0,
+    historyCount: Array.isArray(sourceSession.messages) ? sourceSession.messages.length : 0,
+  };
+  const handoffNotice = `已创建接力新窗口：AI 已根据新任务分析 ${handoff.historyCount} 条旧窗口消息，并生成交接文档。`;
+  const handoffSummaryMessage = [
+    `接力来源：${sourceTitle}`,
+    sourceSession.cwd ? `工作目录：${sourceSession.cwd}` : '',
+    '',
+    '自动交接摘要：',
+    handoff.summaryText || '已自动生成交接摘要。',
+    '',
+    '新任务：',
+    normalizedTask || '请继续处理接力任务。',
+  ].filter((line) => line !== '').join('\n');
+  const session = {
+    id,
+    title: handoffSessionTitle(normalizedTask, sourceSession),
+    created: now,
+    updated: now,
+    agent,
+    claudeSessionId: null,
+    codexThreadId: null,
+    codexRuntimeFingerprint: null,
+    runtimeContexts: { claude: {}, codex: {} },
+    model: sourceSession.model || null,
+    reasoningEffort: requestedReasoningEffort,
+    permissionMode: resolvedMode.mode,
+    totalCost: 0,
+    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+    messages: [{ role: 'system', content: handoffSummaryMessage, timestamp: now }],
+    cwd: sourceSession.cwd || null,
+    projectId: sourceSession.projectId || null,
+    handoff: {
+      sourceSessionId,
+      sourceTitle: sourceSession.title || '',
+      createdAt: now,
+    },
+  };
+  saveSession(session);
+  wsSessionMap.set(ws, id);
+
+  handleMessage(ws, {
+    type: 'message',
+    sessionId: id,
+    text: normalizedTask || '请继续处理接力任务。',
+    attachments,
+    fileRefs: msg?.fileRefs,
+    mode: resolvedMode.mode,
+    reasoningEffort: requestedReasoningEffort,
+    agent,
+  }, {
+    runtimeInputText: handoff.prompt,
+    emitSessionInfo: true,
+  });
+
+  wsSend(ws, { type: 'system_message', sessionId: id, message: handoffNotice });
+
+  if (resolvedMode.downgraded) {
+    wsSend(ws, { type: 'system_message', sessionId: id, message: resolvedMode.message });
+    wsSend(ws, { type: 'mode_changed', sessionId: id, mode: resolvedMode.mode });
+  }
+}
+
 function handleLoadSession(ws, sessionId) {
   const session = loadSession(sessionId);
   if (!session) {
@@ -6901,7 +7337,7 @@ function dispatchNextServerQueuedMessage(sessionId) {
 // === Runtime Message Handler ===
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false } = options;
+  const { hideInHistory = false, runtimeInputText = null, emitSessionInfo = false } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -6930,6 +7366,9 @@ function handleMessage(ws, msg, options = {}) {
   }));
   const savedFileRefs = resolvedFileRefs.map(fileRefHistoryMeta);
   const effectiveInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
+  const runtimeInputBaseText = typeof runtimeInputText === 'string'
+    ? buildContextFilePrompt(runtimeInputText, resolvedFileRefs)
+    : effectiveInputText;
   const messageAgent = normalizeAgent(msg.agent);
 
   if (sessionId && activeProcesses.has(sessionId)) {
@@ -7037,7 +7476,7 @@ function handleMessage(ws, msg, options = {}) {
   detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.set(ws, currentSessionId);
 
-  if (!sessionId) {
+  if (!sessionId || emitSessionInfo) {
     wsSend(ws, {
       type: 'session_info',
       sessionId: currentSessionId,
@@ -7048,6 +7487,7 @@ function handleMessage(ws, msg, options = {}) {
       model: sessionModelLabel(session),
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
+      projectId: session.projectId || null,
       totalCost: session.totalCost || 0,
       totalUsage: session.totalUsage || null,
       lastUsage: session.lastUsage || null,
@@ -7073,7 +7513,7 @@ function handleMessage(ws, msg, options = {}) {
     ? (Array.isArray(session.messages) ? session.messages.slice(0, -1) : [])
     : [];
   const threadCarryover = shouldInjectCarryover
-    ? buildThreadCarryoverPayload(session, effectiveInputText, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
+    ? buildThreadCarryoverPayload(session, runtimeInputBaseText, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
     : null;
   if (permissionModeNotice) {
     wsSend(ws, { type: 'system_message', message: permissionModeNotice });
@@ -7085,7 +7525,7 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.threadReset) {
     wsSend(ws, { type: 'system_message', message: buildThreadCarryoverNotice(threadCarryover) });
   }
-  const runtimeInputText = threadCarryover?.prompt || effectiveInputText;
+  const runtimeProcessInputText = threadCarryover?.prompt || runtimeInputBaseText;
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -7097,7 +7537,7 @@ function handleMessage(ws, msg, options = {}) {
 
   if (isClaudeSession(session) && resolvedAttachments.length > 0) {
     const content = [];
-    if (runtimeInputText) content.push({ type: 'text', text: runtimeInputText });
+    if (runtimeProcessInputText) content.push({ type: 'text', text: runtimeProcessInputText });
     for (const attachment of resolvedAttachments) {
       const data = fs.readFileSync(attachment.path).toString('base64');
       content.push({
@@ -7117,7 +7557,7 @@ function handleMessage(ws, msg, options = {}) {
       },
     })}\n`);
   } else {
-    fs.writeFileSync(inputPath, runtimeInputText);
+    fs.writeFileSync(inputPath, runtimeProcessInputText);
   }
 
   const inputFd = fs.openSync(inputPath, 'r');
