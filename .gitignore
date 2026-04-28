@@ -51,3 +51,5 @@ coverage/
 tmp/
 
 config/bridge-usage.jsonl
+
+config/generated-message-images/

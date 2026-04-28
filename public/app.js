@@ -4400,6 +4400,11 @@
     const segmentEl = buildMessageSegmentElement({
       type: 'image',
       src: image.src,
+      rawUrl: image.rawUrl || '',
+      path: image.path || '',
+      relativePath: image.relativePath || '',
+      rootKey: image.rootKey || '',
+      mime: image.mime || '',
       alt: image.alt || 'Generated image',
       id: image.id || null,
       prompt: image.prompt || '',
@@ -5025,7 +5030,14 @@
     if (typeof message.content === 'string' && message.content.trim()) return message.content;
     if (Array.isArray(message.segments)) {
       return message.segments
-        .map((segment) => (segment && typeof segment.text === 'string' ? segment.text : ''))
+        .map((segment) => {
+          if (segment && typeof segment.text === 'string') return segment.text;
+          if (segment?.type === 'image') {
+            const label = `[图片] ${segment.prompt || segment.alt || ''}`.trim();
+            return segment.path ? `${label}\n${segment.path}` : label;
+          }
+          return '';
+        })
         .filter((text) => text.trim())
         .join('\n\n');
     }
@@ -5276,6 +5288,11 @@
           return {
             type: 'image',
             src: typeof segment.src === 'string' ? segment.src : '',
+            rawUrl: typeof segment.rawUrl === 'string' ? segment.rawUrl : '',
+            path: typeof segment.path === 'string' ? segment.path : '',
+            relativePath: typeof segment.relativePath === 'string' ? segment.relativePath : '',
+            rootKey: typeof segment.rootKey === 'string' ? segment.rootKey : '',
+            mime: typeof segment.mime === 'string' ? segment.mime : '',
             alt: typeof segment.alt === 'string' ? segment.alt : 'Generated image',
             id: segment.id || null,
             prompt: typeof segment.prompt === 'string' ? segment.prompt : '',
@@ -5388,22 +5405,83 @@
     return group;
   }
 
+  async function openGeneratedImageInViewer(segment = {}) {
+    const imagePath = String(segment.path || '').trim();
+    if (!imagePath) {
+      if (segment.src) window.open(segment.src, '_blank', 'noopener');
+      return;
+    }
+    clearFileViewerObjectUrl();
+    fileViewerState = { open: true, loading: true, error: '', data: null, activePath: imagePath, activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    syncFileViewerWidthForViewport();
+    renderFileTree();
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ path: imagePath });
+      const response = await fetch(`/api/generated-image-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== imagePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, 'preview');
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+    } catch (err) {
+      if (fileViewerState.activePath !== imagePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '无法打开生成图片';
+      fileViewerState.data = null;
+      renderFileViewer();
+    }
+  }
+
   function createImageSegmentElement(segment = {}) {
     if (!segment.src) return null;
     const wrap = document.createElement('figure');
     wrap.className = 'msg-image-segment msg-segment';
+    const imgButton = document.createElement('button');
+    imgButton.type = 'button';
+    imgButton.className = 'msg-generated-image-button';
+    imgButton.title = segment.path ? '打开图片预览' : '在新窗口打开图片';
     const img = document.createElement('img');
     img.className = 'msg-generated-image';
     img.src = segment.src;
     img.alt = segment.alt || 'Generated image';
     img.loading = 'lazy';
-    wrap.appendChild(img);
-    if (segment.prompt) {
-      const caption = document.createElement('figcaption');
-      caption.className = 'msg-image-caption';
-      caption.textContent = 'AI 生成图片';
-      wrap.appendChild(caption);
+    imgButton.appendChild(img);
+    imgButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openGeneratedImageInViewer(segment);
+    });
+    wrap.appendChild(imgButton);
+
+    const caption = document.createElement('figcaption');
+    caption.className = 'msg-image-caption';
+    const title = document.createElement('span');
+    title.className = 'msg-image-title';
+    title.textContent = 'AI 生成图片';
+    caption.appendChild(title);
+    if (segment.path) {
+      const pathBtn = document.createElement('button');
+      pathBtn.type = 'button';
+      pathBtn.className = 'msg-image-path';
+      pathBtn.textContent = segment.path;
+      pathBtn.title = '点击后在右侧文件预览器打开图片';
+      pathBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openGeneratedImageInViewer(segment);
+      });
+      caption.appendChild(pathBtn);
     }
+    wrap.appendChild(caption);
     return wrap;
   }
 

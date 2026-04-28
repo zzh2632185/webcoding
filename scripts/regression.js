@@ -2966,6 +2966,89 @@ async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
   });
 }
 
+async function runCodexBridgeRealtimeUsageRegressionCase({ tempRoot }) {
+  const caseRoot = path.join(tempRoot, 'codex-bridge-realtime-usage');
+  const configDir = path.join(caseRoot, 'config');
+  const sessionsDir = path.join(caseRoot, 'sessions');
+  const logsDir = path.join(caseRoot, 'logs');
+  const homeDir = path.join(caseRoot, 'home');
+  mkdirp(configDir);
+  mkdirp(sessionsDir);
+  mkdirp(logsDir);
+  mkdirp(homeDir);
+
+  const codexDir = path.join(homeDir, '.codex');
+  mkdirp(codexDir);
+  fs.writeFileSync(path.join(codexDir, 'config.toml'), [
+    'model_provider = "cliproxyapi"',
+    'model = "gpt-5.5"',
+    'model_context_window = 400000',
+    '',
+    '[model_providers.cliproxyapi]',
+    'name = "cliproxyapi"',
+    'wire_api = "responses"',
+    'base_url = "https://cpap.example.test/v1"',
+  ].join('\n'));
+  fs.writeFileSync(path.join(codexDir, 'auth.json'), JSON.stringify({
+    OPENAI_API_KEY: 'local-cpap-key',
+  }, null, 2));
+
+  const port = await getFreePort();
+  const password = 'Regression!234';
+  const serverEnv = {
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  };
+
+  await withServer(serverEnv, async () => {
+    await withAuthedClient(port, password, async ({ client }) => {
+      const session = await client.sendAndWaitType(
+        { type: 'new_session', agent: 'codex', cwd: caseRoot, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === 'codex' && msg.cwd === caseRoot,
+      );
+
+      client.send(buildAgentMessagePayload({ text: 'trigger codex slow stream realtime-usage', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await client.waitForType('text_delta', (msg) => msg.sessionId === session.sessionId && /slow-start:realtime-usage/.test(msg.text || ''), 5000);
+
+      const bridgeRuntimePath = path.join(configDir, 'bridge-runtime.json');
+      await waitForCondition(() => fs.existsSync(bridgeRuntimePath), { timeoutMs: 3000, label: 'bridge runtime token' });
+      const bridgeRuntime = JSON.parse(fs.readFileSync(bridgeRuntimePath, 'utf8'));
+      const bridgeEntry = bridgeRuntime?.runtimes
+        ? Object.values(bridgeRuntime.runtimes).find((entry) => entry?.upstream?.name === '本地 Codex: cliproxyapi')
+        : null;
+      assert(bridgeEntry?.token, 'Realtime bridge usage regression should have an active bridge token');
+
+      fs.appendFileSync(path.join(configDir, 'bridge-usage.jsonl'), `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        token: bridgeEntry.token,
+        provider: 'openai',
+        model: 'gpt-5.5',
+        endpoint: 'responses_stream',
+        usage: { input_tokens: 12345, cached_tokens: 10000, output_tokens: 67, total_tokens: 12412 },
+      })}\n`);
+
+      const usageMsg = await client.waitForType(
+        'usage',
+        (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 12345,
+        5000,
+      );
+      assert(usageMsg.currentUsage?.outputTokens === 67, 'Realtime bridge usage should preserve output tokens');
+      assert(usageMsg.currentUsage?.totalTokens === 12412, 'Realtime bridge usage should preserve total tokens');
+
+      await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 10000);
+      const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+      assert(stored.lastUsage?.inputTokens === 12345, 'Realtime bridge usage should persist session lastUsage before process completion');
+    });
+  });
+}
+
 
 async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
   const caseRoot = path.join(tempRoot, 'codex-config-carryover');
@@ -3873,6 +3956,7 @@ async function main() {
       await runner.run('claude sticky resume across channel switch', () => runClaudeStickyResumeRegressionCase(ctx));
       await runner.run('codex local config fingerprint refresh', () => runCodexLocalConfigFingerprintRegressionCase(ctx));
       await runner.run('codex local bridge runtime', () => runCodexLocalBridgeRuntimeRegressionCase(ctx));
+      await runner.run('codex bridge realtime usage', () => runCodexBridgeRealtimeUsageRegressionCase(ctx));
       await runner.run('codex config switch carryover', () => runCodexConfigCarryoverRegressionCase(ctx));
       await runner.run('codex sticky resume inside managed runtime home', () => runCodexStickyUnifiedResumeRegressionCase(ctx));
       await runner.run('codex config migration', () => runCodexConfigMigrationRegressionCase(ctx));

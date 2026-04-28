@@ -3274,7 +3274,23 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-width: min(420px, 74vw);
+  max-width: min(520px, 78vw);
+}
+
+.msg-generated-image-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+  text-align: left;
+}
+
+.msg-generated-image-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: calc(var(--chat-card-border-radius) + 4px);
 }
 
 .msg-generated-image {
@@ -3287,10 +3303,44 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   box-shadow: var(--shadow);
 }
 
+.msg-generated-image-button:hover .msg-generated-image {
+  border-color: var(--accent);
+}
+
 .msg-image-caption {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   color: var(--text-secondary);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.msg-image-title {
+  font-weight: 600;
+}
+
+.msg-image-path {
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--accent);
+  cursor: pointer;
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 5px 7px;
+  text-align: left;
+  user-select: text;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.msg-image-path:hover {
+  background: var(--accent-soft-strong);
+  border-color: var(--accent);
 }
 
 /* System messages */

@@ -2684,17 +2684,41 @@ function persistGeneratedImageFromResult(result, sessionId, callId) {
   return filePath;
 }
 
+function generatedImageInfoForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!isGeneratedImageExtension(absPath)) return null;
+  for (const [rootKey, rootDir] of generatedImageRootEntries()) {
+    const root = path.resolve(rootDir);
+    if (!isPathInside(absPath, root)) continue;
+    const relativeParts = path.relative(root, absPath).split(path.sep).filter(Boolean);
+    if (!relativeParts.length || relativeParts.some((part) => part === '..' || part.includes('\0'))) return null;
+    return {
+      rootKey,
+      root,
+      path: absPath,
+      relativePath: relativeParts.join('/'),
+      rawUrl: generatedImageUrlForFile(absPath),
+    };
+  }
+  return null;
+}
+
 function createGeneratedImageSegmentFromCodexEvent(codexEvent = {}, options = {}) {
   const callId = String(codexEvent.call_id || '').trim();
   const preferredThreadId = String(options.threadId || options.runtimeSessionId || '').trim();
   const existingPath = findCodexGeneratedImageByCallId(callId, preferredThreadId);
   const filePath = existingPath || persistGeneratedImageFromResult(codexEvent.result, options.sessionId || preferredThreadId || 'unknown', callId);
-  const src = filePath ? generatedImageUrlForFile(filePath) : '';
+  const info = filePath ? generatedImageInfoForFile(filePath) : null;
+  const src = info?.rawUrl || '';
   if (!src) return null;
-  const detectedMime = extFromMime('image/png') ? 'image/png' : 'image/png';
+  const detectedMime = getFileMime(info.path) || 'image/png';
   return {
     id: callId || null,
     src,
+    rawUrl: src,
+    path: info.path,
+    relativePath: info.relativePath,
+    rootKey: info.rootKey,
     mime: detectedMime,
     alt: 'Generated image',
     prompt: codexEvent.revised_prompt || '',
@@ -4459,6 +4483,70 @@ function applyBridgeUsageToEntry(sessionId, entry) {
   return latest.usage;
 }
 
+function bridgeUsageRecordKey(record, usage) {
+  return JSON.stringify({
+    timestamp: record?.timestamp || '',
+    token: record?.token || '',
+    provider: record?.provider || '',
+    model: record?.model || '',
+    endpoint: record?.endpoint || '',
+    usage,
+  });
+}
+
+function applyRealtimeBridgeUsageRecord(record) {
+  const token = String(record?.token || '').trim();
+  if (!token || activeProcesses.size === 0) return false;
+  const usage = normalizeBridgeUsageRecordUsage(record?.usage);
+  if (!usage) return false;
+
+  const timestampMs = Date.parse(record?.timestamp || '');
+  const recordKey = bridgeUsageRecordKey(record, usage);
+  let applied = false;
+
+  for (const [sessionId, entry] of activeProcesses) {
+    if (!entry || entry.agent !== 'codex') continue;
+    if (String(entry.bridgeToken || '').trim() !== token) continue;
+    const sinceMs = Number(entry.startedAtMs || 0) ? Math.max(0, Number(entry.startedAtMs) - 5000) : 0;
+    if (sinceMs && Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
+    if (entry.lastRealtimeBridgeUsageRecordKey === recordKey) continue;
+
+    entry.lastRealtimeBridgeUsageRecordKey = recordKey;
+    entry.lastRealtimeBridgeUsageTimestampMs = Number.isFinite(timestampMs) ? timestampMs : Date.now();
+    entry.lastUsage = usage;
+
+    const session = loadSession(sessionId);
+    if (session) {
+      session.lastUsage = usage;
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+
+    sendRuntimeMessage(entry, {
+      type: 'usage',
+      sessionId,
+      totalUsage: session?.totalUsage || null,
+      currentUsage: usage,
+      contextWindowTokens: session?.contextWindowTokens || null,
+    });
+    applied = true;
+  }
+
+  return applied;
+}
+
+function processBridgeUsageLogLine(line) {
+  let record = null;
+  try { record = JSON.parse(line); } catch { return; }
+  try {
+    applyRealtimeBridgeUsageRecord(record);
+  } catch (error) {
+    plog('WARN', 'bridge_usage_realtime_error', {
+      error: error?.message || String(error),
+    });
+  }
+}
+
 function listBridgeRuntimeTokens() {
   return Object.keys(loadBridgeRuntimeStore().runtimes);
 }
@@ -4744,6 +4832,9 @@ class FileTailer {
   }
 }
 
+const bridgeUsageTailer = new FileTailer(BRIDGE_USAGE_PATH, processBridgeUsageLogLine);
+bridgeUsageTailer.start();
+
 // === Process Lifecycle ===
 
 function firstMeaningfulLine(text) {
@@ -4896,6 +4987,79 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
   return { pendingRetry, contextLimitExceeded, completionError };
 }
 
+
+function imageSegmentIdentity(segment) {
+  if (!segment || typeof segment !== 'object') return '';
+  return String(segment.id || segment.path || segment.rawUrl || segment.src || '').trim();
+}
+
+function collectAssistantImageSegments(messages) {
+  const images = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || message.role !== 'assistant') continue;
+    for (const segment of Array.isArray(message.segments) ? message.segments : []) {
+      if (segment && segment.type === 'image') images.push(segment);
+    }
+  }
+  return images;
+}
+
+function findLatestCodexRolloutForThread(threadId, startedAtMs = 0) {
+  const targetThreadId = String(threadId || '').trim();
+  if (!targetThreadId || typeof getCodexRolloutFiles !== 'function' || typeof parseCodexRolloutFile !== 'function') return null;
+  const minMtime = startedAtMs ? Math.max(0, Number(startedAtMs) - 60 * 1000) : 0;
+  let best = null;
+  for (const filePath of getCodexRolloutFiles()) {
+    let stat = null;
+    try { stat = fs.statSync(filePath); } catch { continue; }
+    const parsed = parseCodexRolloutFile(filePath);
+    if (parsed?.meta?.threadId !== targetThreadId) continue;
+    const updatedAtMs = parsed.meta.updatedAt ? Date.parse(parsed.meta.updatedAt) : 0;
+    const score = Math.max(stat.mtimeMs || 0, Number.isFinite(updatedAtMs) ? updatedAtMs : 0);
+    if (minMtime && score && score < minMtime) continue;
+    if (!best || score > best.score) best = { filePath, parsed, score };
+  }
+  return best;
+}
+
+function appendCodexRolloutImagesToEntry(sessionId, entry) {
+  if (!entry || entry.agent !== 'codex') return 0;
+  const session = loadSession(sessionId);
+  const threadIds = new Set();
+  if (entry.codexRuntimeSessionId) threadIds.add(String(entry.codexRuntimeSessionId));
+  if (session?.codexThreadId) threadIds.add(String(session.codexThreadId));
+  for (const runtimeId of getAllRuntimeSessionIds(session, 'codex')) threadIds.add(String(runtimeId));
+  if (threadIds.size === 0) return 0;
+
+  entry.segments = Array.isArray(entry.segments) ? entry.segments : [];
+  const known = new Set(entry.segments.filter((segment) => segment?.type === 'image').map(imageSegmentIdentity).filter(Boolean));
+  let appended = 0;
+
+  for (const threadId of threadIds) {
+    const rollout = findLatestCodexRolloutForThread(threadId, entry.startedAtMs || 0);
+    const images = collectAssistantImageSegments(rollout?.parsed?.messages || []);
+    for (const image of images) {
+      const identity = imageSegmentIdentity(image);
+      if (identity && known.has(identity)) continue;
+      const segment = { type: 'image', ...image };
+      entry.segments.push(segment);
+      if (identity) known.add(identity);
+      appended += 1;
+      sendRuntimeMessage(entry, { type: 'image_delta', sessionId, ...image });
+    }
+    if (appended > 0) {
+      plog('INFO', 'codex_rollout_images_recovered', {
+        sessionId: sessionId.slice(0, 8),
+        threadId,
+        count: appended,
+        rolloutPath: rollout?.filePath || null,
+      });
+      break;
+    }
+  }
+  return appended;
+}
+
 function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const session = loadSession(sessionId);
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || (entry.segments && entry.segments.length > 0))) {
@@ -5032,6 +5196,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   }
 
   applyBridgeUsageToEntry(sessionId, entry);
+  appendCodexRolloutImagesToEntry(sessionId, entry);
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
@@ -5154,6 +5319,34 @@ function recoverProcesses() {
 // === HTTP Static File Server ===
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === 'GET' && url.pathname === '/api/generated-image-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const requestedPath = url.searchParams.get('path') || '';
+      const info = generatedImageInfoForFile(requestedPath);
+      if (!info) {
+        return jsonResponse(res, 400, { ok: false, message: '生成图片路径无效或不在允许目录内' });
+      }
+      const stat = fs.statSync(info.path);
+      if (!stat.isFile()) {
+        return jsonResponse(res, 404, { ok: false, message: '图片不存在' });
+      }
+      return jsonResponse(res, 200, {
+        ...buildFileIdentity(info.root, info.path, stat, 'image'),
+        path: info.path,
+        relativePath: info.path,
+        generatedRelativePath: info.relativePath,
+        generatedRootKey: info.rootKey,
+        rawUrl: info.rawUrl,
+      });
+    } catch (err) {
+      return jsonErrorResponse(res, err, '无法打开生成图片');
+    }
+  }
 
   if (req.method === 'GET' && url.pathname.startsWith('/api/generated-image/')) {
     const prefix = '/api/generated-image/';
