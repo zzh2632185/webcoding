@@ -299,6 +299,13 @@
   const attachUploadImage = $('#attach-upload-image');
   const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
+  const messagesWrap = messagesDiv?.closest('.messages-wrap');
+  const jumpToLatestBtn = document.createElement('button');
+  jumpToLatestBtn.type = 'button';
+  jumpToLatestBtn.className = 'jump-to-latest-btn';
+  jumpToLatestBtn.textContent = '新内容 ↓';
+  jumpToLatestBtn.hidden = true;
+  if (messagesWrap) messagesWrap.appendChild(jumpToLatestBtn);
   const msgInput = $('#msg-input');
   const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
@@ -4410,7 +4417,7 @@
       prompt: image.prompt || '',
     });
     if (segmentEl) bubble.appendChild(segmentEl);
-    scrollToBottom();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function handleImageDeltaMessage(msg) {
@@ -4939,7 +4946,7 @@
     textDiv.dataset.rawText = nextText;
     textDiv.innerHTML = renderMarkdown(nextText);
     composeState.pendingText = '';
-    scrollToBottom();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function renderMarkdown(text) {
@@ -5524,6 +5531,7 @@
       const segmentEl = buildMessageSegmentElement(segment);
       if (segmentEl) bubble.appendChild(segmentEl);
     });
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function markStreamingProcessTextSegments() {
@@ -5907,7 +5915,7 @@
     } else {
       bubble.appendChild(details);
     }
-    scrollToBottom();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function updateToolCall(toolUseId, result) {
@@ -5996,12 +6004,46 @@
     div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  function scrollToBottom() {
-    requestAnimationFrame(() => {
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  const MESSAGE_BOTTOM_THRESHOLD = 72;
+  let shouldFollowMessageStream = true;
+  let messageScrollProgrammatic = false;
+
+  function getMessageBottomDistance() {
+    return Math.max(0, messagesDiv.scrollHeight - messagesDiv.clientHeight - messagesDiv.scrollTop);
+  }
+
+  function isMessagesNearBottom() {
+    return getMessageBottomDistance() <= MESSAGE_BOTTOM_THRESHOLD;
+  }
+
+  function setJumpToLatestVisible(visible) {
+    if (!jumpToLatestBtn) return;
+    jumpToLatestBtn.hidden = !visible;
+  }
+
+  function syncMessageFollowStateFromScroll() {
+    shouldFollowMessageStream = isMessagesNearBottom();
+    setJumpToLatestVisible(!shouldFollowMessageStream && composeState.isGenerating);
+  }
+
+  function scrollToBottom(options = {}) {
+    const onlyIfFollowing = options.onlyIfFollowing === true;
+    if (onlyIfFollowing && !shouldFollowMessageStream) {
+      setJumpToLatestVisible(composeState.isGenerating);
       updateScrollbar();
+      return;
+    }
+    requestAnimationFrame(() => {
+      messageScrollProgrammatic = true;
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      shouldFollowMessageStream = true;
+      setJumpToLatestVisible(false);
+      updateScrollbar();
+      requestAnimationFrame(() => { messageScrollProgrammatic = false; });
     });
   }
+
+  jumpToLatestBtn.addEventListener('click', () => scrollToBottom());
 
   // --- Custom Scrollbar ---
   const scrollbarEl = document.getElementById('custom-scrollbar');
@@ -6024,6 +6066,7 @@
 
   messagesDiv.addEventListener('scroll', () => {
     updateScrollbar();
+    if (!messageScrollProgrammatic) syncMessageFollowStateFromScroll();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
     clearTimeout(scrollbarEl._hideTimer);
