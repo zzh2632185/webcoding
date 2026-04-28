@@ -6285,6 +6285,9 @@ body.file-viewer-resizing * {
 }
 .file-viewer-table-wrap {
   padding: 12px;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
   overflow: auto;
 }
 .file-viewer-table {
