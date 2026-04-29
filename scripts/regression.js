@@ -866,6 +866,8 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
   const sessionListSource = extractFunctionSource(appSource, 'handleSessionListMessage');
   const markReadSource = extractFunctionSource(appSource, 'markSessionReadLocally');
+  const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
 
   assert(
     findReusableSource.includes('getLastMessageElement()'),
@@ -925,6 +927,22 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   assert(
     /#streaming-msg\s+\.msg-actions\s*\{[^}]*display:\s*none;/.test(styleSource),
     'Streaming placeholder must hide message actions/copy button while loading',
+  );
+  assert(
+    createMessageActionsSource.includes("role === 'assistant'")
+      && createMessageActionsSource.includes('msg-jump-top-btn')
+      && createMessageActionsSource.includes('handleMessageJumpTopClick(topBtn)'),
+    'Assistant message actions must include a per-message jump-to-top button',
+  );
+  assert(
+    scrollMessageToTopSource.includes('getBoundingClientRect()')
+      && scrollMessageToTopSource.includes('messagesDiv.scrollTo')
+      && scrollMessageToTopSource.includes('shouldFollowMessageStream = false'),
+    'Message jump-to-top must scroll the message container to the selected message head without re-enabling stream follow',
+  );
+  assert(
+    styleSource.includes('.msg-jump-top-btn'),
+    'Message jump-to-top button must have a dedicated CSS hook',
   );
 }
 

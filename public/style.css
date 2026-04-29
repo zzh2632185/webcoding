@@ -3259,6 +3259,9 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   border-color: var(--blue);
   outline: none;
 }
+.msg-jump-top-btn {
+  color: var(--blue);
+}
 .msg-copy-btn.copied {
   color: var(--success, #118a4f);
   border-color: var(--success, #118a4f);

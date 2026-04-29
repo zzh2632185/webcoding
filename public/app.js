@@ -5174,9 +5174,44 @@
     });
   }
 
-  function createMessageActions() {
+  function scrollMessageToTop(msgEl) {
+    if (!msgEl || !messagesDiv) return;
+    const containerRect = messagesDiv.getBoundingClientRect();
+    const messageRect = msgEl.getBoundingClientRect();
+    const targetTop = Math.max(0, messagesDiv.scrollTop + messageRect.top - containerRect.top - 12);
+    messageScrollProgrammatic = true;
+    shouldFollowMessageStream = false;
+    setJumpToLatestVisible(composeState.isGenerating);
+    messagesDiv.scrollTo({ top: targetTop, behavior: 'smooth' });
+    updateScrollbar();
+    setTimeout(() => {
+      messageScrollProgrammatic = false;
+      updateScrollbar();
+    }, 360);
+  }
+
+  function handleMessageJumpTopClick(btn) {
+    const msgEl = btn?.closest('.msg');
+    scrollMessageToTop(msgEl);
+  }
+
+  function createMessageActions(role) {
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
+    if (role === 'assistant') {
+      const topBtn = document.createElement('button');
+      topBtn.type = 'button';
+      topBtn.className = 'msg-action-btn msg-jump-top-btn';
+      topBtn.textContent = '本条顶部 ↑';
+      topBtn.title = '跳到这条回复的开头';
+      topBtn.setAttribute('aria-label', '跳到这条回复的开头');
+      topBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        handleMessageJumpTopClick(topBtn);
+      });
+      actions.appendChild(topBtn);
+    }
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
     copyBtn.className = 'msg-action-btn msg-copy-btn';
@@ -5246,7 +5281,7 @@
     const contentWrap = document.createElement('div');
     contentWrap.className = 'msg-content';
     contentWrap.appendChild(bubble);
-    contentWrap.appendChild(createMessageActions());
+    contentWrap.appendChild(createMessageActions(role));
 
     div.appendChild(avatar);
     div.appendChild(contentWrap);
