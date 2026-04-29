@@ -788,6 +788,7 @@ const MAX_SERVER_QUEUED_MESSAGES = 10;
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, segments, lastCost, tailer }
 const activeProcesses = new Map();
+const activeHandoffProcesses = new Map();
 
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
@@ -2851,7 +2852,7 @@ const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
 const HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET = 90000;
 const HANDOFF_AI_MESSAGE_CHAR_LIMIT = 2400;
 const HANDOFF_AI_SUMMARY_MAX_CHARS = 12000;
-const HANDOFF_AI_TIMEOUT_MS = 180000;
+const HANDOFF_AI_TIMEOUT_MS = 300000;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
@@ -4667,6 +4668,49 @@ function cleanRunDir(sessionId) {
   } catch {}
 }
 
+function getActiveHandoffPending(session) {
+  const pending = session && typeof session === 'object' ? session.handoffPending : null;
+  if (!pending || pending.status !== 'analyzing') return null;
+  const expiresAt = pending.expiresAt ? Date.parse(pending.expiresAt) : 0;
+  if (expiresAt && expiresAt < Date.now()) return null;
+  return {
+    id: pending.id || null,
+    status: 'analyzing',
+    message: pending.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+    startedAt: pending.startedAt || null,
+    updatedAt: pending.updatedAt || null,
+    newTaskPreview: pending.newTaskPreview || '',
+  };
+}
+
+function setSessionHandoffPending(session, pending) {
+  if (!session) return null;
+  session.handoffPending = pending;
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sessionListCache.expiresAt = 0;
+  return getActiveHandoffPending(session);
+}
+
+function clearSessionHandoffPending(sessionId) {
+  const session = loadSession(sessionId);
+  if (!session || !session.handoffPending) return null;
+  delete session.handoffPending;
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sessionListCache.expiresAt = 0;
+  return session;
+}
+
+function broadcastSessionListRefresh() {
+  const sessions = getSessionListSnapshot({ forceRefresh: true });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated === true) {
+      sendSessionList(client, { sessions });
+    }
+  }
+}
+
 function collectSessionListSnapshot() {
   const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
   const sessions = [];
@@ -4688,6 +4732,7 @@ function collectSessionListSnapshot() {
         reasoningEffort: s.reasoningEffort || '',
         queuedCount: Array.isArray(s.queuedMessages) ? s.queuedMessages.length : 0,
         isRunning: activeProcesses.has(s.id),
+        handoffPending: getActiveHandoffPending(s),
         projectId: s.projectId || null,
         cwd: s.cwd || localMeta?.cwd || null,
         importedFrom: s.importedFrom || localMeta?.projectDir || null,
@@ -6804,11 +6849,20 @@ function runAgentOnceForText(session, inputText, options = {}) {
     let stderr = '';
     let settled = false;
     const timeoutMs = Number(options.timeoutMs || HANDOFF_AI_TIMEOUT_MS) || HANDOFF_AI_TIMEOUT_MS;
+    const abortSignal = options.abortSignal || options.signal || null;
+    let abortHandler = null;
+
+    function handoffAbortError() {
+      const error = new Error('AI 交接分析已停止');
+      error.code = 'HANDOFF_ABORTED';
+      return error;
+    }
 
     function settle(fn, value) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (abortSignal && abortHandler) abortSignal.removeEventListener('abort', abortHandler);
       fn(value);
     }
 
@@ -6828,6 +6882,11 @@ function runAgentOnceForText(session, inputText, options = {}) {
       settle(reject, new Error('AI 交接分析超时'));
     }, timeoutMs);
 
+    if (abortSignal?.aborted) {
+      clearTimeout(timer);
+      return reject(handoffAbortError());
+    }
+
     try {
       proc = spawn(spawnSpec.command, spawnSpec.args, {
         env: spawnSpec.env,
@@ -6842,6 +6901,16 @@ function runAgentOnceForText(session, inputText, options = {}) {
       return reject(error);
     }
     entry.pid = proc.pid;
+    if (typeof options.onProcess === 'function') {
+      try { options.onProcess(proc, entry, spawnSpec); } catch {}
+    }
+    if (abortSignal) {
+      abortHandler = () => {
+        try { if (proc?.pid) killProcess(proc.pid, true); } catch {}
+        settle(reject, handoffAbortError());
+      };
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
+    }
 
     proc.stdout.setEncoding('utf8');
     proc.stdout.on('data', (chunk) => {
@@ -6888,7 +6957,11 @@ async function generateAiHandoffSummary(sourceSession, newTask, attachments = []
     projectId: sourceSession?.projectId || null,
   };
   const prompt = buildAiHandoffSummaryPrompt(sourceSession, newTask, attachments);
-  const summary = await runAgentOnceForText(scratchSession, prompt, { timeoutMs: HANDOFF_AI_TIMEOUT_MS });
+  const summary = await runAgentOnceForText(scratchSession, prompt, {
+    timeoutMs: HANDOFF_AI_TIMEOUT_MS,
+    abortSignal: options.abortSignal || options.signal || null,
+    onProcess: options.onProcess,
+  });
   const normalized = normalizeReplayText(summary);
   if (!normalized) throw new Error('AI 没有返回交接分析');
   return normalized.length > HANDOFF_AI_SUMMARY_MAX_CHARS
@@ -6972,22 +7045,88 @@ async function handleHandoffSession(ws, msg) {
     return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：请输入要在新窗口继续的新任务。' });
   }
 
+  const pendingHandoff = setSessionHandoffPending(sourceSession, {
+    id: crypto.randomUUID(),
+    status: 'analyzing',
+    message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+    newTaskPreview: truncateReplayText(normalizedTask || '请继续处理接力任务。', 120),
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + HANDOFF_AI_TIMEOUT_MS + 60000).toISOString(),
+  });
   wsSend(ws, {
     type: 'system_message',
     sessionId: sourceSessionId,
-    message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+    message: pendingHandoff?.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+  });
+  broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: pendingHandoff });
+  broadcastSessionListRefresh();
+  const handoffAbortController = new AbortController();
+  const activeHandoffEntry = {
+    controller: handoffAbortController,
+    pid: null,
+    proc: null,
+    sourceSessionId,
+    pendingId: pendingHandoff?.id || null,
+    startedAt: pendingHandoff?.startedAt || new Date().toISOString(),
+  };
+  activeHandoffProcesses.set(sourceSessionId, activeHandoffEntry);
+  plog('INFO', 'handoff_ai_summary_start', {
+    sourceSessionId: sourceSessionId.slice(0, 8),
+    agent,
+    historyCount: Array.isArray(sourceSession.messages) ? sourceSession.messages.length : 0,
   });
 
   let aiSummary = '';
+  let handoffSummarySource = 'ai';
   try {
-    aiSummary = await generateAiHandoffSummary(sourceSession, normalizedTask, resolvedAttachments, { agent });
+    aiSummary = await generateAiHandoffSummary(sourceSession, normalizedTask, resolvedAttachments, {
+      agent,
+      abortSignal: handoffAbortController.signal,
+      onProcess: (proc) => {
+        activeHandoffEntry.proc = proc;
+        activeHandoffEntry.pid = proc?.pid || null;
+      },
+    });
+    plog('INFO', 'handoff_ai_summary_complete', {
+      sourceSessionId: sourceSessionId.slice(0, 8),
+      chars: aiSummary.length,
+    });
   } catch (error) {
-    return wsSend(ws, {
-      type: 'error',
+    if (handoffAbortController.signal.aborted || error?.code === 'HANDOFF_ABORTED') {
+      activeHandoffProcesses.delete(sourceSessionId);
+      clearSessionHandoffPending(sourceSessionId);
+      broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: null });
+      broadcastSessionListRefresh();
+      wsSend(ws, { type: 'system_message', sessionId: sourceSessionId, message: '已停止接力 AI 交接分析。' });
+      plog('INFO', 'handoff_ai_summary_aborted', { sourceSessionId: sourceSessionId.slice(0, 8), pid: activeHandoffEntry.pid || null });
+      return;
+    }
+    handoffSummarySource = 'fallback';
+    const fallback = buildHandoffRuntimePrompt(sourceSession, normalizedTask, resolvedAttachments);
+    const reason = error?.message || String(error);
+    aiSummary = [
+      `AI 交接分析未能在限定时间内完成（${reason}）。`,
+      '为避免接力中断，已自动改用系统结构化摘要继续创建新窗口。',
+      '',
+      fallback.summaryText || '系统未能生成结构化摘要，请参考最近对话和新任务继续。',
+    ].join('\n');
+    wsSend(ws, {
+      type: 'system_message',
       sessionId: sourceSessionId,
-      message: `接力失败：AI 交接分析没有完成（${error?.message || String(error)}）`,
+      message: `AI 交接分析未完成（${reason}），已改用系统摘要继续创建接力新窗口…`,
+    });
+    plog('WARN', 'handoff_ai_summary_fallback', {
+      sourceSessionId: sourceSessionId.slice(0, 8),
+      reason,
+      fallbackChars: aiSummary.length,
     });
   }
+
+  activeHandoffProcesses.delete(sourceSessionId);
+  const refreshedSourceAfterSummary = clearSessionHandoffPending(sourceSessionId);
+  broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: null });
+  if (refreshedSourceAfterSummary) broadcastSessionListRefresh();
 
   detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
 
@@ -6998,7 +7137,9 @@ async function handleHandoffSession(ws, msg) {
   const handoff = {
     prompt: [
       '[webcoding 接力新窗口]',
-      '这是 AI 已经根据旧窗口聊天记录和用户新任务分析出的交接文档。',
+      handoffSummarySource === 'ai'
+        ? '这是 AI 已经根据旧窗口聊天记录和用户新任务分析出的交接文档。'
+        : 'AI 交接分析未完成，下面是系统结构化摘要和旧窗口关键信息。',
       '请不要再要求用户重新整理进度；直接基于交接文档和新任务继续执行。',
       '',
       '[来源窗口]',
@@ -7013,11 +7154,13 @@ async function handleHandoffSession(ws, msg) {
       taskText,
     ].filter((line) => line !== '').join('\n'),
     summaryText: aiSummary,
-    summaryDetailed: true,
+    summaryDetailed: handoffSummarySource === 'ai',
     recentCount: 0,
     historyCount: Array.isArray(sourceSession.messages) ? sourceSession.messages.length : 0,
   };
-  const handoffNotice = `已创建接力新窗口：AI 已根据新任务分析 ${handoff.historyCount} 条旧窗口消息，并生成交接文档。`;
+  const handoffNotice = handoffSummarySource === 'ai'
+    ? `已创建接力新窗口：AI 已根据新任务分析 ${handoff.historyCount} 条旧窗口消息，并生成交接文档。`
+    : `已创建接力新窗口：AI 交接分析未完成，已使用系统摘要接力 ${handoff.historyCount} 条旧窗口消息。`;
   const handoffSummaryMessage = [
     `接力来源：${sourceTitle}`,
     sourceSession.cwd ? `工作目录：${sourceSession.cwd}` : '',
@@ -7070,11 +7213,18 @@ async function handleHandoffSession(ws, msg) {
   });
 
   wsSend(ws, { type: 'system_message', sessionId: id, message: handoffNotice });
+  broadcastSessionListRefresh();
 
   if (resolvedMode.downgraded) {
     wsSend(ws, { type: 'system_message', sessionId: id, message: resolvedMode.message });
     wsSend(ws, { type: 'mode_changed', sessionId: id, mode: resolvedMode.mode });
   }
+  plog('INFO', 'handoff_session_created', {
+    sourceSessionId: sourceSessionId.slice(0, 8),
+    sessionId: id.slice(0, 8),
+    summarySource: handoffSummarySource,
+    historyCount: handoff.historyCount,
+  });
 }
 
 function handleLoadSession(ws, sessionId) {
@@ -7140,6 +7290,7 @@ function handleLoadSession(ws, sessionId) {
     historyPending: olderChunks.length > 0,
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
+    handoffPending: getActiveHandoffPending(session),
     ...buildSessionRuntimeMeta(session),
   });
 
@@ -7383,7 +7534,18 @@ function handleAbort(ws) {
   const sessionId = wsSessionMap.get(ws);
   if (!sessionId) return;
   const entry = activeProcesses.get(sessionId);
-  if (!entry) return;
+  if (!entry) {
+    const handoffEntry = activeHandoffProcesses.get(sessionId);
+    if (!handoffEntry) return;
+    plog('INFO', 'user_abort_handoff', { sessionId: sessionId.slice(0, 8), pid: handoffEntry.pid || null });
+    try { handoffEntry.controller?.abort(); } catch {}
+    try { if (handoffEntry.pid) killProcess(handoffEntry.pid, true); } catch {}
+    clearSessionHandoffPending(sessionId);
+    broadcastToSessionViewers(sessionId, { type: 'handoff_status', sessionId, handoffPending: null });
+    broadcastSessionListRefresh();
+    wsSend(ws, { type: 'system_message', sessionId, message: '正在停止接力 AI 交接分析…' });
+    return;
+  }
 
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
   killProcess(entry.pid);
@@ -7690,6 +7852,7 @@ function handleMessage(ws, msg, options = {}) {
       hasUnread: false,
       historyPending: false,
       isRunning: false,
+      handoffPending: getActiveHandoffPending(session),
       ...buildSessionRuntimeMeta(session),
     });
   }

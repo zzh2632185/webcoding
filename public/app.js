@@ -147,6 +147,7 @@
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
+  let currentHandoffPending = null;
   let skipDeleteConfirm = localStorage.getItem('webcoding-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
@@ -220,6 +221,8 @@
     set currentCwd(value) { currentCwd = value; },
     get currentSessionRunning() { return currentSessionRunning; },
     set currentSessionRunning(value) { currentSessionRunning = value; },
+    get currentHandoffPending() { return currentHandoffPending; },
+    set currentHandoffPending(value) { currentHandoffPending = value; },
   };
 
   const composeState = {
@@ -310,6 +313,7 @@
   const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
   const handoffBtn = $('#handoff-btn');
+  const composerStatus = $('#composer-status');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
@@ -734,7 +738,7 @@
     const visibleSessions = getVisibleSessions();
     const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     const activeProject = getCurrentProjectContext();
-    const runningCount = visibleSessions.filter((session) => session.isRunning).length;
+    const runningCount = visibleSessions.filter((session) => session.isRunning || normalizeHandoffPending(session.handoffPending)).length;
     const currentMessageCount = getCurrentMessageCount();
     const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
@@ -744,7 +748,7 @@
     const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent;
-    const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
+    const runtimeLabel = sessionState.currentHandoffPending ? '接力分析中' : (sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始');
     const projectSessionCount = getCurrentProjectSessionCount(activeProject);
     const actionButtons = buildWorkspaceActionButtons([
       { action: 'new-session', label: '新建会话', primary: true },
@@ -1730,6 +1734,7 @@
         projectId: Object.prototype.hasOwnProperty.call(snapshot || {}, 'projectId') ? snapshot.projectId : session.projectId,
         updated: snapshot?.updated || session.updated,
         isRunning: Object.prototype.hasOwnProperty.call(snapshot || {}, 'isRunning') ? !!snapshot.isRunning : !!session.isRunning,
+        handoffPending: Object.prototype.hasOwnProperty.call(snapshot || {}, 'handoffPending') ? normalizeHandoffPending(snapshot.handoffPending) : normalizeHandoffPending(session.handoffPending),
         hasUnread: false,
       };
     });
@@ -1942,7 +1947,8 @@
       const title = getChatTabTitle(sessionLike);
       const active = sessionId === sessionState.currentSessionId;
       const tabEl = document.createElement('div');
-      tabEl.className = `chat-tab${active ? ' active' : ''}${sessionLike?.isRunning ? ' is-running' : ''}${sessionLike?.hasUnread ? ' has-unread' : ''}`;
+      const tabBusy = !!sessionLike?.isRunning || !!normalizeHandoffPending(sessionLike?.handoffPending);
+      tabEl.className = `chat-tab${active ? ' active' : ''}${tabBusy ? ' is-running' : ''}${sessionLike?.hasUnread ? ' has-unread' : ''}`;
       tabEl.dataset.sessionId = sessionId;
       tabEl.setAttribute('role', 'button');
       tabEl.setAttribute('tabindex', '0');
@@ -2111,6 +2117,19 @@
     };
   }
 
+  function normalizeHandoffPending(value) {
+    if (!value || typeof value !== 'object') return null;
+    if (value.status && value.status !== 'analyzing') return null;
+    return {
+      id: value.id || null,
+      status: 'analyzing',
+      message: value.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+      startedAt: value.startedAt || null,
+      updatedAt: value.updatedAt || null,
+      newTaskPreview: value.newTaskPreview || '',
+    };
+  }
+
   function normalizeSessionSnapshot(payload, options = {}) {
     const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, payload.agent, payload.model || '');
     const hasPayloadModel = Object.prototype.hasOwnProperty.call(payload || {}, 'model');
@@ -2138,6 +2157,7 @@
       queuedMessages: normalizeQueuedMessages(payload.queuedMessages || []),
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
+      handoffPending: normalizeHandoffPending(payload.handoffPending),
       historyPending: !!payload.historyPending,
       complete: options.complete !== undefined ? !!options.complete : !payload.historyPending,
     };
@@ -2218,7 +2238,7 @@
     const entry = sessionState.sessionCache.get(sessionId);
     const meta = getSessionMeta(sessionId);
     if (!entry?.snapshot?.complete || !meta) return 'miss';
-    if (entry.version === (meta.updated || null) && !meta.hasUnread && !meta.isRunning) {
+    if (entry.version === (meta.updated || null) && !meta.hasUnread && !meta.isRunning && !normalizeHandoffPending(meta.handoffPending)) {
       return 'strong';
     }
     return 'weak';
@@ -3495,19 +3515,21 @@
     return Date.now() - awaitingRuntimeStartAt < 5000;
   }
 
-  function setCurrentSessionRunningState(isRunning) {
-    let running = !!isRunning;
+  function setCurrentSessionRunningState(isRunning, label = '运行中', handoffPendingValue = null) {
+    const handoffPending = normalizeHandoffPending(handoffPendingValue);
+    let running = !!isRunning || !!handoffPending;
     if (shouldHoldOptimisticRunningState(running)) {
       running = true;
-    } else if (running) {
+    } else if (running && !handoffPending) {
       clearAwaitingRuntimeStart();
     }
     const wasRunning = !!sessionState.currentSessionRunning;
     if (running && queuedMessagesRestoredAt) queuedMessagesRestoredSawRunning = true;
     sessionState.currentSessionRunning = running;
+    sessionState.currentHandoffPending = handoffPending;
     if (chatRuntimeState) {
       chatRuntimeState.hidden = !running;
-      chatRuntimeState.textContent = running ? '运行中' : '';
+      chatRuntimeState.textContent = running ? (handoffPending ? (handoffPending.message || '接力分析中') : label) : '';
     }
     updateComposerActionButtons();
     updateCwdBadge();
@@ -3635,6 +3657,7 @@
     sessionState.loadedHistorySessionId = null;
     clearSessionLoading();
     setCurrentSessionRunningState(false);
+    sessionState.currentHandoffPending = null;
     sessionState.currentCwd = null;
     sessionState.currentModel = '';
     sessionState.currentActiveRuntime = null;
@@ -3693,10 +3716,11 @@
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
     const snapshotRunning = !!snapshot.isRunning;
+    const snapshotHandoffPending = normalizeHandoffPending(snapshot.handoffPending);
     const effectiveSnapshotRunning = preserveStreaming && composeState.isGenerating
-      ? (snapshotRunning || sessionState.currentSessionRunning || composeState.isGenerating)
-      : snapshotRunning;
-    setCurrentSessionRunningState(effectiveSnapshotRunning);
+      ? (snapshotRunning || !!snapshotHandoffPending || sessionState.currentSessionRunning || composeState.isGenerating)
+      : (snapshotRunning || !!snapshotHandoffPending);
+    setCurrentSessionRunningState(effectiveSnapshotRunning, snapshotHandoffPending ? '接力分析中' : '运行中', snapshotHandoffPending);
     setStatsDisplay(snapshot);
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
@@ -3925,6 +3949,23 @@
     hideCmdMenu();
     hideOptionPicker();
     markAwaitingRuntimeStart();
+    const optimisticHandoffPending = normalizeHandoffPending({
+      id: `local-${Date.now()}`,
+      status: 'analyzing',
+      message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      newTaskPreview: text.slice(0, 120),
+    });
+    sessionState.sessions = sessionState.sessions.map((session) => (
+      session.id === sessionState.currentSessionId
+        ? { ...session, handoffPending: optimisticHandoffPending }
+        : session
+    ));
+    setCurrentSessionRunningState(true, '接力分析中', optimisticHandoffPending);
+    renderSessionList();
+    renderChatTabs();
+    renderWorkspaceInsights();
     send({
       type: 'handoff_session',
       sourceSessionId: sessionState.currentSessionId,
@@ -4266,17 +4307,20 @@
       ...session,
       reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
       hasUnread: session.id === sessionState.currentSessionId ? false : !!session.hasUnread,
+      handoffPending: normalizeHandoffPending(session.handoffPending),
     }));
     reconcileSessionCacheWithSessions();
     reconcileOpenChatTabsWithSessions();
     renderSessionList();
     if (sessionState.currentSessionId) {
-      const currentMetaRunning = !!getSessionMeta(sessionState.currentSessionId)?.isRunning;
-      setCurrentSessionRunningState(currentMetaRunning);
+      const currentMeta = getSessionMeta(sessionState.currentSessionId);
+      const currentMetaRunning = !!currentMeta?.isRunning;
+      const currentHandoff = normalizeHandoffPending(currentMeta?.handoffPending);
+      setCurrentSessionRunningState(currentMetaRunning || !!currentHandoff, currentHandoff ? '接力分析中' : '运行中', currentHandoff);
       if (currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))) {
         startGenerating();
       }
-      if (!shouldHoldOptimisticRunningState(currentMetaRunning)) {
+      if (!shouldHoldOptimisticRunningState(currentMetaRunning || !!currentHandoff)) {
         scheduleQueuedMessageFollowupAfterIdle();
       }
     }
@@ -4595,6 +4639,14 @@
   function handleErrorMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
     clearAwaitingRuntimeStart();
+    if (sessionState.currentHandoffPending) {
+      sessionState.currentHandoffPending = null;
+      sessionState.sessions = sessionState.sessions.map((session) => (
+        session.id === sessionState.currentSessionId ? { ...session, handoffPending: null } : session
+      ));
+      renderSessionList();
+      renderChatTabs();
+    }
     const errorMsg = msg.message || '发生未知错误';
     appendError(errorMsg);
     // Also show toast for critical errors to ensure user notice
@@ -4603,7 +4655,9 @@
     }
     clearSessionLoading();
     if (!composeState.isGenerating && sessionState.currentSessionId) {
-      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+      const meta = getSessionMeta(sessionState.currentSessionId);
+      const handoffPending = normalizeHandoffPending(meta?.handoffPending);
+      setCurrentSessionRunningState(!!meta?.isRunning || !!handoffPending, handoffPending ? '接力分析中' : '运行中', handoffPending);
     }
     if (composeState.isGenerating) finishGenerating();
   }
@@ -4697,6 +4751,26 @@
     emitWsEvent('git_result', msg);
   }
 
+  function handleHandoffStatusMessage(msg) {
+    const sessionId = String(msg.sessionId || '').trim();
+    if (!sessionId) return;
+    const pending = normalizeHandoffPending(msg.handoffPending);
+    sessionState.sessions = sessionState.sessions.map((session) => (
+      session.id === sessionId ? { ...session, handoffPending: pending, isRunning: !!session.isRunning } : session
+    ));
+    const cacheEntry = sessionState.sessionCache.get(sessionId);
+    if (cacheEntry?.meta) cacheEntry.meta.handoffPending = pending;
+    if (cacheEntry?.snapshot) cacheEntry.snapshot.handoffPending = pending;
+    if (sessionId === sessionState.currentSessionId) {
+      const meta = getSessionMeta(sessionId);
+      setCurrentSessionRunningState(!!meta?.isRunning || !!pending, pending ? '接力分析中' : '运行中', pending);
+      if (pending) showToast(pending.message || '接力分析中');
+    }
+    renderSessionList();
+    renderChatTabs();
+    renderWorkspaceInsights();
+  }
+
   const SERVER_MESSAGE_HANDLERS = Object.freeze({
     auth_result: handleAuthResultMessage,
     session_list: handleSessionListMessage,
@@ -4711,6 +4785,7 @@
     usage: handleUsageMessage,
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
+    handoff_status: handleHandoffStatusMessage,
     mode_changed: handleModeChangedMessage,
     reasoning_effort_changed: handleReasoningEffortChangedMessage,
     model_changed: handleModelChangedMessage,
@@ -4769,10 +4844,19 @@
 
   // --- Generating State ---
   function updateComposerActionButtons() {
+    const handoffPending = normalizeHandoffPending(sessionState.currentHandoffPending);
+    const busy = composeState.isGenerating || !!handoffPending;
     sendBtn.hidden = false;
-    abortBtn.hidden = !composeState.isGenerating;
-    sendBtn.title = composeState.isGenerating ? '加入发送队列' : '发送';
-    sendBtn.setAttribute('aria-label', composeState.isGenerating ? '加入发送队列' : '发送');
+    abortBtn.hidden = !busy;
+    abortBtn.title = handoffPending ? '停止接力分析' : '停止';
+    abortBtn.setAttribute('aria-label', handoffPending ? '停止接力分析' : '停止');
+    sendBtn.title = busy ? '加入发送队列' : '发送';
+    sendBtn.setAttribute('aria-label', busy ? '加入发送队列' : '发送');
+    if (composerStatus) {
+      composerStatus.hidden = !handoffPending;
+      composerStatus.textContent = handoffPending ? (handoffPending.message || '接力分析中') : '';
+      composerStatus.title = handoffPending ? (handoffPending.message || '接力分析中') : '';
+    }
     if (handoffBtn) {
       handoffBtn.disabled = isBlockingSessionLoad() || composeState.isGenerating || sessionState.currentSessionRunning;
       handoffBtn.title = (composeState.isGenerating || sessionState.currentSessionRunning)
@@ -6246,7 +6330,9 @@
 
   function buildSessionItem(s) {
     const item = document.createElement('div');
-    item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${s.isRunning ? ' is-running' : ''}`;
+    const handoffPending = normalizeHandoffPending(s.handoffPending);
+    const sessionBusy = !!s.isRunning || !!handoffPending;
+    item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${sessionBusy ? ' is-running' : ''}`;
     item.dataset.id = s.id;
     item.setAttribute('tabindex', '0');
     item.setAttribute('role', 'button');
@@ -6277,10 +6363,10 @@
       right.appendChild(unread);
     }
 
-    if (s.isRunning) {
+    if (sessionBusy) {
       const status = document.createElement('span');
       status.className = 'session-item-status';
-      status.textContent = '运行中';
+      status.textContent = handoffPending ? '接力中' : '运行中';
       right.appendChild(status);
     }
 
@@ -6510,7 +6596,7 @@
     const isSelectedProject = selectedProject?.id === project.id
       || (!!selectedProject?.path && !!project.path && normalizeComparablePath(selectedProject.path) === normalizeComparablePath(project.path));
     const isCollapsed = collapsedProjects.has(project.id);
-    const runningCount = groupSessions.reduce((count, session) => count + (session.isRunning ? 1 : 0), 0);
+    const runningCount = groupSessions.reduce((count, session) => count + ((session.isRunning || normalizeHandoffPending(session.handoffPending)) ? 1 : 0), 0);
     const unreadCount = groupSessions.reduce((count, session) => count + (session.hasUnread ? 1 : 0), 0);
 
     const group = document.createElement('section');
