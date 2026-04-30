@@ -306,7 +306,7 @@
   const jumpToLatestBtn = document.createElement('button');
   jumpToLatestBtn.type = 'button';
   jumpToLatestBtn.className = 'jump-to-latest-btn';
-  jumpToLatestBtn.textContent = '新内容 ↓';
+  jumpToLatestBtn.textContent = '到最后';
   jumpToLatestBtn.hidden = true;
   if (messagesWrap) messagesWrap.appendChild(jumpToLatestBtn);
   const msgInput = $('#msg-input');
@@ -5181,7 +5181,7 @@
     const targetTop = Math.max(0, messagesDiv.scrollTop + messageRect.top - containerRect.top - 12);
     messageScrollProgrammatic = true;
     shouldFollowMessageStream = false;
-    setJumpToLatestVisible(composeState.isGenerating);
+    setJumpToLatestVisible(true);
     messagesDiv.scrollTo({ top: targetTop, behavior: 'smooth' });
     updateScrollbar();
     setTimeout(() => {
@@ -6142,13 +6142,13 @@
 
   function syncMessageFollowStateFromScroll() {
     shouldFollowMessageStream = isMessagesNearBottom();
-    setJumpToLatestVisible(!shouldFollowMessageStream && composeState.isGenerating);
+    setJumpToLatestVisible(!shouldFollowMessageStream);
   }
 
   function scrollToBottom(options = {}) {
     const onlyIfFollowing = options.onlyIfFollowing === true;
     if (onlyIfFollowing && !shouldFollowMessageStream) {
-      setJumpToLatestVisible(composeState.isGenerating);
+      setJumpToLatestVisible(true);
       updateScrollbar();
       return;
     }
