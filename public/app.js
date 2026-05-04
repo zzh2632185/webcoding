@@ -2700,7 +2700,7 @@
     if (!Array.isArray(items) || items.length === 0) return '';
     return items.map((item) => {
       const isDir = item.type === 'directory';
-      const canAttach = !isDir && item.isText && !item.tooLarge;
+      const canAttach = isDir || (item.isText && !item.tooLarge);
       const isActiveFile = !isDir && fileViewerState.activePath && item.path === fileViewerState.activePath;
       const expanded = isDir && fileTreeState.expandedDirs instanceof Set && fileTreeState.expandedDirs.has(item.path);
       const classes = ['file-tree-row', isDir ? 'directory' : 'file'];
@@ -2710,9 +2710,17 @@
       const icon = isDir ? (expanded ? '▾' : '▸') : '•';
       const sizeText = !isDir && Number.isFinite(item.size) ? `<span class="file-tree-size">${formatFileSize(item.size)}</span>` : '';
       const fileOpenPayload = !isDir ? { path: item.path, relativePath: item.relativePath, name: item.name, size: item.size } : null;
+      const refPayload = canAttach ? {
+        type: isDir ? 'directory' : 'file',
+        path: item.path,
+        relativePath: item.relativePath || item.name || item.path,
+        name: item.name || item.relativePath || item.path,
+        size: isDir ? 0 : Number(item.size) || 0,
+      } : null;
+      const dragAttrs = refPayload ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : '';
       const attrs = isDir
-        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"`
-        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${canAttach ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify({ path: item.path, relativePath: item.relativePath, size: item.size }))}"` : ''}`;
+        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"${dragAttrs}`
+        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${dragAttrs}`;
       const children = isDir && expanded ? renderFileTreeItems(item.children || [], level + 1) : '';
       return `
         <div class="file-tree-node" style="--level:${level}">
@@ -2780,9 +2788,14 @@
     fileTree.querySelectorAll('.file-tree-row[draggable="true"]').forEach((row) => {
       row.addEventListener('dragstart', (e) => {
         const raw = row.getAttribute('data-file-ref') || '';
-        e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, raw);
-        e.dataTransfer?.setData('text/plain', JSON.parse(raw).relativePath || 'file');
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
+        try {
+          const ref = JSON.parse(raw);
+          e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, raw);
+          e.dataTransfer?.setData('text/plain', ref.relativePath || ref.path || (ref.type === 'directory' ? 'directory' : 'file'));
+          if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
+        } catch {
+          e.preventDefault();
+        }
       });
     });
   }
