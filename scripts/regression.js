@@ -1881,7 +1881,7 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
           {
             type: 'fetch_models',
             apiBase: variant.apiBase,
-            apiKey: 'sk-regression',
+            apiKey: 'test-regression-key',
             upstreamType: 'openai',
             templateName: `Regression ${variant.label}`,
           },
@@ -1898,7 +1898,7 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
             activeTemplate: `Regression ${variant.label}`,
             templates: [{
               name: `Regression ${variant.label}`,
-              apiKey: 'sk-regression',
+              apiKey: 'test-regression-key',
               apiBase: variant.apiBase,
               upstreamType: 'openai',
               defaultModel: 'regression-api-model',
@@ -2328,7 +2328,7 @@ async function runClaudeLocalModelMapRegressionCase({ tempRoot }) {
   mkdirp(path.dirname(claudeSettingsPath));
   fs.writeFileSync(claudeSettingsPath, JSON.stringify({
     env: {
-      ANTHROPIC_API_KEY: 'sk-local-custom',
+      ANTHROPIC_API_KEY: 'test-local-custom-key',
       ANTHROPIC_BASE_URL: 'https://local.example.test',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'local-opus-model',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'local-sonnet-model',
@@ -2423,7 +2423,7 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Backup Regression',
           templates: [{
             name: 'Claude Backup Regression',
-            apiKey: 'sk-regression',
+            apiKey: 'test-regression-key',
             apiBase: 'https://example.com/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -2588,7 +2588,7 @@ async function runClaudeConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Carryover Unified',
           templates: [{
             name: 'Claude Carryover Unified',
-            apiKey: 'sk-carryover',
+            apiKey: 'test-carryover-key',
             apiBase: 'https://unified.carryover.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -2636,7 +2636,7 @@ async function runClaudeConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Carryover Unified',
           templates: [{
             name: 'Claude Carryover Unified',
-            apiKey: 'sk-carryover',
+            apiKey: 'test-carryover-key',
             apiBase: 'https://unified.carryover.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-opus-4-6',
@@ -2778,7 +2778,7 @@ async function runClaudeStickyResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Sticky Unified',
           templates: [{
             name: 'Claude Sticky Unified',
-            apiKey: 'sk-claude-sticky',
+            apiKey: 'test-claude-sticky',
             apiBase: 'https://sticky-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -2971,7 +2971,7 @@ async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
       const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
       assert(runtimeToml.includes('[mcp_servers.nocturne_memory]'), 'Local Codex bridge runtime should preserve local MCP config');
       assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Local Codex bridge runtime should rewrite active provider base_url to local bridge');
-      assert(runtimeToml.includes('env_key = "OPENAI_API_KEY"'), 'Local Codex bridge runtime should force bridge token env key');
+      assert(runtimeToml.includes('env_key = "CODEX_OPENAI_COMPAT_KEY"'), 'Local Codex bridge runtime should force dedicated bridge token env key');
       assert(fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'instruction.md'), 'utf8') === 'local instruction should be copied', 'Local Codex bridge runtime should copy relative instruction file');
 
       const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
@@ -3134,7 +3134,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Carryover Unified',
           templates: [{
             name: 'Codex Carryover Unified',
-            apiKey: 'sk-codex-carryover',
+            apiKey: 'test-codex-carryover',
             apiBase: 'https://codex-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4',
@@ -3189,7 +3189,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Carryover Unified',
           templates: [{
             name: 'Codex Carryover Unified',
-            apiKey: 'sk-codex-carryover',
+            apiKey: 'test-codex-carryover',
             apiBase: 'https://codex-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4-large',
@@ -3315,7 +3315,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Sticky Unified A',
           templates: [{
             name: 'Codex Sticky Unified A',
-            apiKey: 'sk-codex-sticky-a',
+            apiKey: 'test-codex-sticky-a',
             apiBase: 'https://codex-sticky-a.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4',
@@ -3362,7 +3362,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Sticky Unified B',
           templates: [{
             name: 'Codex Sticky Unified B',
-            apiKey: 'sk-codex-sticky-b',
+            apiKey: 'test-codex-sticky-b',
             apiBase: 'https://codex-sticky-b.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4-large',
@@ -3428,7 +3428,7 @@ async function runCodexConfigMigrationRegressionCase({ port, password, sessionsD
         activeTemplate: 'Regression Unified API',
         templates: [{
           name: 'Regression Unified API',
-          apiKey: 'sk-regression',
+          apiKey: 'test-regression-key',
           apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'custom-regression-model',
@@ -3495,7 +3495,7 @@ async function runCodexReasoningEffortRegressionCase({ port, password, tempRoot,
         activeTemplate: 'Reasoning Regression API',
         templates: [{
           name: 'Reasoning Regression API',
-          apiKey: 'sk-regression',
+          apiKey: 'test-regression-key',
           apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'gpt-5.4',
@@ -3551,7 +3551,7 @@ async function runCodexBridgeProtocolNormalizationRegressionCase({ port, passwor
         activeTemplate: 'Codex Bridge Mislabel',
         templates: [{
           name: 'Codex Bridge Mislabel',
-          apiKey: 'sk-codex-bridge-mislabel',
+          apiKey: 'test-codex-bridge-mislabel',
           apiBase: 'https://bridge-mislabel.example.test',
           upstreamType: 'anthropic',
           defaultModel: 'gpt-5.4-large',
@@ -3697,7 +3697,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
         activeTemplate: 'Regression Unified API',
         templates: [{
           name: 'Regression Unified API',
-          apiKey: 'sk-regression',
+          apiKey: 'test-regression-key',
           apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'custom-regression-model',
@@ -3770,6 +3770,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex unified runtime should write isolated runtime auth mode');
     assert(runtimeToml.includes('name = "Regression Unified API"'), 'Codex unified runtime should point at the active unified API template');
     assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Codex unified runtime should route through the local bridge base_url');
+    assert(runtimeToml.includes('env_key = "CODEX_OPENAI_COMPAT_KEY"'), 'Codex unified runtime should use dedicated bridge token env key');
     assert(/# bridge_api_key = "/.test(runtimeToml), 'Codex unified runtime should expose local bridge token in generated config comments');
     assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Codex spawn should force openai_compat provider via CLI overrides');
     assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex spawn should force bridge base_url via CLI overrides');

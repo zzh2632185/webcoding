@@ -3029,7 +3029,8 @@
     }
     try {
       await loadFileTree(cwd);
-      fileRefPickerExpandedDirs = collectDefaultExpandedFileRefDirs(fileTreeState.items || []);
+      // 引用附件弹窗每次打开时默认全部折叠，避免手机端一进来就铺满文件列表。
+      fileRefPickerExpandedDirs = new Set();
       renderFileRefPicker(fileTreeState.items || []);
     } catch (err) {
       appendError(err.message || '读取可引用文件失败');

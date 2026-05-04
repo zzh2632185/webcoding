@@ -34,6 +34,7 @@ const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
 const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const CODEX_OPENAI_COMPAT_ENV_KEY = 'CODEX_OPENAI_COMPAT_KEY';
 const GENERATED_IMAGES_ROOT = path.join(CODEX_RUNTIME_HOME, 'generated_images');
 const GENERATED_MESSAGE_IMAGES_ROOT = path.join(CONFIG_DIR, 'generated-message-images');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
@@ -1423,13 +1424,17 @@ function setTomlSectionString(text, sectionName, key, value) {
   return before + body + after;
 }
 
-function readCodexLocalAuthKey(envKey = 'OPENAI_API_KEY') {
-  const keyName = String(envKey || 'OPENAI_API_KEY').trim() || 'OPENAI_API_KEY';
+function readCodexLocalAuthKey(envKey = CODEX_OPENAI_COMPAT_ENV_KEY) {
+  const keyName = String(envKey || CODEX_OPENAI_COMPAT_ENV_KEY).trim() || CODEX_OPENAI_COMPAT_ENV_KEY;
   try {
     const auth = JSON.parse(fs.readFileSync(CODEX_LOCAL_AUTH_PATH, 'utf8'));
+    // Backward compatibility: existing Codex auth.json commonly stores the upstream key
+    // under OPENAI_API_KEY. Read it from the file, but avoid trusting the globally
+    // inherited OPENAI_API_KEY process env, which can pollute unrelated projects.
     const fileKey = String(auth?.[keyName] || auth?.OPENAI_API_KEY || auth?.api_key || '').trim();
     if (fileKey) return fileKey;
   } catch {}
+  if (keyName === 'OPENAI_API_KEY') return '';
   return String(process.env[keyName] || '').trim();
 }
 
@@ -1441,7 +1446,7 @@ function resolveCodexLocalBridgeSource() {
   if (!provider) return { mode: 'local' };
   const sectionName = `model_providers.${provider}`;
   const apiBase = readTomlSectionString(configText, sectionName, 'base_url');
-  const envKey = readTomlSectionString(configText, sectionName, 'env_key') || 'OPENAI_API_KEY';
+  const envKey = readTomlSectionString(configText, sectionName, 'env_key') || CODEX_OPENAI_COMPAT_ENV_KEY;
   const apiKey = readCodexLocalAuthKey(envKey);
   if (!apiBase || !apiKey) return { mode: 'local' };
   return {
@@ -1460,7 +1465,7 @@ function writeCodexLocalBridgeConfig(source, bridge) {
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
   let configToml = String(source.configText || '');
   configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'base_url', bridge.openaiBaseUrl);
-  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'env_key', 'OPENAI_API_KEY');
+  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'env_key', CODEX_OPENAI_COMPAT_ENV_KEY);
   configToml = `${configToml.replace(/\s*$/, '')}\n\n# webcoding_bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}\n`;
   fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
   const localInstruction = path.join(path.dirname(CODEX_LOCAL_CONFIG_PATH), 'instruction.md');
@@ -1609,7 +1614,7 @@ function prepareCodexCustomRuntime(config) {
     '[model_providers.openai_compat]',
     `name = ${tomlString(source.name || 'AI Provider')}`,
     `base_url = ${tomlString(bridge.openaiBaseUrl)}`,
-    'env_key = "OPENAI_API_KEY"',
+    `env_key = ${tomlString(CODEX_OPENAI_COMPAT_ENV_KEY)}`,
     'wire_api = "responses"',
     '',
   ].filter((line) => line !== null).join('\n');
