@@ -1,8 +1,8 @@
 # Webcoding 一键安装脚本 (Windows PowerShell)
 # 用法 (在 PowerShell 中运行):
-#   irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1 | iex
 # 或指定安装目录:
-#   $env:WEBCODING_DIR = "C:\webcoding"; irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1 | iex
+#   $env:WEBCODING_DIR = "C:\webcoding"; irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 
@@ -17,8 +17,8 @@ function Pause-IfNeeded {
     }
 }
 
-$REPO        = 'https://github.com/HsMirage/webcoding.git'
-$RAW_BASE    = 'https://raw.githubusercontent.com/HsMirage/webcoding/main'
+$REPO        = 'https://github.com/zzh2632185/webcoding.git'
+$RAW_BASE    = 'https://raw.githubusercontent.com/zzh2632185/webcoding/main'
 $INSTALL_DIR = if ($env:WEBCODING_DIR) { $env:WEBCODING_DIR } else { Join-Path $HOME 'webcoding' }
 
 function Write-Info    { param($msg) Write-Host "[Webcoding] $msg" -ForegroundColor Cyan   }

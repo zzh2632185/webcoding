@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Webcoding 一键安装脚本 (Linux / macOS)
 # 用法:
-#   curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh | bash
 # 或指定安装目录:
-#   curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh | bash -s -- ~/mydir
+#   curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh | bash -s -- ~/mydir
 
 set -e
 
-REPO="https://github.com/HsMirage/webcoding.git"
-RAW_BASE="https://raw.githubusercontent.com/HsMirage/webcoding/main"
+REPO="https://github.com/zzh2632185/webcoding.git"
+RAW_BASE="https://raw.githubusercontent.com/zzh2632185/webcoding/main"
 INSTALL_DIR="${1:-$HOME/webcoding}"
 
 # ── 颜色 ──────────────────────────────────────────────────────

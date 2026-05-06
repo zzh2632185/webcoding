@@ -44,12 +44,12 @@ npm install -g @openai/codex
 
 **Linux / macOS**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh)
 ```
 
 **Windows (PowerShell)**
 ```powershell
-$s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression $s
+$s = irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1; Invoke-Expression $s
 ```
 
 The script presents an interactive menu — choose to install, launch, update, reinstall dependencies, uninstall, or exit. After installing, visit `http://localhost:8001` and enter your password.
@@ -64,7 +64,7 @@ The script presents an interactive menu — choose to install, launch, update, r
 
 **Linux / macOS**
 ```bash
-git clone https://github.com/HsMirage/webcoding.git
+git clone https://github.com/zzh2632185/webcoding.git
 cd webcoding
 npm install
 npm start
@@ -72,7 +72,7 @@ npm start
 
 **Windows**
 ```cmd
-git clone https://github.com/HsMirage/webcoding.git
+git clone https://github.com/zzh2632185/webcoding.git
 cd webcoding
 npm install
 ```
