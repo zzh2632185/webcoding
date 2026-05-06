@@ -84,6 +84,48 @@ function sleep(ms) {
     process.exit(1);
   }
 
+  if (input === 'trigger codex capacity retry') {
+    state.capacityAttempts = Number(state.capacityAttempts || 0) + 1;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    if (state.capacityAttempts <= 2) {
+      process.stderr.write('Selected model is at capacity. Please try a different model.\n');
+      process.exit(1);
+    }
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_capacity_retry_success',
+        type: 'agent_message',
+        text: 'Codex mock capacity retry succeeded.',
+      },
+    })}\n`);
+    try { fs.unlinkSync(statePath); } catch {}
+    return;
+  }
+
+  if (input === 'trigger codex stream disconnect retry') {
+    state.streamDisconnectAttempts = Number(state.streamDisconnectAttempts || 0) + 1;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    if (state.streamDisconnectAttempts <= 1) {
+      process.stdout.write(`${JSON.stringify({
+        type: 'error',
+        message: 'Reconnecting... 1/5 (stream disconnected before completion: An error occurred while processing your request.)',
+      })}\n`);
+      process.stderr.write('stream disconnected before completion: error sending request for url (http://127.0.0.1:12345/openai/responses)\n');
+      process.exit(1);
+    }
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_stream_disconnect_retry_success',
+        type: 'agent_message',
+        text: 'Codex mock stream disconnect retry succeeded.',
+      },
+    })}\n`);
+    try { fs.unlinkSync(statePath); } catch {}
+    return;
+  }
+
   if (input === 'trigger codex silent exit') {
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',

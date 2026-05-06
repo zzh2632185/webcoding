@@ -44,6 +44,8 @@ const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_MESSAGE_ATTACHMENTS = 4;
+const CODEX_CAPACITY_RETRY_MAX = 2;
+const WS_HEARTBEAT_INTERVAL_MS = 25000;
 const MAX_CONTEXT_FILE_REFS = 8;
 const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
 const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
@@ -4925,6 +4927,12 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/authentication|unauthorized|forbidden|login|api key|credential/i.test(condensed)) {
       return 'Codex 鉴权失败。请确认本机 Codex CLI 已完成登录，且当前凭据仍然有效。';
     }
+    if (isCodexCapacityError('codex', condensed)) {
+      return codexCapacityFinalMessage();
+    }
+    if (isCodexStreamDisconnectError('codex', `${condensed}\n${raw || ''}`)) {
+      return codexTransientFinalMessage('stream_disconnect');
+    }
     if (/rate limit|quota|billing|credits/i.test(condensed)) {
       return 'Codex 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
     }
@@ -4979,6 +4987,46 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
+function isCodexCapacityError(agent, raw) {
+  if (agent !== 'codex') return false;
+  const text = String(raw || '');
+  return /selected model is at capacity|model is at capacity|at capacity\b/i.test(text);
+}
+
+function isCodexStreamDisconnectError(agent, raw) {
+  if (agent !== 'codex') return false;
+  const text = String(raw || '');
+  return /stream disconnected before completion|error sending request for url|an error occurred while processing your request/i.test(text);
+}
+
+function getCodexTransientErrorKind(agent, raw) {
+  if (isCodexCapacityError(agent, raw)) return 'capacity';
+  if (isCodexStreamDisconnectError(agent, raw)) return 'stream_disconnect';
+  return '';
+}
+
+function codexTransientRetryMessage(kind, nextRetryCount) {
+  if (kind === 'stream_disconnect') {
+    return `Codex 上游流式连接中断，正在自动重试（${nextRetryCount}/${CODEX_CAPACITY_RETRY_MAX}）…`;
+  }
+  return `当前 Codex 模型繁忙，正在自动重试（${nextRetryCount}/${CODEX_CAPACITY_RETRY_MAX}）…`;
+}
+
+function codexCapacityRetryMessage(nextRetryCount) {
+  return codexTransientRetryMessage('capacity', nextRetryCount);
+}
+
+function codexTransientFinalMessage(kind) {
+  if (kind === 'stream_disconnect') {
+    return `Codex 上游流式连接中断，已自动重试 ${CODEX_CAPACITY_RETRY_MAX} 次仍失败。请稍后重试或切换模型。`;
+  }
+  return `当前 Codex 模型繁忙，已自动重试 ${CODEX_CAPACITY_RETRY_MAX} 次仍失败。请稍后重试或切换模型。`;
+}
+
+function codexCapacityFinalMessage() {
+  return codexTransientFinalMessage('capacity');
+}
+
 function readProcessStderrSnippet(sessionId) {
   try {
     const errPath = path.join(runDir(sessionId), 'error.log');
@@ -5008,7 +5056,10 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
       ? `process exited with non-zero status ${exitCode} but returned no stderr`
       : null
   );
-  const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
+  const diagnosticText = `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}\n${loggedCompletionError || ''}`;
+  const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', diagnosticText);
+  const codexTransientErrorKind = getCodexTransientErrorKind(entry.agent || 'claude', diagnosticText);
+  const capacityExceeded = codexTransientErrorKind === 'capacity';
   const completionError = rawCompletionError
     ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal })
     : hasNonZeroExit
@@ -5032,9 +5083,11 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     error: loggedCompletionError,
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
+    modelCapacity: capacityExceeded,
+    transientErrorKind: codexTransientErrorKind || null,
   });
 
-  return { pendingRetry, contextLimitExceeded, completionError };
+  return { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError };
 }
 
 
@@ -5213,6 +5266,45 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
   );
 }
 
+function tryRetryCodexTransientFailure(sessionId, entry, transientErrorKind) {
+  if (!transientErrorKind || entry?.agent !== 'codex') return false;
+  const retryMessage = entry.capacityRetryMessage || null;
+  if (!retryMessage || !retryMessage.text && (!Array.isArray(retryMessage.attachments) || retryMessage.attachments.length === 0) && (!Array.isArray(retryMessage.fileRefs) || retryMessage.fileRefs.length === 0)) return false;
+  const currentRetryCount = Math.max(0, Number(retryMessage.retryCount || 0));
+  if (currentRetryCount >= CODEX_CAPACITY_RETRY_MAX) return false;
+  const nextRetryCount = currentRetryCount + 1;
+  const retryWs = getPrimaryProcessWs(entry) || entry.ws || createClosedQueueWs();
+  sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: codexTransientRetryMessage(transientErrorKind, nextRetryCount) });
+  plog('INFO', 'codex_transient_auto_retry', {
+    sessionId: sessionId.slice(0, 8),
+    pid: entry.pid || null,
+    retryCount: nextRetryCount,
+    maxRetries: CODEX_CAPACITY_RETRY_MAX,
+    transientErrorKind,
+  });
+  setTimeout(() => {
+    try {
+      handleMessage(retryWs, {
+        type: 'message',
+        text: retryMessage.text || '',
+        sessionId,
+        mode: retryMessage.mode || 'yolo',
+        attachments: Array.isArray(retryMessage.attachments) ? retryMessage.attachments : [],
+        fileRefs: Array.isArray(retryMessage.fileRefs) ? retryMessage.fileRefs : [],
+        agent: 'codex',
+        reasoningEffort: retryMessage.reasoningEffort || '',
+        __capacityRetryCount: nextRetryCount,
+      }, {
+        hideInHistory: true,
+        runtimeInputText: retryMessage.runtimeInputText || null,
+      });
+    } finally {
+      if (retryWs.isServerQueueClient) wsSessionMap.delete(retryWs);
+    }
+  }, 0);
+  return true;
+}
+
 function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, shouldReturnForFollowup, shouldAutoCompact) {
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
     pendingCompactRetries.delete(sessionId);
@@ -5250,11 +5342,17 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
-  const { pendingRetry, contextLimitExceeded, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
-  const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
+  const { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
 
   removeActiveProcess(sessionId);
   cleanRunDir(sessionId);
+
+  if (!pendingSlash && tryRetryCodexTransientFailure(sessionId, entry, codexTransientErrorKind || (capacityExceeded ? 'capacity' : ''))) {
+    sendSessionListToProcessClients(entry, { forceRefresh: true });
+    return;
+  }
+
+  const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
 
   const { shouldReturnForFollowup, shouldAutoCompact } = isProcessRealtimeConnected(entry)
     ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
@@ -5998,10 +6096,28 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => handleDisconnect(ws, wsId));
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('error', (err) => {
     plog('WARN', 'ws_error', { wsId, error: err.message });
     handleDisconnect(ws, wsId);
   });
+});
+
+const wsHeartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, WS_HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+  clearInterval(wsHeartbeatTimer);
 });
 
 // === Notify Config Handlers ===
@@ -8027,6 +8143,15 @@ function handleMessage(ws, msg, options = {}) {
     claudePendingCostDelta: 0,
     claudeSessionTotalCost: session.totalCost || 0,
     fullText: '',
+    capacityRetryMessage: {
+      text: textValue,
+      runtimeInputText: typeof runtimeInputText === 'string' ? runtimeInputText : null,
+      mode: session.permissionMode || 'yolo',
+      attachments: savedAttachments,
+      fileRefs: savedFileRefs,
+      reasoningEffort: getSessionAgent(session) === 'codex' ? (session.reasoningEffort || '') : '',
+      retryCount: Math.max(0, Number(msg.__capacityRetryCount || 0)),
+    },
     attachments: resolvedAttachments,
     toolCalls: [],
     segments: [],
