@@ -70,6 +70,10 @@
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
   const OPEN_CHAT_TABS_STORAGE_KEY = 'webcoding-open-chat-tabs-v1';
   const OPEN_CHAT_TABS_LIMIT = 18;
+  const PROJECT_TOUCH_DRAG_LONG_PRESS_MS = 260;
+  const PROJECT_TOUCH_DRAG_CANCEL_DISTANCE = 10;
+  const PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE = 56;
+  const PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP = 18;
   const DEFAULT_THEME = 'auto';
   const THEME_AUTO_VALUE = 'auto';
   const THEME_DAY_VALUE = 'default';
@@ -155,6 +159,8 @@
   let selectedProject = { id: null, path: null };
   let openChatTabs = loadPersistedOpenChatTabs();
   let projectDragState = null;
+  let projectTouchDragState = null;
+  let suppressProjectHeaderClickUntil = 0;
   let sidebarResizeState = null;
   let gitPanelResizeState = null;
   let fileViewerResizeState = null;
@@ -6640,6 +6646,159 @@
     });
   }
 
+  function getTouchByIdentifier(touchList, identifier) {
+    for (const touch of touchList) {
+      if (touch.identifier === identifier) return touch;
+    }
+    return null;
+  }
+
+  function isProjectTouchDragBlockedTarget(target) {
+    return target instanceof Element && !!target.closest(
+      '.project-group-actions, .project-group-menu, .session-item, button, a, input, textarea, select, [contenteditable="true"]'
+    );
+  }
+
+  function getProjectTouchDropPlacement(clientY, draggedId) {
+    const groups = [...sessionList.querySelectorAll('.project-group[data-project-id]')]
+      .filter((node) => {
+        const projectId = node.dataset.projectId;
+        return projectId
+          && projectId !== draggedId
+          && projects.some((project) => project.id === projectId && !project.isVirtualCwd);
+      });
+    if (!groups.length) return null;
+
+    let fallback = null;
+    for (const group of groups) {
+      const rect = group.getBoundingClientRect();
+      const placeAfter = clientY > rect.top + rect.height / 2;
+      if (!placeAfter) {
+        return { targetId: group.dataset.projectId, group, placeAfter: false };
+      }
+      fallback = { targetId: group.dataset.projectId, group, placeAfter: true };
+    }
+    return fallback;
+  }
+
+  function updateProjectTouchDragOver(clientY) {
+    if (!projectTouchDragState?.dragging) return;
+    const draggedId = projectTouchDragState.projectId;
+    const placement = getProjectTouchDropPlacement(clientY, draggedId);
+    clearProjectDragClasses();
+    projectTouchDragState.group.classList.add('dragging');
+    projectTouchDragState.targetId = placement?.targetId || null;
+    projectTouchDragState.placeAfter = !!placement?.placeAfter;
+    if (placement?.group) {
+      placement.group.classList.toggle('drag-over-before', !placement.placeAfter);
+      placement.group.classList.toggle('drag-over-after', placement.placeAfter);
+    }
+  }
+
+  function maybeAutoScrollProjectList(clientY) {
+    const rect = sessionList.getBoundingClientRect();
+    if (clientY < rect.top + PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE) {
+      sessionList.scrollTop -= PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP;
+    } else if (clientY > rect.bottom - PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE) {
+      sessionList.scrollTop += PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP;
+    }
+  }
+
+  function startProjectTouchDrag() {
+    const state = projectTouchDragState;
+    if (!state || state.dragging) return;
+    state.timer = null;
+    state.dragging = true;
+    projectDragState = { projectId: state.projectId, touch: true };
+    document.body.classList.add('project-touch-dragging');
+    document.querySelectorAll('.project-group-menu:not([hidden])').forEach((menu) => {
+      menu.hidden = true;
+      menu.style.top = '';
+      menu.style.left = '';
+      menu._triggerBtn?.classList.remove('active');
+    });
+    updateProjectTouchDragOver(state.startY);
+  }
+
+  function cancelProjectTouchDrag(options = {}) {
+    const state = projectTouchDragState;
+    if (state?.timer) window.clearTimeout(state.timer);
+    projectTouchDragState = null;
+    projectDragState = null;
+    document.body.classList.remove('project-touch-dragging');
+    clearProjectDragClasses();
+    if (options.suppressClick) suppressProjectHeaderClickUntil = Date.now() + 500;
+  }
+
+  function finishProjectTouchDrag(e) {
+    const state = projectTouchDragState;
+    if (!state) return;
+    const wasDragging = state.dragging;
+    const targetId = state.targetId;
+    const placeAfter = state.placeAfter;
+    cancelProjectTouchDrag({ suppressClick: wasDragging });
+    if (!wasDragging) return;
+    e.preventDefault();
+    if (targetId && reorderProjectsLocally(state.projectId, targetId, placeAfter)) {
+      persistProjectOrder();
+      renderSessionList();
+    }
+  }
+
+  function bindProjectTouchDragHandlers(header, group, project, isVirtualCwd) {
+    if (isVirtualCwd || !project?.id || !('TouchEvent' in window)) return;
+
+    header.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1 || isProjectTouchDragBlockedTarget(e.target)) return;
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      if (projectTouchDragState) cancelProjectTouchDrag();
+      projectTouchDragState = {
+        projectId: project.id,
+        group,
+        identifier: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        targetId: null,
+        placeAfter: false,
+        dragging: false,
+        timer: window.setTimeout(startProjectTouchDrag, PROJECT_TOUCH_DRAG_LONG_PRESS_MS),
+      };
+    }, { passive: true });
+
+    header.addEventListener('touchmove', (e) => {
+      const state = projectTouchDragState;
+      if (!state) return;
+      if (e.touches.length !== 1) {
+        cancelProjectTouchDrag({ suppressClick: state.dragging });
+        return;
+      }
+      const touch = getTouchByIdentifier(e.touches, state.identifier);
+      if (!touch) return;
+      const dx = touch.clientX - state.startX;
+      const dy = touch.clientY - state.startY;
+      if (!state.dragging) {
+        if (Math.hypot(dx, dy) > PROJECT_TOUCH_DRAG_CANCEL_DISTANCE) {
+          cancelProjectTouchDrag();
+        }
+        return;
+      }
+      e.preventDefault();
+      maybeAutoScrollProjectList(touch.clientY);
+      updateProjectTouchDragOver(touch.clientY);
+    }, { passive: false });
+
+    header.addEventListener('touchend', (e) => {
+      const state = projectTouchDragState;
+      if (!state || !getTouchByIdentifier(e.changedTouches, state.identifier)) return;
+      finishProjectTouchDrag(e);
+    }, { passive: false });
+
+    header.addEventListener('touchcancel', () => {
+      cancelProjectTouchDrag({ suppressClick: projectTouchDragState?.dragging });
+    });
+  }
+
   function renderProjectGroup(project, groupSessions, container, timestampCache) {
     const isVirtualCwd = Boolean(project.isVirtualCwd);
     const isSelectedProject = selectedProject?.id === project.id
@@ -6666,6 +6825,7 @@
     header.setAttribute('aria-expanded', String(!isCollapsed));
     header.setAttribute('aria-selected', String(isSelectedProject));
     header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话${runningCount ? `，${runningCount} 个运行中` : ''}`);
+    bindProjectTouchDragHandlers(header, group, project, isVirtualCwd);
 
     const main = document.createElement('div');
     main.className = 'project-group-main';
@@ -6890,6 +7050,11 @@
     header.appendChild(actions);
 
     header.addEventListener('click', (e) => {
+      if (Date.now() < suppressProjectHeaderClickUntil) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       // Ignore clicks on the actions area (new chat / more btn / menu)
       if (actions.contains(e.target)) return;
 

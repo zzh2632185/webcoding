@@ -2341,9 +2341,16 @@ html[data-theme="localhost"] .localfile-pre {
 }
 .project-group-draggable {
   cursor: grab;
+  -webkit-user-drag: none;
 }
 .project-group-draggable:active {
   cursor: grabbing;
+}
+body.project-touch-dragging {
+  cursor: grabbing;
+  user-select: none;
+  -webkit-user-select: none;
+  overscroll-behavior: contain;
 }
 .project-group.dragging {
   opacity: 0.48;
@@ -2373,6 +2380,9 @@ html[data-theme="localhost"] .localfile-pre {
   display: flex;
   align-items: center;
   gap: 8px;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
   padding: 8px 8px 8px 10px;
   cursor: pointer;
   transition: background 140ms, border-color 140ms, box-shadow 140ms, transform 140ms;
