@@ -4642,6 +4642,7 @@ function startTunnel() {
   const child = spawn(process.execPath, [TUNNEL_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CF_TUNNEL_STATE_PATH: TUNNEL_STATE_PATH,
@@ -4941,6 +4942,7 @@ function ensureLocalBridgeRunning() {
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CC_WEB_BRIDGE_RUNTIME_PATH: BRIDGE_RUNTIME_PATH,

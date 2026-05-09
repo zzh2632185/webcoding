@@ -3725,6 +3725,7 @@ function runWindowsPathRuntimeSourceRegressionCase() {
   const serverSource = readRepoText('server.js');
   const appSource = readRepoText('public', 'app.js');
   const runtimeSource = readRepoText('lib', 'agent-runtime.js');
+  const cfTunnelSource = readRepoText('lib', 'cf-tunnel.js');
   const { buildCliSpawnCommand } = require(path.join(REPO_DIR, 'lib', 'agent-runtime'));
 
   const jsCliSpec = buildCliSpawnCommand(path.join(REPO_DIR, 'scripts', 'mock-codex.js'), ['exec', '-']);
@@ -3778,6 +3779,11 @@ function runWindowsPathRuntimeSourceRegressionCase() {
       && discoverClaudeSource.includes('spawn(commandSpec.command, commandSpec.args'),
     'Claude slash discovery must use the same Windows .js CLI spawn normalization as normal runtime launches',
   );
+  const startTunnelSource = extractFunctionSource(serverSource, 'startTunnel');
+  assert(startTunnelSource.includes('windowsHide: true'), 'Tunnel manager process must not pop a Windows console window');
+  const ensureBridgeSource = extractFunctionSource(serverSource, 'ensureLocalBridgeRunning');
+  assert(ensureBridgeSource.includes('windowsHide: true'), 'Local bridge process must not pop a Windows console window');
+  assert(cfTunnelSource.includes('windowsHide: true'), 'Cloudflared child process must not pop a Windows console window');
 
   const osHomedirMatches = serverSource.match(/os\.homedir\(\)/g) || [];
   assert(osHomedirMatches.length === 1 && serverSource.includes('const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir() || \'\';'), 'server.js must centralize effective user home resolution');
