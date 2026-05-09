@@ -772,6 +772,21 @@ async function uploadAttachmentExpectFailure(port, token, { filename, mime, data
   return { response, payload };
 }
 
+async function fileOpsRequest(port, token, payload, expectedStatus = 200) {
+  const response = await fetch(`http://127.0.0.1:${port}/api/file-ops`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  let data = null;
+  try { data = await response.json(); } catch {}
+  assert(response.status === expectedStatus, `Expected file op status ${expectedStatus}, got ${response.status}: ${data?.message || data?.error?.message || 'non-json response'}`);
+  return data;
+}
+
 function nextMessage(messages, ws, predicate, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const stackLines = (new Error().stack || '').split('\n').map((line) => line.trim());
@@ -815,7 +830,7 @@ function typeMatcher(type, predicate = null) {
   return (msg) => msg.type === type && (!predicate || predicate(msg));
 }
 
-function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments }) {
+function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments, fileRefs }) {
   return {
     type: 'message',
     text,
@@ -823,6 +838,7 @@ function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments })
     mode,
     agent,
     ...(attachments ? { attachments } : {}),
+    ...(fileRefs ? { fileRefs } : {}),
   };
 }
 
@@ -948,8 +964,10 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
 
 function createTestRunner() {
   const results = [];
+  const filter = String(process.env.REGRESSION_FILTER || '').trim().toLowerCase();
   return {
     async run(name, fn) {
+      if (filter && !String(name || '').toLowerCase().includes(filter)) return;
       const startedAt = Date.now();
       try {
         await fn();
@@ -3687,6 +3705,147 @@ async function runCodexMetadataWarningRegressionCase({ port, password }) {
   });
 }
 
+async function runFileRefProjectCwdRegressionCase({ port, password, tempRoot }) {
+  await withAuthedClient(port, password, async ({ client, messages }) => {
+    const projectCwd = path.join(tempRoot, 'file-ref-project-root');
+    const docsDir = path.join(projectCwd, 'docs');
+    mkdirp(docsDir);
+    const requirementsPath = path.join(docsDir, 'requirements.md');
+    const requirementsText = '# Referenced Requirements\n\nThis file must be accepted from the selected project cwd.\n';
+    fs.writeFileSync(requirementsPath, requirementsText, 'utf8');
+    const stat = fs.statSync(requirementsPath);
+
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && !msg.cwd,
+    );
+
+    const startIndex = messages.length;
+    client.send({
+      type: 'enqueue_message',
+      id: 'queued-selected-project-file-ref',
+      text: 'queued selected project file ref',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+      fileRefs: [{
+        type: 'file',
+        path: requirementsPath,
+        relativePath: 'docs/requirements.md',
+        size: stat.size,
+      }],
+    });
+
+    const terminal = await client.waitFor(
+      (msg) => (
+        (msg.type === 'error' && !msg.sessionId)
+        || (msg.type === 'queue_update' && msg.sessionId === session.sessionId)
+      ),
+      7000,
+    );
+    assert(
+      terminal.type === 'queue_update',
+      `File ref enqueue should pass, got error: ${terminal.message || 'unknown error'}`,
+    );
+    const queuedRef = terminal.queuedMessages?.find((item) => item.id === 'queued-selected-project-file-ref')?.fileRefs?.[0];
+    assert(queuedRef?.cwd === projectCwd, 'Queued file ref should preserve its selected project cwd');
+    const errors = messages.slice(startIndex).filter((msg) => msg.type === 'error');
+    assert(
+      !errors.some((msg) => /文件不在当前目录内|当前目录无效|引用路径无效/.test(msg.message || '')),
+      'File refs from the selected project cwd should not be rejected by a cwd-less chat session',
+    );
+  });
+}
+
+async function runFileOpsRegressionCase({ port, password, tempRoot }) {
+  await withAuthedClient(port, password, async ({ token }) => {
+    const cwd = path.join(tempRoot, 'file-ops-project');
+    const docsDir = path.join(cwd, 'docs');
+    const archiveDir = path.join(cwd, 'archive');
+    mkdirp(docsDir);
+    mkdirp(path.join(cwd, '.git'));
+    fs.writeFileSync(path.join(docsDir, 'old.md'), 'old content', 'utf8');
+
+    const createdFile = await fileOpsRequest(port, token, {
+      cwd,
+      action: 'create_file',
+      path: 'docs/new.md',
+    }, 201);
+    assert(createdFile.ok === true && fs.existsSync(path.join(docsDir, 'new.md')), 'create_file should create the requested file');
+
+    await fileOpsRequest(port, token, {
+      cwd,
+      action: 'create_directory',
+      path: 'archive',
+    }, 201);
+    assert(fs.statSync(archiveDir).isDirectory(), 'create_directory should create the requested folder');
+
+    await fileOpsRequest(port, token, {
+      cwd,
+      action: 'rename',
+      path: 'docs/new.md',
+      targetPath: 'docs/renamed.md',
+    });
+    assert(!fs.existsSync(path.join(docsDir, 'new.md')) && fs.existsSync(path.join(docsDir, 'renamed.md')), 'rename should keep item in the same folder with the new name');
+
+    await fileOpsRequest(port, token, {
+      cwd,
+      action: 'move',
+      path: 'docs/renamed.md',
+      targetPath: 'archive/renamed.md',
+    });
+    assert(fs.existsSync(path.join(archiveDir, 'renamed.md')), 'move should move a file inside the project');
+
+    fs.writeFileSync(path.join(cwd, 'not-a-folder'), 'plain file', 'utf8');
+    const parentIsFile = await fileOpsRequest(port, token, {
+      cwd,
+      action: 'move',
+      path: 'archive/renamed.md',
+      targetPath: 'not-a-folder/renamed.md',
+    }, 422);
+    assert(parentIsFile.code === 'PARENT_NOT_DIRECTORY', 'move should reject a target parent that is a file');
+    assert(fs.existsSync(path.join(archiveDir, 'renamed.md')), 'failed move should keep the source file in place');
+
+    await fileOpsRequest(port, token, {
+      cwd,
+      action: 'delete',
+      path: 'archive/renamed.md',
+    });
+    assert(!fs.existsSync(path.join(archiveDir, 'renamed.md')), 'delete should remove a file');
+
+    const nonEmptyDelete = await fileOpsRequest(port, token, {
+      cwd,
+      action: 'delete',
+      path: 'docs',
+    }, 409);
+    assert(nonEmptyDelete.code === 'DIRECTORY_NOT_EMPTY', 'delete should reject non-empty folders without recursive=true');
+
+    await fileOpsRequest(port, token, {
+      cwd,
+      action: 'delete',
+      path: 'docs',
+      recursive: true,
+    });
+    assert(!fs.existsSync(docsDir), 'delete recursive should remove a non-empty folder');
+
+    const outside = await fileOpsRequest(port, token, {
+      cwd,
+      action: 'create_file',
+      path: '../outside.txt',
+    }, 400);
+    assert(/当前目录|目录内|路径/.test(outside.message || ''), 'file ops should reject traversal outside cwd');
+
+    const gitDelete = await fileOpsRequest(port, token, {
+      cwd,
+      action: 'delete',
+      path: '.git',
+      recursive: true,
+    }, 403);
+    assert(gitDelete.code === 'PROTECTED_PATH', 'file ops should reject protected .git operations');
+  });
+}
+
 async function runHappyPathRegressionCase({ port, password, tempRoot, configDir, sessionsDir, logsDir, homeDir, codexFixture, tinyPng }) {
   await withAuthedClient(port, password, async ({ client, token, messages }) => {
     const modelConfigMsg = await saveConfigAndWait(
@@ -3984,6 +4143,8 @@ async function main() {
       await runner.run('codex anomalous usage guard', () => runCodexAnomalousUsageRegressionCase(ctx));
       await runner.run('codex in-window cumulative usage guard', () => runCodexCumulativeUsageWithinWindowRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
+      await runner.run('file ref selected project cwd', () => runFileRefProjectCwdRegressionCase(ctx));
+      await runner.run('file ops api safety', () => runFileOpsRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));
       await runner.run('attachment boundary handling', () => runAttachmentBoundaryRegressionCase(ctx));

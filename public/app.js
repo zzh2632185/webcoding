@@ -291,6 +291,7 @@
   const sessionList = $('#session-list');
   const sidebarFilePanel = $('#sidebar-file-panel');
   const fileTree = $('#file-tree');
+  const filePanelNew = $('#file-panel-new');
   const filePanelRefresh = $('#file-panel-refresh');
   const contextBar = $('#context-bar');
   const contextRefList = $('#context-ref-list');
@@ -2716,8 +2717,11 @@
       const icon = isDir ? (expanded ? '▾' : '▸') : '•';
       const sizeText = !isDir && Number.isFinite(item.size) ? `<span class="file-tree-size">${formatFileSize(item.size)}</span>` : '';
       const fileOpenPayload = !isDir ? { path: item.path, relativePath: item.relativePath, name: item.name, size: item.size } : null;
+      const fileOpPayload = { type: isDir ? 'directory' : 'file', path: item.path, relativePath: item.relativePath || item.name || item.path, name: item.name || item.relativePath || item.path, size: isDir ? 0 : Number(item.size) || 0 };
+      const refCwd = fileTreeState.cwd || getFileTreeCwd();
       const refPayload = canAttach ? {
         type: isDir ? 'directory' : 'file',
+        cwd: refCwd,
         path: item.path,
         relativePath: item.relativePath || item.name || item.path,
         name: item.name || item.relativePath || item.path,
@@ -2725,8 +2729,8 @@
       } : null;
       const dragAttrs = refPayload ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : '';
       const attrs = isDir
-        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"${dragAttrs}`
-        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${dragAttrs}`;
+        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}" data-file-ops="${escapeHtml(JSON.stringify(fileOpPayload))}"${dragAttrs}`
+        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}" data-file-ops="${escapeHtml(JSON.stringify(fileOpPayload))}"${dragAttrs}`;
       const children = isDir && expanded ? renderFileTreeItems(item.children || [], level + 1) : '';
       return `
         <div class="file-tree-node" style="--level:${level}">
@@ -2734,6 +2738,7 @@
             <span class="file-tree-icon">${icon}</span>
             <span class="file-tree-name">${escapeHtml(item.name)}</span>
             ${sizeText}
+            <button class="file-tree-action" type="button" data-file-menu="${escapeHtml(JSON.stringify(fileOpPayload))}" aria-label="文件操作">⋯</button>
           </div>
           ${children}
         </div>
@@ -2761,7 +2766,8 @@
     }
     fileTree.innerHTML = renderFileTreeItems(fileTreeState.items);
     fileTree.querySelectorAll('.file-tree-row.directory[data-dir-path]').forEach((row) => {
-      const toggle = () => {
+      const toggle = (event) => {
+        if (event?.target instanceof Element && event.target.closest('.file-tree-action')) return;
         const dirPath = row.getAttribute('data-dir-path') || '';
         if (!dirPath) return;
         if (!(fileTreeState.expandedDirs instanceof Set)) fileTreeState.expandedDirs = new Set();
@@ -2778,7 +2784,8 @@
       });
     });
     fileTree.querySelectorAll('.file-tree-row.file[data-file-open]').forEach((row) => {
-      const open = () => {
+      const open = (event) => {
+        if (event?.target instanceof Element && event.target.closest('.file-tree-action')) return;
         const raw = row.getAttribute('data-file-open') || '';
         try { openFileViewer(JSON.parse(raw)); }
         catch { appendError('文件打开数据无效。'); }
@@ -2789,6 +2796,21 @@
           e.preventDefault();
           open();
         }
+      });
+    });
+    fileTree.querySelectorAll('[data-file-menu]').forEach((btn) => {
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        try { openFileOperationMenu(JSON.parse(btn.getAttribute('data-file-menu') || ''), btn); }
+        catch { appendError('文件操作数据无效。'); }
+      });
+    });
+    fileTree.querySelectorAll('.file-tree-row[data-file-ops]').forEach((row) => {
+      row.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        try { openFileOperationMenu(JSON.parse(row.getAttribute('data-file-ops') || ''), { getBoundingClientRect: () => ({ left: event.clientX, bottom: event.clientY }) }); }
+        catch { appendError('文件操作数据无效。'); }
       });
     });
     fileTree.querySelectorAll('.file-tree-row[draggable="true"]').forEach((row) => {
@@ -2847,11 +2869,467 @@
     }
     composeState.pendingFileRefs.push({
       type: isDir ? 'directory' : 'file',
+      cwd: ref.cwd || getFileTreeCwd() || null,
       path: ref.path,
       relativePath: ref.relativePath || ref.path,
       size: isDir ? 0 : Number(ref.size) || 0,
     });
     renderContextBar();
+  }
+
+  function closeFileOperationMenu() {
+    document.getElementById('file-operation-menu')?.remove();
+  }
+
+  function getPathSeparator(pathValue) {
+    return String(pathValue || '').includes('\\') ? '\\' : '/';
+  }
+
+  function pathBasename(pathValue) {
+    const parts = String(pathValue || '').replace(/\\/g, '/').split('/').filter(Boolean);
+    return parts[parts.length - 1] || '';
+  }
+
+  function pathDirname(pathValue) {
+    const raw = String(pathValue || '');
+    if (!raw) return '';
+    const sep = getPathSeparator(raw);
+    const parts = raw.split(/[\\/]+/).filter(Boolean);
+    if (parts.length <= 1) return '';
+    return parts.slice(0, -1).join(sep);
+  }
+
+  function joinPathPart(parent, child) {
+    const base = String(parent || '').trim();
+    const name = String(child || '').trim();
+    if (!base) return name;
+    const sep = getPathSeparator(base);
+    return `${base.replace(/[\\/]+$/, '')}${sep}${name.replace(/^[\\/]+/, '')}`;
+  }
+
+  function validateSimpleFileName(name) {
+    const value = String(name || '').trim();
+    if (!value) return '名称不能为空';
+    if (value === '.' || value === '..' || /[\\/]/.test(value) || /\u0000/.test(value)) return '名称无效';
+    if (/[<>:"|?*]/.test(value)) return '名称包含 Windows 不支持的字符';
+    return '';
+  }
+
+  function replacePathPrefix(pathValue, oldPrefix, newPrefix) {
+    const normalizedPath = normalizeComparablePath(pathValue);
+    const normalizedOld = normalizeComparablePath(oldPrefix);
+    if (!normalizedPath || !normalizedOld) return pathValue;
+    if (normalizedPath !== normalizedOld && !normalizedPath.startsWith(`${normalizedOld}/`)) return pathValue;
+    const suffix = normalizedPath === normalizedOld ? '' : normalizedPath.slice(normalizedOld.length).replace(/^\//, '');
+    return suffix ? joinPathPart(newPrefix, suffix) : newPrefix;
+  }
+
+  function fileOpRefFromItem(item) {
+    if (!item) return null;
+    return {
+      type: item.type === 'directory' ? 'directory' : 'file',
+      cwd: fileTreeState.cwd || getFileTreeCwd(),
+      path: item.path,
+      relativePath: item.relativePath || item.name || item.path,
+      name: item.name || pathBasename(item.path),
+      size: item.type === 'directory' ? 0 : Number(item.size) || 0,
+    };
+  }
+
+  async function requestFileOperation(payload) {
+    await ensureAuthenticatedWs();
+    const response = await fetch('/api/file-ops', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${connectionState.authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.ok) throw new Error(result?.message || `文件操作失败 (${response.status})`);
+    return result;
+  }
+
+  function syncFileViewerAfterFileOperation(action, sourcePath, result) {
+    const activePath = fileViewerState.activePath;
+    if (!activePath || !sourcePath) return;
+    const affected = normalizeComparablePath(activePath) === normalizeComparablePath(sourcePath)
+      || isSameOrChildPath(sourcePath, activePath);
+    if (!affected) return;
+    if (action === 'delete') {
+      closeFileViewer();
+      return;
+    }
+    if ((action === 'rename' || action === 'move') && result?.path) {
+      const nextPath = replacePathPrefix(activePath, sourcePath, result.path);
+      if (nextPath && nextPath !== activePath) {
+        openFileViewer({ path: nextPath, relativePath: result.relativePath || nextPath, name: pathBasename(nextPath), size: result.size || 0 });
+      }
+    }
+  }
+
+  async function runFileOperation(payload, options = {}) {
+    try {
+      const result = await requestFileOperation(payload);
+      syncFileViewerAfterFileOperation(payload.action, payload.path, result);
+      await loadFileTree(getFileTreeCwd());
+      showToast(options.successText || '文件操作已完成');
+      return result;
+    } catch (err) {
+      appendError(err.message || '文件操作失败');
+      return null;
+    }
+  }
+
+  function showFileTextInputModal({
+    title,
+    label,
+    initialValue = '',
+    confirmLabel = '确认',
+    danger = false,
+    placeholder = '',
+    helpText = '',
+    allowEmpty = false,
+    quickActions = [],
+  }) {
+    return new Promise((resolve) => {
+      const modalId = `file-op-modal-${Date.now()}`;
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.id = modalId;
+      overlay.innerHTML = `
+        <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="${modalId}-title">
+          <div class="modal-header">
+            <span class="modal-title" id="${modalId}-title">${escapeHtml(title)}</span>
+            <button class="modal-close-btn" type="button" aria-label="关闭">✕</button>
+          </div>
+          <div class="modal-body file-op-modal-body">
+            <label class="modal-field-label" for="${modalId}-input">${escapeHtml(label)}</label>
+            <input id="${modalId}-input" class="modal-text-input" type="text" value="${escapeHtml(initialValue)}" placeholder="${escapeHtml(placeholder)}">
+            ${helpText ? `<div class="file-op-modal-help">${escapeHtml(helpText)}</div>` : ''}
+            ${quickActions.length ? `<div class="file-op-quick-actions">${quickActions.map((action, index) => `<button type="button" data-quick-action="${index}">${escapeHtml(action.label)}</button>`).join('')}</div>` : ''}
+            <div class="file-op-modal-status" aria-live="polite"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="modal-btn-secondary" type="button" data-action="cancel">取消</button>
+            <button class="modal-btn-${danger ? 'danger' : 'primary'}" type="button" data-action="submit">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </div>
+      `;
+      const finish = (value) => {
+        overlay.remove();
+        resolve(value);
+      };
+      document.body.appendChild(overlay);
+      const input = overlay.querySelector('input');
+      const status = overlay.querySelector('.file-op-modal-status');
+      const submit = () => {
+        const value = input.value.trim();
+        if (!value && !allowEmpty) {
+          status.textContent = '请输入名称或路径';
+          input.focus();
+          return;
+        }
+        finish(value);
+      };
+      overlay.querySelectorAll('[data-quick-action]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const index = Number(button.dataset.quickAction);
+          const action = quickActions[index];
+          finish(action ? String(action.value ?? '') : '');
+        });
+      });
+      overlay.querySelector('.modal-close-btn')?.addEventListener('click', () => finish(null));
+      overlay.querySelector('[data-action="cancel"]')?.addEventListener('click', () => finish(null));
+      overlay.querySelector('[data-action="submit"]')?.addEventListener('click', submit);
+      overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(null); });
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') submit();
+        if (event.key === 'Escape') finish(null);
+      });
+      setTimeout(() => {
+        input.focus();
+        input.select();
+      }, 0);
+    });
+  }
+
+  async function createFileTreeItem(parentItem, type) {
+    const baseDir = parentItem?.type === 'directory' ? (parentItem.relativePath || '') : '';
+    const name = await showFileTextInputModal({
+      title: type === 'directory' ? '新建文件夹' : '新建文件',
+      label: type === 'directory' ? '文件夹名称' : '文件名称',
+      confirmLabel: '创建',
+    });
+    if (!name) return;
+    const error = validateSimpleFileName(name);
+    if (error) {
+      appendError(error);
+      return;
+    }
+    await runFileOperation({
+      cwd: getFileTreeCwd(),
+      action: type === 'directory' ? 'create_directory' : 'create_file',
+      path: joinPathPart(baseDir, name),
+    }, { successText: type === 'directory' ? '文件夹已创建' : '文件已创建' });
+  }
+
+  async function renameFileTreeItem(item) {
+    const nextName = await showFileTextInputModal({
+      title: item.type === 'directory' ? '重命名文件夹' : '重命名文件',
+      label: '新名称',
+      initialValue: item.name || pathBasename(item.path),
+      confirmLabel: '重命名',
+    });
+    if (!nextName || nextName === item.name) return;
+    const error = validateSimpleFileName(nextName);
+    if (error) {
+      appendError(error);
+      return;
+    }
+    const parentRel = pathDirname(item.relativePath || '');
+    await runFileOperation({
+      cwd: getFileTreeCwd(),
+      action: 'rename',
+      path: item.path,
+      targetPath: joinPathPart(parentRel, nextName),
+    }, { successText: '已重命名' });
+  }
+
+  function normalizeRelativePathForCompare(pathValue) {
+    return String(pathValue || '')
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+  }
+
+  function isSameOrChildRelativePath(parentPath, childPath) {
+    const parent = normalizeRelativePathForCompare(parentPath);
+    const child = normalizeRelativePathForCompare(childPath);
+    if (!parent || !child) return false;
+    return parent === child || child.startsWith(`${parent}/`);
+  }
+
+  function findFileTreeItemByRelativePath(items, relativePath) {
+    const target = normalizeRelativePathForCompare(relativePath);
+    if (!target || !Array.isArray(items)) return null;
+    for (const entry of items) {
+      const entryPath = normalizeRelativePathForCompare(entry?.relativePath || entry?.name);
+      if (entryPath === target) return entry;
+      const childMatch = findFileTreeItemByRelativePath(entry?.children || [], target);
+      if (childMatch) return childMatch;
+    }
+    return null;
+  }
+
+  function validateMoveTargetDir(item, targetDir) {
+    const target = normalizeRelativePathForCompare(targetDir === '.' ? '' : targetDir);
+    const targetName = item?.name || pathBasename(item?.path);
+    const currentRel = normalizeRelativePathForCompare(item?.relativePath || targetName);
+    const targetRel = normalizeRelativePathForCompare(joinPathPart(target, targetName));
+    const knownTarget = target ? findFileTreeItemByRelativePath(fileTreeState.items || [], target) : null;
+    if (knownTarget && knownTarget.type !== 'directory') return '该路径是文件，请选择文件夹作为目标目录';
+    if (item?.type === 'directory' && isSameOrChildRelativePath(item.relativePath, target)) {
+      return '不能移动文件夹到自身或子目录内';
+    }
+    if (targetRel && targetRel === currentRel) return '已经在该目录下';
+    return '';
+  }
+
+  function renderMoveDestinationRows(items, sourceItem, selectedDir, level = 0) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    return items.map((entry) => {
+      if (entry?.type !== 'directory') return '';
+      const relativePath = normalizeRelativePathForCompare(entry.relativePath || entry.name);
+      const selected = normalizeRelativePathForCompare(selectedDir) === relativePath;
+      const disabled = sourceItem?.type === 'directory' && isSameOrChildRelativePath(sourceItem.relativePath, relativePath);
+      const classes = ['file-op-destination-option'];
+      if (selected) classes.push('active');
+      const reason = disabled ? '不能移动到自身或子目录内' : '';
+      const children = renderMoveDestinationRows(entry.children || [], sourceItem, selectedDir, level + 1);
+      return `
+        <button type="button" class="${classes.join(' ')}" data-move-dest="${escapeHtml(relativePath)}" style="--level:${level}" ${disabled ? 'disabled' : ''} title="${escapeHtml(reason || relativePath)}">
+          <span class="file-op-destination-name">${escapeHtml(entry.name || relativePath)}</span>
+          <span class="file-op-destination-path">${escapeHtml(relativePath)}</span>
+        </button>
+        ${children}
+      `;
+    }).join('');
+  }
+
+  function syncMoveDestinationSelection(overlay, selectedDir) {
+    const selected = normalizeRelativePathForCompare(selectedDir);
+    overlay.querySelectorAll('[data-move-dest]').forEach((button) => {
+      const isActive = normalizeRelativePathForCompare(button.getAttribute('data-move-dest') || '') === selected;
+      button.classList.toggle('active', isActive);
+      button.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    });
+  }
+
+  function buildMoveDestinationModalHtml(modalId, item, initialDir, directoryRows) {
+    const rootActive = initialDir ? '' : ' active';
+    return `
+      <div class="modal-panel file-move-modal" role="dialog" aria-modal="true" aria-labelledby="${modalId}-title">
+        <div class="modal-header">
+          <span class="modal-title" id="${modalId}-title">${item.type === 'directory' ? '移动文件夹' : '移动文件'}</span>
+          <button class="modal-close-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="modal-body file-op-modal-body">
+          <label class="modal-field-label" for="${modalId}-input">目标目录（项目内）</label>
+          <input id="${modalId}-input" class="modal-text-input" type="text" value="${escapeHtml(initialDir)}" placeholder="选择下方目录，或输入 docs/assets">
+          <div class="file-op-modal-help">优先从下方选择文件夹；留空表示项目根目录。</div>
+          <div class="file-op-destination-list" role="listbox" aria-label="目标目录">
+            <button type="button" class="file-op-destination-option root${rootActive}" data-move-dest="" style="--level:0" aria-selected="${initialDir ? 'false' : 'true'}">
+              <span class="file-op-destination-name">项目根目录</span>
+              <span class="file-op-destination-path">/</span>
+            </button>
+            ${directoryRows || '<div class="file-op-destination-empty">当前文件树没有可选子目录。</div>'}
+          </div>
+          <div class="file-op-modal-status" aria-live="polite"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn-secondary" type="button" data-action="cancel">取消</button>
+          <button class="modal-btn-primary" type="button" data-action="submit">移动</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindMoveDestinationModal(overlay, item, finish) {
+    const input = overlay.querySelector('input');
+    const status = overlay.querySelector('.file-op-modal-status');
+    const submit = () => {
+      const value = normalizeRelativePathForCompare(input.value === '.' ? '' : input.value);
+      const error = validateMoveTargetDir(item, value);
+      if (error) {
+        status.textContent = error;
+        input.focus();
+        return;
+      }
+      finish(value);
+    };
+    overlay.querySelectorAll('[data-move-dest]').forEach((button) => {
+      button.addEventListener('click', () => {
+        if (button.hasAttribute('disabled')) return;
+        input.value = normalizeRelativePathForCompare(button.getAttribute('data-move-dest') || '');
+        status.textContent = '';
+        syncMoveDestinationSelection(overlay, input.value);
+      });
+    });
+    input.addEventListener('input', () => syncMoveDestinationSelection(overlay, input.value));
+    overlay.querySelector('.modal-close-btn')?.addEventListener('click', () => finish(null));
+    overlay.querySelector('[data-action="cancel"]')?.addEventListener('click', () => finish(null));
+    overlay.querySelector('[data-action="submit"]')?.addEventListener('click', submit);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(null); });
+    overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') finish(null); });
+    setTimeout(() => {
+      input.focus();
+      input.select();
+      syncMoveDestinationSelection(overlay, input.value);
+    }, 0);
+  }
+
+  function showMoveDestinationModal(item) {
+    return new Promise((resolve) => {
+      const modalId = `file-move-modal-${Date.now()}`;
+      const initialDir = normalizeRelativePathForCompare(pathDirname(item.relativePath || ''));
+      const directoryRows = renderMoveDestinationRows(fileTreeState.items || [], item, initialDir);
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.id = modalId;
+      overlay.innerHTML = buildMoveDestinationModalHtml(modalId, item, initialDir, directoryRows);
+      const finish = (value) => {
+        overlay.remove();
+        resolve(value);
+      };
+      document.body.appendChild(overlay);
+      bindMoveDestinationModal(overlay, item, finish);
+    });
+  }
+
+  async function moveFileTreeItem(item) {
+    const targetDir = await showMoveDestinationModal(item);
+    if (targetDir === null) return;
+    await runFileOperation({
+      cwd: getFileTreeCwd(),
+      action: 'move',
+      path: item.path,
+      targetPath: joinPathPart(targetDir, item.name || pathBasename(item.path)),
+    }, { successText: '已移动' });
+  }
+
+  async function deleteFileTreeItem(item) {
+    const isDir = item.type === 'directory';
+    const confirmed = await showGitConfirmModal({
+      title: isDir ? '删除文件夹' : '删除文件',
+      message: isDir ? `确认删除文件夹「${item.name || item.relativePath}」及其内容？` : `确认删除文件「${item.name || item.relativePath}」？`,
+      detail: isDir ? '该操作会删除整个目录树，不能撤销。' : '该操作不能撤销。',
+      confirmLabel: '删除',
+      danger: true,
+    });
+    if (!confirmed) return;
+    await runFileOperation({
+      cwd: getFileTreeCwd(),
+      action: 'delete',
+      path: item.path,
+      recursive: isDir,
+    }, { successText: isDir ? '文件夹已删除' : '文件已删除' });
+  }
+
+  function openFileOperationMenu(item, anchor) {
+    closeFileOperationMenu();
+    if (!item) return;
+    const isDir = item.type === 'directory';
+    const menu = document.createElement('div');
+    menu.id = 'file-operation-menu';
+    menu.className = 'file-operation-menu';
+    menu.setAttribute('role', 'menu');
+    const actions = isDir
+      ? [
+          ['new-file', '新建文件'],
+          ['new-directory', '新建文件夹'],
+          ['reference', '引用目录'],
+          ['rename', '重命名'],
+          ['move', '移动到...'],
+          ['delete', '删除'],
+        ]
+      : [
+          ['open', '打开'],
+          ['reference', '引用文件'],
+          ['rename', '重命名'],
+          ['move', '移动到...'],
+          ['delete', '删除'],
+        ];
+    menu.innerHTML = actions.map(([action, label]) => `
+      <button type="button" role="menuitem" data-action="${action}" class="${action === 'delete' ? 'danger' : ''}">${escapeHtml(label)}</button>
+    `).join('');
+    const rect = anchor?.getBoundingClientRect?.() || { left: 16, bottom: 120 };
+    document.body.appendChild(menu);
+    const menuRect = menu.getBoundingClientRect();
+    const left = Math.min(Math.max(8, rect.left), window.innerWidth - menuRect.width - 8);
+    const top = Math.min(Math.max(8, rect.bottom + 4), window.innerHeight - menuRect.height - 8);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.querySelectorAll('button[data-action]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        closeFileOperationMenu();
+        const action = button.dataset.action;
+        if (action === 'open') openFileViewer(item);
+        else if (action === 'reference') addPendingFileRef(fileOpRefFromItem(item));
+        else if (action === 'new-file') await createFileTreeItem(item, 'file');
+        else if (action === 'new-directory') await createFileTreeItem(item, 'directory');
+        else if (action === 'rename') await renameFileTreeItem(item);
+        else if (action === 'move') await moveFileTreeItem(item);
+        else if (action === 'delete') await deleteFileTreeItem(item);
+      });
+    });
+    const close = (event) => {
+      if (menu.contains(event.target)) return;
+      closeFileOperationMenu();
+      document.removeEventListener('mousedown', close, true);
+    };
+    setTimeout(() => document.addEventListener('mousedown', close, true), 0);
   }
 
 
@@ -2860,6 +3338,7 @@
     if (!item.isText || item.tooLarge || (Number(item.size) || 0) > MAX_PENDING_FILE_REF_SIZE) return null;
     return {
       type: 'file',
+      cwd: fileTreeState.cwd || getFileTreeCwd(),
       path: item.path,
       relativePath: item.relativePath || item.name || item.path,
       name: item.name || item.relativePath || item.path,
@@ -2871,6 +3350,7 @@
     if (!item || item.type !== 'directory') return null;
     return {
       type: 'directory',
+      cwd: fileTreeState.cwd || getFileTreeCwd(),
       path: item.path,
       relativePath: item.relativePath || item.name || item.path,
       name: item.name || item.relativePath || item.path,
@@ -6275,6 +6755,7 @@
   }
 
   function getPathLeaf(pathValue) {
+    if (pathValue === '::drives::') return '此电脑';
     const normalized = normalizeComparablePath(pathValue);
     if (!normalized || normalized === '/') return pathValue || '/';
     const parts = normalized.split('/');
@@ -8459,6 +8940,16 @@
       removeQueuedMessage(btn.dataset.queuedMessageCancel || '');
     });
   }
+  if (filePanelNew) {
+    filePanelNew.addEventListener('click', (event) => {
+      const rootPath = getFileTreeCwd();
+      if (!rootPath) {
+        appendError('请先打开项目目录，再新建文件。');
+        return;
+      }
+      openFileOperationMenu({ type: 'directory', path: rootPath, relativePath: '', name: getPathLeaf(rootPath), size: 0 }, filePanelNew || event.currentTarget);
+    });
+  }
   if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
   renderContextBar();
   if (attachBtn) {
@@ -10130,6 +10621,11 @@
       currentPathEl.textContent = '载入后会在这里显示你当前选中的完整路径。';
       return;
     }
+    if (pathValue === '::drives::') {
+      currentNameEl.textContent = '此电脑';
+      currentPathEl.textContent = '选择一个盘符进入';
+      return;
+    }
     currentNameEl.textContent = getPathLeaf(pathValue);
     currentPathEl.textContent = hasError
       ? `${pathValue}（当前不可用，请换一个目录）`
@@ -10173,32 +10669,77 @@
   function renderNewSessionCrumbs(crumbsEl, fullPath, onNavigate) {
     crumbsEl.innerHTML = '';
     if (!fullPath) return;
-    const parts = fullPath.split('/').filter(Boolean);
-    const rootSpan = document.createElement(parts.length > 0 ? 'button' : 'span');
-    if (parts.length > 0) rootSpan.type = 'button';
-    rootSpan.className = parts.length > 0 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
-    rootSpan.textContent = '/';
-    if (parts.length > 0) {
-      rootSpan.addEventListener('click', () => onNavigate('/'));
-    }
-    crumbsEl.appendChild(rootSpan);
 
-    parts.forEach((seg, i) => {
-      const sep = document.createElement('span');
-      sep.className = 'dir-browser-crumb-sep';
-      sep.textContent = '\u203A';
-      crumbsEl.appendChild(sep);
-
-      const isLast = i === parts.length - 1;
-      const span = document.createElement(isLast ? 'span' : 'button');
-      if (!isLast) span.type = 'button';
-      span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
-      span.textContent = seg;
-      if (!isLast) {
-        span.addEventListener('click', () => onNavigate('/' + parts.slice(0, i + 1).join('/')));
-      }
+    // Windows drive listing sentinel
+    if (fullPath === '::drives::') {
+      const span = document.createElement('span');
+      span.className = 'dir-browser-crumb-current';
+      span.textContent = '\u6B64\u7535\u8111';
       crumbsEl.appendChild(span);
-    });
+      return;
+    }
+
+    const isWinPath = /^[A-Z]:\\/i.test(fullPath);
+    const sep = isWinPath ? '\\' : '/';
+    const parts = fullPath.split(sep).filter(Boolean);
+
+    if (isWinPath) {
+      // Windows: root is the drive (e.g. "C:")
+      const driveRoot = parts[0];
+      const rootEl = document.createElement(parts.length > 1 ? 'button' : 'span');
+      if (parts.length > 1) rootEl.type = 'button';
+      rootEl.className = parts.length > 1 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
+      rootEl.textContent = driveRoot;
+      if (parts.length > 1) {
+        rootEl.addEventListener('click', () => onNavigate(driveRoot));
+      }
+      crumbsEl.appendChild(rootEl);
+
+      for (let i = 1; i < parts.length; i++) {
+        const sepEl = document.createElement('span');
+        sepEl.className = 'dir-browser-crumb-sep';
+        sepEl.textContent = '\u203A';
+        crumbsEl.appendChild(sepEl);
+
+        const isLast = i === parts.length - 1;
+        const span = document.createElement(isLast ? 'span' : 'button');
+        if (!isLast) span.type = 'button';
+        span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
+        span.textContent = parts[i];
+        if (!isLast) {
+          const crumbPath = parts.slice(0, i + 1).join('\\');
+          span.addEventListener('click', () => onNavigate(crumbPath));
+        }
+        crumbsEl.appendChild(span);
+      }
+    } else {
+      // Unix: root is "/"
+      const rootSpan = document.createElement(parts.length > 0 ? 'button' : 'span');
+      if (parts.length > 0) rootSpan.type = 'button';
+      rootSpan.className = parts.length > 0 ? 'dir-browser-crumb' : 'dir-browser-crumb-current';
+      rootSpan.textContent = '/';
+      if (parts.length > 0) {
+        rootSpan.addEventListener('click', () => onNavigate('/'));
+      }
+      crumbsEl.appendChild(rootSpan);
+
+      parts.forEach((seg, i) => {
+        const sepEl = document.createElement('span');
+        sepEl.className = 'dir-browser-crumb-sep';
+        sepEl.textContent = '\u203A';
+        crumbsEl.appendChild(sepEl);
+
+        const isLast = i === parts.length - 1;
+        const span = document.createElement(isLast ? 'span' : 'button');
+        if (!isLast) span.type = 'button';
+        span.className = isLast ? 'dir-browser-crumb-current' : 'dir-browser-crumb';
+        span.textContent = seg;
+        if (!isLast) {
+          span.addEventListener('click', () => onNavigate('/' + parts.slice(0, i + 1).join('/')));
+        }
+        crumbsEl.appendChild(span);
+      });
+    }
 
     crumbsEl.scrollLeft = crumbsEl.scrollWidth;
   }
@@ -10234,7 +10775,14 @@
     }
     for (const name of dirs) {
       const item = createDirBrowserItemElement(name, '进入这个目录继续浏览', () => {
-        const childPath = currentBrowsePath === '/' ? '/' + name : currentBrowsePath + '/' + name;
+        let childPath;
+        if (currentBrowsePath === '::drives::') {
+          childPath = name;
+        } else if (currentBrowsePath === '/') {
+          childPath = '/' + name;
+        } else {
+          childPath = currentBrowsePath + '/' + name;
+        }
         onNavigate(childPath);
       });
       dirListEl.appendChild(item);

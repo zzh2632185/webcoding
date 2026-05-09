@@ -86,6 +86,13 @@ const BRIDGE_SCRIPT_PATH = path.join(__dirname, 'lib', 'local-api-bridge.js');
 const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || '';
 const BROWSE_ROOTS = USER_HOME ? [path.resolve(USER_HOME)] : [path.resolve(process.cwd())];
+if (process.platform === 'win32') {
+  for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+    const root = String.fromCharCode(code) + ':\\';
+    try { fs.statSync(root); BROWSE_ROOTS.push(root); } catch {}
+  }
+}
+const DRIVES_LIST_SENTINEL = '::drives::';
 const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_CLEANUP_MS = 60 * 60 * 1000;
 const HISTORY_CHUNK_BUFFER_LIMIT = 512 * 1024;
@@ -1582,6 +1589,85 @@ function buildCodexRuntimeResult(source, bridge) {
   };
 }
 
+function copyDirectorySync(src, dst) {
+  fs.mkdirSync(dst, { recursive: true });
+  const entries = fs.readdirSync(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const dstPath = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectorySync(srcPath, dstPath);
+    } else if (entry.isSymbolicLink()) {
+      try { fs.symlinkSync(fs.readlinkSync(srcPath), dstPath); } catch {}
+    } else {
+      fs.copyFileSync(srcPath, dstPath);
+    }
+  }
+}
+
+function syncCodexRuntimeAssets() {
+  const localCodexHome = path.join(os.homedir(), '.codex');
+  if (!fs.existsSync(localCodexHome)) return;
+
+  const dirsToSync = ['skills', 'mcp', 'commands', 'agents', 'rules', 'plugins'];
+  const filesToSync = ['hooks.json', 'settings.json', 'AGENTS.md', 'instruction.md'];
+
+  fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
+
+  for (const dir of dirsToSync) {
+    const src = path.join(localCodexHome, dir);
+    const dst = path.join(CODEX_RUNTIME_HOME, dir);
+    if (!fs.existsSync(src)) continue;
+
+    try { fs.unlinkSync(dst); } catch {}
+    try { fs.rmSync(dst, { recursive: true, force: true }); } catch {}
+
+    try {
+      fs.symlinkSync(src, dst, 'junction');
+    } catch {
+      try {
+        fs.symlinkSync(src, dst, 'dir');
+      } catch {
+        copyDirectorySync(src, dst);
+      }
+    }
+  }
+
+  for (const file of filesToSync) {
+    const src = path.join(localCodexHome, file);
+    const dst = path.join(CODEX_RUNTIME_HOME, file);
+    if (!fs.existsSync(src)) continue;
+    try { fs.copyFileSync(src, dst); } catch {}
+  }
+
+  // Handle helloagents symlink
+  const haSrc = path.join(localCodexHome, 'helloagents');
+  const haDst = path.join(CODEX_RUNTIME_HOME, 'helloagents');
+  if (fs.existsSync(haSrc)) {
+    try { fs.unlinkSync(haDst); } catch {}
+    try { fs.rmSync(haDst, { recursive: true, force: true }); } catch {}
+    try {
+      const haStat = fs.lstatSync(haSrc);
+      if (haStat.isSymbolicLink()) {
+        const target = fs.readlinkSync(haSrc);
+        try {
+          fs.symlinkSync(target, haDst, 'junction');
+        } catch {
+          try { fs.symlinkSync(target, haDst, 'dir'); } catch {}
+        }
+      } else if (haStat.isDirectory()) {
+        try {
+          fs.symlinkSync(haSrc, haDst, 'junction');
+        } catch {
+          try { fs.symlinkSync(haSrc, haDst, 'dir'); } catch {
+            copyDirectorySync(haSrc, haDst);
+          }
+        }
+      }
+    } catch {}
+  }
+}
+
 function prepareCodexCustomRuntime(config) {
   let source = resolveCodexActiveSource(config);
   if (source?.error) return source;
@@ -1591,6 +1677,7 @@ function prepareCodexCustomRuntime(config) {
     try {
       const bridge = ensureBridgeRuntimeForTemplate(source, { forceNewToken: true });
       writeCodexLocalBridgeConfig(source, bridge);
+      syncCodexRuntimeAssets();
       return buildCodexRuntimeResult(source, bridge);
     } catch (error) {
       return { error: error.message || '本地 Codex API 桥接初始化失败' };
@@ -1621,6 +1708,7 @@ function prepareCodexCustomRuntime(config) {
     '',
   ].filter((line) => line !== null).join('\n');
   fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  syncCodexRuntimeAssets();
 
   return buildCodexRuntimeResult(source, bridge);
 }
@@ -2258,6 +2346,160 @@ function resolvePathWithinCwd(cwd, targetPath = '') {
   return { root, resolved };
 }
 
+class FileOperationError extends Error {
+  constructor(statusCode, code, message) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+function fileOperationErrorResponse(res, err, fallbackMessage = '文件操作失败') {
+  const statusCode = Number(err?.statusCode || 0) || 400;
+  return jsonResponse(res, statusCode, {
+    ok: false,
+    code: err?.code || 'FILE_OPERATION_FAILED',
+    message: err?.message || fallbackMessage,
+  });
+}
+
+function validateFileOperationName(name, label = '名称') {
+  const value = String(name || '').trim();
+  if (!value) throw new FileOperationError(422, 'INVALID_NAME', `${label}不能为空`);
+  if (value === '.' || value === '..') throw new FileOperationError(422, 'INVALID_NAME', `${label}无效`);
+  if (/[\u0000]/.test(value)) throw new FileOperationError(422, 'INVALID_NAME', `${label}包含无效字符`);
+  if (process.platform === 'win32' && /[<>:"|?*]/.test(value)) {
+    throw new FileOperationError(422, 'INVALID_NAME', `${label}包含 Windows 不支持的字符`);
+  }
+  return value;
+}
+
+function relativePathSegments(root, resolved) {
+  const relativePath = path.relative(root, resolved);
+  return relativePath ? relativePath.split(/[\\/]+/).filter(Boolean) : [];
+}
+
+function assertFileOperationPathAllowed(root, resolved, options = {}) {
+  if (!isPathInside(resolved, root)) throw new FileOperationError(400, 'PATH_OUTSIDE_CWD', '路径不在当前目录内');
+  const allowRoot = !!options.allowRoot;
+  if (!allowRoot && path.resolve(resolved) === path.resolve(root)) {
+    throw new FileOperationError(403, 'PROTECTED_PATH', '不能操作项目根目录');
+  }
+  const segments = relativePathSegments(root, resolved).map((part) => part.toLowerCase());
+  if (segments.includes('.git')) {
+    throw new FileOperationError(403, 'PROTECTED_PATH', '不能操作 .git 目录');
+  }
+}
+
+function resolveFileOperationPath(cwd, targetPath, options = {}) {
+  let resolved;
+  let root;
+  try {
+    ({ root, resolved } = resolvePathWithinCwd(cwd, targetPath));
+  } catch (err) {
+    throw new FileOperationError(400, 'INVALID_PATH', err?.message || '路径无效');
+  }
+  assertFileOperationPathAllowed(root, resolved, options);
+  return { root, resolved };
+}
+
+function assertTargetAvailable(targetPath) {
+  if (fs.existsSync(targetPath)) {
+    throw new FileOperationError(409, 'TARGET_EXISTS', '目标名称已存在');
+  }
+  const parent = path.dirname(targetPath);
+  let parentStat;
+  try {
+    parentStat = fs.statSync(parent);
+  } catch {
+    throw new FileOperationError(404, 'PARENT_NOT_FOUND', '目标目录不存在');
+  }
+  if (!parentStat.isDirectory()) {
+    throw new FileOperationError(422, 'PARENT_NOT_DIRECTORY', '目标位置不是目录');
+  }
+}
+
+function buildFileOperationResult(root, resolved, operation) {
+  let stat = null;
+  try { stat = fs.lstatSync(resolved); } catch {}
+  return {
+    ok: true,
+    operation,
+    cwd: root,
+    path: resolved,
+    relativePath: path.relative(root, resolved) || path.basename(resolved),
+    type: stat?.isDirectory() ? 'directory' : 'file',
+    size: stat && stat.isFile() ? stat.size : 0,
+  };
+}
+
+function executeFileOperation(payload) {
+  const cwd = String(payload?.cwd || '').trim();
+  const action = String(payload?.action || '').trim();
+  const rawPath = String(payload?.path || '').trim();
+  const rawTargetPath = String(payload?.targetPath || '').trim();
+  if (!cwd) throw new FileOperationError(422, 'MISSING_CWD', '缺少当前目录');
+  if (!action) throw new FileOperationError(422, 'MISSING_ACTION', '缺少操作类型');
+  if (!rawPath) throw new FileOperationError(422, 'MISSING_PATH', '缺少路径');
+
+  if (action === 'create_file' || action === 'create_directory') {
+    const { root, resolved } = resolveFileOperationPath(cwd, rawPath);
+    validateFileOperationName(path.basename(resolved), action === 'create_file' ? '文件名' : '文件夹名');
+    assertTargetAvailable(resolved);
+    if (action === 'create_file') {
+      fs.writeFileSync(resolved, '', { encoding: 'utf8', flag: 'wx' });
+      return { statusCode: 201, payload: buildFileOperationResult(root, resolved, action) };
+    }
+    fs.mkdirSync(resolved);
+    return { statusCode: 201, payload: buildFileOperationResult(root, resolved, action) };
+  }
+
+  const { root, resolved } = resolveFileOperationPath(cwd, rawPath);
+  let sourceStat;
+  try { sourceStat = fs.lstatSync(resolved); }
+  catch { throw new FileOperationError(404, 'SOURCE_NOT_FOUND', '文件或目录不存在'); }
+
+  if (action === 'delete') {
+    if (sourceStat.isDirectory() && !sourceStat.isSymbolicLink()) {
+      const entries = fs.readdirSync(resolved);
+      if (entries.length > 0 && !payload.recursive) {
+        throw new FileOperationError(409, 'DIRECTORY_NOT_EMPTY', '目录非空，需要确认后删除');
+      }
+      fs.rmSync(resolved, { recursive: true, force: false });
+    } else {
+      fs.unlinkSync(resolved);
+    }
+    return {
+      statusCode: 200,
+      payload: {
+        ok: true,
+        operation: action,
+        cwd: root,
+        path: resolved,
+        relativePath: path.relative(root, resolved) || path.basename(resolved),
+        deleted: true,
+      },
+    };
+  }
+
+  if (action === 'rename' || action === 'move') {
+    if (!rawTargetPath) throw new FileOperationError(422, 'MISSING_TARGET_PATH', '缺少目标路径');
+    const { resolved: targetResolved } = resolveFileOperationPath(cwd, rawTargetPath);
+    validateFileOperationName(path.basename(targetResolved), '目标名称');
+    assertTargetAvailable(targetResolved);
+    if (action === 'rename' && path.dirname(resolved) !== path.dirname(targetResolved)) {
+      throw new FileOperationError(422, 'INVALID_TARGET_PATH', '重命名只能在原目录内修改名称');
+    }
+    if (sourceStat.isDirectory() && isPathInside(targetResolved, resolved)) {
+      throw new FileOperationError(422, 'INVALID_TARGET_PATH', '不能移动目录到自身或子目录内');
+    }
+    fs.renameSync(resolved, targetResolved);
+    return { statusCode: 200, payload: buildFileOperationResult(root, targetResolved, action) };
+  }
+
+  throw new FileOperationError(422, 'UNSUPPORTED_ACTION', '不支持的文件操作');
+}
+
 function isLikelyTextFile(filePath, size = 0) {
   const base = path.basename(filePath).toLowerCase();
   const ext = path.extname(base).toLowerCase();
@@ -2481,9 +2723,10 @@ function normalizeContextFileRefs(fileRefs, cwd) {
   for (const ref of refs) {
     const rawPath = String(ref?.path || ref?.relativePath || '').trim();
     if (!rawPath) continue;
+    const refCwd = String(ref?.cwd || '').trim() || inferContextFileRefCwd(ref, cwd) || cwd;
     let root;
     let resolved;
-    try { ({ root, resolved } = resolvePathWithinCwd(cwd, rawPath)); }
+    try { ({ root, resolved } = resolvePathWithinCwd(refCwd, rawPath)); }
     catch (err) { return { refs: [], error: err.message || '引用路径无效' }; }
     if (seen.has(resolved)) continue;
     seen.add(resolved);
@@ -2494,6 +2737,7 @@ function normalizeContextFileRefs(fileRefs, cwd) {
     if (stat.isDirectory()) {
       normalized.push({
         type: 'directory',
+        cwd: root,
         path: resolved,
         relativePath,
         size: 0,
@@ -2510,6 +2754,7 @@ function normalizeContextFileRefs(fileRefs, cwd) {
     catch { return { refs: [], error: `读取失败: ${relativePath}` }; }
     normalized.push({
       type: 'file',
+      cwd: root,
       path: resolved,
       relativePath,
       size: stat.size,
@@ -2517,6 +2762,30 @@ function normalizeContextFileRefs(fileRefs, cwd) {
     });
   }
   return { refs: normalized, error: '' };
+}
+
+function inferContextFileRefCwd(ref, fallbackCwd) {
+  const rawPath = String(ref?.path || '').trim();
+  const relativePath = String(ref?.relativePath || '').trim();
+  if (!rawPath || !relativePath || !path.isAbsolute(rawPath) || path.isAbsolute(relativePath)) return '';
+  const normalizedRelative = path.normalize(relativePath);
+  if (!normalizedRelative || normalizedRelative === '.' || normalizedRelative.startsWith('..') || path.isAbsolute(normalizedRelative)) return '';
+  const resolvedPath = path.resolve(rawPath);
+
+  const project = findBestProjectForPath(loadProjectsConfig().projects, resolvedPath);
+  if (project?.path && isSameOrChildProjectPath(project.path, resolvedPath)) return normalizeProjectPathKey(project.path);
+
+  const normalizedSegments = normalizedRelative.split(/[\\/]+/).filter(Boolean);
+  if (normalizedSegments.length === 0) return '';
+  let inferredRoot = resolvedPath;
+  for (let index = 0; index < normalizedSegments.length; index += 1) {
+    inferredRoot = path.dirname(inferredRoot);
+  }
+  if (!inferredRoot || inferredRoot === resolvedPath) return '';
+  const actualRelative = path.normalize(path.relative(inferredRoot, resolvedPath));
+  if (actualRelative !== normalizedRelative) return '';
+  if (fallbackCwd && isPathInside(resolvedPath, fallbackCwd)) return '';
+  return inferredRoot;
 }
 
 function buildContextFilePrompt(text, fileRefs) {
@@ -2544,6 +2813,7 @@ ${normalizedText}`;
 function fileRefHistoryMeta(ref) {
   return {
     type: ref.type === 'directory' ? 'directory' : 'file',
+    cwd: ref.cwd || null,
     path: ref.path,
     relativePath: ref.relativePath,
     size: ref.type === 'directory' ? 0 : ref.size,
@@ -3377,6 +3647,7 @@ function normalizeQueuedMessageFileRefs(fileRefs) {
     const type = ref.type === 'directory' ? 'directory' : 'file';
     return {
       type,
+      cwd: ref.cwd ? String(ref.cwd) : null,
       path: String(ref.path || relativePath),
       relativePath,
       size: type === 'directory' ? 0 : Number(ref.size || 0) || 0,
@@ -5643,6 +5914,39 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/file-ops') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+      if (Buffer.byteLength(body, 'utf8') > 32 * 1024) {
+        tooLarge = true;
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      try {
+        if (tooLarge) return jsonResponse(res, 413, { ok: false, code: 'PAYLOAD_TOO_LARGE', message: '文件操作请求过大' });
+        const payload = body ? JSON.parse(body) : {};
+        const result = executeFileOperation(payload);
+        return jsonResponse(res, result.statusCode || 200, result.payload);
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          return jsonResponse(res, 400, { ok: false, code: 'INVALID_JSON', message: '请求内容不是有效 JSON' });
+        }
+        return fileOperationErrorResponse(res, err);
+      }
+    });
+    req.on('error', () => {
+      if (!res.headersSent) jsonResponse(res, 500, { ok: false, code: 'REQUEST_INTERRUPTED', message: '文件操作请求中断' });
+    });
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/file-view') {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {
@@ -6722,9 +7026,14 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     default: {
-      // For unrecognized slash commands, pass through to the CLI process if a session is active
-      if (sessionId && activeProcesses.has(sessionId)) {
-        handleMessage(ws, { text, sessionId, mode: session?.permissionMode || 'yolo' }, { hideInHistory: false });
+      // Forward unrecognized slash commands to the CLI (e.g. Codex built-in /skills, /init, /mcp)
+      if (session) {
+        handleMessage(ws, {
+          text,
+          sessionId,
+          mode: session.permissionMode || 'yolo',
+          agent: getSessionAgent(session),
+        }, { hideInHistory: false });
       } else {
         wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
       }
@@ -9298,6 +9607,23 @@ async function handleGitCommand(ws, msg) {
 function handleBrowseDirectory(ws, msg) {
   const home = USER_HOME || '/';
   const requestedPath = msg && typeof msg.path === 'string' ? msg.path : '';
+
+  // Windows: show all available drives
+  if (requestedPath === DRIVES_LIST_SENTINEL && process.platform === 'win32') {
+    const drives = [];
+    for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+      const root = String.fromCharCode(code) + ':\\';
+      try { fs.statSync(root); drives.push(root); } catch {}
+    }
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: DRIVES_LIST_SENTINEL,
+      parent: home || null,
+      dirs: drives,
+      error: null,
+    });
+  }
+
   let targetPath;
   try {
     targetPath = requestedPath ? path.resolve(String(requestedPath)) : home;
@@ -9348,11 +9674,12 @@ function handleBrowseDirectory(ws, msg) {
   try {
     entries = fs.readdirSync(targetPath, { withFileTypes: true });
   } catch (e) {
-    const parentPath = path.dirname(targetPath);
+    const pp = path.dirname(targetPath);
+    const isWinRoot = process.platform === 'win32' && pp === targetPath;
     return wsSend(ws, {
       type: 'directory_listing',
       path: targetPath,
-      parent: parentPath !== targetPath ? parentPath : null,
+      parent: isWinRoot ? DRIVES_LIST_SENTINEL : (pp !== targetPath ? pp : null),
       dirs: [],
       error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : '读取目录失败',
     });
@@ -9368,10 +9695,11 @@ function handleBrowseDirectory(ws, msg) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
   const parentPath = path.dirname(targetPath);
+  const isWinRoot = process.platform === 'win32' && parentPath === targetPath;
   wsSend(ws, {
     type: 'directory_listing',
     path: targetPath,
-    parent: parentPath !== targetPath ? parentPath : null,
+    parent: isWinRoot ? DRIVES_LIST_SENTINEL : (parentPath !== targetPath ? parentPath : null),
     dirs,
     error: null,
   });
