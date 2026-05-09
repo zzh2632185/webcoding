@@ -60,6 +60,8 @@
   const RECONNECT_MAX_ATTEMPTS = 8;
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
   const FILE_REF_TRANSFER_TYPE = 'application/x-webcoding-file-ref';
+  const FILE_MOVE_TRANSFER_TYPE = 'application/x-webcoding-file-move';
+  const FILE_UPLOAD_MAX_SIZE = 50 * 1024 * 1024;
   const MAX_PENDING_FILE_REFS = 8;
   const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
   const MAX_QUEUED_MESSAGES = 10;
@@ -146,6 +148,8 @@
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+  let fileTreeUploadTargetRow = null;
+  let fileTreeUploadActive = false;
   let fileRefPickerExpandedDirs = new Set();
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
@@ -2723,13 +2727,23 @@
         name: item.name || item.relativePath || item.path,
         size: isDir ? 0 : Number(item.size) || 0,
       } : null;
-      const dragAttrs = refPayload ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : '';
+      const movePayload = !isDir ? {
+        type: 'file',
+        path: item.path,
+        relativePath: item.relativePath || item.name || item.path,
+        name: item.name || item.relativePath || item.path,
+        size: Number(item.size) || 0,
+      } : null;
+      const dragAttrs = isDir
+        ? (refPayload ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : '')
+        : ` draggable="true" data-file-move="${escapeHtml(JSON.stringify(movePayload))}"${refPayload ? ` data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : ''}`;
       const attrs = isDir
         ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"${dragAttrs}`
         : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${dragAttrs}`;
       const children = isDir && expanded ? renderFileTreeItems(item.children || [], level + 1) : '';
+      const nodeAttrs = isDir ? ` data-tree-dir-path="${escapeHtml(item.path)}"` : '';
       return `
-        <div class="file-tree-node" style="--level:${level}">
+        <div class="file-tree-node" style="--level:${level}"${nodeAttrs}>
           <div class="${classes.join(' ')}" ${attrs} title="${escapeHtml(item.relativePath || item.name)}">
             <span class="file-tree-icon">${icon}</span>
             <span class="file-tree-name">${escapeHtml(item.name)}</span>
@@ -2790,15 +2804,36 @@
           open();
         }
       });
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const raw = row.getAttribute('data-file-open') || '';
+        try { showFileTreeContextMenu(JSON.parse(raw), e); }
+        catch { appendError('文件菜单数据无效。'); }
+      });
     });
     fileTree.querySelectorAll('.file-tree-row[draggable="true"]').forEach((row) => {
       row.addEventListener('dragstart', (e) => {
-        const raw = row.getAttribute('data-file-ref') || '';
+        const refRaw = row.getAttribute('data-file-ref') || '';
+        const moveRaw = row.getAttribute('data-file-move') || '';
         try {
-          const ref = JSON.parse(raw);
-          e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, raw);
-          e.dataTransfer?.setData('text/plain', ref.relativePath || ref.path || (ref.type === 'directory' ? 'directory' : 'file'));
-          if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
+          let label = 'file';
+          if (refRaw) {
+            const ref = JSON.parse(refRaw);
+            e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, refRaw);
+            label = ref.relativePath || ref.path || (ref.type === 'directory' ? 'directory' : 'file');
+          }
+          if (moveRaw) {
+            const moveRef = JSON.parse(moveRaw);
+            e.dataTransfer?.setData(FILE_MOVE_TRANSFER_TYPE, moveRaw);
+            label = moveRef.relativePath || moveRef.path || label;
+          }
+          if (!refRaw && !moveRaw) {
+            e.preventDefault();
+            return;
+          }
+          e.dataTransfer?.setData('text/plain', label);
+          if (e.dataTransfer) e.dataTransfer.effectAllowed = moveRaw ? 'copyMove' : 'copy';
         } catch {
           e.preventDefault();
         }
@@ -2830,6 +2865,252 @@
     renderFileTree();
   }
 
+  function hasExternalFilesDrag(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes('Files') && !types.includes(FILE_REF_TRANSFER_TYPE);
+  }
+
+  function hasFileTreeMoveDrag(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes(FILE_MOVE_TRANSFER_TYPE);
+  }
+
+  function clearFileTreeUploadTarget() {
+    if (fileTreeUploadTargetRow) fileTreeUploadTargetRow.classList.remove('upload-target');
+    fileTreeUploadTargetRow = null;
+    if (fileTree) fileTree.classList.toggle('upload-drag-over', false);
+    fileTreeUploadActive = false;
+  }
+
+  function getParentPathFromFileTreePath(filePath) {
+    const raw = String(filePath || '');
+    const normalized = raw.replace(/\\/g, '/');
+    const slashIndex = normalized.lastIndexOf('/');
+    if (slashIndex <= 0) return getFileTreeCwd();
+    return raw.slice(0, slashIndex);
+  }
+
+  function getFileTreeUploadTargetInfo(event) {
+    if (!fileTree || !(event.target instanceof Element)) return { path: getFileTreeCwd(), row: null };
+    const directDirRow = event.target.closest('.file-tree-row.directory[data-dir-path]');
+    if (directDirRow) return { path: directDirRow.getAttribute('data-dir-path') || getFileTreeCwd(), row: directDirRow };
+
+    const fileRow = event.target.closest('.file-tree-row.file[data-file-open]');
+    if (fileRow) {
+      try {
+        const payload = JSON.parse(fileRow.getAttribute('data-file-open') || '{}');
+        const containingDir = getParentPathFromFileTreePath(payload.path || '');
+        const dirNode = fileRow.closest('.file-tree-node[data-tree-dir-path]');
+        const dirRow = dirNode?.querySelector('.file-tree-row.directory[data-dir-path]') || null;
+        return { path: containingDir, row: dirRow };
+      } catch {}
+    }
+
+    const dirNode = event.target.closest('.file-tree-node[data-tree-dir-path]');
+    const dirPath = dirNode?.getAttribute('data-tree-dir-path') || '';
+    const dirRow = dirNode?.querySelector('.file-tree-row.directory[data-dir-path]') || null;
+    return { path: dirPath || getFileTreeCwd(), row: dirRow };
+  }
+
+  function updateFileTreeUploadTarget(event) {
+    if (!fileTree) return getFileTreeCwd();
+    const { path, row } = getFileTreeUploadTargetInfo(event);
+    if (fileTreeUploadTargetRow && fileTreeUploadTargetRow !== row) {
+      fileTreeUploadTargetRow.classList.remove('upload-target');
+    }
+    fileTreeUploadTargetRow = row || null;
+    if (fileTreeUploadTargetRow) fileTreeUploadTargetRow.classList.add('upload-target');
+    fileTree.classList.toggle('upload-drag-over', true);
+    fileTreeUploadActive = true;
+    return path || getFileTreeCwd();
+  }
+
+  async function uploadExternalFilesToFileTree(files, targetPath) {
+    const cwd = getFileTreeCwd();
+    if (!cwd) {
+      appendError('请先选择当前目录再上传文件。');
+      return;
+    }
+    const uploadFiles = Array.from(files || []).filter(Boolean);
+    if (uploadFiles.length === 0) return;
+    const tooLarge = uploadFiles.filter((file) => file.size > FILE_UPLOAD_MAX_SIZE);
+    const validFiles = uploadFiles.filter((file) => file.size <= FILE_UPLOAD_MAX_SIZE);
+    if (tooLarge.length > 0) {
+      appendError(`${tooLarge.length} 个文件超过 50MB，已跳过。`);
+    }
+    if (validFiles.length === 0) return;
+    let okCount = 0;
+    const failures = [];
+    try {
+      await ensureAuthenticatedWs();
+      for (const file of validFiles) {
+        const params = new URLSearchParams({
+          cwd,
+          path: targetPath || cwd,
+          filename: file.name || 'upload.bin',
+        });
+        const response = await fetch(`/api/file-upload?${params.toString()}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${connectionState.authToken}`,
+            'Content-Type': file.type || 'application/octet-stream',
+          },
+          body: file,
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data?.ok) {
+          failures.push(`${file.name || '未命名文件'}：${data?.message || `上传失败 (${response.status})`}`);
+          continue;
+        }
+        okCount += 1;
+      }
+      await loadFileTree(cwd);
+      if (okCount > 0) showToast(`已上传 ${okCount} 个文件`);
+      if (failures.length > 0) appendError(failures.slice(0, 3).join('；') + (failures.length > 3 ? `；另有 ${failures.length - 3} 个失败` : ''));
+    } catch (err) {
+      appendError(err.message || '上传失败');
+    }
+  }
+
+  async function moveFileInFileTree(fileRef, targetDir) {
+    const cwd = getFileTreeCwd();
+    const sourcePath = fileRef?.path || '';
+    if (!cwd || !sourcePath || !targetDir) return;
+    if (getParentPathFromFileTreePath(sourcePath) === targetDir) {
+      showToast('文件已在目标目录');
+      return;
+    }
+    try {
+      await ensureAuthenticatedWs();
+      const response = await fetch('/api/file-move', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${connectionState.authToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ cwd, path: sourcePath, targetDir }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `移动失败 (${response.status})`);
+      composeState.pendingFileRefs = composeState.pendingFileRefs.filter((ref) => ref.path !== sourcePath);
+      renderContextBar();
+      if (fileViewerState.activePath === sourcePath) closeFileViewer();
+      await loadFileTree(cwd);
+      showToast(data.moved === false ? '文件已在目标目录' : '文件已移动');
+    } catch (err) {
+      appendError(err.message || '移动文件失败');
+    }
+  }
+
+  async function deleteFileFromFileTree(fileRef) {
+    const cwd = getFileTreeCwd();
+    const filePath = fileRef?.path || '';
+    if (!cwd || !filePath) return;
+    const confirmed = await showGitConfirmModal({
+      title: '删除文件',
+      message: `确认删除「${fileRef.relativePath || fileRef.name || filePath}」？`,
+      detail: '只会删除当前目录内的这个文件，不能撤销。',
+      confirmLabel: '删除',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: filePath });
+      const response = await fetch(`/api/file-entry?${params.toString()}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `删除失败 (${response.status})`);
+      composeState.pendingFileRefs = composeState.pendingFileRefs.filter((ref) => ref.path !== filePath);
+      renderContextBar();
+      if (fileViewerState.activePath === filePath) closeFileViewer();
+      await loadFileTree(cwd);
+      showToast('文件已删除');
+    } catch (err) {
+      appendError(err.message || '删除文件失败');
+    }
+  }
+
+  function closeFileTreeContextMenu() {
+    document.querySelectorAll('.file-tree-context-menu').forEach((menu) => menu.remove());
+  }
+
+  function showFileTreeContextMenu(fileRef, event) {
+    closeFileTreeContextMenu();
+    const menu = document.createElement('div');
+    menu.className = 'project-group-menu file-tree-context-menu';
+    menu.hidden = false;
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'project-group-menu-item project-group-menu-item--danger';
+    deleteBtn.textContent = '删除文件';
+    deleteBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFileTreeContextMenu();
+      deleteFileFromFileTree(fileRef);
+    });
+    menu.appendChild(deleteBtn);
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(4, Math.min(event.clientX, window.innerWidth - rect.width - 4));
+    const top = Math.max(4, Math.min(event.clientY, window.innerHeight - rect.height - 4));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    const closeOnClick = (e) => {
+      if (menu.contains(e.target)) return;
+      closeFileTreeContextMenu();
+      document.removeEventListener('click', closeOnClick, true);
+    };
+    setTimeout(() => document.addEventListener('click', closeOnClick, true), 0);
+  }
+
+  function bindFileTreeExternalUpload() {
+    if (!fileTree || fileTree.dataset.externalUploadBound === '1') return;
+    fileTree.dataset.externalUploadBound = '1';
+    fileTree.addEventListener('dragenter', (e) => {
+      if (!hasExternalFilesDrag(e.dataTransfer) && !hasFileTreeMoveDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      updateFileTreeUploadTarget(e);
+    });
+    fileTree.addEventListener('dragover', (e) => {
+      const isMove = hasFileTreeMoveDrag(e.dataTransfer);
+      if (!hasExternalFilesDrag(e.dataTransfer) && !isMove) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = isMove ? 'move' : 'copy';
+      updateFileTreeUploadTarget(e);
+    });
+    fileTree.addEventListener('dragleave', (e) => {
+      if (!fileTreeUploadActive) return;
+      const related = e.relatedTarget;
+      if (related instanceof Node && fileTree.contains(related)) return;
+      clearFileTreeUploadTarget();
+    });
+    fileTree.addEventListener('drop', (e) => {
+      const isMove = hasFileTreeMoveDrag(e.dataTransfer);
+      if (!hasExternalFilesDrag(e.dataTransfer) && !isMove) return;
+      e.preventDefault();
+      const targetPath = updateFileTreeUploadTarget(e);
+      if (isMove) {
+        let ref = null;
+        try { ref = JSON.parse(e.dataTransfer?.getData(FILE_MOVE_TRANSFER_TYPE) || '{}'); }
+        catch {}
+        clearFileTreeUploadTarget();
+        if (!ref?.path) {
+          appendError('移动文件数据无效。');
+          return;
+        }
+        moveFileInFileTree(ref, targetPath);
+        return;
+      }
+      const files = Array.from(e.dataTransfer?.files || []);
+      clearFileTreeUploadTarget();
+      uploadExternalFilesToFileTree(files, targetPath);
+    });
+  }
+
   function addPendingFileRef(ref) {
     if (!ref?.path) return;
     const isDir = ref.type === 'directory';
@@ -2839,10 +3120,6 @@
     }
     if (composeState.pendingFileRefs.length >= MAX_PENDING_FILE_REFS) {
       appendError(`最多一次引用 ${MAX_PENDING_FILE_REFS} 个项目。`);
-      return;
-    }
-    if (!isDir && (Number(ref.size) || 0) > MAX_PENDING_FILE_REF_SIZE) {
-      appendError('文件超过 256KB，不能作为上下文引用。');
       return;
     }
     composeState.pendingFileRefs.push({
@@ -2857,7 +3134,6 @@
 
   function toAttachableFileRef(item) {
     if (!item || item.type === 'directory') return null;
-    if (!item.isText || item.tooLarge || (Number(item.size) || 0) > MAX_PENDING_FILE_REF_SIZE) return null;
     return {
       type: 'file',
       path: item.path,
@@ -2925,15 +3201,21 @@
         `;
       }
       const ref = toAttachableFileRef(item);
-      if (!ref) return '';
-      const selected = selectedPaths.has(ref.path);
+      const fallbackSize = Number(item.size) || 0;
+      const fallbackName = item.name || item.relativePath || item.path || '文件';
+      const selected = !!ref && selectedPaths.has(ref.path);
+      const unavailableReason = !ref
+        ? (fallbackSize > MAX_PENDING_FILE_REF_SIZE ? '文件超过 256KB，不能直接作为文本上下文引用' : '该文件类型不能直接作为文本上下文引用')
+        : '';
       return `
         <div class="file-ref-picker-node">
-          <div class="file-ref-picker-row file${selected ? ' selected' : ''}" style="--level:${level}">
+          <div class="file-ref-picker-row file${selected ? ' selected' : ''}${!ref ? ' unavailable' : ''}" style="--level:${level}" ${unavailableReason ? `title="${escapeHtml(unavailableReason)}"` : ''}>
             <span class="file-ref-picker-icon">•</span>
-            <span class="file-ref-picker-name">${escapeHtml(item.name || ref.relativePath || ref.path)}</span>
-            <span class="file-ref-picker-size">${formatFileSize(ref.size)}</span>
-            <button class="file-ref-picker-action" type="button" data-file-ref="${escapeHtml(JSON.stringify(ref))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>
+            <span class="file-ref-picker-name">${escapeHtml(fallbackName)}</span>
+            <span class="file-ref-picker-size">${formatFileSize(fallbackSize)}</span>
+            ${ref
+              ? `<button class="file-ref-picker-action" type="button" data-file-ref="${escapeHtml(JSON.stringify(ref))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>`
+              : `<button class="file-ref-picker-action" type="button" disabled>不可引用</button>`}
           </div>
         </div>
       `;
@@ -3009,7 +3291,7 @@
         <div class="file-ref-picker-header">
           <div>
             <div class="file-ref-picker-title">引用附件</div>
-            <div class="file-ref-picker-subtitle">按目录展开当前项目，目录和文件都可以作为独立引用。</div>
+            <div class="file-ref-picker-subtitle">按目录展开当前项目，目录和文件都会作为路径引用。</div>
           </div>
           <button class="file-ref-picker-close" type="button" aria-label="关闭">×</button>
         </div>
@@ -8460,6 +8742,7 @@
     });
   }
   if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
+  bindFileTreeExternalUpload();
   renderContextBar();
   if (attachBtn) {
     attachBtn.addEventListener('click', (event) => {

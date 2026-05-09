@@ -51,6 +51,7 @@ const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
 const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
 const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
 const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
+const FILE_UPLOAD_MAX_SIZE = 50 * 1024 * 1024;
 const FILE_VIEW_TABLE_MAX_ROWS = 1000;
 const FILE_VIEW_TABLE_MAX_COLS = 50;
 const FILE_TREE_MAX_DEPTH = 3;
@@ -2258,6 +2259,22 @@ function resolvePathWithinCwd(cwd, targetPath = '') {
   return { root, resolved };
 }
 
+function sanitizeUploadFilename(name) {
+  const raw = String(name || '').trim().replace(/[\\/]+/g, '_').replace(/[\u0000-\u001f\u007f]+/g, '');
+  const base = path.basename(raw).trim();
+  if (!base || base === '.' || base === '..') {
+    const err = new Error('文件名无效');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (Buffer.byteLength(base, 'utf8') > 255) {
+    const err = new Error('文件名过长');
+    err.statusCode = 400;
+    throw err;
+  }
+  return base;
+}
+
 function isLikelyTextFile(filePath, size = 0) {
   const base = path.basename(filePath).toLowerCase();
   const ext = path.extname(base).toLowerCase();
@@ -2477,7 +2494,6 @@ function normalizeContextFileRefs(fileRefs, cwd) {
   if (refs.length === 0) return { refs: [], error: '' };
   const seen = new Set();
   const normalized = [];
-  let totalSize = 0;
   for (const ref of refs) {
     const rawPath = String(ref?.path || ref?.relativePath || '').trim();
     if (!rawPath) continue;
@@ -2489,7 +2505,7 @@ function normalizeContextFileRefs(fileRefs, cwd) {
     seen.add(resolved);
     let stat;
     try { stat = fs.statSync(resolved); }
-    catch { return { refs: [], error: `无法读取引用: ${path.basename(resolved)}` }; }
+    catch { return { refs: [], error: `无法读取引用路径: ${path.basename(resolved)}` }; }
     const relativePath = path.relative(root, resolved) || path.basename(resolved);
     if (stat.isDirectory()) {
       normalized.push({
@@ -2501,19 +2517,11 @@ function normalizeContextFileRefs(fileRefs, cwd) {
       continue;
     }
     if (!stat.isFile()) return { refs: [], error: `只能引用文件或目录: ${relativePath}` };
-    if (stat.size > MAX_CONTEXT_FILE_SIZE) return { refs: [], error: `文件超过 256KB: ${relativePath}` };
-    if (!isLikelyTextFile(resolved, stat.size)) return { refs: [], error: `只能引用文本文件: ${relativePath}` };
-    totalSize += stat.size;
-    if (totalSize > MAX_CONTEXT_FILES_TOTAL_SIZE) return { refs: [], error: '引用文件总大小不能超过 1MB' };
-    let content;
-    try { content = fs.readFileSync(resolved, 'utf8'); }
-    catch { return { refs: [], error: `读取失败: ${relativePath}` }; }
     normalized.push({
       type: 'file',
       path: resolved,
       relativePath,
       size: stat.size,
-      content,
     });
   }
   return { refs: normalized, error: '' };
@@ -2527,13 +2535,10 @@ function buildContextFilePrompt(text, fileRefs) {
     if (ref.type === 'directory') {
       return `<directory path="${safePath}" />`;
     }
-    return [
-      `<file path="${safePath}">`,
-      ref.content,
-      '</file>',
-    ].join('\n');
-  }).join('\n\n');
-  return `下面是用户从当前工作目录引用的文件和目录。目录引用表示用户选中了整个目录本身；不要把它理解为已经展开了目录下所有文件内容，如需查看请基于路径自行读取。
+    const sizeAttr = Number.isFinite(ref.size) ? ` size="${ref.size}"` : '';
+    return `<file path="${safePath}"${sizeAttr} />`;
+  }).join('\n');
+  return `下面是用户从当前工作目录引用的文件和目录。文件和目录引用只表示用户选中了这些路径；不要假设文件内容已经提供。如需查看内容，请基于 path 在当前工作目录自行读取或解析。
 
 ${blocks}
 
@@ -5640,6 +5645,147 @@ const server = http.createServer((req, res) => {
       });
     } catch (err) {
       return jsonResponse(res, 400, { ok: false, message: err.message || '无法读取目录' });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/file-upload') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    const cwd = url.searchParams.get('cwd') || '';
+    const requestedDir = url.searchParams.get('path') || '';
+    const requestedName = url.searchParams.get('filename') || req.headers['x-file-name'] || '';
+    let root;
+    let targetDir;
+    let filename;
+    try {
+      ({ root, resolved: targetDir } = resolvePathWithinCwd(cwd, requestedDir));
+      const dirStat = fs.statSync(targetDir);
+      if (!dirStat.isDirectory()) {
+        return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+      }
+      filename = sanitizeUploadFilename(requestedName);
+    } catch (err) {
+      return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err.message || '上传路径无效' });
+    }
+
+    const targetPath = path.join(targetDir, filename);
+    if (!isPathInside(targetPath, root)) {
+      return jsonResponse(res, 400, { ok: false, message: '文件不在当前目录内' });
+    }
+    if (fs.existsSync(targetPath)) {
+      return jsonResponse(res, 409, { ok: false, message: `文件已存在：${filename}` });
+    }
+
+    const chunks = [];
+    let total = 0;
+    let responded = false;
+    const fail = (statusCode, message) => {
+      if (responded || res.headersSent) return;
+      responded = true;
+      jsonResponse(res, statusCode, { ok: false, message });
+    };
+    req.on('data', (chunk) => {
+      if (responded) return;
+      total += chunk.length;
+      if (total > FILE_UPLOAD_MAX_SIZE) {
+        fail(413, '上传文件不能超过 50MB');
+        try { req.destroy(); } catch {}
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (responded) return;
+      try {
+        const buffer = Buffer.concat(chunks);
+        fs.writeFileSync(targetPath, buffer, { flag: 'wx' });
+        const stat = fs.statSync(targetPath);
+        return jsonResponse(res, 200, {
+          ok: true,
+          uploaded: true,
+          ...buildFileIdentity(root, targetPath, stat, getFileViewType(targetPath, stat)),
+          relativePath: path.relative(root, targetPath) || filename,
+        });
+      } catch (err) {
+        const exists = err?.code === 'EEXIST';
+        return jsonResponse(res, exists ? 409 : 500, { ok: false, message: exists ? `文件已存在：${filename}` : (err.message || '保存上传文件失败') });
+      }
+    });
+    req.on('error', () => {
+      if (!responded && !res.headersSent) jsonResponse(res, 500, { ok: false, message: '上传过程中断' });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/file-move') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+      if (Buffer.byteLength(body, 'utf8') > 8192) {
+        tooLarge = true;
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      try {
+        if (tooLarge) return jsonResponse(res, 413, { ok: false, message: '移动请求过大' });
+        const payload = body ? JSON.parse(body) : {};
+        const cwd = String(payload.cwd || '');
+        const requestedPath = String(payload.path || '');
+        const requestedTargetDir = String(payload.targetDir || '');
+        const { root, resolved: sourcePath } = resolvePathWithinCwd(cwd, requestedPath);
+        const sourceStat = fs.statSync(sourcePath);
+        if (!sourceStat.isFile()) return jsonResponse(res, 400, { ok: false, message: '只能移动文件' });
+        const { resolved: targetDir } = resolvePathWithinCwd(root, requestedTargetDir);
+        const targetStat = fs.statSync(targetDir);
+        if (!targetStat.isDirectory()) return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+        const destPath = path.join(targetDir, path.basename(sourcePath));
+        if (!isPathInside(destPath, root)) return jsonResponse(res, 400, { ok: false, message: '目标不在当前目录内' });
+        if (sourcePath === destPath) {
+          return jsonResponse(res, 200, { ok: true, moved: false, message: '文件已在目标目录' });
+        }
+        if (fs.existsSync(destPath)) {
+          return jsonResponse(res, 409, { ok: false, message: `目标目录已存在同名文件：${path.basename(sourcePath)}` });
+        }
+        fs.renameSync(sourcePath, destPath);
+        const nextStat = fs.statSync(destPath);
+        return jsonResponse(res, 200, {
+          ok: true,
+          moved: true,
+          ...buildFileIdentity(root, destPath, nextStat, getFileViewType(destPath, nextStat)),
+        });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '移动文件失败');
+      }
+    });
+    req.on('error', () => {
+      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '移动请求中断' });
+    });
+    return;
+  }
+
+  if (req.method === 'DELETE' && url.pathname === '/api/file-entry') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || '';
+      const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '只能删除文件' });
+      fs.unlinkSync(resolved);
+      return jsonResponse(res, 200, { ok: true, deleted: true, path: resolved });
+    } catch (err) {
+      return jsonErrorResponse(res, err, '删除文件失败');
     }
   }
 

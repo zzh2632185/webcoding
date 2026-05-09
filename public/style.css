@@ -7579,6 +7579,17 @@ body.git-panel-resizing * {
   color: var(--danger);
 }
 
+.file-tree.upload-drag-over {
+  outline: 1px dashed var(--accent);
+  outline-offset: -4px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.file-tree-row.directory.upload-target {
+  background: var(--accent-light);
+  color: var(--text-primary);
+}
+
 .file-tree-node {
   min-width: 0;
 }
@@ -7627,6 +7638,14 @@ body.git-panel-resizing * {
 
 .file-tree-row.not-context .file-tree-size {
   opacity: 0.72;
+}
+
+.file-ref-picker-row.unavailable {
+  opacity: 0.72;
+}
+
+.file-ref-picker-row.unavailable .file-ref-picker-action {
+  cursor: not-allowed;
 }
 
 .file-tree-icon {
