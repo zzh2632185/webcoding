@@ -2337,6 +2337,41 @@ function normalizeWorkspaceCwd(cwd) {
   return resolved;
 }
 
+function resolveMessageWorkspaceCwd(msg) {
+  const rawCwd = String(msg?.cwd || '').trim();
+  const projectId = String(msg?.projectId || '').trim();
+  let candidate = rawCwd;
+  if (!candidate && projectId) {
+    const project = loadProjectsConfig().projects.find((item) => item?.id === projectId);
+    candidate = project?.path || '';
+  }
+  if (!candidate) return { cwd: null, projectId: projectId || null, error: '' };
+  const cwd = normalizeWorkspaceCwd(candidate);
+  if (!cwd) return { cwd: null, projectId: projectId || null, error: '工作目录无效或不可访问' };
+  return { cwd, projectId: projectId || null, error: '' };
+}
+
+function inferWorkspaceCwdFromFileRefs(fileRefs) {
+  const refs = Array.isArray(fileRefs) ? fileRefs : [];
+  const first = refs.map((ref) => String(ref?.cwd || '').trim()).find(Boolean);
+  return first ? normalizeWorkspaceCwd(first) : null;
+}
+
+function bindSessionWorkspaceIfMissing(session, workspaceCwd, projectId = null) {
+  if (!session || session.cwd || !workspaceCwd) return false;
+  session.cwd = workspaceCwd;
+  const projects = loadProjectsConfig().projects;
+  const explicitProject = projectId ? projects.find((item) => item?.id === projectId) : null;
+  const matchedProject = explicitProject || findBestProjectForPath(projects, workspaceCwd);
+  if (matchedProject?.id) session.projectId = matchedProject.id;
+  else {
+    const ensured = ensureProjectForPath(workspaceCwd);
+    if (ensured.project?.id) session.projectId = ensured.project.id;
+  }
+  clearRuntimeSessionId(session);
+  return true;
+}
+
 function resolvePathWithinCwd(cwd, targetPath = '') {
   const root = normalizeWorkspaceCwd(cwd);
   if (!root) throw new Error('当前目录无效');
@@ -3655,6 +3690,10 @@ function normalizeQueuedMessageFileRefs(fileRefs) {
   }).filter(Boolean);
 }
 
+function normalizeQueuedMessageCwd(cwd) {
+  return cwd ? String(cwd) : '';
+}
+
 function normalizeQueuedMessagesForSession(session, value) {
   if (!Array.isArray(value)) return [];
   const queued = [];
@@ -3670,6 +3709,8 @@ function normalizeQueuedMessagesForSession(session, value) {
       text,
       attachments,
       fileRefs,
+      cwd: normalizeQueuedMessageCwd(raw.cwd),
+      projectId: raw.projectId ? String(raw.projectId) : null,
       mode: typeof raw.mode === 'string' ? raw.mode : (session?.permissionMode || 'yolo'),
       reasoningEffort: normalizeCodexReasoningEffort(raw.reasoningEffort),
       agent: normalizeAgent(raw.agent || session?.agent),
@@ -3690,6 +3731,8 @@ function buildQueuedMessagesPayload(session) {
     text: item.text || '',
     attachments: item.attachments || [],
     fileRefs: item.fileRefs || [],
+    cwd: item.cwd || '',
+    projectId: item.projectId || null,
     mode: item.mode || session?.permissionMode || 'yolo',
     reasoningEffort: item.reasoningEffort || '',
     agent: normalizeAgent(item.agent || session?.agent),
@@ -6250,7 +6293,7 @@ wss.on('connection', (ws, req) => {
     switch (msg.type) {
       case 'message':
         if (msg.text && msg.text.trim().startsWith('/')) {
-          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent);
+          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent, msg);
         } else {
           handleMessage(ws, msg);
         }
@@ -6757,7 +6800,7 @@ function handleFetchModels(ws, msg) {
 }
 
 // === Slash Command Handler ===
-function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
+function handleSlashCommand(ws, text, sessionId, fallbackAgent, sourceMsg = null) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
@@ -7033,6 +7076,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           sessionId,
           mode: session.permissionMode || 'yolo',
           agent: getSessionAgent(session),
+          cwd: sourceMsg?.cwd || null,
+          projectId: sourceMsg?.projectId || null,
+          fileRefs: sourceMsg?.fileRefs || [],
         }, { hideInHistory: false });
       } else {
         wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
@@ -7997,7 +8043,9 @@ function buildQueueItemFromClientMessage(session, msg) {
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
     return { error: '图片附件已过期或不可用，请重新上传后再发送。' };
   }
-  const cwdForFileRefs = session?.cwd || process.cwd();
+  const requestedWorkspace = resolveMessageWorkspaceCwd(msg);
+  if (requestedWorkspace.error) return { error: requestedWorkspace.error };
+  const cwdForFileRefs = session?.cwd || requestedWorkspace.cwd || process.cwd();
   const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
   if (resolvedFileRefResult.error) return { error: resolvedFileRefResult.error };
   const resolvedFileRefs = resolvedFileRefResult.refs;
@@ -8022,6 +8070,8 @@ function buildQueueItemFromClientMessage(session, msg) {
       text: textValue,
       attachments: savedAttachments,
       fileRefs: resolvedFileRefs.map(fileRefHistoryMeta),
+      cwd: requestedWorkspace.cwd || inferWorkspaceCwdFromFileRefs(resolvedFileRefs) || '',
+      projectId: requestedWorkspace.projectId || null,
       mode: typeof msg.mode === 'string' ? msg.mode : (session.permissionMode || 'yolo'),
       reasoningEffort: normalizeCodexReasoningEffort(msg.reasoningEffort),
       agent: normalizeAgent(msg.agent || session.agent),
@@ -8102,7 +8152,7 @@ function dispatchNextServerQueuedMessage(sessionId) {
   }
   plog('INFO', 'server_queue_dispatch', { sessionId: sessionId.slice(0, 8), remaining: session.queuedMessages.length });
   try {
-    if (text.startsWith('/')) handleSlashCommand(dispatchWs, text, sessionId, payload.agent);
+    if (text.startsWith('/')) handleSlashCommand(dispatchWs, text, sessionId, payload.agent, payload);
     else handleMessage(dispatchWs, payload);
   } finally {
     if (dispatchWs.isServerQueueClient) wsSessionMap.delete(dispatchWs);
@@ -8131,7 +8181,9 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
   }
   const pendingSession = sessionId ? loadSession(sessionId) : null;
-  const cwdForFileRefs = pendingSession?.cwd || process.cwd();
+  const requestedWorkspace = resolveMessageWorkspaceCwd(msg);
+  if (requestedWorkspace.error) return wsSend(ws, { type: 'error', message: requestedWorkspace.error });
+  const cwdForFileRefs = pendingSession?.cwd || requestedWorkspace.cwd || process.cwd();
   const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
   if (resolvedFileRefResult.error) {
     return wsSend(ws, { type: 'error', message: resolvedFileRefResult.error });
@@ -8195,7 +8247,7 @@ function handleMessage(ws, msg, options = {}) {
   if (!session) {
     const id = crypto.randomUUID();
     const agent = messageAgent;
-    const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+    const resolvedCwd = requestedWorkspace.cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
     session = {
       id,
       title: derivedTitle,
@@ -8212,9 +8264,12 @@ function handleMessage(ws, msg, options = {}) {
       totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
       messages: [],
       cwd: resolvedCwd,
+      projectId: requestedWorkspace.projectId || null,
     };
   }
   normalizeSession(session);
+  const inferredWorkspaceCwd = inferWorkspaceCwdFromFileRefs(resolvedFileRefs);
+  bindSessionWorkspaceIfMissing(session, requestedWorkspace.cwd || inferredWorkspaceCwd, requestedWorkspace.projectId);
 
   if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' });
@@ -8395,6 +8450,7 @@ function handleMessage(ws, msg, options = {}) {
     model: session.model || 'default',
     resume: spawnSpec.resume,
     threadResetReason: spawnSpec.threadReset?.reason || null,
+    cwd: spawnSpec.cwd || null,
     carryover: threadCarryover
       ? {
           summaryDetailed: threadCarryover.summaryDetailed,

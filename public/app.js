@@ -4396,7 +4396,23 @@
     return options;
   }
 
+  function getMessageWorkspaceContext(fileRefs = []) {
+    const fileRefCwd = (Array.isArray(fileRefs) ? fileRefs : [])
+      .map((ref) => String(ref?.cwd || '').trim())
+      .find(Boolean) || '';
+    const cwd = sessionState.currentCwd || selectedProject?.path || fileRefCwd || '';
+    const projectId = cwd && selectedProject?.id && selectedProject?.path
+      && normalizeComparablePath(cwd) === normalizeComparablePath(selectedProject.path)
+      ? selectedProject.id
+      : null;
+    return {
+      ...(cwd ? { cwd } : {}),
+      ...(projectId ? { projectId } : {}),
+    };
+  }
+
   function sendCoreMessage(text) {
+    const workspaceContext = getMessageWorkspaceContext();
     markAwaitingRuntimeStart();
     return send({
       type: 'message',
@@ -4405,10 +4421,12 @@
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
       agent: sessionState.currentAgent,
+      ...workspaceContext,
     });
   }
 
   function sendUserMessage(payload = {}) {
+    const workspaceContext = getMessageWorkspaceContext(payload.fileRefs);
     markAwaitingRuntimeStart();
     return send({
       type: 'message',
@@ -4416,6 +4434,7 @@
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
       agent: sessionState.currentAgent,
+      ...workspaceContext,
       ...payload,
     });
   }
@@ -8339,6 +8358,8 @@
         text,
         attachments,
         fileRefs,
+        cwd: typeof raw.cwd === 'string' ? raw.cwd : '',
+        projectId: typeof raw.projectId === 'string' ? raw.projectId : null,
         mode: typeof raw.mode === 'string' ? raw.mode : '',
         reasoningEffort: typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort : '',
         agent: normalizeAgent(raw.agent || sessionState.currentAgent || selectedAgent),
@@ -8388,6 +8409,8 @@
       text: item.text || '',
       attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
       fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
+      cwd: item.cwd || '',
+      projectId: item.projectId || null,
       mode: item.mode || sessionState.currentMode,
       reasoningEffort: item.reasoningEffort || sessionState.currentReasoningEffort || '',
       agent: item.agent || sessionState.currentAgent,
@@ -8540,6 +8563,7 @@
       text,
       attachments: composeState.pendingAttachments.map((attachment) => ({ ...attachment })),
       fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
+      ...getMessageWorkspaceContext(composeState.pendingFileRefs),
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
       agent: sessionState.currentAgent,

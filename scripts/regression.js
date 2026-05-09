@@ -830,7 +830,7 @@ function typeMatcher(type, predicate = null) {
   return (msg) => msg.type === type && (!predicate || predicate(msg));
 }
 
-function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments, fileRefs }) {
+function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments, fileRefs, cwd, projectId }) {
   return {
     type: 'message',
     text,
@@ -839,6 +839,8 @@ function buildAgentMessagePayload({ text, sessionId, mode, agent, attachments, f
     agent,
     ...(attachments ? { attachments } : {}),
     ...(fileRefs ? { fileRefs } : {}),
+    ...(cwd ? { cwd } : {}),
+    ...(projectId ? { projectId } : {}),
   };
 }
 
@@ -3758,6 +3760,39 @@ async function runFileRefProjectCwdRegressionCase({ port, password, tempRoot }) 
   });
 }
 
+async function runSlashCommandWorkspaceCwdRegressionCase({ port, password, tempRoot, sessionsDir, logsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const cwd = path.join(tempRoot, 'slash-selected-project-cwd');
+    mkdirp(cwd);
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && !msg.cwd,
+    );
+    client.send(buildAgentMessagePayload({
+      text: '/report cwd',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+      cwd,
+    }));
+    const cwdMessage = await client.waitFor((msg) => (
+      (msg.type === 'text_delta' && msg.sessionId === session.sessionId && String(msg.text || '').includes(`cwd:${cwd}`))
+      || (msg.type === 'error' && (!msg.sessionId || msg.sessionId === session.sessionId))
+    ), 8000);
+    const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+    assert(stored.cwd === cwd, 'Slash command should bind a cwd-less session to the selected project cwd');
+    if (cwdMessage.type === 'text_delta') {
+      await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
+      const spawnLines = findProcessLogLines(logsDir, session.sessionId, 'process_spawn');
+      const latestSpawn = spawnLines[spawnLines.length - 1] || '';
+      assert(latestSpawn.includes(JSON.stringify(cwd).slice(1, -1)), 'Slash command runtime spawn should use the selected project cwd');
+    } else {
+      assert(/spawn EFTYPE/.test(cwdMessage.message || ''), `Slash command should not fail before binding cwd: ${cwdMessage.message || 'unknown error'}`);
+    }
+  });
+}
+
 async function runFileOpsRegressionCase({ port, password, tempRoot }) {
   await withAuthedClient(port, password, async ({ token }) => {
     const cwd = path.join(tempRoot, 'file-ops-project');
@@ -4144,6 +4179,7 @@ async function main() {
       await runner.run('codex in-window cumulative usage guard', () => runCodexCumulativeUsageWithinWindowRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('file ref selected project cwd', () => runFileRefProjectCwdRegressionCase(ctx));
+      await runner.run('slash command selected project cwd', () => runSlashCommandWorkspaceCwdRegressionCase(ctx));
       await runner.run('file ops api safety', () => runFileOpsRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));

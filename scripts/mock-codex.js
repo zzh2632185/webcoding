@@ -66,6 +66,17 @@ function sleep(ms) {
     })}\n`);
   }
 
+  if (/report cwd/i.test(input)) {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_report_cwd',
+        type: 'agent_message',
+        text: `cwd:${process.cwd()}`,
+      },
+    })}\n`);
+  }
+
   if (input === '/compact') {
     state.compacted = true;
     fs.writeFileSync(statePath, JSON.stringify(state));
