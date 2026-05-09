@@ -8468,6 +8468,8 @@ function handleMessage(ws, msg, options = {}) {
     resume: spawnSpec.resume,
     threadResetReason: spawnSpec.threadReset?.reason || null,
     cwd: spawnSpec.cwd || null,
+    command: spawnSpec.command || null,
+    useShell: !!spawnSpec.useShell,
     carryover: threadCarryover
       ? {
           summaryDetailed: threadCarryover.summaryDetailed,

@@ -3732,6 +3732,43 @@ function runWindowsPathRuntimeSourceRegressionCase() {
     assert(jsCliSpec.command === process.execPath, 'Windows .js CLI paths must be launched through node.exe');
     assert(jsCliSpec.args[0].endsWith(path.join('scripts', 'mock-codex.js')), 'Windows .js CLI launch must preserve the script path as the first arg');
     assert(jsCliSpec.useShell === false, 'Windows .js CLI launch must not depend on shell/file associations');
+
+    const shimRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-shim-regression-'));
+    const oldPath = process.env.PATH;
+    try {
+      const binDir = path.join(shimRoot, 'bin');
+      mkdirp(path.join(binDir, 'node_modules', 'pkg', 'bin'));
+      const targetScript = path.join(binDir, 'node_modules', 'pkg', 'bin', 'cli.js');
+      fs.writeFileSync(targetScript, '#!/usr/bin/env node\n', 'utf8');
+      fs.writeFileSync(path.join(binDir, 'sample-cli.cmd'), [
+        '@ECHO off',
+        'GOTO start',
+        ':find_dp0',
+        'SET dp0=%~dp0',
+        'EXIT /b',
+        ':start',
+        'SETLOCAL',
+        'CALL :find_dp0',
+        '',
+        'IF EXIST "%dp0%\\node.exe" (',
+        '  SET "_prog=%dp0%\\node.exe"',
+        ') ELSE (',
+        '  SET "_prog=node"',
+        ')',
+        '',
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\pkg\\bin\\cli.js" %*',
+        '',
+      ].join('\r\n'), 'utf8');
+      process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`;
+      const shimSpec = buildCliSpawnCommand('sample-cli', ['run', '-']);
+      assert(shimSpec.command === process.execPath, 'Windows npm .cmd shims must resolve to node.exe instead of cmd.exe');
+      assert(shimSpec.args[0] === targetScript, 'Windows npm .cmd shims must prepend the real CLI script path');
+      assert(shimSpec.args.slice(1).join(' ') === 'run -', 'Windows npm .cmd shim resolution must preserve CLI args');
+      assert(shimSpec.useShell === false, 'Windows npm .cmd shim resolution must avoid shell-wrapped stdin');
+    } finally {
+      process.env.PATH = oldPath;
+      fs.rmSync(shimRoot, { recursive: true, force: true });
+    }
   }
 
   assert(runtimeSource.includes('function buildCliSpawnCommand'), 'Runtime spawn normalization helper must exist');
