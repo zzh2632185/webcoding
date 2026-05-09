@@ -3721,6 +3721,53 @@ async function runCodexMetadataWarningRegressionCase({ port, password }) {
   });
 }
 
+function runWindowsPathRuntimeSourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const appSource = readRepoText('public', 'app.js');
+  const runtimeSource = readRepoText('lib', 'agent-runtime.js');
+  const { buildCliSpawnCommand } = require(path.join(REPO_DIR, 'lib', 'agent-runtime'));
+
+  const jsCliSpec = buildCliSpawnCommand(path.join(REPO_DIR, 'scripts', 'mock-codex.js'), ['exec', '-']);
+  if (process.platform === 'win32') {
+    assert(jsCliSpec.command === process.execPath, 'Windows .js CLI paths must be launched through node.exe');
+    assert(jsCliSpec.args[0].endsWith(path.join('scripts', 'mock-codex.js')), 'Windows .js CLI launch must preserve the script path as the first arg');
+    assert(jsCliSpec.useShell === false, 'Windows .js CLI launch must not depend on shell/file associations');
+  }
+
+  assert(runtimeSource.includes('function buildCliSpawnCommand'), 'Runtime spawn normalization helper must exist');
+  const discoverClaudeSource = extractFunctionSource(serverSource, 'discoverClaudeSlashCommands');
+  assert(
+    discoverClaudeSource.includes('buildCliSpawnCommand(CLAUDE_PATH, args)')
+      && discoverClaudeSource.includes('spawn(commandSpec.command, commandSpec.args'),
+    'Claude slash discovery must use the same Windows .js CLI spawn normalization as normal runtime launches',
+  );
+
+  const osHomedirMatches = serverSource.match(/os\.homedir\(\)/g) || [];
+  assert(osHomedirMatches.length === 1 && serverSource.includes('const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir() || \'\';'), 'server.js must centralize effective user home resolution');
+  assert(!/process\.env\.HOME \|\| process\.env\.USERPROFILE/.test(serverSource.replace(/const USER_HOME = .+/, '')), 'server.js must not reimplement HOME/USERPROFILE precedence in scattered call sites');
+  assert(!serverSource.includes('filePath.startsWith(CLAUDE_PROJECTS_DIR)'), 'Claude import containment must not use raw string prefix checks');
+  assert(!serverSource.includes('requestedPath.startsWith(CODEX_SESSIONS_DIR)'), 'Codex import containment must not use raw string prefix checks');
+  assert(!serverSource.includes('filePath.startsWith(CODEX_SESSIONS_DIR)'), 'Codex deletion containment must not use raw string prefix checks');
+  assert(
+    serverSource.includes('isPathInside(filePath, CODEX_SESSIONS_DIR)')
+      && serverSource.includes('isPathInside(requestedPath, CODEX_SESSIONS_DIR)')
+      && serverSource.includes('isPathInside(filePath, CLAUDE_PROJECTS_DIR)'),
+    'Session file containment must use path.relative-based checks',
+  );
+
+  const updateCwdBadgeSource = extractFunctionSource(appSource, 'updateCwdBadge');
+  assert(updateCwdBadgeSource.includes('split(/[\\\\/]+/)'), 'Current cwd badge must split both Windows and POSIX separators');
+  const rendererLinkIndex = appSource.indexOf('renderer.link = function');
+  assert(rendererLinkIndex >= 0, 'Markdown renderer link hook must exist');
+  const rendererLinkSource = appSource.slice(rendererLinkIndex, rendererLinkIndex + 1400);
+  assert(
+    rendererLinkSource.includes('isWindowsLocalPath')
+      && rendererLinkSource.includes('sessionState.currentCwd.includes(\'\\\\\')')
+      && rendererLinkSource.includes('replace(/[\\\\/]+$/, \'\')'),
+    'Markdown local file links must handle Windows absolute paths and Windows cwd-relative joins',
+  );
+}
+
 async function runFileRefProjectCwdRegressionCase({ port, password, tempRoot }) {
   await withAuthedClient(port, password, async ({ client, messages }) => {
     const projectCwd = path.join(tempRoot, 'file-ref-project-root');
@@ -4105,7 +4152,14 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     await waitForCondition(() => !fs.existsSync(importedSessionPath), { label: 'Codex session JSON deletion' });
     await waitForCondition(() => !fs.existsSync(codexFixture.rolloutPath), { label: 'Codex rollout deletion' });
     await waitForCondition(
-      () => sql(codexFixture.stateDb, `select count(*) from threads where id=${sqlQuote(codexFixture.threadId)}`) === '0',
+      () => {
+        try {
+          return sql(codexFixture.stateDb, `select count(*) from threads where id=${sqlQuote(codexFixture.threadId)}`) === '0';
+        } catch (error) {
+          if (/database is locked/i.test(String(error?.message || error))) return false;
+          throw error;
+        }
+      },
       { label: 'Codex thread row deletion' },
     );
   });
@@ -4114,6 +4168,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
 async function main() {
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  await sourceRunner.run('windows path and runtime source guard', runWindowsPathRuntimeSourceRegressionCase);
   sourceRunner.finish();
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));

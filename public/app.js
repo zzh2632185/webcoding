@@ -3988,7 +3988,7 @@
   function updateCwdBadge() {
     if (!chatCwd) return;
     if (sessionState.currentCwd) {
-      const parts = sessionState.currentCwd.replace(/\/+$/, '').split('/');
+      const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/);
       const short = parts.slice(-2).join('/') || sessionState.currentCwd;
       chatCwd.textContent = '~/' + short;
       chatCwd.title = sessionState.currentCwd;
@@ -4549,12 +4549,15 @@
   renderer.link = function (href, title, text) {
     // Detect absolute local file paths (e.g. /Users/... or /home/...)
     const rawHref = String(href || '').trim();
-    if (/^\/[A-Za-z]/.test(rawHref) && !rawHref.startsWith('//')) {
+    const isWindowsLocalPath = /^[A-Za-z]:[\\/]/.test(rawHref) || /^\\\\[^\\]+\\[^\\]+/.test(rawHref);
+    const isPosixLocalPath = /^\/[A-Za-z]/.test(rawHref) && !rawHref.startsWith('//');
+    if (isPosixLocalPath || isWindowsLocalPath) {
       return `<a href="#" class="local-file-link" data-path="${escapeHtml(rawHref)}" onclick="ccCopyFilePath(this);return false;" title="点击复制路径">${text || escapeHtml(rawHref)}</a>`;
     }
     // Detect relative local file paths with a known extension when cwd is available
     if (sessionState.currentCwd && /^[^/#?][^#?]*\.[a-zA-Z0-9]+$/.test(rawHref) && !/^https?:\/\//i.test(rawHref)) {
-      const absPath = sessionState.currentCwd.replace(/\/$/, '') + '/' + rawHref;
+      const sep = sessionState.currentCwd.includes('\\') ? '\\' : '/';
+      const absPath = sessionState.currentCwd.replace(/[\\/]+$/, '') + sep + rawHref.replace(/^[\\/]+/, '');
       return `<a href="#" class="local-file-link" data-path="${escapeHtml(absPath)}" onclick="ccCopyFilePath(this);return false;" title="点击复制路径">${text || escapeHtml(rawHref)}</a>`;
     }
     const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: true });

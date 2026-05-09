@@ -8,7 +8,7 @@ const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const XLSX = require('xlsx');
 const mammoth = require('mammoth');
-const { createAgentRuntime } = require('./lib/agent-runtime');
+const { createAgentRuntime, buildCliSpawnCommand } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 
 // Load .env
@@ -84,7 +84,7 @@ const TUNNEL_START_TIMEOUT_MS = 30000;
 const CLAUDE_SETTINGS_BACKUP_PATH = path.join(CONFIG_DIR, 'claude-settings-backup.json');
 const BRIDGE_SCRIPT_PATH = path.join(__dirname, 'lib', 'local-api-bridge.js');
 const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
-const USER_HOME = process.env.HOME || process.env.USERPROFILE || '';
+const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir() || '';
 const BROWSE_ROOTS = USER_HOME ? [path.resolve(USER_HOME)] : [path.resolve(process.cwd())];
 if (process.platform === 'win32') {
   for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
@@ -662,11 +662,14 @@ function discoverClaudeSlashCommands() {
     }, 30000);
 
     try {
-      const proc = spawn(CLAUDE_PATH, args, {
+      const commandSpec = buildCliSpawnCommand(CLAUDE_PATH, args);
+      const proc = spawn(commandSpec.command, commandSpec.args, {
         env: { ...process.env },
         cwd: __dirname,
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
+        windowsHide: true,
+        shell: !!commandSpec.useShell,
       });
 
       let buf = '';
@@ -705,7 +708,7 @@ function discoverClaudeSlashCommands() {
 //   2. Skills from ~/.codex/skills/ (user-installed + .system/)
 //   3. Plugins from ~/.codex/.tmp/bundled-marketplaces/*/plugins/
 function discoverCodexSlashCommands() {
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const codexHome = process.env.CODEX_HOME || path.join(USER_HOME, '.codex');
   const skillsDir = path.join(codexHome, 'skills');
   const marketplacesDir = path.join(codexHome, '.tmp', 'bundled-marketplaces');
   const commands = new Set();
@@ -1365,8 +1368,8 @@ function getModelConfigMasked() {
   };
 }
 
-const CODEX_LOCAL_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
-const CODEX_LOCAL_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
+const CODEX_LOCAL_CONFIG_PATH = path.join(USER_HOME, '.codex', 'config.toml');
+const CODEX_LOCAL_AUTH_PATH = path.join(USER_HOME, '.codex', 'auth.json');
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
@@ -1606,7 +1609,7 @@ function copyDirectorySync(src, dst) {
 }
 
 function syncCodexRuntimeAssets() {
-  const localCodexHome = path.join(os.homedir(), '.codex');
+  const localCodexHome = path.join(USER_HOME, '.codex');
   if (!fs.existsSync(localCodexHome)) return;
 
   const dirsToSync = ['skills', 'mcp', 'commands', 'agents', 'rules', 'plugins'];
@@ -1766,7 +1769,7 @@ function getCodexModelsCachePaths(config) {
   if (config?.mode && config.mode !== 'local') {
     paths.push(path.join(CODEX_RUNTIME_HOME, 'models_cache.json'));
   }
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const home = USER_HOME;
   if (home) {
     paths.push(path.join(home, '.codex', 'models_cache.json'));
   }
@@ -1971,7 +1974,7 @@ function loadClaudeLocalModelMap() {
   if (settingsMap) return settingsMap;
 
   try {
-    const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
+    const p = path.join(USER_HOME, '.claude.json');
     if (fs.existsSync(p)) {
       const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
       const claudeJsonMap = extractClaudeModelMapFromEnv(raw?.env || {});
@@ -1994,7 +1997,7 @@ function fileContentFingerprint(filePath) {
 }
 
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
-const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+const CLAUDE_SETTINGS_PATH = path.join(USER_HOME, '.claude', 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
@@ -2173,7 +2176,7 @@ function getClaudeRuntimeFingerprint(config = null) {
     runtimeVersion: 1,
     mode: 'local',
     settingsFingerprint: fileContentFingerprint(CLAUDE_SETTINGS_PATH),
-    claudeJsonFingerprint: fileContentFingerprint(path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json')),
+    claudeJsonFingerprint: fileContentFingerprint(path.join(USER_HOME, '.claude.json')),
   });
 }
 
@@ -2332,7 +2335,9 @@ function wsSend(ws, data) {
 }
 
 function isPathInside(filePath, rootDir) {
-  const relative = path.relative(rootDir, filePath);
+  const root = path.resolve(String(rootDir || ''));
+  const target = path.resolve(String(filePath || ''));
+  const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
@@ -7116,7 +7121,7 @@ function handleNewSession(ws, msg) {
     if (proj) resolvedCwd = proj.path;
   }
   if (!resolvedCwd) {
-    resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+    resolvedCwd = agent === 'claude' ? (USER_HOME || process.cwd()) : null;
   }
   if (resolvedCwd) {
     resolvedCwd = normalizeProjectPathKey(resolvedCwd);
@@ -7812,7 +7817,7 @@ function sqlQuote(value) {
 function deleteClaudeLocalSession(claudeSessionId) {
   const safeId = sanitizeId(claudeSessionId);
   if (!safeId) return;
-  const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+  const projectsDir = path.join(USER_HOME, '.claude', 'projects');
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
       const target = path.join(projectsDir, proj, `${safeId}.jsonl`);
@@ -7837,7 +7842,7 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   let removedFiles = 0;
   for (const filePath of rolloutPaths) {
     try {
-      if ((filePath.startsWith(CODEX_SESSIONS_DIR) || filePath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
+      if ((isPathInside(filePath, CODEX_SESSIONS_DIR) || isPathInside(filePath, CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
         removedFiles++;
       }
@@ -8259,7 +8264,7 @@ function handleMessage(ws, msg, options = {}) {
   if (!session) {
     const id = crypto.randomUUID();
     const agent = messageAgent;
-    const resolvedCwd = requestedWorkspace.cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
+    const resolvedCwd = requestedWorkspace.cwd || (agent === 'claude' ? (USER_HOME || process.cwd()) : null);
     session = {
       id,
       title: derivedTitle,
@@ -8669,11 +8674,11 @@ function handleCheckUpdate(ws) {
 
 // === Native Session Import ===
 
-const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
-const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'sessions');
+const CLAUDE_PROJECTS_DIR = path.join(USER_HOME, '.claude', 'projects');
+const CODEX_SESSIONS_DIR = path.join(USER_HOME, '.codex', 'sessions');
 const CODEX_RUNTIME_SESSIONS_DIR = path.join(CODEX_RUNTIME_HOME, 'sessions');
-const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
-const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
+const CODEX_STATE_DB_PATH = path.join(USER_HOME, '.codex', 'state_5.sqlite');
+const CODEX_LOG_DB_PATH = path.join(USER_HOME, '.codex', 'logs_1.sqlite');
 
 function resolveClaudeSessionLocalMeta(claudeSessionId) {
   if (!claudeSessionId) return null;
@@ -8926,7 +8931,7 @@ function handleImportNativeSession(ws, msg) {
     return wsSend(ws, { type: 'error', message: '缺少 sessionId 或 projectDir' });
   }
   const filePath = path.join(CLAUDE_PROJECTS_DIR, String(projectDir), `${sanitizeId(sessionId)}.jsonl`);
-  if (!filePath.startsWith(CLAUDE_PROJECTS_DIR)) {
+  if (!isPathInside(filePath, CLAUDE_PROJECTS_DIR)) {
     return wsSend(ws, { type: 'error', message: '非法路径' });
   }
   let content;
@@ -9064,7 +9069,7 @@ function handleImportCodexSession(ws, msg) {
 
   let parsed = null;
   const requestedPath = msg?.rolloutPath ? path.resolve(String(msg.rolloutPath)) : '';
-  if (requestedPath && (requestedPath.startsWith(CODEX_SESSIONS_DIR) || requestedPath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(requestedPath)) {
+  if (requestedPath && (isPathInside(requestedPath, CODEX_SESSIONS_DIR) || isPathInside(requestedPath, CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(requestedPath)) {
     parsed = parseCodexRolloutFile(requestedPath);
   }
   if (!parsed) {
@@ -9147,7 +9152,7 @@ function handleImportCodexSession(ws, msg) {
 function handleListCwdSuggestions(ws) {
   const paths = new Set();
   // Always include HOME
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const home = USER_HOME;
   if (home) paths.add(home);
   try {
     const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
