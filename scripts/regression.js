@@ -215,9 +215,13 @@ async function waitForPort(port, timeoutMs = 10000) {
 }
 
 async function startServer(env) {
+  const childEnv = { ...process.env, ...env };
+  if (process.platform === 'win32' && env?.HOME && !Object.prototype.hasOwnProperty.call(env, 'USERPROFILE')) {
+    childEnv.USERPROFILE = env.HOME;
+  }
   const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: REPO_DIR,
-    env: { ...process.env, ...env },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -249,8 +253,17 @@ async function withServer(env, fn) {
   } catch (err) {
     const stdoutTail = handle.stdout().slice(-1200);
     const stderrTail = handle.stderr().slice(-1200);
-    if (stdoutTail || stderrTail) {
-      err.message = `${err.message}\n--- server stdout tail ---\n${stdoutTail}\n--- server stderr tail ---\n${stderrTail}`;
+    const processLogPath = handle.env?.CC_WEB_LOGS_DIR ? path.join(handle.env.CC_WEB_LOGS_DIR, 'process.log') : '';
+    let processLogTail = '';
+    try {
+      processLogTail = fs.readFileSync(processLogPath, 'utf8')
+        .split(/\r?\n/)
+        .filter((line) => line && !line.includes('"tailer_read_error"'))
+        .slice(-30)
+        .join('\n');
+    } catch {}
+    if (stdoutTail || stderrTail || processLogTail) {
+      err.message = `${err.message}\n--- server stdout tail ---\n${stdoutTail}\n--- server stderr tail ---\n${stderrTail}\n--- process log tail ---\n${processLogTail}`;
     }
     throw err;
   } finally {
@@ -817,7 +830,8 @@ function nextMessage(messages, ws, predicate, timeoutMs = 5000) {
     timeout = setTimeout(() => {
       waiters.delete(waiter);
       const tailTypes = messages.slice(-12).map((msg) => msg && msg.type).filter(Boolean).join(', ');
-      reject(new Error(`Timed out waiting for expected WebSocket message (${caller}) tail=[${tailTypes}]`));
+      const tailPreview = messages.slice(-6).map((msg) => JSON.stringify(msg).slice(0, 260)).join(' | ');
+      reject(new Error(`Timed out waiting for expected WebSocket message (${caller}) tail=[${tailTypes}] preview=[${tailPreview}]`));
     }, timeoutMs);
   });
 }
@@ -3919,10 +3933,12 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(codexConfigMsg.config.supportsSearch === false, 'Codex config should expose unsupported search capability');
     assert(codexConfigMsg.config.enableSearch === false, 'Codex config should ignore unsupported search toggle');
 
+    const codexSpaceCwd = path.join(tempRoot, 'codex-space');
+    mkdirp(codexSpaceCwd);
     const codexSession = await client.sendAndWaitType(
-      { type: 'new_session', agent: 'codex', cwd: '/tmp/codex-space', mode: 'plan' },
+      { type: 'new_session', agent: 'codex', cwd: codexSpaceCwd, mode: 'plan' },
       'session_info',
-      (msg) => msg.agent === 'codex' && msg.cwd === '/tmp/codex-space',
+      (msg) => msg.agent === 'codex' && msg.cwd === codexSpaceCwd,
     );
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
     assert(codexSession.model === null, 'Codex new_session should not inject a default model');
@@ -3945,15 +3961,17 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
       mime: 'image/png',
       data: tinyPng,
     });
+    const firstCodexPrompt = 'trigger codex slow stream happy';
     const firstMessageSession = await client.sendAndWaitType(
-      buildAgentMessagePayload({ text: 'first codex prompt', attachments: [codexAttachment], mode: 'yolo', agent: 'codex' }),
+      buildAgentMessagePayload({ text: firstCodexPrompt, attachments: [codexAttachment], mode: 'yolo', agent: 'codex' }),
       'session_info',
-      (msg) => msg.agent === 'codex' && msg.title === 'first codex prompt',
+      (msg) => msg.agent === 'codex' && msg.title === firstCodexPrompt,
     );
     assert(firstMessageSession.agent === 'codex', 'First-message path created wrong agent');
     const runningSessionList = await client.waitForType(
       'session_list',
       (msg) => msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning),
+      10000,
     );
     assert(runningSessionList.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning), 'Running Codex session should be marked as isRunning');
     await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId);

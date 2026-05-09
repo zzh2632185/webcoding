@@ -163,6 +163,7 @@ function sleep(ms) {
   const slowStreamMatch = input.match(/^trigger codex slow stream(?:\s+(.+))?$/i);
   if (slowStreamMatch) {
     const label = String(slowStreamMatch[1] || 'default').trim() || 'default';
+    const delayMs = label === 'restart' ? 5000 : 1500;
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',
       item: {
@@ -171,7 +172,7 @@ function sleep(ms) {
         text: `slow-start:${label} `,
       },
     })}\n`);
-    await sleep(1500);
+    await sleep(delayMs);
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',
       item: {
@@ -180,7 +181,7 @@ function sleep(ms) {
         text: `slow-mid:${label} `,
       },
     })}\n`);
-    await sleep(1500);
+    await sleep(delayMs);
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',
       item: {

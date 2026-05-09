@@ -1841,7 +1841,19 @@ function fetchCodexModelsFromApi(profile) {
       },
     };
     const proto = url.protocol === 'https:' ? https : http;
-    const req = proto.request(options, (res) => {
+    let settled = false;
+    let req = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      fn(value);
+    };
+    const overallTimer = setTimeout(() => {
+      try { req?.destroy(new Error('timeout')); } catch {}
+      finish(reject, new Error('timeout'));
+    }, 1500);
+    req = proto.request(options, (res) => {
       let body = '';
       let bodyBytes = 0;
       res.on('data', (chunk) => {
@@ -1854,18 +1866,18 @@ function fetchCodexModelsFromApi(profile) {
       });
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+          return finish(reject, new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
         }
         try {
           const json = JSON.parse(body);
           const entries = normalizeCodexModelEntries(json.data || json.models || []);
-          resolve(entries.length ? { entries, source: 'provider-api' } : null);
+          finish(resolve, entries.length ? { entries, source: 'provider-api' } : null);
         } catch (error) {
-          reject(error);
+          finish(reject, error);
         }
       });
     });
-    req.on('error', reject);
+    req.on('error', (error) => finish(reject, error));
     req.setTimeout(1500, () => req.destroy(new Error('timeout')));
     req.end();
   });
@@ -8412,7 +8424,7 @@ function handleMessage(ws, msg, options = {}) {
       env: spawnSpec.env,
       cwd: spawnSpec.cwd,
       stdio: [inputFd, outputFd, errorFd],
-      detached: !IS_WIN,
+      detached: true,
       windowsHide: true,
       shell: !!spawnSpec.useShell,
     });
