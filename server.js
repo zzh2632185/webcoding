@@ -8431,7 +8431,7 @@ function handleMessage(ws, msg, options = {}) {
       env: spawnSpec.env,
       cwd: spawnSpec.cwd,
       stdio: [inputFd, outputFd, errorFd],
-      detached: true,
+      detached: !IS_WIN,
       windowsHide: true,
       shell: !!spawnSpec.useShell,
     });

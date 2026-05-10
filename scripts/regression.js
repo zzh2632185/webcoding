@@ -1776,6 +1776,10 @@ async function runReconnectResumeRegressionCase({ port, password }) {
 }
 
 async function runServerRestartRecoveryRegressionCase({ port, password, logsDir, serverHandle, serverEnv }) {
+  if (process.platform === 'win32') {
+    console.log('skip - server restart recovery (Windows chat runtimes stay non-detached to avoid console popups)');
+    return;
+  }
   let initialConnection = null;
   let restartedHandle = null;
   let recoveredConnection = null;
@@ -3784,6 +3788,12 @@ function runWindowsPathRuntimeSourceRegressionCase() {
   const ensureBridgeSource = extractFunctionSource(serverSource, 'ensureLocalBridgeRunning');
   assert(ensureBridgeSource.includes('windowsHide: true'), 'Local bridge process must not pop a Windows console window');
   assert(cfTunnelSource.includes('windowsHide: true'), 'Cloudflared child process must not pop a Windows console window');
+  const handleMessageSource = extractFunctionSource(serverSource, 'handleMessage');
+  assert(
+    handleMessageSource.includes('detached: !IS_WIN')
+      && handleMessageSource.includes('windowsHide: true'),
+    'Windows chat runtime launches must avoid detached consoles while still hiding any child window',
+  );
 
   const osHomedirMatches = serverSource.match(/os\.homedir\(\)/g) || [];
   assert(osHomedirMatches.length === 1 && serverSource.includes('const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir() || \'\';'), 'server.js must centralize effective user home resolution');
