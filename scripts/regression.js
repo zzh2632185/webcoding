@@ -1482,8 +1482,23 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
   });
 }
 
-async function runAttachmentBoundaryRegressionCase({ port, password }) {
+async function runAttachmentBoundaryRegressionCase({ port, password, tinyPng }) {
   await withAuthedClient(port, password, async ({ token }) => {
+    const uploaded = await uploadAttachment(port, token, {
+      filename: 'preview.png',
+      mime: 'image/png',
+      data: tinyPng,
+    });
+    const previewResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/${encodeURIComponent(uploaded.id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(previewResponse.ok, 'Uploaded attachment should be readable for thumbnail preview');
+    assert(/^image\/png/i.test(previewResponse.headers.get('content-type') || ''), 'Attachment preview should preserve image content type');
+    const previewBytes = Buffer.from(await previewResponse.arrayBuffer());
+    assert(previewBytes.equals(tinyPng), 'Attachment preview should stream original uploaded image bytes');
+    const unauthPreview = await fetch(`http://127.0.0.1:${port}/api/attachments/${encodeURIComponent(uploaded.id)}`);
+    assert(unauthPreview.status === 401, 'Attachment preview endpoint should require authentication');
+
     try {
       const oversizedUpload = await uploadAttachmentExpectFailure(
         port,
@@ -3810,6 +3825,9 @@ function runWindowsPathRuntimeSourceRegressionCase() {
 
   const updateCwdBadgeSource = extractFunctionSource(appSource, 'updateCwdBadge');
   assert(updateCwdBadgeSource.includes('split(/[\\\\/]+/)'), 'Current cwd badge must split both Windows and POSIX separators');
+  assert(appSource.includes('function openAttachmentPreview'), 'Uploaded image attachments must have a full-size preview opener');
+  assert(appSource.includes('image-attachment-preview') && appSource.includes('attachment-chip-thumb'), 'Uploaded image attachments must render clickable thumbnails in messages and the composer');
+  assert(serverSource.includes("req.method === 'GET' && url.pathname.startsWith('/api/attachments/')"), 'Uploaded attachment images must have an authenticated raw preview endpoint');
   const rendererLinkIndex = appSource.indexOf('renderer.link = function');
   assert(rendererLinkIndex >= 0, 'Markdown renderer link hook must exist');
   const rendererLinkSource = appSource.slice(rendererLinkIndex, rendererLinkIndex + 1400);

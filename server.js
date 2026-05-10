@@ -5948,6 +5948,43 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    const id = sanitizeId(url.pathname.split('/').pop() || '');
+    if (!id) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Missing attachment ID');
+    }
+    const meta = loadAttachmentMeta(id);
+    const state = currentAttachmentState(meta);
+    if (state === 'expired') removeAttachmentById(id);
+    if (state !== 'available') {
+      writeHeadWithSecurity(res, state === 'expired' ? 410 : 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(state === 'expired' ? 'Attachment expired' : 'Attachment not found');
+    }
+    const filePath = path.resolve(meta.path);
+    const root = path.resolve(ATTACHMENTS_DIR);
+    if (!isPathInside(filePath, root) || !IMAGE_MIME_TYPES.has(meta.mime)) {
+      writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Forbidden');
+    }
+    const asciiFilename = safeFilename(meta.filename).replace(/[^A-Za-z0-9._-]+/g, '_') || 'image';
+    writeHeadWithSecurity(res, 200, {
+      'Content-Type': meta.mime,
+      'Content-Length': String(meta.size || fs.statSync(filePath).size),
+      'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(meta.filename || 'image')}`,
+      'Cache-Control': 'private, max-age=300',
+    });
+    fs.createReadStream(filePath).on('error', () => {
+      try { res.destroy(); } catch {}
+    }).pipe(res);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/files') {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {

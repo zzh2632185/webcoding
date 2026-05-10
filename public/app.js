@@ -137,6 +137,7 @@
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  const attachmentPreviewUrls = new Map();
   let pendingFileRefs = [];
   let queuedMessages = [];
   let queuedDispatchTimer = null;
@@ -2349,6 +2350,112 @@
     } catch {}
   }
 
+  function rememberAttachmentPreviewUrl(id, url) {
+    const key = String(id || '').trim();
+    const value = String(url || '').trim();
+    if (!key || !value) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing !== value && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.set(key, value);
+  }
+
+  function forgetAttachmentPreviewUrl(id) {
+    const key = String(id || '').trim();
+    if (!key) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.delete(key);
+  }
+
+  function attachmentRawUrl(id) {
+    const key = String(id || '').trim();
+    return key ? `/api/attachments/${encodeURIComponent(key)}` : '';
+  }
+
+  function getAttachmentPreviewSrc(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    return String((id ? attachmentPreviewUrls.get(id) : '') || attachment.previewUrl || '');
+  }
+
+  function attachmentTransportPayload(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id) return null;
+    return {
+      id,
+      kind: attachment.kind || 'image',
+      filename: attachment.filename || 'image',
+      mime: attachment.mime || 'image/png',
+      size: Number(attachment.size || 0) || 0,
+      createdAt: attachment.createdAt || null,
+      expiresAt: attachment.expiresAt || null,
+      storageState: attachment.storageState || 'available',
+    };
+  }
+
+  function attachmentTransportPayloads(attachments = []) {
+    return Array.isArray(attachments)
+      ? attachments.map(attachmentTransportPayload).filter(Boolean)
+      : [];
+  }
+
+  async function fetchAttachmentPreviewUrl(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id || attachment.storageState === 'expired') return '';
+    const existing = attachmentPreviewUrls.get(id);
+    if (existing) return existing;
+    await ensureAuthenticatedWs();
+    const response = await fetch(attachmentRawUrl(id), {
+      headers: { Authorization: `Bearer ${connectionState.authToken}` },
+    });
+    if (!response.ok) throw new Error(response.status === 410 ? '图片已过期' : `图片读取失败 (${response.status})`);
+    const blob = await response.blob();
+    if (!/^image\//i.test(blob.type || '')) throw new Error('附件不是图片');
+    const url = URL.createObjectURL(blob);
+    rememberAttachmentPreviewUrl(id, url);
+    return url;
+  }
+
+  function openAttachmentImagePreview({ src = '', title = '图片附件', meta = '' } = {}) {
+    const safeSrc = String(src || '').trim();
+    if (!safeSrc) return;
+    const { overlay, panel, close } = createOverlayPanel({
+      overlayClass: 'modal-overlay attachment-preview-overlay',
+      panelClass: 'modal-panel attachment-preview-panel',
+      maxWidth: 'min(980px, calc(100vw - 28px))',
+      panelHtml: `
+        <div class="modal-header">
+          <span class="modal-title">${escapeHtml(title || '图片附件')}</span>
+          <button class="modal-close-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="attachment-preview-body">
+          <img class="attachment-preview-image" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(title || '图片附件')}">
+        </div>
+        ${meta ? `<div class="attachment-preview-meta">${escapeHtml(meta)}</div>` : ''}
+      `,
+    });
+    const closePreview = () => {
+      document.removeEventListener('keydown', onKeydown);
+      close();
+    };
+    const onKeydown = (event) => {
+      if (event.key === 'Escape') closePreview();
+    };
+    panel.querySelector('.modal-close-btn')?.addEventListener('click', closePreview);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) closePreview(); });
+    document.addEventListener('keydown', onKeydown);
+  }
+
+  async function openAttachmentPreview(attachment = {}) {
+    const src = getAttachmentPreviewSrc(attachment) || await fetchAttachmentPreviewUrl(attachment);
+    const title = attachment.filename || '图片附件';
+    const meta = [formatFileSize(attachment.size), attachment.mime].filter(Boolean).join(' · ');
+    openAttachmentImagePreview({ src, title, meta });
+  }
+
   function ensureAuthenticatedWs() {
     return new Promise((resolve, reject) => {
       if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN && connectionState.authToken) {
@@ -2402,10 +2509,71 @@
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
     const labels = attachments.map((attachment) => {
       const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '';
+      const id = String(attachment.id || '').trim();
       const name = escapeHtml(attachment.filename || 'image');
-      return `<span class="msg-attachment-label">图片: ${name}${stateSuffix}</span>`;
+      const src = getAttachmentPreviewSrc(attachment);
+      const disabled = !id && !src;
+      const subtitle = Number(attachment.size) ? formatFileSize(attachment.size) : (attachment.mime || 'image');
+      return `
+        <button class="msg-attachment-label image-attachment-preview" type="button"
+          ${id ? `data-attachment-id="${escapeHtml(id)}"` : ''}
+          ${src ? `data-preview-src="${escapeHtml(src)}"` : ''}
+          data-filename="${name}"
+          data-size="${escapeHtml(String(attachment.size || ''))}"
+          data-mime="${escapeHtml(attachment.mime || '')}"
+          ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
+          aria-label="查看图片 ${name}">
+          <span class="attachment-thumb" aria-hidden="true">${src ? `<img src="${escapeHtml(src)}" alt="">` : ''}</span>
+          <span class="attachment-thumb-meta">
+            <span class="attachment-thumb-title">图片: ${name}${stateSuffix}</span>
+            <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
+          </span>
+        </button>
+      `;
     }).join('');
     return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+  }
+
+  function hydrateAttachmentPreviews(root = document) {
+    const scope = root && typeof root.querySelectorAll === 'function' ? root : document;
+    scope.querySelectorAll('.image-attachment-preview[data-attachment-id]').forEach((button) => {
+      const id = button.dataset.attachmentId || '';
+      if (!id || button.dataset.previewHydrated === '1') return;
+      const existing = attachmentPreviewUrls.get(id);
+      if (existing) {
+        setAttachmentButtonPreview(button, existing);
+        return;
+      }
+      button.dataset.previewHydrated = '1';
+      fetchAttachmentPreviewUrl({
+        id,
+        filename: button.dataset.filename || 'image',
+        mime: button.dataset.mime || '',
+        size: Number(button.dataset.size || 0) || 0,
+      }).then((url) => {
+        setAttachmentButtonPreview(button, url);
+      }).catch(() => {
+        button.classList.add('preview-unavailable');
+      });
+    });
+  }
+
+  function setAttachmentButtonPreview(button, src) {
+    if (!button || !src) return;
+    button.dataset.previewSrc = src;
+    button.dataset.previewHydrated = '1';
+    const thumb = button.querySelector('.attachment-thumb');
+    if (thumb) {
+      let img = thumb.querySelector('img');
+      if (!img) {
+        img = document.createElement('img');
+        img.alt = '';
+        img.loading = 'lazy';
+        thumb.innerHTML = '';
+        thumb.appendChild(img);
+      }
+      img.src = src;
+    }
   }
 
   function renderPendingAttachments() {
@@ -2419,6 +2587,14 @@
     attachmentTray.hidden = false;
     const uploadingHtml = composeState.uploadingAttachments.map((attachment) => `
       <div class="attachment-chip uploading">
+        <button class="attachment-chip-thumb" type="button"
+          ${attachment.previewUrl ? `data-preview-src="${escapeHtml(attachment.previewUrl)}"` : ''}
+          data-filename="${escapeHtml(attachment.filename || 'image')}"
+          data-size="${escapeHtml(String(attachment.size || ''))}"
+          data-mime="${escapeHtml(attachment.mime || '')}"
+          aria-label="查看图片 ${escapeHtml(attachment.filename || 'image')}">
+          ${attachment.previewUrl ? `<img src="${escapeHtml(attachment.previewUrl)}" alt="">` : ''}
+        </button>
         <div class="attachment-chip-meta">
           <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
           <span class="attachment-chip-note">上传中 · ${formatFileSize(attachment.size)}</span>
@@ -2427,6 +2603,15 @@
     `).join('');
     const readyHtml = composeState.pendingAttachments.map((attachment, index) => `
       <div class="attachment-chip" data-index="${index}">
+        <button class="attachment-chip-thumb" type="button"
+          ${attachment.id ? `data-attachment-id="${escapeHtml(attachment.id)}"` : ''}
+          ${getAttachmentPreviewSrc(attachment) ? `data-preview-src="${escapeHtml(getAttachmentPreviewSrc(attachment))}"` : ''}
+          data-filename="${escapeHtml(attachment.filename || 'image')}"
+          data-size="${escapeHtml(String(attachment.size || ''))}"
+          data-mime="${escapeHtml(attachment.mime || '')}"
+          aria-label="查看图片 ${escapeHtml(attachment.filename || 'image')}">
+          ${getAttachmentPreviewSrc(attachment) ? `<img src="${escapeHtml(getAttachmentPreviewSrc(attachment))}" alt="">` : ''}
+        </button>
         <div class="attachment-chip-meta">
           <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
           <span class="attachment-chip-note">${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
@@ -2447,6 +2632,23 @@
         const [removed] = composeState.pendingAttachments.splice(index, 1);
         renderPendingAttachments();
         deleteUploadedAttachment(removed?.id);
+        forgetAttachmentPreviewUrl(removed?.id);
+      });
+    });
+    attachmentTray.querySelectorAll('.attachment-chip-thumb').forEach((btn) => {
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = btn.dataset.attachmentId || '';
+        const attachment = [...composeState.pendingAttachments, ...composeState.uploadingAttachments]
+          .find((item) => (id && item.id === id) || item.previewUrl === btn.dataset.previewSrc);
+        openAttachmentPreview({
+          id,
+          filename: btn.dataset.filename || attachment?.filename || 'image',
+          size: Number(btn.dataset.size || attachment?.size || 0) || 0,
+          mime: btn.dataset.mime || attachment?.mime || '',
+          previewUrl: btn.dataset.previewSrc || attachment?.previewUrl || '',
+        }).catch((error) => appendError(error.message || '无法打开图片'));
       });
     });
     syncAttachmentActions();
@@ -3949,19 +4151,30 @@
       id: nextLocalId(`upload-${index}`),
       filename: file.name || 'image',
       size: file.size || 0,
+      mime: file.type || '',
+      previewUrl: URL.createObjectURL(file),
     }));
     composeState.uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
-      const results = await Promise.allSettled(files.map(async (file) => {
+      const results = await Promise.allSettled(files.map(async (file, index) => {
         const optimized = await compressImageFile(file);
-        return uploadImageFile(optimized);
+        const attachment = await uploadImageFile(optimized);
+        return {
+          ...attachment,
+          previewUrl: batch[index]?.previewUrl || '',
+        };
       }));
       const errors = [];
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status === 'fulfilled') {
           composeState.pendingAttachments.push(result.value);
+          rememberAttachmentPreviewUrl(result.value.id, result.value.previewUrl);
         } else {
+          const failedPreview = batch[index]?.previewUrl || '';
+          if (failedPreview) {
+            try { URL.revokeObjectURL(failedPreview); } catch {}
+          }
           errors.push(result.reason?.message || '图片上传失败');
         }
       }
@@ -4463,7 +4676,7 @@
       return;
     }
 
-    const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const attachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
     hideCmdMenu();
     hideOptionPicker();
@@ -5581,6 +5794,7 @@
   function appendMessageAttachments(bubble, attachments = []) {
     if (!bubble || !Array.isArray(attachments) || attachments.length === 0) return;
     bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
+    hydrateAttachmentPreviews(bubble);
   }
 
   function appendMessageFileRefs(bubble, fileRefs = []) {
@@ -5807,6 +6021,7 @@
 
     div.appendChild(avatar);
     div.appendChild(contentWrap);
+    hydrateAttachmentPreviews(bubble);
     return div;
   }
 
@@ -8349,7 +8564,7 @@
       if (!raw || typeof raw !== 'object') return null;
       const text = typeof raw.text === 'string' ? raw.text : '';
       const attachments = Array.isArray(raw.attachments)
-        ? raw.attachments.filter(Boolean).map((attachment) => ({ ...attachment })).slice(0, MAX_QUEUED_ATTACHMENTS)
+        ? attachmentTransportPayloads(raw.attachments).slice(0, MAX_QUEUED_ATTACHMENTS)
         : [];
       const fileRefs = Array.isArray(raw.fileRefs)
         ? raw.fileRefs.filter(Boolean).map((ref) => ({ ...ref })).slice(0, MAX_PENDING_FILE_REFS)
@@ -8410,7 +8625,7 @@
       id: item.id,
       sessionId: targetSessionId,
       text: item.text || '',
-      attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
+      attachments: attachmentTransportPayloads(item.attachments),
       fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
       cwd: item.cwd || '',
       projectId: item.projectId || null,
@@ -8564,7 +8779,7 @@
       id: nextLocalId('queued'),
       sessionId: sessionState.currentSessionId || null,
       text,
-      attachments: composeState.pendingAttachments.map((attachment) => ({ ...attachment })),
+      attachments: attachmentTransportPayloads(composeState.pendingAttachments),
       fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
       ...getMessageWorkspaceContext(composeState.pendingFileRefs),
       mode: sessionState.currentMode,
@@ -8663,11 +8878,12 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const payloadAttachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
     messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs));
     scrollToBottom();
 
-    sendUserMessage({ text, attachments, fileRefs });
+    sendUserMessage({ text, attachments: payloadAttachments, fileRefs });
     msgInput.value = '';
     composeState.pendingAttachments = [];
     composeState.pendingFileRefs = [];
@@ -8867,6 +9083,20 @@
 
   function handleGlobalDocumentClick(event) {
     const target = event.target;
+
+    const attachmentPreviewBtn = target instanceof Element ? target.closest('.image-attachment-preview') : null;
+    if (attachmentPreviewBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openAttachmentPreview({
+        id: attachmentPreviewBtn.dataset.attachmentId || '',
+        filename: attachmentPreviewBtn.dataset.filename || 'image',
+        size: Number(attachmentPreviewBtn.dataset.size || 0) || 0,
+        mime: attachmentPreviewBtn.dataset.mime || '',
+        previewUrl: attachmentPreviewBtn.dataset.previewSrc || '',
+      }).catch((error) => appendError(error.message || '无法打开图片'));
+      return;
+    }
 
     // Git panel toggle button
     if (target instanceof Element && (target === gitPanelBtn || target.closest('#git-panel-btn'))) {
