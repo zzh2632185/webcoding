@@ -146,6 +146,8 @@
   let generationIdleFinalizeTimer = null;
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
+  let currentGenerationHadError = false;
+  let currentGenerationAbortRequested = false;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
   let fileRefPickerExpandedDirs = new Set();
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
@@ -170,6 +172,9 @@
   let cachedInputMaxHeight = INPUT_MAX_HEIGHT_FALLBACK;
   const toastQueue = [];
   let activeToast = null;
+  let activeTaskCompleteToast = null;
+  let taskCompleteAudioContext = null;
+  let lastTaskStatusAlert = { key: '', at: 0 };
   let pendingProjectSaveCallback = null;
   let gitState = {
     cwd: null,
@@ -5374,6 +5379,12 @@
   function handleErrorMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
     clearAwaitingRuntimeStart();
+    currentGenerationHadError = true;
+    notifyTaskFailure({
+      title: getSessionMeta(sessionState.currentSessionId)?.title || chatTitle.textContent || '当前会话',
+      sessionId: sessionState.currentSessionId,
+      message: msg.message || '发生未知错误',
+    });
     if (sessionState.currentHandoffPending) {
       sessionState.currentHandoffPending = null;
       sessionState.sessions = sessionState.sessions.map((session) => (
@@ -5394,12 +5405,33 @@
       const handoffPending = normalizeHandoffPending(meta?.handoffPending);
       setCurrentSessionRunningState(!!meta?.isRunning || !!handoffPending, handoffPending ? '接力分析中' : '运行中', handoffPending);
     }
-    if (composeState.isGenerating) finishGenerating();
+    if (composeState.isGenerating) {
+      finishGenerating(undefined, {
+        suppressNotification: true,
+        notifyComplete: false,
+        resetCompletionFlags: false,
+      });
+    }
   }
 
   function handleBackgroundDoneMessage(msg) {
-    showToast(`「${msg.title}」任务完成`, msg.sessionId);
-    showBrowserNotification(msg.title);
+    if (msg.success === false) {
+      notifyTaskFailure({
+        title: msg.title,
+        sessionId: msg.sessionId,
+        message: '后台任务结束但出现错误',
+        background: true,
+        browser: true,
+      });
+    } else {
+      notifyTaskCompletion({
+        title: msg.title,
+        sessionId: msg.sessionId,
+        background: true,
+        costUsd: msg.costUsd,
+        browser: true,
+      });
+    }
     if (msg.sessionId === sessionState.currentSessionId) {
       openSession(msg.sessionId, { forceSync: true, blocking: false });
     } else {
@@ -5518,7 +5550,22 @@
     image_delta: handleImageDeltaMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
-    done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
+    done: (msg) => {
+      if (isMessageForCurrentSession(msg)) {
+        if (msg.success === false && !currentGenerationAbortRequested) {
+          notifyTaskFailure({
+            title: getSessionMeta(msg.sessionId)?.title || chatTitle.textContent || '当前会话',
+            sessionId: msg.sessionId || sessionState.currentSessionId,
+            message: '任务异常中断',
+            costUsd: msg.costUsd,
+          });
+        }
+        finishGenerating(msg.sessionId, {
+          costUsd: msg.costUsd,
+          notifyComplete: msg.success !== false,
+        });
+      }
+    },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     handoff_status: handleHandoffStatusMessage,
     mode_changed: handleModeChangedMessage,
@@ -5701,6 +5748,8 @@
 
   function startGenerating() {
     composeState.isGenerating = true;
+    currentGenerationHadError = false;
+    currentGenerationAbortRequested = false;
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
@@ -5714,7 +5763,7 @@
     }
   }
 
-  function finishGenerating(sessionId) {
+  function finishGenerating(sessionId, options = {}) {
     clearAwaitingRuntimeStart();
     composeState.isGenerating = false;
     updateComposerActionButtons();
@@ -5746,6 +5795,26 @@
     queuedMessagesRestoredAt = 0;
     queuedMessagesRestoredSawRunning = false;
     scheduleQueuedMessageDispatch();
+    const shouldNotifyComplete = options.notifyComplete !== false
+      && !currentGenerationHadError
+      && !currentGenerationAbortRequested
+      && !options.suppressNotification;
+    if (shouldNotifyComplete) {
+      const completionSessionId = sessionId || sessionState.currentSessionId || null;
+      if (completionSessionId) {
+        const meta = getSessionMeta(completionSessionId);
+        notifyTaskCompletion({
+          title: meta?.title || chatTitle.textContent || '当前会话',
+          sessionId: completionSessionId,
+          background: false,
+          costUsd: options.costUsd ?? null,
+        });
+      }
+    }
+    if (options.resetCompletionFlags !== false) {
+      currentGenerationHadError = false;
+      currentGenerationAbortRequested = false;
+    }
   }
 
   // --- Rendering ---
@@ -8912,7 +8981,10 @@
     send({ type: 'auth', password: pw });
     // Request notification permission on first user interaction
     requestNotificationPermission();
+    primeTaskCompletionSound();
   });
+  document.addEventListener('pointerdown', primeTaskCompletionSound, { once: true, passive: true });
+  document.addEventListener('keydown', primeTaskCompletionSound, { once: true });
   if (rememberPw) {
     rememberPw.addEventListener('change', () => {
       if (!rememberPw.checked) clearRememberedPassword();
@@ -9188,7 +9260,10 @@
   });
   sendBtn.addEventListener('click', sendMessage);
   if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
-  abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  abortBtn.addEventListener('click', () => {
+    currentGenerationAbortRequested = true;
+    send({ type: 'abort' });
+  });
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {
       const btn = event.target instanceof Element ? event.target.closest('[data-queued-message-cancel]') : null;
@@ -9409,13 +9484,185 @@
     consumeToastQueue();
   }
 
+  function getTaskCompletionTitle(title, sessionId) {
+    const directTitle = String(title || '').trim();
+    if (directTitle) return directTitle;
+    const metaTitle = sessionId ? String(getSessionMeta(sessionId)?.title || '').trim() : '';
+    return metaTitle || String(chatTitle?.textContent || '').trim() || '当前会话';
+  }
+
+  function formatTaskCompletionCost(costUsd) {
+    const value = Number(costUsd);
+    return Number.isFinite(value) ? `$${value.toFixed(4)}` : '';
+  }
+
+  function closeTaskCompleteToast() {
+    if (!activeTaskCompleteToast) return;
+    const { element, hideTimer, removeTimer } = activeTaskCompleteToast;
+    clearTimeout(hideTimer);
+    clearTimeout(removeTimer);
+    element.classList.remove('show');
+    const nextRemoveTimer = setTimeout(() => {
+      element.remove();
+      if (activeTaskCompleteToast?.element === element) activeTaskCompleteToast = null;
+    }, 260);
+    activeTaskCompleteToast.removeTimer = nextRemoveTimer;
+  }
+
+  function showTaskStatusToast({
+    title = '',
+    sessionId = null,
+    background = false,
+    costUsd = null,
+    status = 'success',
+    message = '',
+  } = {}) {
+    const displayTitle = getTaskCompletionTitle(title, sessionId);
+    const costText = formatTaskCompletionCost(costUsd);
+    const isError = status === 'error';
+    const subtitle = message || (isError
+      ? (background ? '后台任务异常中断，点击查看会话' : '任务异常中断')
+      : (background ? '后台任务已完成，点击查看会话' : '任务已完成'));
+    closeTaskCompleteToast();
+    const toast = document.createElement(sessionId ? 'button' : 'div');
+    toast.className = `task-complete-toast${isError ? ' task-complete-toast-error' : ''}`;
+    if (sessionId) {
+      toast.type = 'button';
+      toast.addEventListener('click', () => {
+        openSession(sessionId);
+        closeTaskCompleteToast();
+      });
+    }
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    toast.setAttribute('aria-label', `${subtitle}: ${displayTitle}`);
+    toast.innerHTML = `
+      <span class="task-complete-toast-icon" aria-hidden="true">${isError ? '!' : '✓'}</span>
+      <span class="task-complete-toast-copy">
+        <span class="task-complete-toast-kicker">${isError ? '异常中断' : '任务完成'}</span>
+        <span class="task-complete-toast-title">${escapeHtml(displayTitle)}</span>
+        <span class="task-complete-toast-meta">${escapeHtml([subtitle, costText].filter(Boolean).join(' · '))}</span>
+      </span>
+    `;
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add('show'));
+    const hideTimer = setTimeout(closeTaskCompleteToast, 7000);
+    activeTaskCompleteToast = { element: toast, hideTimer, removeTimer: null };
+  }
+
+  function getTaskCompleteAudioContext() {
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) return null;
+    if (!taskCompleteAudioContext) {
+      try {
+        taskCompleteAudioContext = new AudioContextCtor();
+      } catch (error) {
+        console.warn('[notify] failed to initialize completion sound', error);
+        taskCompleteAudioContext = null;
+      }
+    }
+    return taskCompleteAudioContext;
+  }
+
+  function primeTaskCompletionSound() {
+    const ctx = getTaskCompleteAudioContext();
+    if (!ctx || ctx.state !== 'suspended') return;
+    const resumeResult = ctx.resume();
+    if (resumeResult && typeof resumeResult.catch === 'function') {
+      resumeResult.catch(() => {});
+    }
+  }
+
+  function playTaskStatusSound(kind = 'success') {
+    const ctx = getTaskCompleteAudioContext();
+    if (!ctx) return;
+    const play = () => {
+      try {
+        const now = ctx.currentTime;
+        const gain = ctx.createGain();
+        const isError = kind === 'error';
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(isError ? 0.10 : 0.12, now + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + (isError ? 0.36 : 0.42));
+        gain.connect(ctx.destination);
+        const tones = isError
+          ? [
+            { freq: 392.00, start: 0, end: 0.14, type: 'triangle' },
+            { freq: 293.66, start: 0.13, end: 0.30, type: 'triangle' },
+          ]
+          : [
+            { freq: 659.25, start: 0, end: 0.16, type: 'sine' },
+            { freq: 783.99, start: 0.12, end: 0.32, type: 'sine' },
+            { freq: 987.77, start: 0.25, end: 0.42, type: 'sine' },
+          ];
+        tones.forEach((tone) => {
+          const osc = ctx.createOscillator();
+          osc.type = tone.type;
+          osc.frequency.setValueAtTime(tone.freq, now + tone.start);
+          osc.connect(gain);
+          osc.start(now + tone.start);
+          osc.stop(now + tone.end);
+        });
+        setTimeout(() => {
+          try { gain.disconnect(); } catch {}
+        }, 520);
+      } catch (error) {
+        console.warn('[notify] failed to play task status sound', error);
+      }
+    };
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(play).catch((error) => {
+        console.warn('[notify] task status sound blocked', error);
+      });
+      return;
+    }
+    play();
+  }
+
+  function playTaskCompletionSound() {
+    playTaskStatusSound('success');
+  }
+
+  function playTaskFailureSound() {
+    playTaskStatusSound('error');
+  }
+
+  function notifyTaskCompletion({ title = '', sessionId = null, background = false, costUsd = null, browser = false } = {}) {
+    const displayTitle = getTaskCompletionTitle(title, sessionId);
+    const key = `success:${sessionId || 'current'}:${displayTitle}:${background ? 'background' : 'foreground'}`;
+    const now = Date.now();
+    if (lastTaskStatusAlert.key === key && now - lastTaskStatusAlert.at < 1500) return;
+    lastTaskStatusAlert = { key, at: now };
+    showTaskStatusToast({ title: displayTitle, sessionId, background, costUsd, status: 'success' });
+    playTaskCompletionSound();
+    if (browser) showBrowserNotification(displayTitle);
+  }
+
+  function notifyTaskFailure({
+    title = '',
+    sessionId = null,
+    background = false,
+    costUsd = null,
+    message = '任务异常中断',
+    browser = false,
+  } = {}) {
+    const displayTitle = getTaskCompletionTitle(title, sessionId);
+    const key = `error:${sessionId || 'current'}:${displayTitle}:${String(message || '')}`;
+    const now = Date.now();
+    if (lastTaskStatusAlert.key === key && now - lastTaskStatusAlert.at < 1500) return;
+    lastTaskStatusAlert = { key, at: now };
+    showTaskStatusToast({ title: displayTitle, sessionId, background, costUsd, status: 'error', message });
+    playTaskFailureSound();
+    if (browser) showBrowserNotification(displayTitle, { body: `「${displayTitle}」${message || '任务异常中断'}` });
+  }
+
   // --- Browser Notification (via Service Worker for mobile) ---
-  function showBrowserNotification(title) {
+  function showBrowserNotification(title, options = {}) {
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.ready.then((reg) => {
         reg.showNotification('Webcoding', {
-          body: `「${title}」任务完成`,
+          body: options.body || `「${title}」任务完成`,
           tag: 'webcoding-task',
           renotify: true,
         });
@@ -10727,7 +10974,13 @@
     authToken = null;
     localStorage.removeItem('webcoding-token');
     document.dispatchEvent(new CustomEvent('webcoding-auth-failed'));
-    if (isGenerating) finishGenerating();
+    if (isGenerating) {
+      finishGenerating(undefined, {
+        suppressNotification: true,
+        notifyComplete: false,
+        resetCompletionFlags: false,
+      });
+    }
     hideForceChangePassword();
     loginOverlay.hidden = false;
     app.hidden = true;

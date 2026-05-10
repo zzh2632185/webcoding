@@ -3828,6 +3828,10 @@ function runWindowsPathRuntimeSourceRegressionCase() {
   assert(appSource.includes('function openAttachmentPreview'), 'Uploaded image attachments must have a full-size preview opener');
   assert(appSource.includes('image-attachment-preview') && appSource.includes('attachment-chip-thumb'), 'Uploaded image attachments must render clickable thumbnails in messages and the composer');
   assert(serverSource.includes("req.method === 'GET' && url.pathname.startsWith('/api/attachments/')"), 'Uploaded attachment images must have an authenticated raw preview endpoint');
+  assert(appSource.includes('function notifyTaskCompletion') && appSource.includes('task-complete-toast'), 'Task completion must show a dedicated bottom-right completion toast');
+  assert(appSource.includes('function playTaskCompletionSound') && appSource.includes('primeTaskCompletionSound'), 'Task completion must prime and play an audible completion cue');
+  assert(appSource.includes('function notifyTaskFailure') && appSource.includes('task-complete-toast-error'), 'Task failures must show a dedicated bottom-right abnormal interruption toast');
+  assert(appSource.includes('function playTaskFailureSound'), 'Task failures must play a distinct abnormal interruption sound cue');
   const rendererLinkIndex = appSource.indexOf('renderer.link = function');
   assert(rendererLinkIndex >= 0, 'Markdown renderer link hook must exist');
   const rendererLinkSource = appSource.slice(rendererLinkIndex, rendererLinkIndex + 1400);

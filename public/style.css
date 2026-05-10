@@ -4899,6 +4899,111 @@ button.msg-attachment-label:not(:disabled):focus-visible {
   transform: translateX(-50%) translateY(0);
 }
 
+.task-complete-toast {
+  position: fixed;
+  right: max(18px, var(--safe-right, 0px));
+  bottom: max(18px, calc(var(--safe-bottom) + 18px));
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  width: min(360px, calc(100vw - 32px));
+  padding: 14px 16px;
+  border: 2px solid var(--line);
+  border-radius: var(--chat-card-border-radius);
+  background: color-mix(in srgb, var(--surface) 92%, var(--success) 8%);
+  color: var(--text-primary);
+  box-shadow: var(--panel-shadow-soft);
+  z-index: 2300;
+  opacity: 0;
+  transform: translateY(18px) scale(0.98);
+  transition: opacity 0.24s ease, transform 0.24s ease, border-color 0.18s ease;
+}
+button.task-complete-toast {
+  cursor: pointer;
+  text-align: left;
+}
+.task-complete-toast.show {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+.task-complete-toast:hover,
+.task-complete-toast:focus-visible {
+  border-color: var(--success);
+  outline: none;
+}
+.task-complete-toast-error {
+  background: color-mix(in srgb, var(--surface) 90%, var(--danger) 10%);
+}
+.task-complete-toast-error:hover,
+.task-complete-toast-error:focus-visible {
+  border-color: var(--danger);
+}
+.task-complete-toast-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border: 2px solid var(--success);
+  border-radius: 999px;
+  background: var(--success);
+  color: var(--toast-success-text);
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 900;
+  line-height: 1;
+}
+.task-complete-toast-error .task-complete-toast-icon {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+.task-complete-toast-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+.task-complete-toast-kicker {
+  color: var(--success);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.task-complete-toast-error .task-complete-toast-kicker {
+  color: var(--danger);
+}
+.task-complete-toast-title {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-complete-toast-meta {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-complete-toast {
+    transition: opacity 0.01ms linear;
+    transform: none;
+  }
+  .task-complete-toast.show {
+    transform: none;
+  }
+}
+
 /* === Connection Status Indicator === */
 body.ws-reconnecting::before {
   content: '⟳ 重连中';

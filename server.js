@@ -5570,12 +5570,12 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     sendRuntimeMessage(entry, { type: 'error', sessionId, message: completionError });
   }
 
-  sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
+  sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null, success: !completionError });
   sendSessionListToProcessClients(entry);
   return { shouldReturnForFollowup, shouldAutoCompact };
 }
 
-function handleDisconnectedProcessCompletion(sessionId, entry) {
+function handleDisconnectedProcessCompletion(sessionId, entry, completionError = null) {
   const session = loadSession(sessionId);
   const title = session?.title || 'Untitled';
   const sessions = getSessionListSnapshot();
@@ -5588,14 +5588,15 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
       sessionId,
       title,
       costUsd: entry.lastCost ?? null,
+      success: !completionError,
       responseLen: (entry.fullText || '').length,
     });
   }
   const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
   const respLen = (entry.fullText || '').length;
   sendNotification(
-    'webcoding 任务完成',
-    `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
+    completionError ? 'webcoding 任务结束但出现错误' : 'webcoding 任务完成',
+    `会话: ${title}\n状态: ${completionError ? '失败' : '完成'}\n字数: ${respLen}\n费用: ${cost}`
   );
 }
 
@@ -5689,7 +5690,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   const { shouldReturnForFollowup, shouldAutoCompact } = isProcessRealtimeConnected(entry)
     ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
-    : (handleDisconnectedProcessCompletion(sessionId, entry), { shouldReturnForFollowup: false, shouldAutoCompact: false });
+    : (handleDisconnectedProcessCompletion(sessionId, entry, completionError), { shouldReturnForFollowup: false, shouldAutoCompact: false });
 
   runProcessCompletionFollowup(
     sessionId,
@@ -7920,7 +7921,7 @@ function deleteSessionById(sessionId) {
     try { killProcess(entry.pid); } catch {}
     if (entry.tailer) entry.tailer.stop();
     removeActiveProcess(sessionId);
-    sendRuntimeMessage(entry, { type: 'done', sessionId });
+    sendRuntimeMessage(entry, { type: 'done', sessionId, success: false });
   }
   cleanRunDir(sessionId);
   const p = sessionPath(sessionId);
