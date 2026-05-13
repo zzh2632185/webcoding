@@ -64,6 +64,8 @@
   const FILE_UPLOAD_MAX_SIZE = 50 * 1024 * 1024;
   const MAX_PENDING_FILE_REFS = 8;
   const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
+  const MAX_PENDING_ATTACHMENTS = 4;
+  const DOCUMENT_UPLOAD_ACCEPT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.csv', '.tsv', '.json', '.jsonl', '.log']);
   const MAX_QUEUED_MESSAGES = 10;
   const MAX_QUEUED_ATTACHMENTS = 4;
   const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
@@ -139,6 +141,7 @@
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  const attachmentPreviewUrls = new Map();
   let pendingFileRefs = [];
   let queuedMessages = [];
   let queuedDispatchTimer = null;
@@ -306,10 +309,14 @@
   const costDisplay = $('#topbar-cost-display');
   const attachmentTray = $('#attachment-tray');
   const queuedMessageList = $('#queued-message-list');
+  const fileUploadInput = $('#file-upload-input');
   const imageUploadInput = $('#image-upload-input');
+  const documentUploadInput = $('#document-upload-input');
   const attachBtn = $('#attach-btn');
   const attachMenu = $('#attach-menu');
+  const attachUploadFile = $('#attach-upload-file');
   const attachUploadImage = $('#attach-upload-image');
+  const attachUploadDocument = $('#attach-upload-document');
   const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
   const messagesWrap = messagesDiv?.closest('.messages-wrap');
@@ -2352,6 +2359,132 @@
     } catch {}
   }
 
+  function rememberAttachmentPreviewUrl(id, url) {
+    const key = String(id || '').trim();
+    const value = String(url || '').trim();
+    if (!key || !value) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing !== value && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.set(key, value);
+  }
+
+  function forgetAttachmentPreviewUrl(id) {
+    const key = String(id || '').trim();
+    if (!key) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.delete(key);
+  }
+
+  function attachmentRawUrl(id) {
+    const key = String(id || '').trim();
+    return key ? `/api/attachments/${encodeURIComponent(key)}` : '';
+  }
+
+  function getAttachmentPreviewSrc(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    return String((id ? attachmentPreviewUrls.get(id) : '') || attachment.previewUrl || '');
+  }
+
+  function attachmentKindLabel(attachment = {}) {
+    return (attachment.kind || 'image') === 'document' ? '文档' : '图片';
+  }
+
+  function attachmentDefaultName(attachment = {}) {
+    return (attachment.kind || 'image') === 'document' ? 'document' : 'image';
+  }
+
+  function isImageAttachment(attachment = {}) {
+    return (attachment.kind || 'image') === 'image' || /^image\//i.test(attachment.mime || '');
+  }
+
+  function documentUploadLooksSupported(file = {}) {
+    const name = String(file.name || '').toLowerCase();
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : '';
+    return DOCUMENT_UPLOAD_ACCEPT_EXTENSIONS.has(ext);
+  }
+
+  function attachmentTransportPayload(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id) return null;
+    const kind = attachment.kind || 'image';
+    return {
+      id,
+      kind,
+      filename: attachment.filename || (kind === 'document' ? 'document' : 'image'),
+      mime: attachment.mime || (kind === 'document' ? 'application/octet-stream' : 'image/png'),
+      documentType: attachment.documentType || null,
+      size: Number(attachment.size || 0) || 0,
+      createdAt: attachment.createdAt || null,
+      expiresAt: attachment.expiresAt || null,
+      storageState: attachment.storageState || 'available',
+    };
+  }
+
+  function attachmentTransportPayloads(attachments = []) {
+    return Array.isArray(attachments)
+      ? attachments.map(attachmentTransportPayload).filter(Boolean)
+      : [];
+  }
+
+  async function fetchAttachmentPreviewUrl(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id || attachment.storageState === 'expired') return '';
+    const existing = attachmentPreviewUrls.get(id);
+    if (existing) return existing;
+    await ensureAuthenticatedWs();
+    const response = await fetch(attachmentRawUrl(id), {
+      headers: { Authorization: `Bearer ${connectionState.authToken}` },
+    });
+    if (!response.ok) throw new Error(response.status === 410 ? '图片已过期' : `图片读取失败 (${response.status})`);
+    const blob = await response.blob();
+    if (!/^image\//i.test(blob.type || '')) throw new Error('附件不是图片');
+    const url = URL.createObjectURL(blob);
+    rememberAttachmentPreviewUrl(id, url);
+    return url;
+  }
+
+  function openAttachmentImagePreview({ src = '', title = '图片附件', meta = '' } = {}) {
+    const safeSrc = String(src || '').trim();
+    if (!safeSrc) return;
+    const { overlay, panel, close } = createOverlayPanel({
+      overlayClass: 'modal-overlay attachment-preview-overlay',
+      panelClass: 'modal-panel attachment-preview-panel',
+      maxWidth: 'min(980px, calc(100vw - 28px))',
+      panelHtml: `
+        <div class="modal-header">
+          <span class="modal-title">${escapeHtml(title || '图片附件')}</span>
+          <button class="modal-close-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="attachment-preview-body">
+          <img class="attachment-preview-image" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(title || '图片附件')}">
+        </div>
+        ${meta ? `<div class="attachment-preview-meta">${escapeHtml(meta)}</div>` : ''}
+      `,
+    });
+    const closePreview = () => {
+      document.removeEventListener('keydown', onKeydown);
+      close();
+    };
+    const onKeydown = (event) => {
+      if (event.key === 'Escape') closePreview();
+    };
+    panel.querySelector('.modal-close-btn')?.addEventListener('click', closePreview);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) closePreview(); });
+    document.addEventListener('keydown', onKeydown);
+  }
+
+  async function openAttachmentPreview(attachment = {}) {
+    const src = getAttachmentPreviewSrc(attachment) || await fetchAttachmentPreviewUrl(attachment);
+    const title = attachment.filename || '图片附件';
+    const meta = [formatFileSize(attachment.size), attachment.mime].filter(Boolean).join(' · ');
+    openAttachmentImagePreview({ src, title, meta });
+  }
+
   function ensureAuthenticatedWs() {
     return new Promise((resolve, reject) => {
       if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN && connectionState.authToken) {
@@ -2359,7 +2492,7 @@
         return;
       }
       if (!connectionState.authToken) {
-        reject(new Error('登录状态已失效，请重新登录后再上传图片。'));
+        reject(new Error('登录状态已失效，请重新登录后再上传附件。'));
         return;
       }
       const timeout = setTimeout(() => {
@@ -2377,7 +2510,7 @@
       };
       const onFailed = () => {
         cleanup();
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传附件。'));
       };
       document.addEventListener('webcoding-auth-restored', onRestored);
       document.addEventListener('webcoding-auth-failed', onFailed);
@@ -2405,10 +2538,91 @@
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
     const labels = attachments.map((attachment) => {
       const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '';
-      const name = escapeHtml(attachment.filename || 'image');
-      return `<span class="msg-attachment-label">图片: ${name}${stateSuffix}</span>`;
+      const id = String(attachment.id || '').trim();
+      const kind = attachment.kind || 'image';
+      const kindLabel = attachmentKindLabel(attachment);
+      const name = escapeHtml(attachment.filename || attachmentDefaultName(attachment));
+      const src = getAttachmentPreviewSrc(attachment);
+      const disabled = !id && !src;
+      const subtitle = Number(attachment.size) ? formatFileSize(attachment.size) : (attachment.mime || kindLabel);
+      const isImage = isImageAttachment(attachment);
+      if (!isImage) {
+        return `
+          <button class="msg-attachment-label document-attachment-download" type="button"
+            ${id ? `data-attachment-id="${escapeHtml(id)}"` : ''}
+            data-filename="${name}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
+            aria-label="下载文档 ${name}">
+            <span class="attachment-thumb document" aria-hidden="true">📄</span>
+            <span class="attachment-thumb-meta">
+              <span class="attachment-thumb-title">${kindLabel}: ${name}${stateSuffix}</span>
+              <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
+            </span>
+          </button>
+        `;
+      }
+      return `
+        <button class="msg-attachment-label image-attachment-preview" type="button"
+          ${id ? `data-attachment-id="${escapeHtml(id)}"` : ''}
+          ${src ? `data-preview-src="${escapeHtml(src)}"` : ''}
+          data-filename="${name}"
+          data-size="${escapeHtml(String(attachment.size || ''))}"
+          data-mime="${escapeHtml(attachment.mime || '')}"
+          ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
+          aria-label="查看图片 ${name}">
+          <span class="attachment-thumb" aria-hidden="true">${src ? `<img src="${escapeHtml(src)}" alt="">` : ''}</span>
+          <span class="attachment-thumb-meta">
+            <span class="attachment-thumb-title">图片: ${name}${stateSuffix}</span>
+            <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
+          </span>
+        </button>
+      `;
     }).join('');
     return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+  }
+
+  function hydrateAttachmentPreviews(root = document) {
+    const scope = root && typeof root.querySelectorAll === 'function' ? root : document;
+    scope.querySelectorAll('.image-attachment-preview[data-attachment-id]').forEach((button) => {
+      const id = button.dataset.attachmentId || '';
+      if (!id || button.dataset.previewHydrated === '1') return;
+      const existing = attachmentPreviewUrls.get(id);
+      if (existing) {
+        setAttachmentButtonPreview(button, existing);
+        return;
+      }
+      button.dataset.previewHydrated = '1';
+      fetchAttachmentPreviewUrl({
+        id,
+        filename: button.dataset.filename || 'image',
+        mime: button.dataset.mime || '',
+        size: Number(button.dataset.size || 0) || 0,
+      }).then((url) => {
+        setAttachmentButtonPreview(button, url);
+      }).catch(() => {
+        button.classList.add('preview-unavailable');
+      });
+    });
+  }
+
+  function setAttachmentButtonPreview(button, src) {
+    if (!button || !src) return;
+    button.dataset.previewSrc = src;
+    button.dataset.previewHydrated = '1';
+    const thumb = button.querySelector('.attachment-thumb');
+    if (thumb) {
+      let img = thumb.querySelector('img');
+      if (!img) {
+        img = document.createElement('img');
+        img.alt = '';
+        img.loading = 'lazy';
+        thumb.innerHTML = '';
+        thumb.appendChild(img);
+      }
+      img.src = src;
+    }
   }
 
   function renderPendingAttachments() {
@@ -2420,28 +2634,54 @@
       return;
     }
     attachmentTray.hidden = false;
-    const uploadingHtml = composeState.uploadingAttachments.map((attachment) => `
-      <div class="attachment-chip uploading">
-        <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
-          <span class="attachment-chip-note">上传中 · ${formatFileSize(attachment.size)}</span>
+    const uploadingHtml = composeState.uploadingAttachments.map((attachment) => {
+      const isImage = isImageAttachment(attachment);
+      const label = attachmentKindLabel(attachment);
+      const name = attachment.filename || attachmentDefaultName(attachment);
+      return `
+        <div class="attachment-chip uploading">
+          <button class="attachment-chip-thumb" type="button"
+            ${isImage && attachment.previewUrl ? `data-preview-src="${escapeHtml(attachment.previewUrl)}"` : ''}
+            data-filename="${escapeHtml(name)}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            aria-label="查看附件 ${escapeHtml(name)}">
+            ${isImage && attachment.previewUrl ? `<img src="${escapeHtml(attachment.previewUrl)}" alt="">` : '📄'}
+          </button>
+          <div class="attachment-chip-meta">
+            <span class="attachment-chip-name">${escapeHtml(name)}</span>
+            <span class="attachment-chip-note">${label}上传中 · ${formatFileSize(attachment.size)}</span>
+          </div>
         </div>
-      </div>
-    `).join('');
-    const readyHtml = composeState.pendingAttachments.map((attachment, index) => `
-      <div class="attachment-chip" data-index="${index}">
-        <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
-          <span class="attachment-chip-note">${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
+      `;
+    }).join('');
+    const readyHtml = composeState.pendingAttachments.map((attachment, index) => {
+      const isImage = isImageAttachment(attachment);
+      const label = attachmentKindLabel(attachment);
+      const name = attachment.filename || attachmentDefaultName(attachment);
+      const previewSrc = isImage ? getAttachmentPreviewSrc(attachment) : '';
+      return `
+        <div class="attachment-chip" data-index="${index}">
+          <button class="attachment-chip-thumb" type="button"
+            ${attachment.id ? `data-attachment-id="${escapeHtml(attachment.id)}"` : ''}
+            ${previewSrc ? `data-preview-src="${escapeHtml(previewSrc)}"` : ''}
+            data-filename="${escapeHtml(name)}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            aria-label="查看附件 ${escapeHtml(name)}">
+            ${previewSrc ? `<img src="${escapeHtml(previewSrc)}" alt="">` : (isImage ? '' : '📄')}
+          </button>
+          <div class="attachment-chip-meta">
+            <span class="attachment-chip-name">${escapeHtml(name)}</span>
+            <span class="attachment-chip-note">${label} · ${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
+          </div>
+          <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
         </div>
-        <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
-      </div>
-    `).join('');
-    const noteHtml = [
-      composeState.uploadingAttachments.length > 0
-        ? '<div class="attachment-tray-note">图片上传中，此时发送不会包含尚未完成的图片。</div>'
-        : '',
-    ].join('');
+      `;
+    }).join('');
+    const noteHtml = composeState.uploadingAttachments.length > 0
+      ? '<div class="attachment-tray-note">附件上传中，此时发送不会包含尚未完成的附件。</div>'
+      : '';
     attachmentTray.innerHTML = `${uploadingHtml}${readyHtml}${noteHtml}`;
     attachmentTray.querySelectorAll('.attachment-chip-remove').forEach((btn) => {
       btn.addEventListener('click', (e) => {
@@ -2450,6 +2690,27 @@
         const [removed] = composeState.pendingAttachments.splice(index, 1);
         renderPendingAttachments();
         deleteUploadedAttachment(removed?.id);
+        forgetAttachmentPreviewUrl(removed?.id);
+      });
+    });
+    attachmentTray.querySelectorAll('.attachment-chip-thumb').forEach((btn) => {
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = btn.dataset.attachmentId || '';
+        const attachment = [...composeState.pendingAttachments, ...composeState.uploadingAttachments]
+          .find((item) => (id && item.id === id) || item.previewUrl === btn.dataset.previewSrc || item.filename === btn.dataset.filename);
+        if (attachment && !isImageAttachment(attachment)) {
+          if (id) window.open(attachmentRawUrl(id), '_blank', 'noopener');
+          return;
+        }
+        openAttachmentPreview({
+          id,
+          filename: btn.dataset.filename || attachment?.filename || 'image',
+          size: Number(btn.dataset.size || attachment?.size || 0) || 0,
+          mime: btn.dataset.mime || attachment?.mime || '',
+          previewUrl: btn.dataset.previewSrc || attachment?.previewUrl || '',
+        }).catch((error) => appendError(error.message || '无法打开图片'));
       });
     });
     syncAttachmentActions();
@@ -3708,12 +3969,12 @@
     }
   }
 
-  async function uploadImageFile(file) {
+  async function uploadAttachmentFile(file, { kind = 'image' } = {}) {
     await ensureAuthenticatedWs();
     const headers = {
       'Authorization': `Bearer ${connectionState.authToken}`,
       'Content-Type': file.type || 'application/octet-stream',
-      'X-Filename': encodeURIComponent(file.name || 'image'),
+      'X-Filename': encodeURIComponent(file.name || (kind === 'document' ? 'document' : 'image')),
     };
     const response = await fetch('/api/attachments', {
       method: 'POST',
@@ -3728,10 +3989,10 @@
       data = null;
     }
     if (response.status === 401) {
-      throw new Error('登录状态已失效，请刷新页面后重新登录再上传图片。');
+      throw new Error('登录状态已失效，请刷新页面后重新登录再上传附件。');
     }
     if (response.status === 413) {
-      throw new Error('图片大小超过当前上传限制，请压缩到 10MB 以内后重试。');
+      throw new Error(kind === 'document' ? '文档大小超过当前上传限制，请控制到 20MB 以内后重试。' : '图片大小超过当前上传限制，请压缩到 10MB 以内后重试。');
     }
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || `上传失败 (${response.status})`);
@@ -3739,31 +4000,47 @@
     return data.attachment;
   }
 
+  async function uploadImageFile(file) {
+    return uploadAttachmentFile(file, { kind: 'image' });
+  }
+
   async function handleSelectedImageFiles(fileList) {
     const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
     if (!files.length) return;
     const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
-    if (totalAttachments > 4) {
-      appendError('单条消息最多附带 4 张图片。');
+    if (totalAttachments > MAX_PENDING_ATTACHMENTS) {
+      appendError(`单条消息最多附带 ${MAX_PENDING_ATTACHMENTS} 个附件。`);
       return;
     }
     const batch = files.map((file, index) => ({
       id: nextLocalId(`upload-${index}`),
+      kind: 'image',
       filename: file.name || 'image',
       size: file.size || 0,
+      mime: file.type || '',
+      previewUrl: URL.createObjectURL(file),
     }));
     composeState.uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
-      const results = await Promise.allSettled(files.map(async (file) => {
+      const results = await Promise.allSettled(files.map(async (file, index) => {
         const optimized = await compressImageFile(file);
-        return uploadImageFile(optimized);
+        const attachment = await uploadImageFile(optimized);
+        return {
+          ...attachment,
+          previewUrl: batch[index]?.previewUrl || '',
+        };
       }));
       const errors = [];
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status === 'fulfilled') {
           composeState.pendingAttachments.push(result.value);
+          rememberAttachmentPreviewUrl(result.value.id, result.value.previewUrl);
         } else {
+          const failedPreview = batch[index]?.previewUrl || '';
+          if (failedPreview) {
+            try { URL.revokeObjectURL(failedPreview); } catch {}
+          }
           errors.push(result.reason?.message || '图片上传失败');
         }
       }
@@ -3779,6 +4056,56 @@
     }
   }
 
+  async function handleSelectedDocumentFiles(fileList) {
+    const files = Array.from(fileList || []).filter((file) => file && documentUploadLooksSupported(file));
+    if (!files.length) {
+      appendError('请选择 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 等支持的文档。');
+      if (documentUploadInput) documentUploadInput.value = '';
+      return;
+    }
+    const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
+    if (totalAttachments > MAX_PENDING_ATTACHMENTS) {
+      appendError(`单条消息最多附带 ${MAX_PENDING_ATTACHMENTS} 个附件。`);
+      return;
+    }
+    const batch = files.map((file, index) => ({
+      id: nextLocalId(`upload-doc-${index}`),
+      kind: 'document',
+      filename: file.name || 'document',
+      size: file.size || 0,
+      mime: file.type || 'application/octet-stream',
+    }));
+    composeState.uploadingAttachments.push(...batch);
+    renderPendingAttachments();
+    try {
+      const results = await Promise.allSettled(files.map((file) => uploadAttachmentFile(file, { kind: 'document' })));
+      const errors = [];
+      for (const result of results) {
+        if (result.status === 'fulfilled') composeState.pendingAttachments.push(result.value);
+        else errors.push(result.reason?.message || '文档上传失败');
+      }
+      if (errors.length > 0) appendError(errors[0]);
+    } catch (err) {
+      appendError(err.message || '文档上传失败');
+    } finally {
+      composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
+      renderPendingAttachments();
+      if (documentUploadInput) documentUploadInput.value = '';
+    }
+  }
+
+  function handleSelectedAttachmentFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
+    const imageFiles = files.filter((file) => /^image\//.test(file.type || ''));
+    const documentFiles = files.filter((file) => !/^image\//.test(file.type || '') && documentUploadLooksSupported(file));
+    if (imageFiles.length) handleSelectedImageFiles(imageFiles);
+    if (documentFiles.length) handleSelectedDocumentFiles(documentFiles);
+    if (!imageFiles.length && !documentFiles.length && files.length) {
+      appendError('只支持上传图片或 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 等文档。');
+    }
+  }
+
+
   function getVisibleSessions() {
     return sessionState.sessions;
   }
@@ -3790,7 +4117,7 @@
   function updateCwdBadge() {
     if (!chatCwd) return;
     if (sessionState.currentCwd) {
-      const parts = sessionState.currentCwd.replace(/\/+$/, '').split('/');
+      const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/);
       const short = parts.slice(-2).join('/') || sessionState.currentCwd;
       chatCwd.textContent = '~/' + short;
       chatCwd.title = sessionState.currentCwd;
@@ -4226,7 +4553,7 @@
     const text = msgInput.value.trim();
     if (isBlockingSessionLoad()) return;
     if (composeState.uploadingAttachments.length > 0) {
-      appendError('图片还在上传中，请等待上传完成后再接力。');
+      appendError('附件还在上传中，请等待上传完成后再接力。');
       return;
     }
     if (composeState.isGenerating || sessionState.currentSessionRunning) {
@@ -4246,7 +4573,7 @@
       return;
     }
 
-    const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const attachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
     hideCmdMenu();
     hideOptionPicker();
@@ -5361,6 +5688,7 @@
   function appendMessageAttachments(bubble, attachments = []) {
     if (!bubble || !Array.isArray(attachments) || attachments.length === 0) return;
     bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
+    hydrateAttachmentPreviews(bubble);
   }
 
   function appendMessageFileRefs(bubble, fileRefs = []) {
@@ -5587,6 +5915,7 @@
 
     div.appendChild(avatar);
     div.appendChild(contentWrap);
+    hydrateAttachmentPreviews(bubble);
     return div;
   }
 
@@ -7596,14 +7925,9 @@
   }
 
   function canOpenSidebarBySwipe(target) {
-    if (!window.matchMedia('(max-width: 768px), (pointer: coarse)').matches) return false;
-    if (sidebar.classList.contains('open')) return false;
-    if (sessionLoadingOverlay && !sessionLoadingOverlay.hidden) return false;
-    if (!chatMain || !target || !chatMain.contains(target)) return false;
-    if (!app.hidden && target && target.closest('input, textarea, select, button, .modal-panel, .settings-panel, .option-picker, .cmd-menu')) {
-      return false;
-    }
-    return true;
+    // 手机端禁止通过从左向右滑动呼出目录/聊天侧栏，避免阅读或横向操作时误触。
+    // 保留顶部菜单按钮打开侧栏，也保留侧栏已打开时左滑关闭。
+    return false;
   }
 
   function canCloseSidebarBySwipe(target) {
@@ -8128,7 +8452,7 @@
       if (!raw || typeof raw !== 'object') return null;
       const text = typeof raw.text === 'string' ? raw.text : '';
       const attachments = Array.isArray(raw.attachments)
-        ? raw.attachments.filter(Boolean).map((attachment) => ({ ...attachment })).slice(0, MAX_QUEUED_ATTACHMENTS)
+        ? attachmentTransportPayloads(raw.attachments).slice(0, MAX_QUEUED_ATTACHMENTS)
         : [];
       const fileRefs = Array.isArray(raw.fileRefs)
         ? raw.fileRefs.filter(Boolean).map((ref) => ({ ...ref })).slice(0, MAX_PENDING_FILE_REFS)
@@ -8187,7 +8511,7 @@
       id: item.id,
       sessionId: targetSessionId,
       text: item.text || '',
-      attachments: Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [],
+      attachments: attachmentTransportPayloads(item.attachments),
       fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
       mode: item.mode || sessionState.currentMode,
       reasoningEffort: item.reasoningEffort || sessionState.currentReasoningEffort || '',
@@ -8221,7 +8545,7 @@
     if (text) parts.push(text);
     const attachmentCount = Array.isArray(item?.attachments) ? item.attachments.length : 0;
     const fileRefCount = Array.isArray(item?.fileRefs) ? item.fileRefs.length : 0;
-    if (attachmentCount > 0) parts.push(`${attachmentCount} 张图片`);
+    if (attachmentCount > 0) parts.push(`${attachmentCount} 个附件`);
     if (fileRefCount > 0) parts.push(`${fileRefCount} 个文件引用`);
     return parts.join(' · ') || '空消息';
   }
@@ -8331,7 +8655,7 @@
       return false;
     }
     if (text.startsWith('/') && (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0)) {
-      appendError('命令消息暂不支持附带图片或文件引用，请先移除后再发送命令。');
+      appendError('命令消息暂不支持附带附件或文件引用，请先移除后再发送命令。');
       return false;
     }
 
@@ -8339,7 +8663,7 @@
       id: nextLocalId('queued'),
       sessionId: sessionState.currentSessionId || null,
       text,
-      attachments: composeState.pendingAttachments.map((attachment) => ({ ...attachment })),
+      attachments: attachmentTransportPayloads(composeState.pendingAttachments),
       fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
@@ -8404,7 +8728,7 @@
     // Slash commands: don't show as user bubble
     if (text.startsWith('/')) {
       if (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0) {
-        appendError('命令消息暂不支持附带图片或文件引用，请先移除后再发送命令。');
+        appendError('命令消息暂不支持附带附件或文件引用，请先移除后再发送命令。');
         return;
       }
       // /model without argument → show interactive picker
@@ -8437,11 +8761,12 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const payloadAttachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
     messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs));
     scrollToBottom();
 
-    sendUserMessage({ text, attachments, fileRefs });
+    sendUserMessage({ text, attachments: payloadAttachments, fileRefs });
     msgInput.value = '';
     composeState.pendingAttachments = [];
     composeState.pendingFileRefs = [];
@@ -8642,6 +8967,29 @@
   function handleGlobalDocumentClick(event) {
     const target = event.target;
 
+    const attachmentPreviewBtn = target instanceof Element ? target.closest('.image-attachment-preview') : null;
+    if (attachmentPreviewBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openAttachmentPreview({
+        id: attachmentPreviewBtn.dataset.attachmentId || '',
+        filename: attachmentPreviewBtn.dataset.filename || 'image',
+        size: Number(attachmentPreviewBtn.dataset.size || 0) || 0,
+        mime: attachmentPreviewBtn.dataset.mime || '',
+        previewUrl: attachmentPreviewBtn.dataset.previewSrc || '',
+      }).catch((error) => appendError(error.message || '无法打开图片'));
+      return;
+    }
+
+    const documentDownloadBtn = target instanceof Element ? target.closest('.document-attachment-download') : null;
+    if (documentDownloadBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = documentDownloadBtn.dataset.attachmentId || '';
+      if (id) window.open(attachmentRawUrl(id), '_blank', 'noopener');
+      return;
+    }
+
     // Git panel toggle button
     if (target instanceof Element && (target === gitPanelBtn || target.closest('#git-panel-btn'))) {
       toggleGitPanel();
@@ -8750,10 +9098,22 @@
       toggleAttachMenu();
     });
   }
+  if (attachUploadFile && fileUploadInput) {
+    attachUploadFile.addEventListener('click', () => {
+      closeAttachMenu();
+      fileUploadInput.click();
+    });
+  }
   if (attachUploadImage && imageUploadInput) {
     attachUploadImage.addEventListener('click', () => {
       closeAttachMenu();
       imageUploadInput.click();
+    });
+  }
+  if (attachUploadDocument && documentUploadInput) {
+    attachUploadDocument.addEventListener('click', () => {
+      closeAttachMenu();
+      documentUploadInput.click();
     });
   }
   if (attachReferenceFile) {
@@ -8762,9 +9122,20 @@
       openFileRefPicker();
     });
   }
+  if (fileUploadInput) {
+    fileUploadInput.addEventListener('change', () => {
+      handleSelectedAttachmentFiles(fileUploadInput.files);
+      fileUploadInput.value = '';
+    });
+  }
   if (imageUploadInput) {
     imageUploadInput.addEventListener('change', () => {
       handleSelectedImageFiles(imageUploadInput.files);
+    });
+  }
+  if (documentUploadInput) {
+    documentUploadInput.addEventListener('change', () => {
+      handleSelectedDocumentFiles(documentUploadInput.files);
     });
   }
   document.addEventListener('click', (event) => {
@@ -8793,7 +9164,7 @@
       e.preventDefault();
       inputWrapper.classList.remove('drag-active');
       if (handleDroppedFileRef(e.dataTransfer)) return;
-      handleSelectedImageFiles(e.dataTransfer?.files);
+      handleSelectedAttachmentFiles(e.dataTransfer?.files);
     });
   }
 

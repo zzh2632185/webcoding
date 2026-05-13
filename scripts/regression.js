@@ -1470,9 +1470,9 @@ async function runAttachmentBoundaryRegressionCase({ port, password }) {
       port,
       token,
       {
-        filename: 'not-an-image.txt',
-        mime: 'text/plain',
-        data: Buffer.from('plain text is not a supported image'),
+        filename: 'unsupported.zip',
+        mime: 'application/zip',
+        data: Buffer.from('not a supported attachment'),
       },
       400,
     );
@@ -1529,10 +1529,10 @@ async function runExpiredAttachmentCleanupRegressionCase({ port, password, expir
     }));
     const expiredAttachmentError = await client.waitForType(
       'error',
-      (msg) => /图片附件已过期或不可用/.test(msg.message || ''),
+      (msg) => /附件已过期或不可用/.test(msg.message || ''),
       5000,
     );
-    assert(/图片附件已过期或不可用/.test(expiredAttachmentError.message || ''), 'Sending an expired attachment reference should be rejected');
+    assert(/附件已过期或不可用/.test(expiredAttachmentError.message || ''), 'Sending an expired attachment reference should be rejected');
   });
 }
 
@@ -3774,6 +3774,18 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(/# bridge_api_key = "/.test(runtimeToml), 'Codex unified runtime should expose local bridge token in generated config comments');
     assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Codex spawn should force openai_compat provider via CLI overrides');
     assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex spawn should force bridge base_url via CLI overrides');
+
+    const codexDocument = await uploadAttachment(port, token, {
+      filename: 'requirements.md',
+      mime: 'text/markdown',
+      data: Buffer.from('# Requirement\nBuild a temporary document attachment flow.'),
+    });
+    assert(codexDocument.kind === 'document', 'Markdown upload should be stored as a document attachment');
+    client.send(buildAgentMessagePayload({ text: 'read uploaded doc', attachments: [codexDocument], sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await client.waitForType('text_delta', (msg) => /temporary document attachment flow/.test(msg.text || ''), 8000);
+    await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId, 8000);
+    const storedDocSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${firstMessageSession.sessionId}.json`), 'utf8'));
+    assert(storedDocSession.messages.some((message) => Array.isArray(message.attachments) && message.attachments.some((attachment) => attachment.kind === 'document')), 'Document attachment metadata should persist in history');
 
     client.send(buildAgentMessagePayload({ text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await client.waitForType('system_message', (msg) => /正在执行 Codex \/compact/.test(msg.message || ''));

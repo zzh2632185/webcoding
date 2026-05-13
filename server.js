@@ -4,11 +4,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const XLSX = require('xlsx');
 const mammoth = require('mammoth');
-const { createAgentRuntime } = require('./lib/agent-runtime');
+const { createAgentRuntime, buildCliSpawnCommand } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 
 // Load .env
@@ -42,7 +42,11 @@ const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public
 const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
 const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_DOCUMENT_ATTACHMENT_SIZE = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_SIZE = MAX_IMAGE_ATTACHMENT_SIZE;
+const MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS = 120000;
+const MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS = 240000;
 const MAX_MESSAGE_ATTACHMENTS = 4;
 const CODEX_CAPACITY_RETRY_MAX = 2;
 const WS_HEARTBEAT_INTERVAL_MS = 25000;
@@ -57,6 +61,14 @@ const FILE_VIEW_TABLE_MAX_COLS = 50;
 const FILE_TREE_MAX_DEPTH = 3;
 const FILE_TREE_MAX_ENTRIES = 800;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+const TEXT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+const DOCUMENT_ATTACHMENT_MIME_TYPES = new Set([
+  'text/plain', 'text/markdown', 'text/csv', 'text/tab-separated-values', 'application/json', 'application/pdf', 'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+]);
 const FILE_TREE_IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.venv', 'venv', '__pycache__', '.pytest_cache', '.cache']);
 const TEXT_CONTEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.json', '.jsonl', '.css', '.scss', '.sass',
@@ -85,8 +97,15 @@ const TUNNEL_START_TIMEOUT_MS = 30000;
 const CLAUDE_SETTINGS_BACKUP_PATH = path.join(CONFIG_DIR, 'claude-settings-backup.json');
 const BRIDGE_SCRIPT_PATH = path.join(__dirname, 'lib', 'local-api-bridge.js');
 const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
-const USER_HOME = process.env.HOME || process.env.USERPROFILE || '';
+const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir() || '';
 const BROWSE_ROOTS = USER_HOME ? [path.resolve(USER_HOME)] : [path.resolve(process.cwd())];
+if (process.platform === 'win32') {
+  for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+    const root = String.fromCharCode(code) + ':\\';
+    try { fs.statSync(root); BROWSE_ROOTS.push(root); } catch {}
+  }
+}
+const DRIVES_LIST_SENTINEL = '::drives::';
 const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_CLEANUP_MS = 60 * 60 * 1000;
 const HISTORY_CHUNK_BUFFER_LIMIT = 512 * 1024;
@@ -656,11 +675,14 @@ function discoverClaudeSlashCommands() {
     }, 30000);
 
     try {
-      const proc = spawn(CLAUDE_PATH, args, {
+      const commandSpec = buildCliSpawnCommand(CLAUDE_PATH, args);
+      const proc = spawn(commandSpec.command, commandSpec.args, {
         env: { ...process.env },
         cwd: __dirname,
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
+        windowsHide: true,
+        shell: !!commandSpec.useShell,
       });
 
       let buf = '';
@@ -699,7 +721,7 @@ function discoverClaudeSlashCommands() {
 //   2. Skills from ~/.codex/skills/ (user-installed + .system/)
 //   3. Plugins from ~/.codex/.tmp/bundled-marketplaces/*/plugins/
 function discoverCodexSlashCommands() {
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const codexHome = process.env.CODEX_HOME || path.join(USER_HOME, '.codex');
   const skillsDir = path.join(codexHome, 'skills');
   const marketplacesDir = path.join(codexHome, '.tmp', 'bundled-marketplaces');
   const commands = new Set();
@@ -1359,8 +1381,8 @@ function getModelConfigMasked() {
   };
 }
 
-const CODEX_LOCAL_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
-const CODEX_LOCAL_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
+const CODEX_LOCAL_CONFIG_PATH = path.join(USER_HOME, '.codex', 'config.toml');
+const CODEX_LOCAL_AUTH_PATH = path.join(USER_HOME, '.codex', 'auth.json');
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
@@ -1679,7 +1701,7 @@ function getCodexModelsCachePaths(config) {
   if (config?.mode && config.mode !== 'local') {
     paths.push(path.join(CODEX_RUNTIME_HOME, 'models_cache.json'));
   }
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const home = USER_HOME;
   if (home) {
     paths.push(path.join(home, '.codex', 'models_cache.json'));
   }
@@ -1872,7 +1894,7 @@ function loadClaudeLocalModelMap() {
   if (settingsMap) return settingsMap;
 
   try {
-    const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
+    const p = path.join(USER_HOME, '.claude.json');
     if (fs.existsSync(p)) {
       const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
       const claudeJsonMap = extractClaudeModelMapFromEnv(raw?.env || {});
@@ -1895,7 +1917,7 @@ function fileContentFingerprint(filePath) {
 }
 
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
-const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+const CLAUDE_SETTINGS_PATH = path.join(USER_HOME, '.claude', 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
@@ -2074,7 +2096,7 @@ function getClaudeRuntimeFingerprint(config = null) {
     runtimeVersion: 1,
     mode: 'local',
     settingsFingerprint: fileContentFingerprint(CLAUDE_SETTINGS_PATH),
-    claudeJsonFingerprint: fileContentFingerprint(path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json')),
+    claudeJsonFingerprint: fileContentFingerprint(path.join(USER_HOME, '.claude.json')),
   });
 }
 
@@ -2233,7 +2255,9 @@ function wsSend(ws, data) {
 }
 
 function isPathInside(filePath, rootDir) {
-  const relative = path.relative(rootDir, filePath);
+  const root = path.resolve(String(rootDir || ''));
+  const target = path.resolve(String(filePath || ''));
+  const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
@@ -2306,6 +2330,7 @@ function getFileMime(filePath) {
   if (ext === '.tsv') return 'text/tab-separated-values; charset=utf-8';
   if (ext === '.json' || ext === '.jsonl') return 'application/json; charset=utf-8';
   if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.doc') return 'application/msword';
   if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
   if (ext === '.xls') return 'application/vnd.ms-excel';
@@ -2324,6 +2349,7 @@ function getFileViewType(filePath, stat) {
   if (ext === '.csv') return 'csv';
   if (ext === '.tsv') return 'tsv';
   if (ext === '.xlsx' || ext === '.xls') return 'xlsx';
+  if (ext === '.doc') return 'doc';
   if (ext === '.docx') return 'docx';
   if (ext === '.pdf') return 'pdf';
   if (FILE_VIEW_IMAGE_EXTENSIONS.has(ext)) return 'image';
@@ -2589,6 +2615,16 @@ function extFromMime(mime) {
     case 'image/jpeg': return '.jpg';
     case 'image/webp': return '.webp';
     case 'image/gif': return '.gif';
+    case 'text/plain': return '.txt';
+    case 'text/markdown': return '.md';
+    case 'text/csv': return '.csv';
+    case 'text/tab-separated-values': return '.tsv';
+    case 'application/json': return '.json';
+    case 'application/pdf': return '.pdf';
+    case 'application/msword': return '.doc';
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': return '.docx';
+    case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': return '.xlsx';
+    case 'application/vnd.ms-excel': return '.xls';
     default: return '';
   }
 }
@@ -2616,6 +2652,197 @@ function detectMimeFromMagic(buffer) {
     buffer.toString('ascii', 8, 12) === 'WEBP'
   ) return 'image/webp';
   return null;
+}
+
+function inferDocumentAttachmentType(filename, mime = '') {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  const normalizedMime = String(mime || '').split(';')[0].trim().toLowerCase();
+  if (DOCUMENT_ATTACHMENT_EXTENSIONS.has(ext)) {
+    if (ext === '.markdown') return { ext, mime: normalizedMime || 'text/markdown', type: 'markdown' };
+    if (ext === '.md') return { ext, mime: normalizedMime || 'text/markdown', type: 'markdown' };
+    if (ext === '.txt' || ext === '.log') return { ext, mime: normalizedMime || 'text/plain', type: 'text' };
+    if (ext === '.csv') return { ext, mime: normalizedMime || 'text/csv', type: 'csv' };
+    if (ext === '.tsv') return { ext, mime: normalizedMime || 'text/tab-separated-values', type: 'tsv' };
+    if (ext === '.json' || ext === '.jsonl') return { ext, mime: normalizedMime || 'application/json', type: 'json' };
+    if (ext === '.pdf') return { ext, mime: normalizedMime || 'application/pdf', type: 'pdf' };
+    if (ext === '.doc') return { ext, mime: normalizedMime || 'application/msword', type: 'doc' };
+    if (ext === '.docx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', type: 'docx' };
+    if (ext === '.xlsx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type: 'xlsx' };
+    if (ext === '.xls') return { ext, mime: normalizedMime || 'application/vnd.ms-excel', type: 'xlsx' };
+  }
+  if (DOCUMENT_ATTACHMENT_MIME_TYPES.has(normalizedMime)) {
+    const inferredExt = extFromMime(normalizedMime);
+    return inferDocumentAttachmentType(`attachment${inferredExt || '.txt'}`, normalizedMime);
+  }
+  return null;
+}
+
+function hasNullByte(buffer, limit = 8192) {
+  const size = Math.min(Buffer.isBuffer(buffer) ? buffer.length : 0, limit);
+  for (let i = 0; i < size; i += 1) {
+    if (buffer[i] === 0) return true;
+  }
+  return false;
+}
+
+function validateDocumentAttachmentBuffer(buffer, filename, mime) {
+  const info = inferDocumentAttachmentType(filename, mime);
+  if (!info) return { error: '不支持的文档格式' };
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return { error: '文档内容为空' };
+  if (TEXT_ATTACHMENT_EXTENSIONS.has(info.ext)) {
+    if (hasNullByte(buffer)) return { error: '文本文件内容看起来不是纯文本' };
+    return { ...info };
+  }
+  if (info.type === 'pdf') {
+    if (buffer.length < 5 || buffer.toString('ascii', 0, 5) !== '%PDF-') return { error: 'PDF 文件内容与扩展名不一致或已损坏' };
+    return { ...info, mime: 'application/pdf' };
+  }
+  if (info.type === 'doc' || info.type === 'docx' || info.type === 'xlsx') {
+    const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
+    const isOle = buffer.length >= 8 && buffer[0] === 0xd0 && buffer[1] === 0xcf && buffer[2] === 0x11 && buffer[3] === 0xe0;
+    if (!isZip && !isOle) return { error: 'Office 文档内容与扩展名不一致或已损坏' };
+    return { ...info };
+  }
+  return { ...info };
+}
+
+function safeAttachmentDataExtension(filename, mime, kind = 'image') {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  if (kind === 'document' && DOCUMENT_ATTACHMENT_EXTENSIONS.has(ext)) return ext;
+  if (kind === 'image' && ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return ext === '.jpeg' ? '.jpg' : ext;
+  return extFromMime(mime) || (kind === 'document' ? '.txt' : '');
+}
+
+function truncateAttachmentText(text, maxChars = MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS) {
+  const normalized = String(text || '').replace(/\r\n/g, '\n');
+  if (normalized.length <= maxChars) return { text: normalized, truncated: false };
+  return {
+    text: `${normalized.slice(0, maxChars).trimEnd()}\n\n[文档内容超过 ${maxChars} 字符，已截断]`,
+    truncated: true,
+  };
+}
+
+function readTextAttachment(filePath) {
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function extractPdfAttachmentText(filePath) {
+  try {
+    return execFileSync('pdftotext', ['-layout', '-enc', 'UTF-8', filePath, '-'], {
+      encoding: 'utf8',
+      maxBuffer: MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS * 4,
+      timeout: 20000,
+    });
+  } catch (err) {
+    throw new Error(`PDF 文本提取失败：${err.message || err}`);
+  }
+}
+
+function extractDocxAttachmentText(filePath) {
+  const script = `
+    const mammoth = require('mammoth');
+    const file = process.argv[1];
+    mammoth.extractRawText({ path: file })
+      .then((result) => { process.stdout.write(result && result.value ? result.value : ''); })
+      .catch((err) => { console.error(err && err.message ? err.message : String(err)); process.exit(1); });
+  `;
+  try {
+    return execFileSync(process.execPath, ['-e', script, filePath], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      maxBuffer: MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS * 4,
+      timeout: 20000,
+    });
+  } catch (err) {
+    throw new Error(`DOCX 文本提取失败：${err.stderr || err.message || err}`);
+  }
+}
+
+function extractOfficeAttachmentTextWithLibreOffice(filePath) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-doc-'));
+  try {
+    execFileSync('soffice', ['--headless', '--convert-to', 'txt:Text', '--outdir', tmpDir, filePath], {
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      timeout: 30000,
+    });
+    const base = path.basename(filePath).replace(/\.[^.]+$/, '.txt');
+    const converted = path.join(tmpDir, base);
+    const candidates = fs.readdirSync(tmpDir).filter((name) => name.toLowerCase().endsWith('.txt'));
+    const target = fs.existsSync(converted) ? converted : (candidates[0] ? path.join(tmpDir, candidates[0]) : '');
+    if (!target || !fs.existsSync(target)) throw new Error('LibreOffice 未生成文本文件');
+    return fs.readFileSync(target, 'utf8');
+  } catch (err) {
+    throw new Error(`DOC 文本提取失败：${err.stderr || err.message || err}`);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function extractWorkbookAttachmentText(filePath) {
+  const workbook = XLSX.readFile(filePath, { cellDates: true });
+  const sheetNames = Array.isArray(workbook.SheetNames) ? workbook.SheetNames.slice(0, 6) : [];
+  const parts = [];
+  for (const sheetName of sheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
+    const csv = XLSX.utils.sheet_to_csv(sheet, { FS: '\t', RS: '\n', blankrows: false }).trim();
+    if (!csv) continue;
+    parts.push(`## Sheet: ${sheetName}\n${csv}`);
+  }
+  return parts.join('\n\n');
+}
+
+function extractDocumentAttachmentText(attachment) {
+  const ext = path.extname(String(attachment?.filename || attachment?.path || '').toLowerCase());
+  const documentType = attachment?.documentType || inferDocumentAttachmentType(attachment?.filename || '', attachment?.mime || '')?.type || '';
+  if (TEXT_ATTACHMENT_EXTENSIONS.has(ext) || ['text', 'markdown', 'csv', 'tsv', 'json'].includes(documentType)) {
+    return readTextAttachment(attachment.path);
+  }
+  if (documentType === 'pdf' || ext === '.pdf') return extractPdfAttachmentText(attachment.path);
+  if (documentType === 'doc' || ext === '.doc') return extractOfficeAttachmentTextWithLibreOffice(attachment.path);
+  if (documentType === 'docx' || ext === '.docx') return extractDocxAttachmentText(attachment.path);
+  if (documentType === 'xlsx' || ext === '.xlsx' || ext === '.xls') return extractWorkbookAttachmentText(attachment.path);
+  throw new Error('该文档类型暂不支持解析');
+}
+
+function buildAttachmentDocumentPrompt(text, attachments = []) {
+  const docs = (Array.isArray(attachments) ? attachments : []).filter((attachment) => attachment?.kind === 'document');
+  const normalizedText = String(text || '');
+  if (docs.length === 0) return normalizedText;
+  const blocks = [];
+  let remaining = MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS;
+  for (const doc of docs) {
+    const safeName = String(doc.filename || doc.id || 'document').replace(/"/g, '&quot;');
+    let body = '';
+    let note = '';
+    try {
+      const extracted = extractDocumentAttachmentText(doc);
+      const truncated = truncateAttachmentText(extracted, Math.max(0, Math.min(MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS, remaining)));
+      body = truncated.text || '[文档没有提取到可读文本]';
+      remaining = Math.max(0, remaining - body.length);
+      if (truncated.truncated || remaining <= 0) note = '\n[后续文档内容可能已因总长度限制截断]';
+    } catch (err) {
+      body = `[文档解析失败：${err.message || err}]`;
+    }
+    blocks.push(`<document filename="${safeName}" mime="${doc.mime || ''}" size="${doc.size || 0}">\n${body}${note}\n</document>`);
+    if (remaining <= 0) break;
+  }
+  return `下面是用户上传到聊天窗口的临时文档附件内容。附件只存放在临时附件区，不在当前工作目录中。请基于这些内容回答用户。\n\n${blocks.join('\n\n')}\n\n用户问题：\n${normalizedText}`;
+}
+
+function messageAttachmentHistoryMeta(attachment) {
+  return {
+    id: attachment.id,
+    kind: attachment.kind || 'image',
+    filename: attachment.filename,
+    mime: attachment.mime,
+    documentType: attachment.documentType || null,
+    size: attachment.size,
+    createdAt: attachment.createdAt,
+    expiresAt: attachment.expiresAt,
+    storageState: attachment.storageState,
+  };
 }
 
 
@@ -2780,11 +3007,13 @@ function normalizeMessageAttachments(attachments) {
     const meta = loadAttachmentMeta(id);
     const state = currentAttachmentState(meta);
     if (state === 'expired') removeAttachmentById(id);
+    const kind = meta?.kind || attachment?.kind || 'image';
     normalized.push({
       id,
-      kind: 'image',
-      filename: meta?.filename || attachment?.filename || 'image',
-      mime: meta?.mime || attachment?.mime || 'image/png',
+      kind,
+      filename: meta?.filename || attachment?.filename || (kind === 'document' ? 'document' : 'image'),
+      mime: meta?.mime || attachment?.mime || (kind === 'document' ? 'application/octet-stream' : 'image/png'),
+      documentType: meta?.documentType || attachment?.documentType || null,
       size: meta?.size || attachment?.size || 0,
       createdAt: meta?.createdAt || attachment?.createdAt || null,
       expiresAt: meta?.expiresAt || attachment?.expiresAt || null,
@@ -3903,7 +4132,7 @@ function buildCarryoverSummary(session, historyMessages, currentInputText, attac
     || '继续当前会话中的最近任务';
   const pending = extractCarryoverLead(currentInputText)
     || (Array.isArray(attachments) && attachments.length > 0
-      ? `继续处理本次新增的 ${attachments.length} 张图片相关请求`
+      ? `继续处理本次新增的 ${attachments.length} 个附件相关请求`
       : '继续处理当前会话的下一步任务');
   const configLines = buildCarryoverConfigLines(session);
   const historyChars = (Array.isArray(historyMessages) ? historyMessages : [])
@@ -3959,7 +4188,7 @@ function formatCurrentInputForCarryover(text, attachments) {
       .map((attachment) => String(attachment?.filename || attachment?.id || 'image').trim())
       .filter(Boolean)
       .slice(0, 4);
-    blocks.push(`本次还附带图片: ${names.join(', ')}${list.length > names.length ? ` 等 ${list.length} 项` : ''}`);
+    blocks.push(`本次还附带附件: ${names.join(', ')}${list.length > names.length ? ` 等 ${list.length} 项` : ''}`);
   }
   if (blocks.length === 0) {
     blocks.push('请继续处理当前会话中的下一步任务。');
@@ -4316,6 +4545,7 @@ function startTunnel() {
   const child = spawn(process.execPath, [TUNNEL_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CF_TUNNEL_STATE_PATH: TUNNEL_STATE_PATH,
@@ -4615,6 +4845,7 @@ function ensureLocalBridgeRunning() {
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CC_WEB_BRIDGE_RUNTIME_PATH: BRIDGE_RUNTIME_PATH,
@@ -5537,29 +5768,71 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    const id = sanitizeId(url.pathname.split('/').pop() || '');
+    if (!id) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Missing attachment ID');
+    }
+    const meta = loadAttachmentMeta(id);
+    const state = currentAttachmentState(meta);
+    if (state === 'expired') removeAttachmentById(id);
+    if (state !== 'available') {
+      writeHeadWithSecurity(res, state === 'expired' ? 410 : 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(state === 'expired' ? 'Attachment expired' : 'Attachment not found');
+    }
+    const filePath = path.resolve(meta.path);
+    const root = path.resolve(ATTACHMENTS_DIR);
+    if (!isPathInside(filePath, root) || !['image', 'document'].includes(meta.kind || 'image')) {
+      writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Forbidden');
+    }
+    const asciiFilename = safeFilename(meta.filename).replace(/[^A-Za-z0-9._-]+/g, '_') || (meta.kind === 'document' ? 'document' : 'image');
+    writeHeadWithSecurity(res, 200, {
+      'Content-Type': meta.mime,
+      'Content-Length': String(meta.size || fs.statSync(filePath).size),
+      'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(meta.filename || 'image')}`,
+      'Cache-Control': 'private, max-age=300',
+    });
+    fs.createReadStream(filePath).on('error', () => {
+      try { res.destroy(); } catch {}
+    }).pipe(res);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    let rawName = 'image';
+    let rawName = 'attachment';
     try {
-      rawName = decodeURIComponent(String(req.headers['x-filename'] || 'image'));
+      rawName = decodeURIComponent(String(req.headers['x-filename'] || 'attachment'));
     } catch {
-      rawName = String(req.headers['x-filename'] || 'image');
+      rawName = String(req.headers['x-filename'] || 'attachment');
     }
     const filename = safeFilename(rawName);
-    if (!IMAGE_MIME_TYPES.has(mime)) {
-      return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片' });
+    const documentInfo = inferDocumentAttachmentType(filename, mime);
+    const isImageAttachment = IMAGE_MIME_TYPES.has(mime);
+    const isDocumentAttachment = !isImageAttachment && !!documentInfo;
+    if (!isImageAttachment && !isDocumentAttachment) {
+      return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片，或 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 文档' });
     }
+    const sizeLimit = isImageAttachment ? MAX_IMAGE_ATTACHMENT_SIZE : MAX_DOCUMENT_ATTACHMENT_SIZE;
 
     const chunks = [];
     let total = 0;
     let aborted = false;
     req.on('data', (chunk) => {
       total += chunk.length;
-      if (total > MAX_ATTACHMENT_SIZE) {
+      if (total > sizeLimit) {
         aborted = true;
         req.destroy();
         return;
@@ -5568,25 +5841,39 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', () => {
       if (aborted) {
-        return jsonResponse(res, 413, { ok: false, message: '图片大小不能超过 10MB' });
+        return jsonResponse(res, 413, { ok: false, message: isImageAttachment ? '图片大小不能超过 10MB' : '文档大小不能超过 20MB' });
       }
       const buffer = Buffer.concat(chunks);
       if (buffer.length === 0) {
-        return jsonResponse(res, 400, { ok: false, message: '图片内容为空' });
+        return jsonResponse(res, 400, { ok: false, message: isImageAttachment ? '图片内容为空' : '文档内容为空' });
       }
-      const actualMime = detectMimeFromMagic(buffer);
-      if (!actualMime || actualMime !== mime) {
-        return jsonResponse(res, 400, { ok: false, message: '图片内容与声明类型不一致或文件已损坏' });
+      let kind = 'image';
+      let effectiveMime = mime;
+      let documentType = null;
+      if (isImageAttachment) {
+        const actualMime = detectMimeFromMagic(buffer);
+        if (!actualMime || actualMime !== mime) {
+          return jsonResponse(res, 400, { ok: false, message: '图片内容与声明类型不一致或文件已损坏' });
+        }
+      } else {
+        const validation = validateDocumentAttachmentBuffer(buffer, filename, mime);
+        if (validation.error) {
+          return jsonResponse(res, 400, { ok: false, message: validation.error });
+        }
+        kind = 'document';
+        effectiveMime = validation.mime || documentInfo.mime || mime || 'application/octet-stream';
+        documentType = validation.type || documentInfo.type || null;
       }
       const id = crypto.randomUUID();
-      const ext = extFromMime(mime) || path.extname(filename) || '';
+      const ext = safeAttachmentDataExtension(filename, effectiveMime, kind);
       const dataPath = attachmentDataPath(id, ext);
       const now = new Date();
       const meta = {
         id,
-        kind: 'image',
+        kind,
         filename,
-        mime,
+        mime: effectiveMime,
+        documentType,
         size: buffer.length,
         createdAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + ATTACHMENT_TTL_MS).toISOString(),
@@ -5599,9 +5886,10 @@ const server = http.createServer((req, res) => {
           ok: true,
           attachment: {
             id,
-            kind: 'image',
+            kind,
             filename,
-            mime,
+            mime: effectiveMime,
+            documentType,
             size: buffer.length,
             createdAt: meta.createdAt,
             expiresAt: meta.expiresAt,
@@ -5615,7 +5903,7 @@ const server = http.createServer((req, res) => {
       }
     });
     req.on('error', () => {
-      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '上传过程中断' });
+      if (!res.headersSent) jsonResponse(res, aborted ? 413 : 500, { ok: false, message: aborted ? (isImageAttachment ? '图片大小不能超过 10MB' : '文档大小不能超过 20MB') : '上传过程中断' });
     });
     return;
   }
@@ -6895,7 +7183,7 @@ function handleNewSession(ws, msg) {
     if (proj) resolvedCwd = proj.path;
   }
   if (!resolvedCwd) {
-    resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+    resolvedCwd = agent === 'claude' ? (USER_HOME || process.cwd()) : null;
   }
   if (resolvedCwd) {
     resolvedCwd = normalizeProjectPathKey(resolvedCwd);
@@ -7301,7 +7589,7 @@ async function handleHandoffSession(ws, msg) {
   const attachments = Array.isArray(msg?.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：图片附件已过期或不可用，请重新上传后再接力。' });
+    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：附件已过期或不可用，请重新上传后再接力。' });
   }
   const cwdForFileRefs = sourceSession.cwd || process.cwd();
   const resolvedFileRefResult = normalizeContextFileRefs(msg?.fileRefs, cwdForFileRefs);
@@ -7591,7 +7879,7 @@ function sqlQuote(value) {
 function deleteClaudeLocalSession(claudeSessionId) {
   const safeId = sanitizeId(claudeSessionId);
   if (!safeId) return;
-  const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+  const projectsDir = path.join(USER_HOME, '.claude', 'projects');
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
       const target = path.join(projectsDir, proj, `${safeId}.jsonl`);
@@ -7616,7 +7904,7 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   let removedFiles = 0;
   for (const filePath of rolloutPaths) {
     try {
-      if ((filePath.startsWith(CODEX_SESSIONS_DIR) || filePath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
+      if ((isPathInside(filePath, CODEX_SESSIONS_DIR) || isPathInside(filePath, CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
         removedFiles++;
       }
@@ -7832,7 +8120,7 @@ function buildQueueItemFromClientMessage(session, msg) {
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return { error: '图片附件已过期或不可用，请重新上传后再发送。' };
+    return { error: '附件已过期或不可用，请重新上传后再发送。' };
   }
   const cwdForFileRefs = session?.cwd || process.cwd();
   const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
@@ -7840,13 +8128,14 @@ function buildQueueItemFromClientMessage(session, msg) {
   const resolvedFileRefs = resolvedFileRefResult.refs;
   if (!normalizedText && resolvedAttachments.length === 0 && resolvedFileRefs.length === 0) return { error: '消息内容为空。' };
   if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
-    return { error: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' };
+    return { error: '命令消息暂不支持同时附带附件或文件引用。请先发送普通消息，再单独使用命令。' };
   }
   const savedAttachments = resolvedAttachments.map((attachment) => ({
     id: attachment.id,
-    kind: 'image',
+    kind: attachment.kind || 'image',
     filename: attachment.filename,
     mime: attachment.mime,
+    documentType: attachment.documentType || null,
     size: attachment.size,
     createdAt: attachment.createdAt,
     expiresAt: attachment.expiresAt,
@@ -7965,7 +8254,7 @@ function handleMessage(ws, msg, options = {}) {
   const normalizedText = textValue.trim();
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
+    return wsSend(ws, { type: 'error', message: '附件已过期或不可用，请重新上传后再发送。' });
   }
   const pendingSession = sessionId ? loadSession(sessionId) : null;
   const cwdForFileRefs = pendingSession?.cwd || process.cwd();
@@ -7978,18 +8267,21 @@ function handleMessage(ws, msg, options = {}) {
 
   const savedAttachments = resolvedAttachments.map((attachment) => ({
     id: attachment.id,
-    kind: 'image',
+    kind: attachment.kind || 'image',
     filename: attachment.filename,
     mime: attachment.mime,
+    documentType: attachment.documentType || null,
     size: attachment.size,
     createdAt: attachment.createdAt,
     expiresAt: attachment.expiresAt,
     storageState: attachment.storageState,
   }));
   const savedFileRefs = resolvedFileRefs.map(fileRefHistoryMeta);
-  const effectiveInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
+  const resolvedImageAttachments = resolvedAttachments.filter((attachment) => (attachment.kind || 'image') === 'image');
+  const contextInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
+  const effectiveInputText = buildAttachmentDocumentPrompt(contextInputText, resolvedAttachments);
   const runtimeInputBaseText = typeof runtimeInputText === 'string'
-    ? buildContextFilePrompt(runtimeInputText, resolvedFileRefs)
+    ? buildAttachmentDocumentPrompt(buildContextFilePrompt(runtimeInputText, resolvedFileRefs), resolvedAttachments)
     : effectiveInputText;
   const messageAgent = normalizeAgent(msg.agent);
 
@@ -8000,7 +8292,7 @@ function handleMessage(ws, msg, options = {}) {
       isClaudeSession(runningSession) &&
       runningSession.permissionMode === 'plan' &&
       (normalizedText || resolvedFileRefs.length > 0) &&
-      resolvedAttachments.length === 0
+      resolvedImageAttachments.length === 0
     ) {
       // Plan mode: forward user input to the waiting process via stdin (input.txt append)
       const inputPath = path.join(runDir(sessionId), 'input.txt');
@@ -8025,14 +8317,14 @@ function handleMessage(ws, msg, options = {}) {
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
     : (savedFileRefs.length > 0
       ? `引用文件: ${savedFileRefs[0]?.relativePath || 'file'}`
-      : `图片: ${savedAttachments[0]?.filename || 'image'}`);
+      : `${savedAttachments[0]?.kind === 'document' ? '文档' : '图片'}: ${savedAttachments[0]?.filename || 'attachment'}`);
 
   let session;
   if (sessionId) session = loadSession(sessionId);
   if (!session) {
     const id = crypto.randomUUID();
     const agent = messageAgent;
-    const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+    const resolvedCwd = agent === 'claude' ? (USER_HOME || process.cwd()) : null;
     session = {
       id,
       title: derivedTitle,
@@ -8054,7 +8346,7 @@ function handleMessage(ws, msg, options = {}) {
   normalizeSession(session);
 
   if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片或文件引用。请先发送普通消息，再单独使用命令。' });
+    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带附件或文件引用。请先发送普通消息，再单独使用命令。' });
   }
 
   let permissionModeNotice = null;
@@ -8126,8 +8418,8 @@ function handleMessage(ws, msg, options = {}) {
   sendSessionList(ws);
 
   const spawnSpec = isClaudeSession(session)
-    ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
-    : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
+    ? buildClaudeSpawnSpec(session, { attachments: resolvedImageAttachments })
+    : buildCodexSpawnSpec(session, { attachments: resolvedImageAttachments });
   if (spawnSpec?.error) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
   }
@@ -8158,10 +8450,10 @@ function handleMessage(ws, msg, options = {}) {
   const outputPath = path.join(dir, 'output.jsonl');
   const errorPath = path.join(dir, 'error.log');
 
-  if (isClaudeSession(session) && resolvedAttachments.length > 0) {
+  if (isClaudeSession(session) && resolvedImageAttachments.length > 0) {
     const content = [];
     if (runtimeProcessInputText) content.push({ type: 'text', text: runtimeProcessInputText });
-    for (const attachment of resolvedAttachments) {
+    for (const attachment of resolvedImageAttachments) {
       const data = fs.readFileSync(attachment.path).toString('base64');
       content.push({
         type: 'image',
@@ -8438,11 +8730,11 @@ function handleCheckUpdate(ws) {
 
 // === Native Session Import ===
 
-const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
-const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'sessions');
+const CLAUDE_PROJECTS_DIR = path.join(USER_HOME, '.claude', 'projects');
+const CODEX_SESSIONS_DIR = path.join(USER_HOME, '.codex', 'sessions');
 const CODEX_RUNTIME_SESSIONS_DIR = path.join(CODEX_RUNTIME_HOME, 'sessions');
-const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
-const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
+const CODEX_STATE_DB_PATH = path.join(USER_HOME, '.codex', 'state_5.sqlite');
+const CODEX_LOG_DB_PATH = path.join(USER_HOME, '.codex', 'logs_1.sqlite');
 
 function resolveClaudeSessionLocalMeta(claudeSessionId) {
   if (!claudeSessionId) return null;
@@ -8916,7 +9208,7 @@ function handleImportCodexSession(ws, msg) {
 function handleListCwdSuggestions(ws) {
   const paths = new Set();
   // Always include HOME
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const home = USER_HOME;
   if (home) paths.add(home);
   try {
     const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
@@ -9444,6 +9736,23 @@ async function handleGitCommand(ws, msg) {
 function handleBrowseDirectory(ws, msg) {
   const home = USER_HOME || '/';
   const requestedPath = msg && typeof msg.path === 'string' ? msg.path : '';
+
+  // Windows: show all available drives
+  if (requestedPath === DRIVES_LIST_SENTINEL && process.platform === 'win32') {
+    const drives = [];
+    for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+      const root = String.fromCharCode(code) + ':\\';
+      try { fs.statSync(root); drives.push(root); } catch {}
+    }
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: DRIVES_LIST_SENTINEL,
+      parent: home || null,
+      dirs: drives,
+      error: null,
+    });
+  }
+
   let targetPath;
   try {
     targetPath = requestedPath ? path.resolve(String(requestedPath)) : home;
@@ -9494,11 +9803,12 @@ function handleBrowseDirectory(ws, msg) {
   try {
     entries = fs.readdirSync(targetPath, { withFileTypes: true });
   } catch (e) {
-    const parentPath = path.dirname(targetPath);
+    const pp = path.dirname(targetPath);
+    const isWinRoot = process.platform === 'win32' && pp === targetPath;
     return wsSend(ws, {
       type: 'directory_listing',
       path: targetPath,
-      parent: parentPath !== targetPath ? parentPath : null,
+      parent: isWinRoot ? DRIVES_LIST_SENTINEL : (pp !== targetPath ? pp : null),
       dirs: [],
       error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : '读取目录失败',
     });
@@ -9514,10 +9824,11 @@ function handleBrowseDirectory(ws, msg) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
   const parentPath = path.dirname(targetPath);
+  const isWinRoot = process.platform === 'win32' && parentPath === targetPath;
   wsSend(ws, {
     type: 'directory_listing',
     path: targetPath,
-    parent: parentPath !== targetPath ? parentPath : null,
+    parent: isWinRoot ? DRIVES_LIST_SENTINEL : (parentPath !== targetPath ? parentPath : null),
     dirs,
     error: null,
   });
