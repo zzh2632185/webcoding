@@ -3286,6 +3286,16 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
 .msg-jump-top-btn {
   color: var(--blue);
 }
+.msg-completion-time {
+  align-self: center;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.78;
+  user-select: none;
+}
 .msg-copy-btn.copied {
   color: var(--success, #118a4f);
   border-color: var(--success, #118a4f);

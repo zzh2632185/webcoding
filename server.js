@@ -5401,15 +5401,19 @@ function appendCodexRolloutImagesToEntry(sessionId, entry) {
 
 function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const session = loadSession(sessionId);
+  const completedAt = new Date().toISOString();
+  if (entry) entry.completedAt = completedAt;
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || (entry.segments && entry.segments.length > 0))) {
+    const startedAt = Number(entry.startedAtMs || 0) ? new Date(entry.startedAtMs).toISOString() : completedAt;
     session.messages.push({
       role: 'assistant',
       content: entry.fullText,
       toolCalls: entry.toolCalls || [],
       segments: entry.segments || [],
-      timestamp: new Date().toISOString(),
+      timestamp: startedAt,
+      completedAt,
     });
-    session.updated = new Date().toISOString();
+    session.updated = completedAt;
     if (!isProcessRealtimeConnected(entry)) session.hasUnread = true;
     saveSession(session);
   }
@@ -5473,7 +5477,7 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     sendRuntimeMessage(entry, { type: 'error', sessionId, message: completionError });
   }
 
-  sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
+  sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null, completedAt: entry.completedAt || new Date().toISOString() });
   sendSessionListToProcessClients(entry);
   return { shouldReturnForFollowup, shouldAutoCompact };
 }
@@ -5680,14 +5684,16 @@ function recoverProcesses() {
             } catch {}
           }
           if (session && (tempEntry.fullText || (tempEntry.toolCalls && tempEntry.toolCalls.length > 0) || (tempEntry.segments && tempEntry.segments.length > 0))) {
+            const completedAt = new Date().toISOString();
             session.messages.push({
               role: 'assistant',
               content: tempEntry.fullText,
               toolCalls: tempEntry.toolCalls || [],
               segments: tempEntry.segments || [],
-              timestamp: new Date().toISOString(),
+              timestamp: completedAt,
+              completedAt,
             });
-            session.updated = new Date().toISOString();
+            session.updated = completedAt;
             saveSession(session);
           }
         }

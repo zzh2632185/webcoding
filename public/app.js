@@ -5412,7 +5412,7 @@
     image_delta: handleImageDeltaMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
-    done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId); },
+    done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId, msg.completedAt || new Date().toISOString()); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     handoff_status: handleHandoffStatusMessage,
     mode_changed: handleModeChangedMessage,
@@ -5608,7 +5608,7 @@
     }
   }
 
-  function finishGenerating(sessionId) {
+  function finishGenerating(sessionId, completedAt = null) {
     clearAwaitingRuntimeStart();
     composeState.isGenerating = false;
     updateComposerActionButtons();
@@ -5626,6 +5626,7 @@
       if (isEmptyAssistantPlaceholder(streamEl)) {
         streamEl.remove();
       } else {
+        if (completedAt) setMessageCompletedAt(streamEl, completedAt);
         streamEl.removeAttribute('id');
       }
     }
@@ -5825,7 +5826,7 @@
     scrollMessageToTop(msgEl);
   }
 
-  function createMessageActions(role) {
+  function createMessageActions(role, completedAt = null) {
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     if (role === 'assistant') {
@@ -5853,6 +5854,10 @@
       handleMessageCopyClick(copyBtn);
     });
     actions.appendChild(copyBtn);
+    if (role === 'assistant') {
+      const completedTime = createMessageCompletionTimeElement(completedAt);
+      if (completedTime) actions.appendChild(completedTime);
+    }
     return actions;
   }
 
@@ -5881,7 +5886,33 @@
     return time;
   }
 
-  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null) {
+  function createMessageCompletionTimeElement(timestamp) {
+    const label = formatMessageTimestamp(timestamp);
+    if (!label) return null;
+    const time = document.createElement('time');
+    time.className = 'msg-completion-time';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    if (Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString();
+    }
+    time.textContent = label;
+    return time;
+  }
+
+  function setMessageCompletedAt(msgEl, completedAt) {
+    if (!msgEl || !completedAt || !msgEl.classList?.contains('assistant')) return;
+    const actions = msgEl.querySelector('.msg-actions');
+    if (!actions) return;
+    const nextTime = createMessageCompletionTimeElement(completedAt);
+    if (!nextTime) return;
+    msgEl.dataset.completedAt = nextTime.dateTime || String(completedAt);
+    const existing = actions.querySelector('.msg-completion-time');
+    if (existing) existing.replaceWith(nextTime);
+    else actions.appendChild(nextTime);
+  }
+
+  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
     if (role === 'user' || role === 'assistant') {
@@ -5938,7 +5969,7 @@
     const timeEl = createMessageTimeElement(timestamp);
     if (timeEl) contentWrap.appendChild(timeEl);
     contentWrap.appendChild(bubble);
-    contentWrap.appendChild(createMessageActions(role));
+    contentWrap.appendChild(createMessageActions(role, completedAt));
 
     div.appendChild(avatar);
     div.appendChild(contentWrap);
@@ -6323,7 +6354,7 @@
 
   function buildMsgElement(m) {
     if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], m.timestamp || m.createdAt || null);
-    const el = createMsgElement('assistant', '', [], [], m.timestamp || m.createdAt || null);
+    const el = createMsgElement('assistant', '', [], [], m.timestamp || m.createdAt || null, m.completedAt || m.finishedAt || null);
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
