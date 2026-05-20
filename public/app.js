@@ -5552,16 +5552,25 @@
     });
   }
 
+  function getMessageStartedAtFromElement(msgEl) {
+    if (!msgEl) return null;
+    const stored = msgEl.dataset?.startedAt || '';
+    if (stored) return stored;
+    const timeEl = msgEl.querySelector('.msg-time');
+    return timeEl?.dateTime || timeEl?.getAttribute('datetime') || null;
+  }
+
   function createStreamingMessageElement() {
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
-    const msgEl = createMsgElement('assistant', '', [], [], new Date().toISOString());
+    const latestUser = getLatestUserMessageElement();
+    const startedAt = getMessageStartedAtFromElement(latestUser) || new Date().toISOString();
+    const msgEl = createMsgElement('assistant', '', [], [], startedAt);
     msgEl.id = 'streaming-msg';
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';
     bubble.appendChild(createStreamingPlaceholder());
-    const latestUser = getLatestUserMessageElement();
     if (latestUser?.parentElement === messagesDiv) latestUser.insertAdjacentElement('afterend', msgEl);
     else messagesDiv.appendChild(msgEl);
     return msgEl;
@@ -5967,7 +5976,10 @@
     const contentWrap = document.createElement('div');
     contentWrap.className = 'msg-content';
     const timeEl = createMessageTimeElement(timestamp);
-    if (timeEl) contentWrap.appendChild(timeEl);
+    if (timeEl) {
+      div.dataset.startedAt = timeEl.dateTime || String(timestamp);
+      contentWrap.appendChild(timeEl);
+    }
     contentWrap.appendChild(bubble);
     contentWrap.appendChild(createMessageActions(role, completedAt));
 
@@ -6352,9 +6364,21 @@
     });
   }
 
-  function buildMsgElement(m) {
-    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], m.timestamp || m.createdAt || null);
-    const el = createMsgElement('assistant', '', [], [], m.timestamp || m.createdAt || null, m.completedAt || m.finishedAt || null);
+  function resolveMessageDisplayTimes(message, previousUserTimestamp = null) {
+    const messageTimestamp = message?.timestamp || message?.createdAt || null;
+    if (message?.role !== 'assistant') {
+      return { startedAt: messageTimestamp, completedAt: null };
+    }
+    return {
+      startedAt: previousUserTimestamp || message.startedAt || messageTimestamp,
+      completedAt: message.completedAt || message.finishedAt || messageTimestamp,
+    };
+  }
+
+  function buildMsgElement(m, previousUserTimestamp = null) {
+    const displayTimes = resolveMessageDisplayTimes(m, previousUserTimestamp);
+    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt);
+    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt);
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
@@ -6373,7 +6397,11 @@
     }
     if (options.immediate) {
       const frag = document.createDocumentFragment();
-      messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
+      let latestUserTimestamp = null;
+      messages.forEach((message) => {
+        frag.appendChild(buildMsgElement(message, latestUserTimestamp));
+        if (message?.role === 'user') latestUserTimestamp = message.timestamp || message.createdAt || latestUserTimestamp;
+      });
       messagesDiv.appendChild(frag);
       scrollToBottom();
       requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
@@ -6401,8 +6429,15 @@
     }
 
     // Render first batch immediately
+    const previousUserTimestamps = [];
+    let latestUserTimestamp = null;
+    for (let i = 0; i < len; i++) {
+      previousUserTimestamps[i] = latestUserTimestamp;
+      if (messages[i]?.role === 'user') latestUserTimestamp = messages[i].timestamp || messages[i].createdAt || latestUserTimestamp;
+    }
+
     const frag0 = document.createDocumentFragment();
-    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
+    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null));
     messagesDiv.appendChild(frag0);
     scrollToBottom();
     requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
@@ -6419,7 +6454,7 @@
       const prevScrollTop = messagesDiv.scrollTop;
       
       const frag = document.createDocumentFragment();
-      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
+      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null));
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       
       // Compensate scrollTop so visible area stays unchanged
@@ -6446,7 +6481,11 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const frag = document.createDocumentFragment();
-    messages.forEach((m) => frag.appendChild(buildMsgElement(m)));
+    let latestUserTimestamp = null;
+    messages.forEach((m) => {
+      frag.appendChild(buildMsgElement(m, latestUserTimestamp));
+      if (m?.role === 'user') latestUserTimestamp = m.timestamp || m.createdAt || latestUserTimestamp;
+    });
     if (!preserveScroll) {
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       if (!skipScrollbar) updateScrollbar();

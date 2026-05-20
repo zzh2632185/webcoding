@@ -5404,7 +5404,11 @@ function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const completedAt = new Date().toISOString();
   if (entry) entry.completedAt = completedAt;
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || (entry.segments && entry.segments.length > 0))) {
-    const startedAt = Number(entry.startedAtMs || 0) ? new Date(entry.startedAtMs).toISOString() : completedAt;
+    const previousUserMessage = Array.isArray(session.messages)
+      ? [...session.messages].reverse().find((message) => message?.role === 'user')
+      : null;
+    const startedAt = previousUserMessage?.timestamp || previousUserMessage?.createdAt
+      || (Number(entry.startedAtMs || 0) ? new Date(entry.startedAtMs).toISOString() : completedAt);
     session.messages.push({
       role: 'assistant',
       content: entry.fullText,
@@ -5685,12 +5689,16 @@ function recoverProcesses() {
           }
           if (session && (tempEntry.fullText || (tempEntry.toolCalls && tempEntry.toolCalls.length > 0) || (tempEntry.segments && tempEntry.segments.length > 0))) {
             const completedAt = new Date().toISOString();
+            const previousUserMessage = Array.isArray(session.messages)
+              ? [...session.messages].reverse().find((message) => message?.role === 'user')
+              : null;
+            const startedAt = previousUserMessage?.timestamp || previousUserMessage?.createdAt || completedAt;
             session.messages.push({
               role: 'assistant',
               content: tempEntry.fullText,
               toolCalls: tempEntry.toolCalls || [],
               segments: tempEntry.segments || [],
-              timestamp: completedAt,
+              timestamp: startedAt,
               completedAt,
             });
             session.updated = completedAt;
