@@ -3171,6 +3171,20 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
 }
 .msg.user .msg-content { align-items: flex-end; }
 
+.msg-time {
+  margin: 0 0 4px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.78;
+  user-select: none;
+}
+.msg.user .msg-time {
+  text-align: right;
+}
+
 .msg-avatar {
   width: 26px;
   height: 26px;

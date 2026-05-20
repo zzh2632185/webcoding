@@ -5318,7 +5318,7 @@
     renderQueuedMessages();
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
-    messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || [], item.fileRefs || []));
+    messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || [], item.fileRefs || [], item.createdAt || new Date().toISOString()));
     scrollToBottom();
     if (!composeState.isGenerating) startGenerating();
   }
@@ -5556,7 +5556,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
-    const msgEl = createMsgElement('assistant', '');
+    const msgEl = createMsgElement('assistant', '', [], [], new Date().toISOString());
     msgEl.id = 'streaming-msg';
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';
@@ -5856,7 +5856,32 @@
     return actions;
   }
 
-  function createMsgElement(role, content, attachments = [], fileRefs = []) {
+
+  function formatMessageTimestamp(timestamp) {
+    if (!timestamp) return '';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    const time = date.getTime();
+    if (!Number.isFinite(time)) return '';
+    const pad = (value) => String(value).padStart(2, '0');
+    const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${clock}`;
+  }
+
+  function createMessageTimeElement(timestamp) {
+    const label = formatMessageTimestamp(timestamp);
+    if (!label) return null;
+    const time = document.createElement('time');
+    time.className = 'msg-time';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    if (Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString();
+    }
+    time.textContent = label;
+    return time;
+  }
+
+  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
     if (role === 'user' || role === 'assistant') {
@@ -5910,6 +5935,8 @@
 
     const contentWrap = document.createElement('div');
     contentWrap.className = 'msg-content';
+    const timeEl = createMessageTimeElement(timestamp);
+    if (timeEl) contentWrap.appendChild(timeEl);
     contentWrap.appendChild(bubble);
     contentWrap.appendChild(createMessageActions(role));
 
@@ -6295,8 +6322,8 @@
   }
 
   function buildMsgElement(m) {
-    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || []);
-    const el = createMsgElement('assistant', '');
+    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], m.timestamp || m.createdAt || null);
+    const el = createMsgElement('assistant', '', [], [], m.timestamp || m.createdAt || null);
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
@@ -8763,7 +8790,7 @@
     const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
     const payloadAttachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs));
+    messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs, new Date().toISOString()));
     scrollToBottom();
 
     sendUserMessage({ text, attachments: payloadAttachments, fileRefs });
