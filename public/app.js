@@ -5516,6 +5516,7 @@
     usage: handleUsageMessage,
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId, msg.completedAt || new Date().toISOString()); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
+    runtime_warning: (msg) => { if (isMessageForCurrentSession(msg)) appendError(msg.message, { type: 'warning', icon: '⚠️', dismissible: true, style: 'border-color:var(--yellow);color:var(--text-primary);background:rgba(245,158,11,0.08)' }); },
     handoff_status: handleHandoffStatusMessage,
     mode_changed: handleModeChangedMessage,
     reasoning_effort_changed: handleReasoningEffortChangedMessage,

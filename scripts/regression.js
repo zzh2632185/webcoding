@@ -946,6 +946,37 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   );
 }
 
+function runClaudeRuntimeToolResultAndRetrySourceRegressionCase() {
+  const runtimeSource = readRepoText('lib', 'agent-runtime.js');
+  const appSource = readRepoText('public', 'app.js');
+  const processClaudeSource = extractFunctionSource(runtimeSource, 'processClaudeEvent');
+  const completeToolSource = extractFunctionSource(runtimeSource, 'completeClaudeToolResult');
+  const retryWarningSource = extractFunctionSource(runtimeSource, 'sendClaudeApiRetryWarning');
+
+  assert(
+    processClaudeSource.includes("case 'user'")
+      && processClaudeSource.includes("block?.type === 'tool_result'")
+      && processClaudeSource.includes('completeClaudeToolResult(entry, block, sessionId)'),
+    'Claude user/tool_result events must complete running tool cards after Claude Code output format changes',
+  );
+  assert(
+    completeToolSource.includes("type: 'tool_end'")
+      && completeToolSource.includes('updateEntryToolSegment(entry, toolUseId')
+      && completeToolSource.includes('tc.done = true'),
+    'Claude tool_result handling must update stored segments and emit tool_end',
+  );
+  assert(
+    processClaudeSource.includes("event.subtype === 'api_retry'")
+      && retryWarningSource.includes("type: 'runtime_warning'"),
+    'Claude api_retry system events must be surfaced as visible runtime warnings',
+  );
+  assert(
+    appSource.includes('runtime_warning: (msg)')
+      && appSource.includes("appendError(msg.message, { type: 'warning'"),
+    'Frontend must render runtime_warning without finishing the running response',
+  );
+}
+
 function createTestRunner() {
   const results = [];
   return {
@@ -3929,6 +3960,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
 async function main() {
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   sourceRunner.finish();
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));
