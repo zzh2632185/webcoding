@@ -900,7 +900,6 @@ function sendRuntimeMessage(entry, data) {
   if (entry && !isWsOpen(entry.ws)) entry.ws = clients[0] || null;
   return true;
 }
-
 function sendSessionListToProcessClients(entry, options = {}) {
   const clients = getConnectedProcessClients(entry);
   for (const client of clients) sendSessionList(client, options);
@@ -5698,13 +5697,14 @@ function recoverProcesses() {
       if (isProcessRunning(pid)) {
         console.log(`[recovery] Re-attaching to session ${sessionId} (PID ${pid})`);
         plog('INFO', 'recovery_alive', { sessionId: sessionId.slice(0, 8), pid, agent });
-        const entry = { pid, ws: null, agent, fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
+        const entry = { pid, ws: null, agent, startedAtMs: Date.now(), fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
         setActiveProcess(sessionId, entry);
 
         if (fs.existsSync(outputPath)) {
           entry.tailer = new FileTailer(outputPath, (line) => {
             try {
               const event = JSON.parse(line);
+              entry.lastRuntimeEventAtMs = Date.now();
               processRuntimeEvent(entry, event, sessionId);
             } catch {}
           });
@@ -5715,7 +5715,7 @@ function recoverProcesses() {
         console.log(`[recovery] Processing completed output for session ${sessionId}`);
         plog('INFO', 'recovery_dead', { sessionId: sessionId.slice(0, 8), pid, agent });
         if (fs.existsSync(outputPath)) {
-          const tempEntry = { pid: 0, ws: null, agent, fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
+          const tempEntry = { pid: 0, ws: null, agent, startedAtMs: Date.now(), fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
           const content = fs.readFileSync(outputPath, 'utf8');
           for (const line of content.split('\n')) {
             if (!line.trim()) continue;
@@ -8838,7 +8838,35 @@ function parseJsonlToMessages(lines) {
       if (typeof raw === 'string') {
         content = raw;
       } else if (Array.isArray(raw)) {
-        // skip tool_result blocks, only take text blocks
+        const toolResultBlocks = raw.filter(b => b?.type === 'tool_result');
+        if (toolResultBlocks.length > 0) {
+          const lastAssistant = [...messages].reverse().find((message) => message?.role === 'assistant');
+          if (lastAssistant) {
+            for (const b of toolResultBlocks) {
+              const resultText = typeof b.content === 'string'
+                ? b.content
+                : Array.isArray(b.content)
+                  ? b.content.map((item) => item?.text || '').join('\n')
+                  : JSON.stringify(b.content || '');
+              const toolUseId = b.tool_use_id || b.id;
+              const tc = Array.isArray(lastAssistant.toolCalls)
+                ? lastAssistant.toolCalls.find((item) => item.id === toolUseId)
+                : null;
+              if (tc) {
+                tc.done = true;
+                tc.result = resultText.slice(0, 2000);
+              }
+              const segment = Array.isArray(lastAssistant.segments)
+                ? lastAssistant.segments.find((item) => item.type === 'tool_call' && item.id === toolUseId)
+                : null;
+              if (segment) {
+                segment.done = true;
+                segment.result = resultText.slice(0, 2000);
+              }
+            }
+          }
+        }
+        // user-visible content should only include text blocks; tool_result updates the previous assistant message.
         content = raw
           .filter(b => b.type === 'text')
           .map(b => b.text || '')
@@ -8860,7 +8888,7 @@ function parseJsonlToMessages(lines) {
           if (last && last.type === 'text') last.text = `${last.text || ''}${b.text}`;
           else segments.push({ type: 'text', text: b.text });
         } else if (b.type === 'tool_use') {
-          const tc = { name: b.name, id: b.id, input: b.input, done: true };
+          const tc = { name: b.name, id: b.id, input: b.input, done: false };
           toolCalls.push(tc);
           segments.push({ type: 'tool_call', ...tc });
         } else if (b.type === 'tool_result') {

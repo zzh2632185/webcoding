@@ -977,6 +977,21 @@ function runClaudeRuntimeToolResultAndRetrySourceRegressionCase() {
   );
 }
 
+function runClaudeNativeHistoryToolResultSourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const parseSource = extractFunctionSource(serverSource, 'parseJsonlToMessages');
+  assert(
+    parseSource.includes("b?.type === 'tool_result'")
+      && parseSource.includes('lastAssistant.toolCalls.find')
+      && parseSource.includes('segment.done = true'),
+    'Claude native history import must apply user/tool_result blocks to previous assistant tool calls',
+  );
+  assert(
+    parseSource.includes("done: false"),
+    'Claude imported tool_use blocks must remain running until their user/tool_result block is seen',
+  );
+}
+
 function createTestRunner() {
   const results = [];
   return {
@@ -3961,6 +3976,7 @@ async function main() {
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
+  await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
   sourceRunner.finish();
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));
