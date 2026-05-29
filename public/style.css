@@ -2511,6 +2511,12 @@ html[data-theme="localhost"] .project-group-running-dot {
   border-color: var(--blue);
 }
 
+.project-group-new-btn.active {
+  background: var(--yellow);
+  color: var(--text-primary);
+  border-color: var(--yellow);
+}
+
 /* --- Project group dropdown menu --- */
 .project-group-menu {
   position: fixed;
@@ -2550,6 +2556,82 @@ html[data-theme="localhost"] .project-group-running-dot {
   background: var(--danger-soft);
   color: var(--danger);
   border-color: var(--danger);
+}
+
+.project-group-new-session-menu {
+  width: min(286px, calc(100vw - 12px));
+  padding: 3px;
+  border-radius: 10px;
+}
+.project-group-new-session-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 1fr) 74px 48px;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 3px 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+.project-group-new-session-row + .project-group-new-session-row {
+  border-top-color: rgba(56, 56, 56, 0.08);
+}
+.project-group-new-session-row:hover {
+  background: rgba(56, 56, 56, 0.045);
+  border-color: rgba(56, 56, 56, 0.10);
+}
+.project-group-new-session-copy {
+  min-width: 0;
+}
+.project-group-new-session-name {
+  font-size: 10.5px;
+  font-weight: 750;
+  line-height: 1.12;
+  color: var(--text-primary);
+}
+.project-group-new-session-hint {
+  margin-top: 0;
+  font-size: 8.5px;
+  line-height: 1.05;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-group-new-session-mode {
+  width: 100%;
+  min-height: 28px;
+  padding: 0 6px;
+  border: 1px solid rgba(56, 56, 56, 0.20);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  line-height: 1;
+}
+.project-group-new-session-launch {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(56, 56, 56, 0.18);
+  border-radius: 8px;
+  background: var(--cta-primary-background, var(--blue));
+  color: var(--cta-button-color, var(--text-primary));
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.project-group-new-session-launch:hover {
+  background: var(--cta-primary-hover-background, var(--blue-strong));
+}
+html[data-theme="localhost"] .project-group-new-session-launch {
+  background: var(--cta-primary-background);
+  border-color: rgba(15, 138, 167, 0.20);
+  color: var(--cta-button-color);
+}
+html[data-theme="localhost"] .project-group-new-session-launch:hover {
+  background: var(--cta-primary-hover-background);
 }
 .project-group-body {
   padding: 4px 6px 4px 14px;
@@ -5763,6 +5845,64 @@ body.ws-reconnecting::before {
   line-height: 1.7;
 }
 
+
+/* === New session preferences === */
+.new-session-preferences {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px;
+  gap: 8px;
+  align-items: end;
+  padding: 8px 10px;
+  border: 1px solid rgba(56, 56, 56, 0.18);
+  border-radius: 12px;
+  background: var(--surface-strong);
+}
+.new-session-agent-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.new-session-agent-tab {
+  min-height: 32px;
+  border: 1px solid rgba(56, 56, 56, 0.18);
+  border-radius: 9px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.new-session-agent-tab.active {
+  background: var(--yellow);
+  border-color: rgba(56, 56, 56, 0.28);
+}
+.new-session-mode-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+.new-session-mode-select {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid rgba(56, 56, 56, 0.20);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 700;
+}
+.new-session-mode-hint {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
 /* === Directory Browser === */
 .dir-browser-shell {
   gap: 12px;
@@ -6066,6 +6206,12 @@ body.ws-reconnecting::before {
 }
 
 @media (max-width: 728px) {
+  .new-session-preferences {
+    grid-template-columns: 1fr;
+  }
+  .project-group-new-session-row {
+    grid-template-columns: minmax(0, 1fr) 70px 44px;
+  }
   .modal-panel-project {
     max-width: none;
   }
@@ -6357,11 +6503,15 @@ body.file-viewer-resizing * {
 }
 .file-viewer-iframe {
   width: 100%;
+  max-width: none;
   height: 100%;
   min-height: calc(100vh - 92px);
   border: none;
   display: block;
   background: #fff;
+}
+.file-viewer-iframe.content-wide {
+  flex: 0 0 auto;
 }
 .file-viewer-image-wrap {
   min-height: 100%;

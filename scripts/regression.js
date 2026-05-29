@@ -3775,6 +3775,21 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Codex spawn should force openai_compat provider via CLI overrides');
     assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex spawn should force bridge base_url via CLI overrides');
 
+    const slashPassthroughStart = messages.length;
+    const slashPrompt = '/cp 规划一个长需求\n这里模拟用户写了很多内容，不能因为未知指令丢失。';
+    client.send(buildAgentMessagePayload({ text: slashPrompt, sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const slashSessionInfo = await client.waitForType(
+      'session_info',
+      (msg) => msg.sessionId === firstMessageSession.sessionId
+        && Array.isArray(msg.messages)
+        && msg.messages.some((message) => message.role === 'user' && message.content === slashPrompt),
+      8000,
+    );
+    assert(slashSessionInfo.messages.some((message) => message.role === 'user' && message.content === slashPrompt), 'Non-core slash prompt should be persisted in history');
+    await client.waitForType('text_delta', (msg) => msg.sessionId === firstMessageSession.sessionId && /\/cp 规划一个长需求/.test(msg.text || ''), 8000);
+    await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId, 8000);
+    assertNoSystemMessageSince(messages, slashPassthroughStart, /未知指令:\s*\/cp/, 'Codex /cp passthrough should not be rejected as unknown');
+
     const codexDocument = await uploadAttachment(port, token, {
       filename: 'requirements.md',
       mime: 'text/markdown',

@@ -599,6 +599,9 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   rename: '重命名线程',
   skills: '列出可用技能',
   statusline: '配置状态栏显示内容',
+  cp: 'Codex Plan 项目规划',
+  gm: '需求拷问 / 方案压力测试',
+  ui: 'UI 审美优化 / 视觉 review',
   // Codex skills (user-installed) — discovered at runtime from ~/.codex/skills/
   imagegen: 'AI 图像生成',
   'openai-docs': 'OpenAI 官方文档查询',
@@ -730,6 +733,18 @@ function discoverCodexSlashCommands() {
   const builtIn = ['compact', 'model', 'status', 'review', 'fork', 'new',
     'feedback', 'init', 'mcp', 'permissions', 'personality', 'rename', 'skills', 'statusline'];
   builtIn.forEach(c => commands.add(c));
+
+  function addAliasIfSkillExists(skillName, alias) {
+    try {
+      if (fs.existsSync(path.join(skillsDir, skillName, 'SKILL.md'))) commands.add(alias);
+    } catch {}
+  }
+
+  // Local shortcut aliases used by Webcoding/Codex skills.
+  addAliasIfSkillExists('codex-planner', 'cp');
+  addAliasIfSkillExists('gm', 'gm');
+  addAliasIfSkillExists('ui', 'ui');
+  addAliasIfSkillExists('ui-aesthetics', 'ui');
 
   // 2. User-installed skills (directories under ~/.codex/skills/, excluding .system)
   try {
@@ -3108,13 +3123,18 @@ function isRootProcessOnUnix() {
     && process.getuid() === 0;
 }
 
-function normalizePermissionModeInput(mode) {
-  return VALID_PERMISSION_MODES.has(mode) ? mode : 'yolo';
+function defaultPermissionModeForAgent(agent) {
+  return normalizeAgent(agent) === 'codex' ? 'yolo' : 'default';
+}
+
+function normalizePermissionModeInput(mode, agent = 'claude') {
+  return VALID_PERMISSION_MODES.has(mode) ? mode : defaultPermissionModeForAgent(agent);
 }
 
 function resolvePermissionModeForAgent(agent, mode) {
-  const requestedMode = normalizePermissionModeInput(mode);
-  if (normalizeAgent(agent) === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
+  const normalizedAgent = normalizeAgent(agent);
+  const requestedMode = normalizePermissionModeInput(mode, normalizedAgent);
+  if (normalizedAgent === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
     return {
       mode: 'default',
       requestedMode,
@@ -3760,12 +3780,29 @@ function getClaudeModelMenuLabel(modelOrAlias) {
   return entry?.label || null;
 }
 
+function describeClaudeDefaultModel() {
+  let modelField = '';
+  try {
+    const settings = readClaudeSettings();
+    modelField = String(settings?.model || '').trim();
+  } catch {}
+  if (!modelField) return null;
+  const normalized = normalizeClaudeModelAliasInput(modelField);
+  const aliasHit = (modelShortName(normalized) || normalized).toLowerCase();
+  const entry = CLAUDE_MODEL_MENU_ENTRIES.find(
+    (item) => item.alias !== 'default' && item.alias.toLowerCase() === aliasHit,
+  );
+  const display = entry ? entry.label : modelField;
+  return `跟随 ~/.claude/settings.json：${display}`;
+}
+
 function getClaudeModelMenuEntries() {
   const config = loadModelConfig();
   const useResolvedIds = config.mode === 'custom' && !!config.activeTemplate;
+  const defaultDesc = describeClaudeDefaultModel();
   return CLAUDE_MODEL_MENU_ENTRIES.map((entry) => {
     if (entry.alias === 'default') {
-      return { ...entry, value: 'default' };
+      return { ...entry, value: 'default', desc: defaultDesc || entry.desc };
     }
     const isOneM = entry.alias.endsWith('[1m]');
     const baseAlias = isOneM ? entry.alias.slice(0, -4) : entry.alias;
@@ -6394,7 +6431,7 @@ wss.on('connection', (ws, req) => {
     switch (msg.type) {
       case 'message':
         if (msg.text && msg.text.trim().startsWith('/')) {
-          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent);
+          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent, msg);
         } else {
           handleMessage(ws, msg);
         }
@@ -6901,7 +6938,7 @@ function handleFetchModels(ws, msg) {
 }
 
 // === Slash Command Handler ===
-function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
+function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
@@ -7170,12 +7207,19 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     default: {
-      // For unrecognized slash commands, pass through to the CLI process if a session is active
-      if (sessionId && activeProcesses.has(sessionId)) {
-        handleMessage(ws, { text, sessionId, mode: session?.permissionMode || 'yolo' }, { hideInHistory: false });
-      } else {
-        wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
-      }
+      // For non-core slash commands (Codex/Claude native commands or skill aliases
+      // such as /cp), treat the whole draft as a normal runtime prompt instead of
+      // dropping it with “unknown command”. This is especially important for long
+      // multi-line prompts that start with a skill shortcut: the browser clears the
+      // composer after submit, so rejecting here loses the user's text.
+      const passthroughMsg = {
+        ...originalMsg,
+        text,
+        sessionId,
+        agent,
+        mode: originalMsg.mode || session?.permissionMode || 'yolo',
+      };
+      handleMessage(ws, passthroughMsg, { hideInHistory: false, emitSessionInfo: true });
     }
   }
 }

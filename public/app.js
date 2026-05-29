@@ -8,7 +8,7 @@
 
   // Claude Code model entries — matches real /model output
   const CLAUDE_MODEL_ENTRIES = [
-    { alias: 'default', value: 'default', label: '默认（推荐）', desc: '使用默认模型（当前为 Sonnet 4.6）', pricing: '输入/输出 $3 / $15 / 百万 Token' },
+    { alias: 'default', value: 'default', label: '默认（推荐）', desc: '跟随 ~/.claude/settings.json 配置的默认模型', pricing: '输入/输出 $3 / $15 / 百万 Token' },
     { alias: 'sonnet[1m]', value: 'sonnet[1m]', label: 'Sonnet（1M 上下文）', desc: 'Sonnet 4.6，适合长上下文会话', pricing: '输入/输出 $3 / $15 / 百万 Token' },
     { alias: 'opus', value: 'opus', label: 'Opus', desc: 'Opus 4.6，复杂任务能力最强', pricing: '输入/输出 $5 / $25 / 百万 Token' },
     { alias: 'opus[1m]', value: 'opus[1m]', label: 'Opus（1M 上下文）', desc: 'Opus 4.6，支持 1M 上下文，适合复杂任务', pricing: '输入/输出 $5 / $25 / 百万 Token' },
@@ -38,6 +38,10 @@
   };
 
   const DEFAULT_AGENT = 'claude';
+  const DEFAULT_AGENT_MODES = {
+    claude: 'default',
+    codex: 'yolo',
+  };
   const SESSION_CACHE_LIMIT = 4;
   const SESSION_CACHE_MAX_WEIGHT = 1_500_000;
   const SIDEBAR_SWIPE_TRIGGER = 72;
@@ -126,7 +130,7 @@
   let activeToolCalls = new Map();
   let cmdMenuIndex = -1;
   let cmdMenuDelegated = false;
-  let currentMode = 'yolo';
+  let currentMode = DEFAULT_AGENT_MODES[DEFAULT_AGENT];
   let currentModel = '';
   let currentReasoningEffort = '';
   let currentActiveRuntime = null;
@@ -2148,13 +2152,14 @@
   }
 
   function normalizeSessionSnapshot(payload, options = {}) {
-    const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, payload.agent, payload.model || '');
+    const normalizedAgent = normalizeAgent(payload.agent);
+    const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, normalizedAgent, payload.model || '');
     const hasPayloadModel = Object.prototype.hasOwnProperty.call(payload || {}, 'model');
     return {
       sessionId: payload.sessionId,
       messages: cloneMessages(payload.messages || []),
       title: payload.title || '新会话',
-      mode: payload.mode || 'yolo',
+      mode: normalizeMode(payload.mode) || getDefaultModeForAgent(normalizedAgent),
       reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort),
       model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
       activeRuntime: normalizedRuntime,
@@ -2162,7 +2167,7 @@
       runtimeCount: Number.isFinite(payload.runtimeCount)
         ? payload.runtimeCount
         : (normalizedRuntime?.runtimeCount || 0),
-      agent: normalizeAgent(payload.agent),
+      agent: normalizedAgent,
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
       projectId: payload.projectId || null,
@@ -3743,6 +3748,61 @@
     return `<div class="file-viewer-empty">该文件类型暂不支持直接预览。<br>${escapeHtml(data.name || '')} · ${formatFileSize(data.size || 0)}</div>`;
   }
 
+  function measureFileViewerIframeContentWidth(iframe) {
+    try {
+      const doc = iframe.contentDocument || iframe.contentWindow?.document;
+      const win = iframe.contentWindow;
+      const docEl = doc?.documentElement;
+      const body = doc?.body;
+      const widths = [
+        docEl?.scrollWidth,
+        body?.scrollWidth,
+        docEl?.offsetWidth,
+        body?.offsetWidth,
+      ];
+      if (body?.children?.length && win) {
+        Array.from(body.children).forEach((child) => {
+          try {
+            const rect = child.getBoundingClientRect();
+            widths.push(rect.right + (win.scrollX || 0));
+            widths.push(rect.width);
+          } catch {}
+        });
+      }
+      return Math.ceil(Math.max(0, ...widths.filter((value) => Number.isFinite(value))));
+    } catch {
+      return 0;
+    }
+  }
+
+  function syncFileViewerIframeOverflow(iframe) {
+    if (!iframe || !fileViewerBody || !iframe.hasAttribute('srcdoc')) return;
+    const viewportWidth = Math.ceil(fileViewerBody.clientWidth || iframe.parentElement?.clientWidth || 0);
+    const contentWidth = measureFileViewerIframeContentWidth(iframe);
+    if (!viewportWidth || !contentWidth || contentWidth <= viewportWidth + 2) {
+      iframe.classList.remove('content-wide');
+      iframe.style.width = '100%';
+      return;
+    }
+    iframe.classList.add('content-wide');
+    iframe.style.width = `${Math.min(contentWidth, 10000)}px`;
+  }
+
+  function bindFileViewerPreviewIframeOverflow() {
+    if (!fileViewerBody || fileViewerState.activeTab !== 'preview') return;
+    const iframes = Array.from(fileViewerBody.querySelectorAll('.file-viewer-iframe[srcdoc]'));
+    iframes.forEach((iframe) => {
+      const sync = () => syncFileViewerIframeOverflow(iframe);
+      iframe.addEventListener('load', () => {
+        sync();
+        setTimeout(sync, 80);
+        setTimeout(sync, 260);
+      }, { once: true });
+      requestAnimationFrame(sync);
+      setTimeout(sync, 80);
+    });
+  }
+
   async function fetchFileViewerBlob(data) {
     if (!data?.rawUrl || !['image', 'pdf'].includes(data.type)) return;
     const expectedPath = data.path || fileViewerState.activePath;
@@ -3803,6 +3863,7 @@
       }
     });
     bindFileEditorEvents();
+    bindFileViewerPreviewIframeOverflow();
   }
 
   function bindFileEditorEvents() {
@@ -4205,8 +4266,49 @@
     }
   }
 
+  function normalizeMode(value) {
+    return Object.prototype.hasOwnProperty.call(MODE_LABELS, value) ? value : '';
+  }
+
+  function getDefaultModeForAgent(agent) {
+    const normalized = normalizeAgent(agent);
+    return DEFAULT_AGENT_MODES[normalized] || 'default';
+  }
+
   function getSavedModeForAgent(agent) {
-    return localStorage.getItem(getAgentModeStorageKey(agent)) || 'yolo';
+    const normalized = normalizeAgent(agent);
+    const saved = normalizeMode(localStorage.getItem(getAgentModeStorageKey(normalized)));
+    return saved || getDefaultModeForAgent(normalized);
+  }
+
+  function saveModeForAgent(agent, mode) {
+    const normalized = normalizeAgent(agent);
+    const resolvedMode = normalizeMode(mode) || getDefaultModeForAgent(normalized);
+    localStorage.setItem(getAgentModeStorageKey(normalized), resolvedMode);
+    return resolvedMode;
+  }
+
+  function buildPermissionModeOptionsHtml(selectedMode) {
+    const selected = normalizeMode(selectedMode) || 'default';
+    return Object.entries(MODE_LABELS).map(([value, label]) => (
+      `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`
+    )).join('');
+  }
+
+  function applyNewSessionAgentPreference(agent, mode = getSavedModeForAgent(agent), options = {}) {
+    const targetAgent = normalizeAgent(agent);
+    const targetMode = saveModeForAgent(targetAgent, mode);
+    setSelectedAgent(targetAgent, { syncMode: options.syncMode === true });
+    return { agent: targetAgent, mode: targetMode };
+  }
+
+  function normalizeProjectSessionPayload(project, isVirtualCwd, agent, mode) {
+    const targetAgent = normalizeAgent(agent);
+    const targetMode = saveModeForAgent(targetAgent, mode);
+    const reasoningEffort = getSavedReasoningEffortForAgent(targetAgent);
+    return isVirtualCwd
+      ? { type: 'new_session', cwd: project.path, agent: targetAgent, mode: targetMode, reasoningEffort }
+      : { type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort };
   }
 
   function normalizeCodexReasoningEffort(value) {
@@ -4365,7 +4467,7 @@
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       sessionState.currentMode = snapshot.mode;
       modeSelect.value = sessionState.currentMode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     }
     sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(snapshot.reasoningEffort);
     localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
@@ -5149,7 +5251,7 @@
     if (!msg.mode || !MODE_LABELS[msg.mode]) return;
     sessionState.currentMode = msg.mode;
     modeSelect.value = sessionState.currentMode;
-    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+    saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     updateAgentScopedUI();
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
@@ -7573,12 +7675,9 @@
     const actions = document.createElement('div');
     actions.className = 'project-group-actions';
 
-    const createProjectSession = () => {
-      const nextMode = getSavedModeForAgent(selectedAgent);
-      const nextReasoningEffort = getSavedReasoningEffortForAgent(selectedAgent);
-      send(isVirtualCwd
-        ? { type: 'new_session', cwd: project.path, agent: selectedAgent, mode: nextMode, reasoningEffort: nextReasoningEffort }
-        : { type: 'new_session', projectId: project.id, agent: selectedAgent, mode: nextMode, reasoningEffort: nextReasoningEffort });
+    const createProjectSession = (agent = selectedAgent, mode = getSavedModeForAgent(agent)) => {
+      const preference = applyNewSessionAgentPreference(agent, mode, { syncMode: !sessionState.currentSessionId });
+      send(normalizeProjectSessionPayload(project, isVirtualCwd, preference.agent, preference.mode));
     };
 
     /* --- Quick new chat button --- */
@@ -7588,12 +7687,60 @@
     newChatBtn.type = 'button';
     newChatBtn.setAttribute('aria-label', `在 ${project.name} 中新建会话`);
     newChatBtn.textContent = '+';
-    newChatBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      closeOpenProjectMenus();
-      createProjectSession();
-    });
     actions.appendChild(newChatBtn);
+
+    const newSessionMenu = document.createElement('div');
+    newSessionMenu.className = 'project-group-menu project-group-new-session-menu';
+    newSessionMenu.hidden = true;
+
+    function buildProjectNewSessionMenuRow(agent) {
+      const targetAgent = normalizeAgent(agent);
+      const row = document.createElement('div');
+      row.className = 'project-group-new-session-row';
+
+      const copy = document.createElement('div');
+      copy.className = 'project-group-new-session-copy';
+
+      const name = document.createElement('div');
+      name.className = 'project-group-new-session-name';
+      name.textContent = AGENT_LABELS[targetAgent] || targetAgent;
+
+      const hint = document.createElement('div');
+      hint.className = 'project-group-new-session-hint';
+      hint.textContent = `默认 ${MODE_LABELS[getDefaultModeForAgent(targetAgent)] || getDefaultModeForAgent(targetAgent)}`;
+
+      copy.appendChild(name);
+      copy.appendChild(hint);
+
+      const modePicker = document.createElement('select');
+      modePicker.className = 'project-group-new-session-mode';
+      modePicker.dataset.newSessionAgent = targetAgent;
+      modePicker.setAttribute('aria-label', `${AGENT_LABELS[targetAgent] || targetAgent} 权限模式`);
+      modePicker.innerHTML = buildPermissionModeOptionsHtml(getSavedModeForAgent(targetAgent));
+      modePicker.addEventListener('click', (e) => e.stopPropagation());
+      modePicker.addEventListener('change', () => {
+        saveModeForAgent(targetAgent, modePicker.value);
+      });
+
+      const launch = document.createElement('button');
+      launch.type = 'button';
+      launch.className = 'project-group-new-session-launch';
+      launch.textContent = '创建';
+      launch.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeOpenProjectMenus();
+        createProjectSession(targetAgent, modePicker.value);
+      });
+
+      row.appendChild(copy);
+      row.appendChild(modePicker);
+      row.appendChild(launch);
+      return row;
+    }
+
+    newSessionMenu.appendChild(buildProjectNewSessionMenuRow('codex'));
+    newSessionMenu.appendChild(buildProjectNewSessionMenuRow('claude'));
+    document.body.appendChild(newSessionMenu);
 
     /* --- "..." trigger button --- */
     const moreBtn = document.createElement('button');
@@ -7689,13 +7836,14 @@
 
     document.body.appendChild(menu);
 
-    function positionMenu() {
-      const rect = moreBtn.getBoundingClientRect();
+    function positionProjectFloatingMenu(targetMenu, triggerBtn, options = {}) {
+      const rect = triggerBtn.getBoundingClientRect();
       // Measure menu without affecting layout
-      menu.style.visibility = 'hidden';
-      menu.hidden = false;
-      const menuRect = menu.getBoundingClientRect();
+      targetMenu.style.visibility = 'hidden';
+      targetMenu.hidden = false;
+      const menuRect = targetMenu.getBoundingClientRect();
       const viewportH = window.innerHeight;
+      const viewportW = window.innerWidth;
       const spaceBelow = viewportH - rect.bottom;
       const spaceAbove = rect.top;
 
@@ -7705,12 +7853,25 @@
       } else {
         top = rect.top - menuRect.height - 4;
       }
-      // Ensure menu stays within viewport vertically
+      // Ensure menu stays within viewport vertically/horizontally
       top = Math.max(4, Math.min(top, viewportH - menuRect.height - 4));
+      const baseLeft = rect.right - menuRect.width;
+      const anchoredLeft = options.alignToViewportRight
+        ? viewportW - menuRect.width - 4
+        : baseLeft;
+      const left = Math.max(4, Math.min(anchoredLeft, viewportW - menuRect.width - 4));
 
-      menu.style.top = top + 'px';
-      menu.style.left = Math.max(4, rect.right - menuRect.width) + 'px';
-      menu.style.visibility = '';
+      targetMenu.style.top = top + 'px';
+      targetMenu.style.left = left + 'px';
+      targetMenu.style.visibility = '';
+    }
+
+    function positionMenu() {
+      positionProjectFloatingMenu(menu, moreBtn);
+    }
+
+    function positionNewSessionMenu() {
+      positionProjectFloatingMenu(newSessionMenu, moreBtn);
     }
 
     function closeMenu() {
@@ -7718,6 +7879,13 @@
       menu.style.top = '';
       menu.style.left = '';
       moreBtn.classList.remove('active');
+    }
+
+    function closeNewSessionMenu() {
+      newSessionMenu.hidden = true;
+      newSessionMenu.style.top = '';
+      newSessionMenu.style.left = '';
+      newChatBtn.classList.remove('active');
     }
 
     function closeOpenProjectMenus() {
@@ -7742,17 +7910,43 @@
       }
     }
 
+    function toggleNewSessionMenu(e) {
+      e.stopPropagation();
+      if (newSessionMenu.hidden) {
+        newSessionMenu.querySelectorAll('.project-group-new-session-mode').forEach((select) => {
+          const agent = normalizeAgent(select.dataset.newSessionAgent);
+          select.innerHTML = buildPermissionModeOptionsHtml(getSavedModeForAgent(agent));
+        });
+        closeOpenProjectMenus();
+        newChatBtn.classList.add('active');
+        newSessionMenu._triggerBtn = newChatBtn;
+        positionNewSessionMenu();
+      } else {
+        closeNewSessionMenu();
+      }
+    }
+
     moreBtn.addEventListener('click', toggleMenu);
+    newChatBtn.addEventListener('click', toggleNewSessionMenu);
 
     // Close on outside click
     const outsideHandler = (e) => {
-      if (!menu.hidden && !actions.contains(e.target)) {
+      const target = e.target;
+      if ((!menu.hidden || !newSessionMenu.hidden)
+          && !actions.contains(target)
+          && !menu.contains(target)
+          && !newSessionMenu.contains(target)) {
         closeMenu();
+        closeNewSessionMenu();
       }
     };
     document.addEventListener('click', outsideHandler);
     // Clean up when group is removed
-    group._cleanupMenu = () => document.removeEventListener('click', outsideHandler);
+    group._cleanupMenu = () => {
+      document.removeEventListener('click', outsideHandler);
+      menu.remove();
+      newSessionMenu.remove();
+    };
 
     header.appendChild(main);
     header.appendChild(actions);
@@ -8509,7 +8703,7 @@
     showOptionPicker('选择权限模式', MODE_PICKER_OPTIONS, sessionState.currentMode, (value) => {
       sessionState.currentMode = value;
       modeSelect.value = sessionState.currentMode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
       if (sessionState.currentSessionId) {
         send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       }
@@ -8974,7 +9168,7 @@
       const mode = mobileModeSelect.value;
       sessionState.currentMode = mode;
       modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
       updateAgentScopedUI();
       if (sessionState.currentSessionId) send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       renderWorkspaceInsights();
@@ -9275,7 +9469,7 @@
       const mode = btn.dataset.mode;
       sessionState.currentMode = mode;
       modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
       updateAgentScopedUI();
       if (sessionState.currentSessionId) {
         send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
@@ -9285,7 +9479,7 @@
   });
   modeSelect.addEventListener('change', () => {
     sessionState.currentMode = modeSelect.value;
-    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+    saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     updateAgentScopedUI();
     if (sessionState.currentSessionId) {
       send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
@@ -10751,6 +10945,19 @@
           <button class="modal-close-btn" id="ns-close-btn">\u2715</button>
         </div>
         <div class="modal-body modal-body-project">
+          <div class="new-session-preferences" id="ns-preferences">
+            <div class="new-session-agent-tabs" id="ns-agent-tabs" aria-label="选择新会话 Agent">
+              <button type="button" class="new-session-agent-tab" data-ns-agent="codex">Codex</button>
+              <button type="button" class="new-session-agent-tab" data-ns-agent="claude">Claude</button>
+            </div>
+            <label class="new-session-mode-field">
+              <span>权限模式</span>
+              <select id="ns-mode-select" class="new-session-mode-select">
+                ${buildPermissionModeOptionsHtml('default')}
+              </select>
+            </label>
+            <div class="new-session-mode-hint" id="ns-mode-hint">Codex 默认 YOLO；Claude 默认“默认”。</div>
+          </div>
           <div class="modal-stack project-flow-shell" id="ns-step-projects" style="display:none">
             <div class="project-picker-head">
               <div class="project-picker-head-copy">
@@ -10993,7 +11200,8 @@
   }
 
   function showNewSessionModal() {
-    const targetAgent = selectedAgent;
+    let targetAgent = selectedAgent;
+    let targetMode = getSavedModeForAgent(targetAgent);
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
     overlay.id = 'new-session-overlay';
@@ -11019,6 +11227,42 @@
     const currentNameEl = overlay.querySelector('#ns-current-name');
     const currentPathEl = overlay.querySelector('#ns-current-path');
     const selectionHintEl = overlay.querySelector('#ns-selection-hint');
+    const agentTabsEl = overlay.querySelector('#ns-agent-tabs');
+    const modeSelectEl = overlay.querySelector('#ns-mode-select');
+    const modeHintEl = overlay.querySelector('#ns-mode-hint');
+
+    function updateNewSessionPreferenceControls() {
+      targetAgent = normalizeAgent(targetAgent);
+      targetMode = normalizeMode(targetMode) || getSavedModeForAgent(targetAgent);
+      agentTabsEl?.querySelectorAll('[data-ns-agent]').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.nsAgent === targetAgent);
+      });
+      if (modeSelectEl) modeSelectEl.value = targetMode;
+      if (modeHintEl) {
+        const agentLabel = AGENT_LABELS[targetAgent] || targetAgent;
+        const defaultModeLabel = MODE_LABELS[getDefaultModeForAgent(targetAgent)] || getDefaultModeForAgent(targetAgent);
+        modeHintEl.textContent = `${agentLabel} 默认 ${defaultModeLabel}，这里改动会记住为下次默认。`;
+      }
+    }
+
+    agentTabsEl?.querySelectorAll('[data-ns-agent]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        targetAgent = normalizeAgent(btn.dataset.nsAgent);
+        targetMode = getSavedModeForAgent(targetAgent);
+        applyNewSessionAgentPreference(targetAgent, targetMode, { syncMode: !sessionState.currentSessionId });
+        updateNewSessionPreferenceControls();
+      });
+    });
+    modeSelectEl?.addEventListener('change', () => {
+      targetMode = saveModeForAgent(targetAgent, modeSelectEl.value);
+      if (targetAgent === sessionState.currentAgent && !sessionState.currentSessionId) {
+        sessionState.currentMode = targetMode;
+        modeSelect.value = targetMode;
+        updateAgentScopedUI();
+      }
+      updateNewSessionPreferenceControls();
+    });
+    updateNewSessionPreferenceControls();
 
     // --- Step 1: Render project list ---
     function renderProjectPicker() {
@@ -11030,7 +11274,7 @@
         getSessionCount: (project) => getCurrentProjectSessionCount(project),
         onProjectSelect: (project) => {
           close();
-          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: getSavedModeForAgent(targetAgent), reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
+          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
         },
       });
       if (projects.length === 0) {
@@ -11147,7 +11391,7 @@
       send(existingProject
         ? { type: 'save_project', id: projectId, path: cwd }
         : { type: 'save_project', id: projectId, path: cwd, name: getPathLeaf(cwd) || cwd });
-      send({ type: 'new_session', cwd, agent: targetAgent, mode: getSavedModeForAgent(targetAgent), reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
+      send({ type: 'new_session', cwd, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
     });
 
     // Initialize — default directly into directory browser
