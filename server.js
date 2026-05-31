@@ -10,6 +10,7 @@ const XLSX = require('xlsx');
 const mammoth = require('mammoth');
 const { createAgentRuntime, buildCliSpawnCommand } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const IS_WIN = process.platform === 'win32';
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -4324,8 +4325,6 @@ function sendHistoryChunks(ws, sessionId, chunks, index = 0) {
   }
 }
 
-const IS_WIN = process.platform === 'win32';
-
 function isProcessRunning(pid) {
   try {
     process.kill(pid, 0);
@@ -4336,13 +4335,23 @@ function isProcessRunning(pid) {
 }
 
 function killProcess(pid, force = false) {
+  const numericPid = Number(pid);
+  if (!Number.isFinite(numericPid) || numericPid <= 0) return;
   try {
     if (IS_WIN) {
-      const args = ['/T', '/PID', String(pid)];
+      const args = ['/T', '/PID', String(numericPid)];
       if (force) args.unshift('/F');
       spawn('taskkill', args, { windowsHide: true, stdio: 'ignore' });
     } else {
-      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
+      const signal = force ? 'SIGKILL' : 'SIGTERM';
+      let groupKilled = false;
+      try {
+        process.kill(-numericPid, signal);
+        groupKilled = true;
+      } catch {}
+      if (!groupKilled) {
+        try { process.kill(numericPid, signal); } catch {}
+      }
     }
   } catch {}
 }
@@ -4877,6 +4886,69 @@ function canReuseBridgeState(state) {
   return !!state.scriptFingerprint && state.scriptFingerprint === currentFingerprint;
 }
 
+function readProcNullSeparatedFile(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function readProcEnvMap(pid) {
+  const env = new Map();
+  for (const item of readProcNullSeparatedFile(path.join('/proc', String(pid), 'environ'))) {
+    const index = item.indexOf('=');
+    if (index <= 0) continue;
+    env.set(item.slice(0, index), item.slice(index + 1));
+  }
+  return env;
+}
+
+function listLocalBridgeProcesses() {
+  if (IS_WIN) return [];
+  let entries = [];
+  try { entries = fs.readdirSync('/proc', { withFileTypes: true }); } catch { return []; }
+  const scriptPath = path.resolve(BRIDGE_SCRIPT_PATH);
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
+    const cmdline = readProcNullSeparatedFile(path.join('/proc', entry.name, 'cmdline'));
+    if (!cmdline.some((arg) => path.resolve(String(arg || '')) === scriptPath)) continue;
+    const env = readProcEnvMap(pid);
+    matches.push({
+      pid,
+      cmdline,
+      statePath: env.get('CC_WEB_BRIDGE_STATE_PATH') || '',
+      runtimePath: env.get('CC_WEB_BRIDGE_RUNTIME_PATH') || '',
+      usagePath: env.get('CC_WEB_BRIDGE_USAGE_PATH') || '',
+    });
+  }
+  return matches;
+}
+
+function cleanupStaleLocalBridgeProcesses(options = {}) {
+  if (IS_WIN) return 0;
+  const targetStatePath = path.resolve(String(options.statePath || BRIDGE_STATE_PATH));
+  const keepPids = new Set((Array.isArray(options.keepPids) ? options.keepPids : [])
+    .map((pid) => Number(pid))
+    .filter((pid) => Number.isFinite(pid) && pid > 0));
+  let killed = 0;
+  for (const info of listLocalBridgeProcesses()) {
+    if (path.resolve(String(info.statePath || '')) !== targetStatePath) continue;
+    if (keepPids.has(info.pid)) continue;
+    killProcess(info.pid, true);
+    killed += 1;
+    plog('WARN', 'stale_bridge_process_killed', {
+      pid: info.pid,
+      statePath: info.statePath || null,
+      keepPids: Array.from(keepPids),
+    });
+  }
+  return killed;
+}
+
 function buildLocalBridgeBaseUrl(port, kind) {
   return `http://127.0.0.1:${port}/${kind}`;
 }
@@ -4901,12 +4973,20 @@ function isBridgePortReachable(port) {
 
 function ensureLocalBridgeRunning() {
   const existing = readBridgeState();
-  if (canReuseBridgeState(existing)) {
+  const reusableExisting = canReuseBridgeState(existing);
+  cleanupStaleLocalBridgeProcesses({
+    statePath: BRIDGE_STATE_PATH,
+    keepPids: reusableExisting && existing?.pid ? [existing.pid] : [],
+  });
+  if (reusableExisting) {
     return existing;
   }
   if (existing?.pid && isProcessRunning(existing.pid)) {
     killProcess(existing.pid, true);
     sleepSync(100);
+  }
+  if (existing?.pid || fs.existsSync(BRIDGE_STATE_PATH)) {
+    deleteCachedJsonConfig(BRIDGE_STATE_PATH);
   }
 
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
@@ -4925,7 +5005,10 @@ function ensureLocalBridgeRunning() {
   const start = Date.now();
   while (Date.now() - start < BRIDGE_START_TIMEOUT_MS) {
     const state = readBridgeState();
-    if (state?.pid && isProcessRunning(state.pid) && state.port) return state;
+    if (state?.pid && isProcessRunning(state.pid) && state.port) {
+      cleanupStaleLocalBridgeProcesses({ statePath: BRIDGE_STATE_PATH, keepPids: [state.pid] });
+      return state;
+    }
     sleepSync(50);
   }
   throw new Error('本地 API 桥接服务启动超时');
@@ -5649,7 +5732,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   }
 
   applyBridgeUsageToEntry(sessionId, entry);
-  appendCodexRolloutImagesToEntry(sessionId, entry);
+  if (!entry.abortRequested) {
+    appendCodexRolloutImagesToEntry(sessionId, entry);
+  }
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
@@ -5658,7 +5743,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   removeActiveProcess(sessionId);
   cleanRunDir(sessionId);
 
-  if (!pendingSlash && tryRetryCodexTransientFailure(sessionId, entry, codexTransientErrorKind || (capacityExceeded ? 'capacity' : ''))) {
+  if (!entry.abortRequested && !pendingSlash && tryRetryCodexTransientFailure(sessionId, entry, codexTransientErrorKind || (capacityExceeded ? 'capacity' : ''))) {
     sendSessionListToProcessClients(entry, { forceRefresh: true });
     return;
   }
@@ -6509,7 +6594,7 @@ wss.on('connection', (ws, req) => {
         handleCancelQueuedMessage(ws, msg);
         break;
       case 'abort':
-        handleAbort(ws);
+        handleAbort(ws, msg);
         break;
       case 'new_session':
         handleNewSession(ws, msg);
@@ -8209,8 +8294,9 @@ function forceLogoutClient(ws, message) {
   }
 }
 
-function handleAbort(ws) {
-  const sessionId = wsSessionMap.get(ws);
+function handleAbort(ws, msg = {}) {
+  const requestedSessionId = sanitizeId(msg?.sessionId || '');
+  const sessionId = requestedSessionId || wsSessionMap.get(ws);
   if (!sessionId) return;
   const entry = activeProcesses.get(sessionId);
   if (!entry) {
@@ -8226,15 +8312,19 @@ function handleAbort(ws) {
     return;
   }
 
+  entry.abortRequested = true;
+  entry.abortRequestedAt = new Date().toISOString();
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
+  sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '正在停止当前任务…' });
   killProcess(entry.pid);
   setTimeout(() => {
     const activeEntry = activeProcesses.get(sessionId);
     if (activeEntry && activeEntry.pid === entry.pid) {
+      plog('WARN', 'user_abort_force_kill', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
       killProcess(entry.pid, true);
     }
-  }, 3000);
-  // handleProcessComplete will be triggered by the PID monitor
+  }, 1200);
+  // handleProcessComplete will be triggered by the process exit event or PID monitor
 }
 
 
@@ -8724,6 +8814,8 @@ function handleMessage(ws, msg, options = {}) {
     pendingProcessComplete: false,
     pendingExitCode: null,
     pendingSignal: null,
+    abortRequested: false,
+    abortRequestedAt: null,
     tailer: null,
   };
   setActiveProcess(currentSessionId, entry);

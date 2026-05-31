@@ -416,6 +416,62 @@ async function stopBridgeProcess(handle) {
   await stopServer(handle.child);
 }
 
+function readProcNullSeparatedFile(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function readProcEnvMap(pid) {
+  const env = new Map();
+  for (const item of readProcNullSeparatedFile(path.join('/proc', String(pid), 'environ'))) {
+    const index = item.indexOf('=');
+    if (index <= 0) continue;
+    env.set(item.slice(0, index), item.slice(index + 1));
+  }
+  return env;
+}
+
+function listRegressionBridgeProcesses() {
+  if (process.platform === 'win32') return [];
+  let entries = [];
+  try { entries = fs.readdirSync('/proc', { withFileTypes: true }); } catch { return []; }
+  const scriptPath = path.resolve(BRIDGE_PATH);
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
+    const cmdline = readProcNullSeparatedFile(path.join('/proc', entry.name, 'cmdline'));
+    if (!cmdline.some((arg) => path.resolve(String(arg || '')) === scriptPath)) continue;
+    const env = readProcEnvMap(pid);
+    matches.push({
+      pid,
+      statePath: env.get('CC_WEB_BRIDGE_STATE_PATH') || '',
+      runtimePath: env.get('CC_WEB_BRIDGE_RUNTIME_PATH') || '',
+    });
+  }
+  return matches;
+}
+
+async function cleanupRegressionBridgeProcesses(predicate) {
+  if (process.platform === 'win32') return 0;
+  let killed = 0;
+  for (const info of listRegressionBridgeProcesses()) {
+    if (!predicate(info)) continue;
+    try { process.kill(-info.pid, 'SIGKILL'); } catch {
+      try { process.kill(info.pid, 'SIGKILL'); } catch {}
+    }
+    killed += 1;
+  }
+  if (killed > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return killed;
+}
+
 async function startResponsesFallbackUpstream(port, options = {}) {
   const counters = {
     responses: 0,
@@ -3995,6 +4051,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
 }
 
 async function main() {
+  await cleanupRegressionBridgeProcesses((info) => /\/tmp\/webcoding-regression-[^/]+\//.test(info.statePath || ''));
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
@@ -4097,6 +4154,7 @@ async function main() {
       runner.finish();
     });
   } finally {
+    await cleanupRegressionBridgeProcesses((info) => String(info.statePath || '').startsWith(tempRoot + path.sep));
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }

@@ -5547,6 +5547,7 @@
     const busy = composeState.isGenerating || !!handoffPending;
     sendBtn.hidden = false;
     abortBtn.hidden = !busy;
+    abortBtn.disabled = busy ? isBlockingSessionLoad() : false;
     abortBtn.title = handoffPending ? '停止接力分析' : '停止';
     abortBtn.setAttribute('aria-label', handoffPending ? '停止接力分析' : '停止');
     sendBtn.title = busy ? '加入发送队列' : '发送';
@@ -9339,7 +9340,13 @@
   });
   sendBtn.addEventListener('click', sendMessage);
   if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
-  abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  abortBtn.addEventListener('click', () => {
+    if (abortBtn.disabled) return;
+    abortBtn.disabled = true;
+    abortBtn.title = '正在停止…';
+    abortBtn.setAttribute('aria-label', '正在停止…');
+    send({ type: 'abort', sessionId: sessionState.currentSessionId || undefined });
+  });
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {
       const btn = event.target instanceof Element ? event.target.closest('[data-queued-message-cancel]') : null;
