@@ -42,11 +42,14 @@ const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public
 const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
 const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
-const MAX_DOCUMENT_ATTACHMENT_SIZE = 20 * 1024 * 1024;
-const MAX_ATTACHMENT_SIZE = MAX_IMAGE_ATTACHMENT_SIZE;
+const ONE_GB_BYTES = 1024 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_DOCUMENT_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_FILE_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_ATTACHMENT_SIZE = ONE_GB_BYTES;
 const MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS = 120000;
 const MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS = 240000;
+const MAX_ATTACHMENT_SNIFF_BYTES = 8192;
 const MAX_MESSAGE_ATTACHMENTS = 4;
 const CODEX_CAPACITY_RETRY_MAX = 2;
 const WS_HEARTBEAT_INTERVAL_MS = 25000;
@@ -55,7 +58,7 @@ const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
 const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
 const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
 const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
-const FILE_UPLOAD_MAX_SIZE = 50 * 1024 * 1024;
+const FILE_UPLOAD_MAX_SIZE = ONE_GB_BYTES;
 const FILE_VIEW_TABLE_MAX_ROWS = 1000;
 const FILE_VIEW_TABLE_MAX_COLS = 50;
 const FILE_TREE_MAX_DEPTH = 3;
@@ -2643,6 +2646,26 @@ function extFromMime(mime) {
   }
 }
 
+function imageMimeFromFilename(filename) {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  switch (ext) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.webp': return 'image/webp';
+    case '.gif': return 'image/gif';
+    default: return '';
+  }
+}
+
+function detectAttachmentImageMime(filename, declaredMime, sniffBuffer) {
+  const magicMime = detectMimeFromMagic(sniffBuffer);
+  if (IMAGE_MIME_TYPES.has(magicMime)) return magicMime;
+  const normalizedMime = String(declaredMime || '').split(';')[0].trim().toLowerCase();
+  if (IMAGE_MIME_TYPES.has(normalizedMime)) return normalizedMime;
+  return imageMimeFromFilename(filename);
+}
+
 function detectMimeFromMagic(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
   if (
@@ -2724,6 +2747,7 @@ function safeAttachmentDataExtension(filename, mime, kind = 'image') {
   const ext = path.extname(String(filename || '').toLowerCase());
   if (kind === 'document' && DOCUMENT_ATTACHMENT_EXTENSIONS.has(ext)) return ext;
   if (kind === 'image' && ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return ext === '.jpeg' ? '.jpg' : ext;
+  if (kind === 'file') return ext || extFromMime(mime) || '.bin';
   return extFromMime(mime) || (kind === 'document' ? '.txt' : '');
 }
 
@@ -2821,9 +2845,11 @@ function extractDocumentAttachmentText(attachment) {
 }
 
 function buildAttachmentDocumentPrompt(text, attachments = []) {
-  const docs = (Array.isArray(attachments) ? attachments : []).filter((attachment) => attachment?.kind === 'document');
+  const list = Array.isArray(attachments) ? attachments : [];
+  const docs = list.filter((attachment) => attachment?.kind === 'document');
+  const files = list.filter((attachment) => attachment?.kind === 'file');
   const normalizedText = String(text || '');
-  if (docs.length === 0) return normalizedText;
+  if (docs.length === 0 && files.length === 0) return normalizedText;
   const blocks = [];
   let remaining = MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS;
   for (const doc of docs) {
@@ -2842,7 +2868,12 @@ function buildAttachmentDocumentPrompt(text, attachments = []) {
     blocks.push(`<document filename="${safeName}" mime="${doc.mime || ''}" size="${doc.size || 0}">\n${body}${note}\n</document>`);
     if (remaining <= 0) break;
   }
-  return `下面是用户上传到聊天窗口的临时文档附件内容。附件只存放在临时附件区，不在当前工作目录中。请基于这些内容回答用户。\n\n${blocks.join('\n\n')}\n\n用户问题：\n${normalizedText}`;
+  for (const file of files) {
+    const safeName = String(file.filename || file.id || 'file').replace(/"/g, '&quot;');
+    const safePath = String(file.path || '').replace(/"/g, '&quot;');
+    blocks.push(`<file filename="${safeName}" mime="${file.mime || ''}" size="${file.size || 0}" path="${safePath}">\n该附件是任意文件/二进制文件，已保存到本机临时附件路径；如需分析、解压或读取，请直接使用 path。\n</file>`);
+  }
+  return `下面是用户上传到聊天窗口的临时附件。文档会尽量提取文本；任意文件会提供本机临时路径。附件只存放在临时附件区，不在当前工作目录中。请基于这些内容回答用户；如果是压缩包或二进制文件，可按 path 自行读取或解压。\n\n${blocks.join('\n\n')}\n\n用户问题：\n${normalizedText}`;
 }
 
 function messageAttachmentHistoryMeta(attachment) {
@@ -3025,8 +3056,8 @@ function normalizeMessageAttachments(attachments) {
     normalized.push({
       id,
       kind,
-      filename: meta?.filename || attachment?.filename || (kind === 'document' ? 'document' : 'image'),
-      mime: meta?.mime || attachment?.mime || (kind === 'document' ? 'application/octet-stream' : 'image/png'),
+      filename: meta?.filename || attachment?.filename || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file')),
+      mime: meta?.mime || attachment?.mime || (kind === 'image' ? 'image/png' : 'application/octet-stream'),
       documentType: meta?.documentType || attachment?.documentType || null,
       size: meta?.size || attachment?.size || 0,
       createdAt: meta?.createdAt || attachment?.createdAt || null,
@@ -5840,15 +5871,15 @@ const server = http.createServer((req, res) => {
     }
     const filePath = path.resolve(meta.path);
     const root = path.resolve(ATTACHMENTS_DIR);
-    if (!isPathInside(filePath, root) || !['image', 'document'].includes(meta.kind || 'image')) {
+    if (!isPathInside(filePath, root) || !['image', 'document', 'file'].includes(meta.kind || 'image')) {
       writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('Forbidden');
     }
-    const asciiFilename = safeFilename(meta.filename).replace(/[^A-Za-z0-9._-]+/g, '_') || (meta.kind === 'document' ? 'document' : 'image');
+    const asciiFilename = safeFilename(meta.filename).replace(/[^A-Za-z0-9._-]+/g, '_') || (meta.kind === 'image' ? 'image' : (meta.kind === 'document' ? 'document' : 'file'));
     writeHeadWithSecurity(res, 200, {
       'Content-Type': meta.mime,
       'Content-Length': String(meta.size || fs.statSync(filePath).size),
-      'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(meta.filename || 'image')}`,
+      'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(meta.filename || asciiFilename)}`,
       'Cache-Control': 'private, max-age=300',
     });
     fs.createReadStream(filePath).on('error', () => {
@@ -5862,7 +5893,7 @@ const server = http.createServer((req, res) => {
     if (!token || !hasActiveToken(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
-    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase() || 'application/octet-stream';
     let rawName = 'attachment';
     try {
       rawName = decodeURIComponent(String(req.headers['x-filename'] || 'attachment'));
@@ -5870,54 +5901,45 @@ const server = http.createServer((req, res) => {
       rawName = String(req.headers['x-filename'] || 'attachment');
     }
     const filename = safeFilename(rawName);
-    const documentInfo = inferDocumentAttachmentType(filename, mime);
-    const isImageAttachment = IMAGE_MIME_TYPES.has(mime);
-    const isDocumentAttachment = !isImageAttachment && !!documentInfo;
-    if (!isImageAttachment && !isDocumentAttachment) {
-      return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片，或 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 文档' });
-    }
-    const sizeLimit = isImageAttachment ? MAX_IMAGE_ATTACHMENT_SIZE : MAX_DOCUMENT_ATTACHMENT_SIZE;
-
-    const chunks = [];
+    const initialDocumentInfo = inferDocumentAttachmentType(filename, mime);
+    const initialKind = IMAGE_MIME_TYPES.has(mime) ? 'image' : (initialDocumentInfo ? 'document' : 'file');
+    const initialEffectiveMime = initialDocumentInfo?.mime || mime || 'application/octet-stream';
+    const sizeLimit = MAX_ATTACHMENT_SIZE;
+    const id = crypto.randomUUID();
+    const ext = safeAttachmentDataExtension(filename, initialEffectiveMime, initialKind);
+    const dataPath = attachmentDataPath(id, ext);
+    const writeStream = fs.createWriteStream(dataPath, { flags: 'wx' });
     let total = 0;
-    let aborted = false;
-    req.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > sizeLimit) {
-        aborted = true;
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
+    let responded = false;
+    let finishedRequest = false;
+    let sniffTotal = 0;
+    const sniffChunks = [];
+
+    const cleanup = () => {
+      try { writeStream.destroy(); } catch {}
+      try { if (fs.existsSync(dataPath)) fs.unlinkSync(dataPath); } catch {}
+      try { if (fs.existsSync(attachmentMetaPath(id))) fs.unlinkSync(attachmentMetaPath(id)); } catch {}
+    };
+    const fail = (statusCode, message) => {
+      if (responded || res.headersSent) return;
+      responded = true;
+      cleanup();
+      jsonResponse(res, statusCode, { ok: false, message });
+    };
+
+    writeStream.on('error', (err) => {
+      if (!responded) fail(err?.code === 'EEXIST' ? 409 : 500, err?.code === 'EEXIST' ? `附件已存在：${filename}` : '保存附件失败，请稍后重试');
     });
-    req.on('end', () => {
-      if (aborted) {
-        return jsonResponse(res, 413, { ok: false, message: isImageAttachment ? '图片大小不能超过 10MB' : '文档大小不能超过 20MB' });
-      }
-      const buffer = Buffer.concat(chunks);
-      if (buffer.length === 0) {
-        return jsonResponse(res, 400, { ok: false, message: isImageAttachment ? '图片内容为空' : '文档内容为空' });
-      }
-      let kind = 'image';
-      let effectiveMime = mime;
-      let documentType = null;
-      if (isImageAttachment) {
-        const actualMime = detectMimeFromMagic(buffer);
-        if (!actualMime || actualMime !== mime) {
-          return jsonResponse(res, 400, { ok: false, message: '图片内容与声明类型不一致或文件已损坏' });
-        }
-      } else {
-        const validation = validateDocumentAttachmentBuffer(buffer, filename, mime);
-        if (validation.error) {
-          return jsonResponse(res, 400, { ok: false, message: validation.error });
-        }
-        kind = 'document';
-        effectiveMime = validation.mime || documentInfo.mime || mime || 'application/octet-stream';
-        documentType = validation.type || documentInfo.type || null;
-      }
-      const id = crypto.randomUUID();
-      const ext = safeAttachmentDataExtension(filename, effectiveMime, kind);
-      const dataPath = attachmentDataPath(id, ext);
+    writeStream.on('finish', () => {
+      if (responded) return;
+      if (!finishedRequest) return;
+      if (total === 0) return fail(400, '附件内容为空');
+      const sniffBuffer = Buffer.concat(sniffChunks, sniffTotal);
+      const imageMime = detectAttachmentImageMime(filename, mime, sniffBuffer);
+      const documentInfo = imageMime ? null : inferDocumentAttachmentType(filename, mime);
+      const kind = imageMime ? 'image' : (documentInfo ? 'document' : 'file');
+      const effectiveMime = imageMime || documentInfo?.mime || mime || 'application/octet-stream';
+      const documentType = documentInfo?.type || null;
       const now = new Date();
       const meta = {
         id,
@@ -5925,14 +5947,14 @@ const server = http.createServer((req, res) => {
         filename,
         mime: effectiveMime,
         documentType,
-        size: buffer.length,
+        size: total,
         createdAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + ATTACHMENT_TTL_MS).toISOString(),
         path: dataPath,
       };
       try {
-        fs.writeFileSync(dataPath, buffer);
         saveAttachmentMeta(meta);
+        responded = true;
         return jsonResponse(res, 200, {
           ok: true,
           attachment: {
@@ -5941,20 +5963,43 @@ const server = http.createServer((req, res) => {
             filename,
             mime: effectiveMime,
             documentType,
-            size: buffer.length,
+            size: total,
             createdAt: meta.createdAt,
             expiresAt: meta.expiresAt,
             storageState: 'available',
           },
         });
       } catch (err) {
-        try { if (fs.existsSync(dataPath)) fs.unlinkSync(dataPath); } catch {}
-        try { if (fs.existsSync(attachmentMetaPath(id))) fs.unlinkSync(attachmentMetaPath(id)); } catch {}
-        return jsonResponse(res, 500, { ok: false, message: '保存附件失败，请稍后重试' });
+        return fail(500, '保存附件失败，请稍后重试');
       }
     });
+    writeStream.on('drain', () => {
+      try { req.resume(); } catch {}
+    });
+    req.on('data', (chunk) => {
+      if (responded) return;
+      total += chunk.length;
+      if (total > sizeLimit) {
+        fail(413, '上传文件不能超过 1GB');
+        try { req.destroy(); } catch {}
+        return;
+      }
+      if (sniffTotal < MAX_ATTACHMENT_SNIFF_BYTES) {
+        const slice = chunk.subarray(0, Math.min(chunk.length, MAX_ATTACHMENT_SNIFF_BYTES - sniffTotal));
+        sniffChunks.push(slice);
+        sniffTotal += slice.length;
+      }
+      if (!writeStream.write(chunk)) {
+        try { req.pause(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      if (responded) return;
+      finishedRequest = true;
+      writeStream.end();
+    });
     req.on('error', () => {
-      if (!res.headersSent) jsonResponse(res, aborted ? 413 : 500, { ok: false, message: aborted ? (isImageAttachment ? '图片大小不能超过 10MB' : '文档大小不能超过 20MB') : '上传过程中断' });
+      if (!responded && !res.headersSent) fail(500, '上传过程中断');
     });
     return;
   }
@@ -6017,30 +6062,32 @@ const server = http.createServer((req, res) => {
       return jsonResponse(res, 409, { ok: false, message: `文件已存在：${filename}` });
     }
 
-    const chunks = [];
+    const writeStream = fs.createWriteStream(targetPath, { flags: 'wx' });
     let total = 0;
     let responded = false;
+    let finishedRequest = false;
+    const cleanup = () => {
+      try { writeStream.destroy(); } catch {}
+      try { if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath); } catch {}
+    };
     const fail = (statusCode, message) => {
       if (responded || res.headersSent) return;
       responded = true;
+      cleanup();
       jsonResponse(res, statusCode, { ok: false, message });
     };
-    req.on('data', (chunk) => {
+    writeStream.on('error', (err) => {
       if (responded) return;
-      total += chunk.length;
-      if (total > FILE_UPLOAD_MAX_SIZE) {
-        fail(413, '上传文件不能超过 50MB');
-        try { req.destroy(); } catch {}
-        return;
-      }
-      chunks.push(chunk);
+      const exists = err?.code === 'EEXIST';
+      if (exists) return fail(409, `文件已存在：${filename}`);
+      return fail(500, err?.message || '保存上传文件失败');
     });
-    req.on('end', () => {
+    writeStream.on('finish', () => {
       if (responded) return;
+      if (!finishedRequest) return;
       try {
-        const buffer = Buffer.concat(chunks);
-        fs.writeFileSync(targetPath, buffer, { flag: 'wx' });
         const stat = fs.statSync(targetPath);
+        responded = true;
         return jsonResponse(res, 200, {
           ok: true,
           uploaded: true,
@@ -6048,12 +6095,31 @@ const server = http.createServer((req, res) => {
           relativePath: path.relative(root, targetPath) || filename,
         });
       } catch (err) {
-        const exists = err?.code === 'EEXIST';
-        return jsonResponse(res, exists ? 409 : 500, { ok: false, message: exists ? `文件已存在：${filename}` : (err.message || '保存上传文件失败') });
+        return fail(500, err?.message || '保存上传文件失败');
       }
     });
+    writeStream.on('drain', () => {
+      try { req.resume(); } catch {}
+    });
+    req.on('data', (chunk) => {
+      if (responded) return;
+      total += chunk.length;
+      if (total > FILE_UPLOAD_MAX_SIZE) {
+        fail(413, '上传文件不能超过 1GB');
+        try { req.destroy(); } catch {}
+        return;
+      }
+      if (!writeStream.write(chunk)) {
+        try { req.pause(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      if (responded) return;
+      finishedRequest = true;
+      writeStream.end();
+    });
     req.on('error', () => {
-      if (!responded && !res.headersSent) jsonResponse(res, 500, { ok: false, message: '上传过程中断' });
+      if (!responded && !res.headersSent) fail(500, '上传过程中断');
     });
     return;
   }

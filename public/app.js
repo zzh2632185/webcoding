@@ -65,7 +65,7 @@
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
   const FILE_REF_TRANSFER_TYPE = 'application/x-webcoding-file-ref';
   const FILE_MOVE_TRANSFER_TYPE = 'application/x-webcoding-file-move';
-  const FILE_UPLOAD_MAX_SIZE = 50 * 1024 * 1024;
+  const FILE_UPLOAD_MAX_SIZE = 1024 * 1024 * 1024;
   const MAX_PENDING_FILE_REFS = 8;
   const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
   const MAX_PENDING_ATTACHMENTS = 4;
@@ -314,13 +314,9 @@
   const attachmentTray = $('#attachment-tray');
   const queuedMessageList = $('#queued-message-list');
   const fileUploadInput = $('#file-upload-input');
-  const imageUploadInput = $('#image-upload-input');
-  const documentUploadInput = $('#document-upload-input');
   const attachBtn = $('#attach-btn');
   const attachMenu = $('#attach-menu');
   const attachUploadFile = $('#attach-upload-file');
-  const attachUploadImage = $('#attach-upload-image');
-  const attachUploadDocument = $('#attach-upload-document');
   const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
   const messagesWrap = messagesDiv?.closest('.messages-wrap');
@@ -2396,11 +2392,13 @@
   }
 
   function attachmentKindLabel(attachment = {}) {
-    return (attachment.kind || 'image') === 'document' ? '文档' : '图片';
+    if (isImageAttachment(attachment)) return '图片';
+    return (attachment.kind || '') === 'document' ? '文档' : '文件';
   }
 
   function attachmentDefaultName(attachment = {}) {
-    return (attachment.kind || 'image') === 'document' ? 'document' : 'image';
+    if (isImageAttachment(attachment)) return 'image';
+    return (attachment.kind || '') === 'document' ? 'document' : 'file';
   }
 
   function isImageAttachment(attachment = {}) {
@@ -2420,8 +2418,8 @@
     return {
       id,
       kind,
-      filename: attachment.filename || (kind === 'document' ? 'document' : 'image'),
-      mime: attachment.mime || (kind === 'document' ? 'application/octet-stream' : 'image/png'),
+      filename: attachment.filename || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file')),
+      mime: attachment.mime || (kind === 'image' ? 'image/png' : 'application/octet-stream'),
       documentType: attachment.documentType || null,
       size: Number(attachment.size || 0) || 0,
       createdAt: attachment.createdAt || null,
@@ -2559,8 +2557,8 @@
             data-size="${escapeHtml(String(attachment.size || ''))}"
             data-mime="${escapeHtml(attachment.mime || '')}"
             ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
-            aria-label="下载文档 ${name}">
-            <span class="attachment-thumb document" aria-hidden="true">📄</span>
+            aria-label="下载附件 ${name}">
+            <span class="attachment-thumb document" aria-hidden="true">${kind === 'document' ? '📄' : '📦'}</span>
             <span class="attachment-thumb-meta">
               <span class="attachment-thumb-title">${kindLabel}: ${name}${stateSuffix}</span>
               <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
@@ -2651,7 +2649,7 @@
             data-size="${escapeHtml(String(attachment.size || ''))}"
             data-mime="${escapeHtml(attachment.mime || '')}"
             aria-label="查看附件 ${escapeHtml(name)}">
-            ${isImage && attachment.previewUrl ? `<img src="${escapeHtml(attachment.previewUrl)}" alt="">` : '📄'}
+            ${isImage && attachment.previewUrl ? `<img src="${escapeHtml(attachment.previewUrl)}" alt="">` : ((attachment.kind || '') === 'document' ? '📄' : '📦')}
           </button>
           <div class="attachment-chip-meta">
             <span class="attachment-chip-name">${escapeHtml(name)}</span>
@@ -2674,7 +2672,7 @@
             data-size="${escapeHtml(String(attachment.size || ''))}"
             data-mime="${escapeHtml(attachment.mime || '')}"
             aria-label="查看附件 ${escapeHtml(name)}">
-            ${previewSrc ? `<img src="${escapeHtml(previewSrc)}" alt="">` : (isImage ? '' : '📄')}
+            ${previewSrc ? `<img src="${escapeHtml(previewSrc)}" alt="">` : (isImage ? '' : ((attachment.kind || '') === 'document' ? '📄' : '📦'))}
           </button>
           <div class="attachment-chip-meta">
             <span class="attachment-chip-name">${escapeHtml(name)}</span>
@@ -3202,7 +3200,7 @@
     const tooLarge = uploadFiles.filter((file) => file.size > FILE_UPLOAD_MAX_SIZE);
     const validFiles = uploadFiles.filter((file) => file.size <= FILE_UPLOAD_MAX_SIZE);
     if (tooLarge.length > 0) {
-      appendError(`${tooLarge.length} 个文件超过 50MB，已跳过。`);
+      appendError(`${tooLarge.length} 个文件超过 1GB，已跳过。`);
     }
     if (validFiles.length === 0) return;
     let okCount = 0;
@@ -3500,7 +3498,7 @@
 
   function toggleAttachMenu() {
     if (!attachMenu) {
-      imageUploadInput?.click();
+      fileUploadInput?.click();
       return;
     }
     const nextHidden = !attachMenu.hidden;
@@ -4035,7 +4033,7 @@
     const headers = {
       'Authorization': `Bearer ${connectionState.authToken}`,
       'Content-Type': file.type || 'application/octet-stream',
-      'X-Filename': encodeURIComponent(file.name || (kind === 'document' ? 'document' : 'image')),
+      'X-Filename': encodeURIComponent(file.name || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file'))),
     };
     const response = await fetch('/api/attachments', {
       method: 'POST',
@@ -4053,7 +4051,7 @@
       throw new Error('登录状态已失效，请刷新页面后重新登录再上传附件。');
     }
     if (response.status === 413) {
-      throw new Error(kind === 'document' ? '文档大小超过当前上传限制，请控制到 20MB 以内后重试。' : '图片大小超过当前上传限制，请压缩到 10MB 以内后重试。');
+      throw new Error('文件大小超过当前上传限制，请控制到 1GB 以内后重试。');
     }
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || `上传失败 (${response.status})`);
@@ -4061,108 +4059,77 @@
     return data.attachment;
   }
 
-  async function uploadImageFile(file) {
-    return uploadAttachmentFile(file, { kind: 'image' });
+  function fileUploadLooksLikeImage(file = {}) {
+    const type = String(file.type || '').toLowerCase();
+    if (/^image\//.test(type)) return true;
+    const name = String(file.name || '').toLowerCase();
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : '';
+    return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
   }
 
-  async function handleSelectedImageFiles(fileList) {
-    const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
+  function attachmentUploadKindForFile(file = {}) {
+    if (fileUploadLooksLikeImage(file)) return 'image';
+    if (documentUploadLooksSupported(file)) return 'document';
+    return 'file';
+  }
+
+  async function handleSelectedAttachmentFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
     if (!files.length) return;
     const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
     if (totalAttachments > MAX_PENDING_ATTACHMENTS) {
       appendError(`单条消息最多附带 ${MAX_PENDING_ATTACHMENTS} 个附件。`);
       return;
     }
-    const batch = files.map((file, index) => ({
-      id: nextLocalId(`upload-${index}`),
-      kind: 'image',
-      filename: file.name || 'image',
-      size: file.size || 0,
-      mime: file.type || '',
-      previewUrl: URL.createObjectURL(file),
-    }));
+    const batch = files.map((file, index) => {
+      const kind = attachmentUploadKindForFile(file);
+      const previewUrl = kind === 'image' ? URL.createObjectURL(file) : '';
+      return {
+        id: nextLocalId(`upload-${index}`),
+        kind,
+        filename: file.name || attachmentDefaultName({ kind }),
+        size: file.size || 0,
+        mime: file.type || 'application/octet-stream',
+        previewUrl,
+      };
+    });
     composeState.uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
       const results = await Promise.allSettled(files.map(async (file, index) => {
-        const optimized = await compressImageFile(file);
-        const attachment = await uploadImageFile(optimized);
-        return {
-          ...attachment,
-          previewUrl: batch[index]?.previewUrl || '',
-        };
+        const kind = attachmentUploadKindForFile(file);
+        let uploadFile = file;
+        if (kind === 'image') {
+          try { uploadFile = await compressImageFile(file); } catch {}
+        }
+        const attachment = await uploadAttachmentFile(uploadFile, { kind });
+        const previewUrl = batch[index]?.previewUrl || '';
+        if (attachment.kind === 'image' && previewUrl) {
+          return { ...attachment, previewUrl };
+        }
+        if (previewUrl) {
+          try { URL.revokeObjectURL(previewUrl); } catch {}
+        }
+        return attachment;
       }));
       const errors = [];
-      for (const [index, result] of results.entries()) {
+      for (const result of results) {
         if (result.status === 'fulfilled') {
           composeState.pendingAttachments.push(result.value);
-          rememberAttachmentPreviewUrl(result.value.id, result.value.previewUrl);
-        } else {
-          const failedPreview = batch[index]?.previewUrl || '';
-          if (failedPreview) {
-            try { URL.revokeObjectURL(failedPreview); } catch {}
+          if (result.value?.kind === 'image' && result.value.previewUrl) {
+            rememberAttachmentPreviewUrl(result.value.id, result.value.previewUrl);
           }
-          errors.push(result.reason?.message || '图片上传失败');
+        } else {
+          errors.push(result.reason?.message || '文件上传失败');
         }
-      }
-      if (errors.length > 0) {
-        appendError(errors[0]);
-      }
-    } catch (err) {
-      appendError(err.message || '图片上传失败');
-    } finally {
-      composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
-      renderPendingAttachments();
-      if (imageUploadInput) imageUploadInput.value = '';
-    }
-  }
-
-  async function handleSelectedDocumentFiles(fileList) {
-    const files = Array.from(fileList || []).filter((file) => file && documentUploadLooksSupported(file));
-    if (!files.length) {
-      appendError('请选择 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 等支持的文档。');
-      if (documentUploadInput) documentUploadInput.value = '';
-      return;
-    }
-    const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
-    if (totalAttachments > MAX_PENDING_ATTACHMENTS) {
-      appendError(`单条消息最多附带 ${MAX_PENDING_ATTACHMENTS} 个附件。`);
-      return;
-    }
-    const batch = files.map((file, index) => ({
-      id: nextLocalId(`upload-doc-${index}`),
-      kind: 'document',
-      filename: file.name || 'document',
-      size: file.size || 0,
-      mime: file.type || 'application/octet-stream',
-    }));
-    composeState.uploadingAttachments.push(...batch);
-    renderPendingAttachments();
-    try {
-      const results = await Promise.allSettled(files.map((file) => uploadAttachmentFile(file, { kind: 'document' })));
-      const errors = [];
-      for (const result of results) {
-        if (result.status === 'fulfilled') composeState.pendingAttachments.push(result.value);
-        else errors.push(result.reason?.message || '文档上传失败');
       }
       if (errors.length > 0) appendError(errors[0]);
     } catch (err) {
-      appendError(err.message || '文档上传失败');
+      appendError(err.message || '文件上传失败');
     } finally {
       composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
       renderPendingAttachments();
-      if (documentUploadInput) documentUploadInput.value = '';
-    }
-  }
-
-  function handleSelectedAttachmentFiles(fileList) {
-    const files = Array.from(fileList || []).filter(Boolean);
-    const imageFiles = files.filter((file) => /^image\//.test(file.type || ''));
-    const documentFiles = files.filter((file) => !/^image\//.test(file.type || '') && documentUploadLooksSupported(file));
-    if (imageFiles.length) handleSelectedImageFiles(imageFiles);
-    if (documentFiles.length) handleSelectedDocumentFiles(documentFiles);
-    if (!imageFiles.length && !documentFiles.length && files.length) {
-      appendError('只支持上传图片或 TXT/MD/PDF/DOC/DOCX/XLSX/CSV 等文档。');
+      if (fileUploadInput) fileUploadInput.value = '';
     }
   }
 
@@ -9396,18 +9363,6 @@
       fileUploadInput.click();
     });
   }
-  if (attachUploadImage && imageUploadInput) {
-    attachUploadImage.addEventListener('click', () => {
-      closeAttachMenu();
-      imageUploadInput.click();
-    });
-  }
-  if (attachUploadDocument && documentUploadInput) {
-    attachUploadDocument.addEventListener('click', () => {
-      closeAttachMenu();
-      documentUploadInput.click();
-    });
-  }
   if (attachReferenceFile) {
     attachReferenceFile.addEventListener('click', () => {
       closeAttachMenu();
@@ -9418,16 +9373,6 @@
     fileUploadInput.addEventListener('change', () => {
       handleSelectedAttachmentFiles(fileUploadInput.files);
       fileUploadInput.value = '';
-    });
-  }
-  if (imageUploadInput) {
-    imageUploadInput.addEventListener('change', () => {
-      handleSelectedImageFiles(imageUploadInput.files);
-    });
-  }
-  if (documentUploadInput) {
-    documentUploadInput.addEventListener('change', () => {
-      handleSelectedDocumentFiles(documentUploadInput.files);
     });
   }
   document.addEventListener('click', (event) => {
@@ -9560,7 +9505,7 @@
       .filter(Boolean);
     if (files.length > 0) {
       e.preventDefault();
-      handleSelectedImageFiles(files);
+      handleSelectedAttachmentFiles(files);
     }
   });
 

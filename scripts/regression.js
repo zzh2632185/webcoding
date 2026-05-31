@@ -1496,33 +1496,55 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
 
 async function runAttachmentBoundaryRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ token }) => {
-    try {
-      const oversizedUpload = await uploadAttachmentExpectFailure(
-        port,
-        token,
-        {
-          filename: 'too-large.png',
-          mime: 'image/png',
-          data: Buffer.alloc(10 * 1024 * 1024 + 1, 0),
-        },
-        413,
-      );
-      assert(/10MB/.test(oversizedUpload.payload.message || ''), 'Oversized attachment should be rejected with size limit message');
-    } catch (error) {
-      assert(/fetch failed|socket hang up|ECONNRESET/i.test(error.message || ''), 'Oversized attachment should be rejected or connection aborted by the server');
-    }
-
-    const invalidTypeUpload = await uploadAttachmentExpectFailure(
+    const pngBytesWithWrongMime = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+      'base64',
+    );
+    const sniffedImageUpload = await uploadAttachment(
       port,
       token,
       {
-        filename: 'unsupported.zip',
-        mime: 'application/zip',
-        data: Buffer.from('not a supported attachment'),
+        filename: 'clipboard-image',
+        mime: 'application/octet-stream',
+        data: pngBytesWithWrongMime,
       },
-      400,
     );
-    assert(/仅支持/.test(invalidTypeUpload.payload.message || ''), 'Unsupported attachment mime type should be rejected');
+    assert(sniffedImageUpload.kind === 'image', 'Image attachments should be detected from file magic even when browser MIME is generic');
+    assert(sniffedImageUpload.mime === 'image/png', 'Sniffed image MIME should be persisted for preview');
+    const imageResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/${sniffedImageUpload.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(imageResponse.ok, 'Sniffed image attachment should be downloadable for preview');
+    assert(/^image\/png/i.test(imageResponse.headers.get('content-type') || ''), 'Sniffed image preview response should use image/png content type');
+
+    const genericUpload = await uploadAttachment(
+      port,
+      token,
+      {
+        filename: 'project.zip',
+        mime: 'application/zip',
+        data: Buffer.from('fake zip payload used by regression'),
+      },
+    );
+    assert(genericUpload.kind === 'file', 'Unsupported document/image types should be accepted as generic file attachments');
+    assert(genericUpload.filename === 'project.zip', 'Generic attachment should preserve the uploaded filename');
+    assert(genericUpload.size > 0, 'Generic attachment should report uploaded size');
+    const genericResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/${genericUpload.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(genericResponse.ok, 'Generic file attachments should be downloadable');
+
+    const largerUpload = await uploadAttachment(
+      port,
+      token,
+      {
+        filename: 'large.bin',
+        mime: 'application/octet-stream',
+        data: Buffer.alloc(10 * 1024 * 1024 + 1, 0),
+      },
+    );
+    assert(largerUpload.kind === 'file', 'Large arbitrary files below 1GB should be accepted');
+    assert(largerUpload.size === 10 * 1024 * 1024 + 1, 'Large arbitrary file size should be preserved');
   });
 }
 
