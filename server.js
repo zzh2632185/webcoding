@@ -3712,9 +3712,90 @@ function buildQueuedMessagesPayload(session) {
   }));
 }
 
+function clipSideConversationText(value, limit = 1200) {
+  const text = String(value || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}…`;
+}
+
+function normalizeSideConversationMessageContext(raw, index = -1) {
+  if (!raw || typeof raw !== 'object') return null;
+  const text = clipSideConversationText(raw.text || raw.content || raw.messageText || '', 1200);
+  if (!text) return null;
+  const role = String(raw.role || 'message').slice(0, 40);
+  return {
+    role,
+    text,
+    index: Number.isFinite(raw.index) ? raw.index : index,
+    messageId: sanitizeId(raw.messageId || ''),
+    timestamp: String(raw.timestamp || '').slice(0, 80),
+  };
+}
+
+function normalizeSideConversationParentContext(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const recentMessages = Array.isArray(raw.recentMessages)
+    ? raw.recentMessages.slice(-8).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const nearbyBefore = Array.isArray(raw.nearbyBefore)
+    ? raw.nearbyBefore.slice(-2).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const nearbyAfter = Array.isArray(raw.nearbyAfter)
+    ? raw.nearbyAfter.slice(0, 2).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const anchorRaw = raw.anchor && typeof raw.anchor === 'object' ? raw.anchor : null;
+  const anchor = anchorRaw ? {
+    messageId: sanitizeId(anchorRaw.messageId || ''),
+    role: String(anchorRaw.role || '').slice(0, 40),
+    index: Number.isFinite(anchorRaw.index) ? anchorRaw.index : -1,
+    timestamp: String(anchorRaw.timestamp || '').slice(0, 80),
+    messageText: clipSideConversationText(anchorRaw.messageText || anchorRaw.text || '', 1800),
+  } : null;
+  return {
+    title: String(raw.title || '').slice(0, 240),
+    cwd: String(raw.cwd || '').slice(0, 1000),
+    projectId: String(raw.projectId || '').slice(0, 120),
+    agent: normalizeAgent(raw.agent),
+    mode: String(raw.mode || '').slice(0, 40),
+    selectedText: clipSideConversationText(raw.selectedText || '', 12000),
+    anchor,
+    nearbyBefore,
+    nearbyAfter,
+    recentMessages,
+  };
+}
+
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
+  const kind = String(session.kind || '').trim();
+  const isSideConversation = kind === 'side_conversation' || session.sidecar === true;
+  session.kind = isSideConversation ? 'side_conversation' : 'main';
+  session.sidecar = session.kind === 'side_conversation';
+  session.parentSessionId = session.sidecar ? sanitizeId(session.parentSessionId || '') : null;
+  if (session.sidecar && session.anchor && typeof session.anchor === 'object') {
+    const anchorType = String(session.anchor.type || 'selection').trim() || 'selection';
+    const anchorText = String(session.anchor.text || session.contextSnippet || '').slice(0, 12000);
+    session.anchor = {
+      type: anchorType,
+      text: anchorText,
+      messageId: sanitizeId(session.anchor.messageId || ''),
+      filePath: String(session.anchor.filePath || '').slice(0, 1000),
+      createdAt: String(session.anchor.createdAt || session.created || new Date().toISOString()),
+    };
+  } else if (session.sidecar) {
+    session.anchor = {
+      type: 'selection',
+      text: String(session.contextSnippet || '').slice(0, 12000),
+      messageId: '',
+      filePath: '',
+      createdAt: String(session.created || new Date().toISOString()),
+    };
+  } else {
+    delete session.anchor;
+  }
+  session.contextSnippet = session.sidecar ? String(session.anchor?.text || session.contextSnippet || '').slice(0, 12000) : '';
+  session.parentContext = session.sidecar ? normalizeSideConversationParentContext(session.parentContext) : null;
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeRuntimeFingerprint')) session.claudeRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
@@ -5116,6 +5197,7 @@ function collectSessionListSnapshot() {
       const localMeta = getSessionAgent(s) === 'claude' && preferredClaudeRuntimeId && (!s.cwd || !s.importedFrom)
         ? resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId)
         : null;
+      if (s.kind === 'side_conversation' || s.sidecar) continue;
       sessions.push({
         id: s.id,
         title: s.title || 'Untitled',
@@ -7112,6 +7194,10 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
         wsSend(ws, {
           type: 'session_info',
           sessionId: session.id,
+          kind: session.kind || 'main',
+          sidecar: !!session.sidecar,
+          parentSessionId: session.parentSessionId || null,
+          anchor: session.anchor || null,
           messages: [],
           title: session.title,
           mode: session.permissionMode || 'yolo',
@@ -7405,10 +7491,27 @@ function handleNewSession(ws, msg) {
       projectsChanged = !!ensured.created;
     }
   }
+  const isSideConversation = msg?.kind === 'side_conversation' || msg?.sidecar === true;
+  const sideAnchorText = String(msg?.anchor?.text || msg?.contextSnippet || '').slice(0, 12000);
+  const sideTitle = isSideConversation
+    ? (String(msg?.title || '').trim() || (sideAnchorText ? '侧边聊天' : '侧边聊天'))
+    : 'New Chat';
   const id = crypto.randomUUID();
   const session = {
     id,
-    title: 'New Chat',
+    kind: isSideConversation ? 'side_conversation' : 'main',
+    sidecar: isSideConversation,
+    parentSessionId: isSideConversation ? sanitizeId(msg?.parentSessionId || '') : null,
+    anchor: isSideConversation ? {
+      type: String(msg?.anchor?.type || 'selection'),
+      text: sideAnchorText,
+      messageId: sanitizeId(msg?.anchor?.messageId || ''),
+      filePath: String(msg?.anchor?.filePath || '').slice(0, 1000),
+      createdAt: new Date().toISOString(),
+    } : undefined,
+    contextSnippet: isSideConversation ? sideAnchorText : '',
+    parentContext: isSideConversation ? normalizeSideConversationParentContext(msg?.parentContext) : null,
+    title: sideTitle,
     created: new Date().toISOString(),
     updated: new Date().toISOString(),
     agent,
@@ -7433,6 +7536,11 @@ function handleNewSession(ws, msg) {
   wsSend(ws, {
     type: 'session_info',
     sessionId: id,
+    kind: session.kind || 'main',
+    sidecar: !!session.sidecar,
+    parentSessionId: session.parentSessionId || null,
+    anchor: session.anchor || null,
+    parentContext: session.parentContext || null,
     messages: [],
     title: session.title,
     mode: session.permissionMode,
@@ -8035,6 +8143,11 @@ function handleLoadSession(ws, sessionId) {
   wsSend(ws, {
     type: 'session_info',
     sessionId: session.id,
+    kind: session.kind || 'main',
+    sidecar: !!session.sidecar,
+    parentSessionId: session.parentSessionId || null,
+    anchor: session.anchor || null,
+    parentContext: session.parentContext || null,
     messages: recentMessages,
     title: session.title,
     mode: session.permissionMode || 'yolo',
@@ -8459,6 +8572,68 @@ function dispatchNextServerQueuedMessage(sessionId) {
   return true;
 }
 
+function formatSideConversationMessageList(label, list) {
+  const items = Array.isArray(list) ? list.filter(Boolean) : [];
+  if (!items.length) return '';
+  const lines = [`${label}：`];
+  for (const item of items) {
+    const role = item.role || 'message';
+    const idx = Number.isFinite(item.index) && item.index >= 0 ? `#${item.index + 1} ` : '';
+    lines.push(`- ${idx}${role}: ${clipSideConversationText(item.text, 900)}`);
+  }
+  return lines.join('\n');
+}
+
+function buildSideConversationRuntimePrompt(session, userText) {
+  if (!session || session.kind !== 'side_conversation') return userText;
+  const anchorText = String(session.anchor?.text || session.contextSnippet || '').trim();
+  const parentContext = normalizeSideConversationParentContext(session.parentContext) || null;
+  const parent = session.parentSessionId ? `父主线程 ID：${session.parentSessionId}` : '父主线程 ID：未记录';
+  const parts = [
+    '这是 Webcoding 当前主线程下的侧边对话（side conversation），不是主线程，也不是 subagent。',
+    parent,
+    '边界规则：主线程内容只作为参考；不要继续执行主线程任务；默认不要修改文件、不要执行长期任务、不要改变主线程状态。',
+    '如果用户要求改文件、运行有副作用命令、提交/部署/删除等操作，请提示回到主线程执行，或要求用户明确确认后再行动。',
+  ];
+
+  if (parentContext) {
+    parts.push('主线程摘要/轻量上下文：');
+    const summary = [];
+    if (parentContext.title) summary.push(`标题：${parentContext.title}`);
+    if (parentContext.cwd) summary.push(`当前项目目录：${parentContext.cwd}`);
+    if (parentContext.agent) summary.push(`主线程 Agent：${parentContext.agent}`);
+    if (summary.length) parts.push(summary.join('\n'));
+    const recent = formatSideConversationMessageList('主线程最近消息摘录', parentContext.recentMessages);
+    if (recent) parts.push(recent);
+  }
+
+  const anchor = parentContext?.anchor || null;
+  if (anchor?.messageText) {
+    parts.push('锚点信息：');
+    parts.push(`选区来自主线程第 ${Number.isFinite(anchor.index) && anchor.index >= 0 ? anchor.index + 1 : '?'} 条消息，角色：${anchor.role || 'unknown'}。`);
+    if (anchor.timestamp) parts.push(`锚点时间：${anchor.timestamp}`);
+    parts.push('锚点消息内容摘录：');
+    parts.push('```text');
+    parts.push(clipSideConversationText(anchor.messageText, 1800));
+    parts.push('```');
+  }
+
+  const nearbyBefore = formatSideConversationMessageList('选中文本前面的附近上下文', parentContext?.nearbyBefore);
+  if (nearbyBefore) parts.push(nearbyBefore);
+  const nearbyAfter = formatSideConversationMessageList('选中文本后面的附近上下文', parentContext?.nearbyAfter);
+  if (nearbyAfter) parts.push(nearbyAfter);
+
+  if (anchorText) {
+    parts.push('用户选中的文本：');
+    parts.push('```text');
+    parts.push(anchorText.slice(0, 12000));
+    parts.push('```');
+  }
+  parts.push('侧边聊天历史已由当前 side conversation 会话自然追加；以下是用户这次真正的问题：');
+  parts.push(userText || '请解释选中的内容。');
+  return parts.join('\n\n');
+}
+
 // === Runtime Message Handler ===
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
@@ -8494,7 +8669,7 @@ function handleMessage(ws, msg, options = {}) {
   const resolvedImageAttachments = resolvedAttachments.filter((attachment) => (attachment.kind || 'image') === 'image');
   const contextInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
   const effectiveInputText = buildAttachmentDocumentPrompt(contextInputText, resolvedAttachments);
-  const runtimeInputBaseText = typeof runtimeInputText === 'string'
+  let runtimeInputBaseText = typeof runtimeInputText === 'string'
     ? buildAttachmentDocumentPrompt(buildContextFilePrompt(runtimeInputText, resolvedFileRefs), resolvedAttachments)
     : effectiveInputText;
   const messageAgent = normalizeAgent(msg.agent);
@@ -8558,6 +8733,9 @@ function handleMessage(ws, msg, options = {}) {
     };
   }
   normalizeSession(session);
+  if (session.kind === 'side_conversation') {
+    runtimeInputBaseText = buildSideConversationRuntimePrompt(session, runtimeInputBaseText);
+  }
 
   if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带附件或文件引用。请先发送普通消息，再单独使用命令。' });
@@ -8608,6 +8786,11 @@ function handleMessage(ws, msg, options = {}) {
     wsSend(ws, {
       type: 'session_info',
       sessionId: currentSessionId,
+      kind: session.kind || 'main',
+      sidecar: !!session.sidecar,
+      parentSessionId: session.parentSessionId || null,
+      anchor: session.anchor || null,
+      parentContext: session.parentContext || null,
       messages: session.messages,
       title: session.title,
       mode: session.permissionMode || 'yolo',

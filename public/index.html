@@ -223,6 +223,23 @@
           <div id="file-viewer-body" class="file-viewer-body"></div>
         </aside>
 
+        <aside id="side-chat-panel" class="side-chat-panel" aria-label="侧边聊天">
+          <div class="side-chat-header">
+            <div class="side-chat-title-wrap">
+              <span class="side-chat-title">侧边聊天</span>
+              <span id="side-chat-context-label" class="side-chat-context-label">当前线程里的临时旁路讨论</span>
+            </div>
+            <button id="side-chat-close" class="side-chat-close" type="button" title="关闭侧边聊天">✕</button>
+          </div>
+          <div id="side-chat-context" class="side-chat-context" hidden></div>
+          <div id="side-chat-messages" class="side-chat-messages"></div>
+          <div class="side-chat-input-area">
+            <textarea id="side-chat-input" class="side-chat-input" rows="1" placeholder="针对选中内容提问…"></textarea>
+            <button id="side-chat-send" class="side-chat-send" type="button" title="发送侧边问题">发送</button>
+            <button id="side-chat-abort" class="side-chat-abort" type="button" title="停止侧边聊天" hidden>停止</button>
+          </div>
+        </aside>
+
         <aside id="workspace-insights" class="workspace-insights" aria-label="工作台摘要">
           <div class="workspace-insights-scroll">
             <div id="workspace-insights-content" class="workspace-insights-content"></div>

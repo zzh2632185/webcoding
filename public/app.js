@@ -72,6 +72,11 @@
   const DOCUMENT_UPLOAD_ACCEPT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.csv', '.tsv', '.json', '.jsonl', '.log']);
   const MAX_QUEUED_MESSAGES = 10;
   const MAX_QUEUED_ATTACHMENTS = 4;
+  const SIDE_CHAT_CONTEXT_LIMIT = 12000;
+  const SIDE_CHAT_SELECTION_LIMIT = 4000;
+  const SIDE_CHAT_PARENT_RECENT_LIMIT = 8;
+  const SIDE_CHAT_PARENT_NEARBY_LIMIT = 2;
+  const SIDE_CHAT_PARENT_MESSAGE_LIMIT = 1200;
   const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
@@ -159,6 +164,24 @@
   let fileTreeUploadActive = false;
   let fileRefPickerExpandedDirs = new Set();
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+  let sideChatState = {
+    open: false,
+    ws: null,
+    authed: false,
+    creating: false,
+    sessionId: null,
+    parentSessionId: null,
+    contextSnippet: '',
+    parentContext: null,
+    pendingSendText: '',
+    messages: [],
+    pendingText: '',
+    isGenerating: false,
+    agent: null,
+    mode: null,
+    reasoningEffort: '',
+  };
+  let sideChatSelectionPopover = null;
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
@@ -294,6 +317,14 @@
   const fileViewerDownload = $('#file-viewer-download');
   const fileViewerRefresh = $('#file-viewer-refresh');
   const fileViewerClose = $('#file-viewer-close');
+  const sideChatPanel = $('#side-chat-panel');
+  const sideChatContextLabel = $('#side-chat-context-label');
+  const sideChatContext = $('#side-chat-context');
+  const sideChatMessages = $('#side-chat-messages');
+  const sideChatInput = $('#side-chat-input');
+  const sideChatSend = $('#side-chat-send');
+  const sideChatAbort = $('#side-chat-abort');
+  const sideChatClose = $('#side-chat-close');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
@@ -1240,6 +1271,7 @@
   }
 
   function openGitPanel(view) {
+    if (sideChatState.open) closeSideChat();
     gitState.panelOpen = true;
     gitState.activePanelView = view || 'status';
     if (gitPanelEl) gitPanelEl.classList.add('visible');
@@ -3986,6 +4018,7 @@
   async function openFileViewer(file) {
     const cwd = getFileTreeCwd();
     if (!file?.path || !cwd) return;
+    if (sideChatState.open) closeSideChat();
     clearFileViewerObjectUrl();
     fileViewerState = { open: true, loading: true, error: '', data: null, activePath: file.path, activeTab: 'preview', objectUrl: '' };
     if (fileViewerPanel) fileViewerPanel.classList.add('visible');
@@ -4935,6 +4968,497 @@
     // Warn user if trying to send while disconnected
     showToast('连接已断开，正在重连…');
     return false;
+  }
+
+  // --- Side Conversation ---
+  function getSideChatDefaultMode(agent) {
+    const normalized = normalizeAgent(agent || sessionState.currentAgent);
+    if (sessionState.currentMode === 'plan') return 'plan';
+    return normalized === 'claude' || normalized === 'codex' ? 'default' : 'default';
+  }
+
+  function resetSideChatRuntimeState() {
+    sideChatState.pendingText = '';
+    sideChatState.isGenerating = false;
+    updateSideChatButtons();
+  }
+
+  function closeSideChatSocket() {
+    const socket = sideChatState.ws;
+    sideChatState.ws = null;
+    sideChatState.authed = false;
+    sideChatState.creating = false;
+    if (socket) {
+      try { socket.send(JSON.stringify({ type: 'detach_view' })); } catch {}
+      try { socket.close(); } catch {}
+    }
+  }
+
+  function sideSend(data) {
+    const socket = sideChatState.ws;
+    if (socket && socket.readyState === WebSocket.OPEN && sideChatState.authed) {
+      try {
+        socket.send(JSON.stringify(data));
+        return true;
+      } catch (error) {
+        console.warn('[WEBCODING]', 'side websocket send failed', error);
+      }
+    }
+    return false;
+  }
+
+  function updateSideChatButtons() {
+    if (sideChatSend) {
+      sideChatSend.hidden = !!sideChatState.isGenerating;
+      sideChatSend.disabled = !sideChatState.open || sideChatState.creating;
+    }
+    if (sideChatAbort) {
+      sideChatAbort.hidden = !sideChatState.isGenerating;
+      sideChatAbort.disabled = !sideChatState.sessionId;
+    }
+  }
+
+  function truncateSideContext(text, limit = SIDE_CHAT_SELECTION_LIMIT) {
+    const raw = String(text || '').trim().replace(/\s+$/g, '');
+    if (raw.length <= limit) return raw;
+    return `${raw.slice(0, limit)}\n…`;
+  }
+
+  function renderSideChatContext() {
+    if (!sideChatContext || !sideChatContextLabel) return;
+    const text = truncateSideContext(sideChatState.contextSnippet, SIDE_CHAT_SELECTION_LIMIT);
+    sideChatContext.hidden = !text;
+    sideChatContext.textContent = text ? `已选内容：\n${text}` : '';
+    sideChatContextLabel.textContent = text ? '1 个已选文本片段' : '当前线程里的临时旁路讨论';
+  }
+
+  function renderSideChatMessages() {
+    if (!sideChatMessages) return;
+    sideChatMessages.innerHTML = '';
+    const list = Array.isArray(sideChatState.messages) ? sideChatState.messages : [];
+    if (list.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'side-chat-empty';
+      empty.textContent = sideChatState.contextSnippet
+        ? '可以针对左侧选中的片段临时提问，不会写入主线程。'
+        : '侧边聊天不会占用左侧主线程。';
+      sideChatMessages.appendChild(empty);
+      return;
+    }
+    for (const item of list) {
+      const row = document.createElement('div');
+      row.className = `side-chat-msg ${item.role || 'assistant'}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'side-chat-bubble';
+      if (item.role === 'assistant') {
+        if (item.content) bubble.innerHTML = renderMarkdown(item.content);
+        else bubble.appendChild(createStreamingPlaceholder());
+      } else if (item.role === 'system') {
+        bubble.textContent = item.content || '';
+      } else {
+        bubble.textContent = item.content || '';
+      }
+      row.appendChild(bubble);
+      sideChatMessages.appendChild(row);
+    }
+    sideChatMessages.scrollTop = sideChatMessages.scrollHeight;
+  }
+
+  function setSideChatVisible(open) {
+    sideChatState.open = !!open;
+    if (sideChatPanel) sideChatPanel.classList.toggle('visible', sideChatState.open);
+    updateSideChatButtons();
+  }
+
+  function closeSideChat() {
+    setSideChatVisible(false);
+    closeSideChatSocket();
+    hideSideChatSelectionPopover();
+    sideChatState.sessionId = null;
+    sideChatState.parentSessionId = null;
+    sideChatState.contextSnippet = '';
+    sideChatState.parentContext = null;
+    sideChatState.pendingSendText = '';
+    sideChatState.messages = [];
+    resetSideChatRuntimeState();
+  }
+
+  function pruneEmptySideChatStreamingPlaceholders() {
+    sideChatState.messages = sideChatState.messages.filter((item) => {
+      if (!item || item.role !== 'assistant' || !item.streaming) return true;
+      return !!String(item.content || '').trim();
+    });
+  }
+
+  function ensureSideChatAssistantMessage() {
+    pruneEmptySideChatStreamingPlaceholders();
+    const list = sideChatState.messages;
+    const last = list[list.length - 1];
+    if (last && last.role === 'assistant' && last.streaming) return last;
+    const item = { role: 'assistant', content: '', streaming: true };
+    list.push(item);
+    return item;
+  }
+
+  function startSideChatGenerating() {
+    sideChatState.isGenerating = true;
+    sideChatState.pendingText = '';
+    ensureSideChatAssistantMessage();
+    updateSideChatButtons();
+    renderSideChatMessages();
+  }
+
+  function finishSideChatGenerating() {
+    sideChatState.isGenerating = false;
+    sideChatState.pendingText = '';
+    for (const item of sideChatState.messages) {
+      if (item && item.role === 'assistant' && item.streaming) item.streaming = false;
+    }
+    pruneEmptySideChatStreamingPlaceholders();
+    updateSideChatButtons();
+    renderSideChatMessages();
+  }
+
+  function appendSideSystemMessage(text) {
+    pruneEmptySideChatStreamingPlaceholders();
+    sideChatState.messages.push({ role: 'system', content: String(text || '') });
+    renderSideChatMessages();
+  }
+
+  function createSideChatSession() {
+    if (!sideChatState.authed || sideChatState.creating || sideChatState.sessionId) return;
+    sideChatState.creating = true;
+    updateSideChatButtons();
+    const agent = normalizeAgent(sideChatState.agent || sessionState.currentAgent);
+    const mode = sideChatState.mode || getSideChatDefaultMode(agent);
+    const currentMeta = getSessionMeta(sessionState.currentSessionId);
+    const payload = {
+      type: 'new_session',
+      kind: 'side_conversation',
+      sidecar: true,
+      title: '侧边聊天',
+      parentSessionId: sideChatState.parentSessionId || sessionState.currentSessionId || '',
+      agent,
+      mode,
+      reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort || sessionState.currentReasoningEffort) : '',
+      parentContext: sideChatState.parentContext || null,
+      anchor: {
+        type: 'selection',
+        text: String(sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+        messageId: sideChatState.parentContext?.anchor?.messageId || '',
+        role: sideChatState.parentContext?.anchor?.role || '',
+        messageText: sideChatState.parentContext?.anchor?.messageText || '',
+        nearbyBefore: sideChatState.parentContext?.nearbyBefore || [],
+        nearbyAfter: sideChatState.parentContext?.nearbyAfter || [],
+        createdAt: new Date().toISOString(),
+      },
+    };
+    const projectId = currentMeta?.projectId || selectedProject?.id || null;
+    const cwd = sessionState.currentCwd || currentMeta?.cwd || selectedProject?.path || null;
+    if (projectId) payload.projectId = projectId;
+    else if (cwd) payload.cwd = cwd;
+    sideSend(payload);
+  }
+
+  function connectSideChatSocket() {
+    const socket = sideChatState.ws;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+    const next = new WebSocket(WS_URL);
+    sideChatState.ws = next;
+    sideChatState.authed = false;
+    next.onopen = () => {
+      if (connectionState.authToken) {
+        try { next.send(JSON.stringify({ type: 'auth', token: connectionState.authToken })); } catch {}
+      } else {
+        appendSideSystemMessage('侧边聊天需要先完成登录。');
+      }
+    };
+    next.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      handleSideChatServerMessage(msg);
+    };
+    next.onclose = () => {
+      if (sideChatState.ws === next) {
+        sideChatState.ws = null;
+        sideChatState.authed = false;
+        sideChatState.creating = false;
+        updateSideChatButtons();
+      }
+    };
+    next.onerror = () => {
+      appendSideSystemMessage('侧边聊天连接异常。');
+    };
+  }
+
+  function handleSideChatServerMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'auth_result') {
+      if (msg.success) {
+        sideChatState.authed = true;
+        createSideChatSession();
+      } else {
+        appendSideSystemMessage(msg.error || '侧边聊天认证失败。');
+      }
+      updateSideChatButtons();
+      return;
+    }
+    if (msg.type === 'session_info') {
+      if (msg.kind && msg.kind !== 'side_conversation' && !msg.sidecar) return;
+      sideChatState.sessionId = msg.sessionId || sideChatState.sessionId;
+      sideChatState.creating = false;
+      if (Array.isArray(msg.messages) && msg.messages.length > 0 && sideChatState.messages.length === 0) {
+        sideChatState.messages = msg.messages.map((item) => ({ role: item.role || 'assistant', content: item.content || '' }));
+      }
+      updateSideChatButtons();
+      renderSideChatMessages();
+      if (sideChatState.pendingSendText) {
+        const pending = sideChatState.pendingSendText;
+        sideChatState.pendingSendText = '';
+        sendSideChatMessage(pending, { fromPending: true });
+      }
+      return;
+    }
+    if (msg.sessionId && sideChatState.sessionId && msg.sessionId !== sideChatState.sessionId) return;
+    switch (msg.type) {
+      case 'text_delta': {
+        if (!sideChatState.isGenerating) startSideChatGenerating();
+        const item = ensureSideChatAssistantMessage();
+        item.content = `${item.content || ''}${msg.text || ''}`;
+        renderSideChatMessages();
+        break;
+      }
+      case 'tool_start': {
+        appendSideSystemMessage(`正在使用工具：${msg.name || 'Tool'}`);
+        break;
+      }
+      case 'image_delta': {
+        appendSideSystemMessage('侧边聊天收到图片结果，请回到主线程查看完整图片能力。');
+        break;
+      }
+      case 'done': {
+        finishSideChatGenerating();
+        break;
+      }
+      case 'system_message':
+      case 'runtime_warning': {
+        appendSideSystemMessage(msg.message || '');
+        break;
+      }
+      case 'error': {
+        appendSideSystemMessage(msg.message || '侧边聊天发生错误。');
+        finishSideChatGenerating();
+        break;
+      }
+      case 'resume_generating': {
+        startSideChatGenerating();
+        const item = ensureSideChatAssistantMessage();
+        item.content = msg.text || '';
+        renderSideChatMessages();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  function openSideChatWithSelection(text, selectionInfo = null) {
+    const snippet = String(text || '').trim();
+    if (!snippet) return;
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开一个主线程，再使用侧边聊天');
+      return;
+    }
+    const parentContext = buildSideChatParentContext(selectionInfo, snippet);
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    sideChatState = {
+      open: true,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: null,
+      parentSessionId: sessionState.currentSessionId,
+      contextSnippet: snippet.slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext,
+      pendingSendText: '',
+      messages: [],
+      pendingText: '',
+      isGenerating: false,
+      agent: sessionState.currentAgent,
+      mode: getSideChatDefaultMode(sessionState.currentAgent),
+      reasoningEffort: sessionState.currentReasoningEffort,
+    };
+    setSideChatVisible(true);
+    renderSideChatContext();
+    renderSideChatMessages();
+    connectSideChatSocket();
+    requestAnimationFrame(() => sideChatInput?.focus());
+  }
+
+  function sendSideChatMessage(forcedText = '', options = {}) {
+    const text = String(forcedText || sideChatInput?.value || '').trim();
+    if (!text) return;
+    if (!options.fromPending) {
+      sideChatState.messages.push({ role: 'user', content: text });
+      renderSideChatMessages();
+    }
+    if (sideChatInput && !forcedText) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
+    if (!sideChatState.sessionId) {
+      sideChatState.pendingSendText = text;
+      connectSideChatSocket();
+      if (sideChatState.authed) createSideChatSession();
+      return;
+    }
+    startSideChatGenerating();
+    sideSend({
+      type: 'message',
+      sessionId: sideChatState.sessionId,
+      text,
+      agent: sideChatState.agent || sessionState.currentAgent,
+      mode: sideChatState.mode || getSideChatDefaultMode(sideChatState.agent || sessionState.currentAgent),
+      reasoningEffort: sideChatState.agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort) : '',
+    });
+  }
+
+  function abortSideChat() {
+    if (!sideChatState.sessionId) return;
+    sideSend({ type: 'abort', sessionId: sideChatState.sessionId });
+    appendSideSystemMessage('已请求停止侧边聊天。');
+    finishSideChatGenerating();
+  }
+
+  function autoResizeSideChatInput() {
+    if (!sideChatInput) return;
+    sideChatInput.style.height = 'auto';
+    sideChatInput.style.height = `${Math.min(sideChatInput.scrollHeight, 140)}px`;
+  }
+
+  function hideSideChatSelectionPopover() {
+    if (sideChatSelectionPopover) {
+      sideChatSelectionPopover.remove();
+      sideChatSelectionPopover = null;
+    }
+  }
+
+  function clipSideChatContextText(value, limit = SIDE_CHAT_PARENT_MESSAGE_LIMIT) {
+    const text = String(value || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text.length <= limit) return text;
+    return `${text.slice(0, limit)}…`;
+  }
+
+  function getSideChatMessageText(el) {
+    if (!el) return '';
+    const stored = el.dataset?.copyText || '';
+    if (stored.trim()) return clipSideChatContextText(stored);
+    const bubble = el.querySelector('.msg-bubble');
+    return clipSideChatContextText(bubble?.innerText || el.innerText || '');
+  }
+
+  function buildSideChatMessageContext(el, index = -1) {
+    if (!el) return null;
+    const role = el.classList.contains('user') ? 'user'
+      : (el.classList.contains('assistant') ? 'assistant'
+        : (el.classList.contains('system') ? 'system' : 'message'));
+    const text = getSideChatMessageText(el);
+    if (!text) return null;
+    return {
+      role,
+      text,
+      index,
+      messageId: el.dataset?.messageId || el.id || '',
+      timestamp: el.dataset?.startedAt || el.querySelector('.msg-time')?.dateTime || '',
+    };
+  }
+
+  function getSideChatVisibleMessageElements() {
+    if (!messagesDiv) return [];
+    return Array.from(messagesDiv.querySelectorAll('.msg'))
+      .filter((el) => !el.classList.contains('welcome-msg'));
+  }
+
+  function buildSideChatParentContext(selectionInfo, selectedText) {
+    const messageEls = getSideChatVisibleMessageElements();
+    const anchorEl = selectionInfo?.messageEl || null;
+    const anchorIndex = anchorEl ? messageEls.indexOf(anchorEl) : -1;
+    const nearbyBefore = anchorIndex >= 0
+      ? messageEls.slice(Math.max(0, anchorIndex - SIDE_CHAT_PARENT_NEARBY_LIMIT), anchorIndex)
+          .map((el, offset) => buildSideChatMessageContext(el, anchorIndex - SIDE_CHAT_PARENT_NEARBY_LIMIT + offset))
+          .filter(Boolean)
+      : [];
+    const nearbyAfter = anchorIndex >= 0
+      ? messageEls.slice(anchorIndex + 1, anchorIndex + 1 + SIDE_CHAT_PARENT_NEARBY_LIMIT)
+          .map((el, offset) => buildSideChatMessageContext(el, anchorIndex + 1 + offset))
+          .filter(Boolean)
+      : [];
+    const recentMessages = messageEls
+      .slice(-SIDE_CHAT_PARENT_RECENT_LIMIT)
+      .map((el, index) => buildSideChatMessageContext(el, Math.max(0, messageEls.length - SIDE_CHAT_PARENT_RECENT_LIMIT) + index))
+      .filter(Boolean);
+    const currentMeta = getSessionMeta(sessionState.currentSessionId) || {};
+    const anchorMessage = buildSideChatMessageContext(anchorEl, anchorIndex);
+    return {
+      kind: 'side_conversation_parent_context',
+      title: chatTitle?.textContent?.trim() || currentMeta.title || '',
+      cwd: sessionState.currentCwd || currentMeta.cwd || selectedProject?.path || '',
+      projectId: currentMeta.projectId || selectedProject?.id || '',
+      agent: sessionState.currentAgent,
+      mode: sessionState.currentMode,
+      selectedText: clipSideChatContextText(selectedText, SIDE_CHAT_CONTEXT_LIMIT),
+      anchor: anchorMessage ? {
+        messageId: anchorMessage.messageId || '',
+        role: anchorMessage.role,
+        index: anchorMessage.index,
+        timestamp: anchorMessage.timestamp || '',
+        messageText: anchorMessage.text,
+      } : null,
+      nearbyBefore,
+      nearbyAfter,
+      recentMessages,
+    };
+  }
+
+  function getSelectionInsideMessages() {
+    const selection = window.getSelection();
+    const text = selection ? selection.toString().trim() : '';
+    if (!selection || !text || selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
+    const anchor = selection.anchorNode;
+    const focus = selection.focusNode;
+    if (!messagesDiv?.contains(anchor) || !messagesDiv.contains(focus)) return null;
+    const container = range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer?.parentElement;
+    const messageEl = container?.closest?.('.msg') || anchor?.parentElement?.closest?.('.msg') || null;
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return null;
+    return { text, rect, messageEl };
+  }
+
+  function showSideChatSelectionPopover(selectionInfo) {
+    if (!selectionInfo?.text) return;
+    hideSideChatSelectionPopover();
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'side-chat-selection-popover';
+    btn.textContent = '在侧边聊天中提问';
+    const top = Math.max(52, selectionInfo.rect.top - 42);
+    const left = Math.min(window.innerWidth - 190, Math.max(12, selectionInfo.rect.left + selectionInfo.rect.width / 2 - 88));
+    btn.style.top = `${top}px`;
+    btn.style.left = `${left}px`;
+    btn.addEventListener('mousedown', (event) => event.preventDefault());
+    btn.addEventListener('click', () => {
+      const selected = selectionInfo.text.slice(0, SIDE_CHAT_CONTEXT_LIMIT);
+      hideSideChatSelectionPopover();
+      try { window.getSelection()?.removeAllRanges(); } catch {}
+      openSideChatWithSelection(selected, selectionInfo);
+    });
+    document.body.appendChild(btn);
+    sideChatSelectionPopover = btn;
   }
 
   function scheduleReconnect() {
@@ -9091,6 +9615,34 @@
     window.addEventListener('pointercancel', handleFileViewerResizeEnd);
   }
   if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
+  if (sideChatClose) sideChatClose.addEventListener('click', closeSideChat);
+  if (sideChatSend) sideChatSend.addEventListener('click', () => sendSideChatMessage());
+  if (sideChatAbort) sideChatAbort.addEventListener('click', abortSideChat);
+  if (sideChatInput) {
+    sideChatInput.addEventListener('input', autoResizeSideChatInput);
+    sideChatInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendSideChatMessage();
+      }
+    });
+  }
+  if (messagesDiv) {
+    messagesDiv.addEventListener('mouseup', () => {
+      setTimeout(() => {
+        const info = getSelectionInsideMessages();
+        if (info) showSideChatSelectionPopover(info);
+        else hideSideChatSelectionPopover();
+      }, 0);
+    });
+  }
+  document.addEventListener('mousedown', (event) => {
+    if (sideChatSelectionPopover && !sideChatSelectionPopover.contains(event.target)) {
+      hideSideChatSelectionPopover();
+    }
+  });
+  if (messagesWrap) messagesWrap.addEventListener('scroll', hideSideChatSelectionPopover, { passive: true });
+  window.addEventListener('resize', hideSideChatSelectionPopover);
   if (fileViewerPreviewTab) fileViewerPreviewTab.addEventListener('click', () => setFileViewerTab('preview'));
   if (fileViewerSourceTab) fileViewerSourceTab.addEventListener('click', () => setFileViewerTab('source'));
   if (fileViewerRefresh) fileViewerRefresh.addEventListener('click', refreshFileViewer);
