@@ -2346,6 +2346,13 @@ html[data-theme="localhost"] .localfile-pre {
 .project-group-draggable:active {
   cursor: grabbing;
 }
+.project-group-drag-handle {
+  cursor: grab;
+  -webkit-user-drag: element;
+}
+.project-group-drag-handle:active {
+  cursor: grabbing;
+}
 body.project-touch-dragging {
   cursor: grabbing;
   user-select: none;
@@ -2356,8 +2363,20 @@ body.project-touch-dragging {
   opacity: 0.48;
 }
 .project-group.drag-over-before,
-.project-group.drag-over-after {
+.project-group.drag-over-after,
+.project-group.drag-over-target {
   position: relative;
+}
+.project-group.drag-over-target > .project-group-header {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 52%, rgba(56, 56, 56, 0.18));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent),
+    0 8px 18px rgba(15, 138, 167, 0.12);
+}
+.project-group.drag-over-target > .project-group-header .project-group-name,
+.project-group.drag-over-target > .project-group-header .project-group-chevron {
+  color: var(--accent-hover);
 }
 .project-group.drag-over-before::before,
 .project-group.drag-over-after::after {
@@ -2365,16 +2384,17 @@ body.project-touch-dragging {
   position: absolute;
   left: 8px;
   right: 8px;
-  height: 3px;
+  height: 4px;
   border-radius: 999px;
   background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
   z-index: 4;
 }
 .project-group.drag-over-before::before {
-  top: -6px;
+  top: -7px;
 }
 .project-group.drag-over-after::after {
-  bottom: -6px;
+  bottom: -7px;
 }
 .project-group-header {
   display: flex;
@@ -6759,7 +6779,7 @@ body.file-viewer-resizing * {
 }
 .side-chat-selection-popover {
   position: fixed;
-  z-index: 360;
+  z-index: 10020;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -6772,6 +6792,9 @@ body.file-viewer-resizing * {
   font-size: 12px;
   font-weight: 650;
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
 }
 .side-chat-selection-popover:hover {
   background: var(--surface-strong);

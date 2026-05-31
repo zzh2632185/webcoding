@@ -182,6 +182,7 @@
     reasoningEffort: '',
   };
   let sideChatSelectionPopover = null;
+  let sideChatSelectionTimer = null;
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
@@ -5339,10 +5340,28 @@
   }
 
   function hideSideChatSelectionPopover() {
+    if (sideChatSelectionTimer) {
+      clearTimeout(sideChatSelectionTimer);
+      sideChatSelectionTimer = null;
+    }
     if (sideChatSelectionPopover) {
       sideChatSelectionPopover.remove();
       sideChatSelectionPopover = null;
     }
+  }
+
+  function refreshSideChatSelectionPopover() {
+    const info = getSelectionInsideMessages();
+    if (info) showSideChatSelectionPopover(info);
+    else hideSideChatSelectionPopover();
+  }
+
+  function scheduleSideChatSelectionPopover(delay = 0) {
+    if (sideChatSelectionTimer) clearTimeout(sideChatSelectionTimer);
+    sideChatSelectionTimer = setTimeout(() => {
+      sideChatSelectionTimer = null;
+      refreshSideChatSelectionPopover();
+    }, delay);
   }
 
   function clipSideChatContextText(value, limit = SIDE_CHAT_PARENT_MESSAGE_LIMIT) {
@@ -5450,13 +5469,19 @@
     const left = Math.min(window.innerWidth - 190, Math.max(12, selectionInfo.rect.left + selectionInfo.rect.width / 2 - 88));
     btn.style.top = `${top}px`;
     btn.style.left = `${left}px`;
-    btn.addEventListener('mousedown', (event) => event.preventDefault());
-    btn.addEventListener('click', () => {
+    let activated = false;
+    const activate = (event) => {
+      if (activated) return;
+      activated = true;
+      event?.preventDefault?.();
       const selected = selectionInfo.text.slice(0, SIDE_CHAT_CONTEXT_LIMIT);
       hideSideChatSelectionPopover();
       try { window.getSelection()?.removeAllRanges(); } catch {}
       openSideChatWithSelection(selected, selectionInfo);
-    });
+    };
+    btn.addEventListener('mousedown', (event) => event.preventDefault());
+    btn.addEventListener('touchend', activate, { passive: false });
+    btn.addEventListener('click', activate);
     document.body.appendChild(btn);
     sideChatSelectionPopover = btn;
   }
@@ -7872,8 +7897,8 @@
   }
 
   function clearProjectDragClasses() {
-    sessionList.querySelectorAll('.project-group.dragging, .project-group.drag-over-before, .project-group.drag-over-after')
-      .forEach((group) => group.classList.remove('dragging', 'drag-over-before', 'drag-over-after'));
+    sessionList.querySelectorAll('.project-group.dragging, .project-group.drag-over-target, .project-group.drag-over-before, .project-group.drag-over-after')
+      .forEach((group) => group.classList.remove('dragging', 'drag-over-target', 'drag-over-before', 'drag-over-after'));
   }
 
   function reorderProjectsLocally(draggedId, targetId, placeAfter) {
@@ -7905,6 +7930,7 @@
         e.preventDefault();
         return;
       }
+      suppressProjectHeaderClickUntil = Date.now() + 500;
       projectDragState = { projectId: project.id };
       group.classList.add('dragging');
       if (e.dataTransfer) {
@@ -7920,19 +7946,21 @@
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
       const rect = group.getBoundingClientRect();
       const placeAfter = e.clientY > rect.top + rect.height / 2;
+      group.classList.add('drag-over-target');
       group.classList.toggle('drag-over-before', !placeAfter);
       group.classList.toggle('drag-over-after', placeAfter);
     });
 
     group.addEventListener('dragleave', (e) => {
       if (e.relatedTarget instanceof Node && group.contains(e.relatedTarget)) return;
-      group.classList.remove('drag-over-before', 'drag-over-after');
+      group.classList.remove('drag-over-target', 'drag-over-before', 'drag-over-after');
     });
 
     group.addEventListener('drop', (e) => {
       const draggedId = projectDragState?.projectId || e.dataTransfer?.getData('text/plain');
       if (!draggedId || draggedId === project.id) return;
       e.preventDefault();
+      suppressProjectHeaderClickUntil = Date.now() + 500;
       const rect = group.getBoundingClientRect();
       const placeAfter = e.clientY > rect.top + rect.height / 2;
       clearProjectDragClasses();
@@ -7944,6 +7972,7 @@
     });
 
     group.addEventListener('dragend', () => {
+      suppressProjectHeaderClickUntil = Date.now() + 500;
       projectDragState = null;
       clearProjectDragClasses();
     });
@@ -7993,6 +8022,7 @@
     projectTouchDragState.targetId = placement?.targetId || null;
     projectTouchDragState.placeAfter = !!placement?.placeAfter;
     if (placement?.group) {
+      placement.group.classList.add('drag-over-target');
       placement.group.classList.toggle('drag-over-before', !placement.placeAfter);
       placement.group.classList.toggle('drag-over-after', placement.placeAfter);
     }
@@ -8125,6 +8155,10 @@
     const header = document.createElement('div');
     header.className = 'project-group-header' + (isCollapsed ? ' collapsed' : '');
     header.dataset.projectId = project.id;
+    if (!isVirtualCwd && project?.id) {
+      header.draggable = true;
+      header.classList.add('project-group-drag-handle');
+    }
     header.setAttribute('aria-expanded', String(!isCollapsed));
     header.setAttribute('aria-selected', String(isSelectedProject));
     header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话${runningCount ? `，${runningCount} 个运行中` : ''}`);
@@ -9628,12 +9662,11 @@
     });
   }
   if (messagesDiv) {
-    messagesDiv.addEventListener('mouseup', () => {
-      setTimeout(() => {
-        const info = getSelectionInsideMessages();
-        if (info) showSideChatSelectionPopover(info);
-        else hideSideChatSelectionPopover();
-      }, 0);
+    messagesDiv.addEventListener('mouseup', () => scheduleSideChatSelectionPopover(0));
+    messagesDiv.addEventListener('touchend', () => scheduleSideChatSelectionPopover(350), { passive: true });
+    document.addEventListener('selectionchange', () => {
+      if (!window.matchMedia('(pointer: coarse)').matches) return;
+      scheduleSideChatSelectionPopover(180);
     });
   }
   document.addEventListener('mousedown', (event) => {
