@@ -157,6 +157,8 @@
   let queuedMessagesRestoredAt = 0;
   let queuedMessagesRestoredSawRunning = false;
   let generationIdleFinalizeTimer = null;
+  let streamingStatusTimer = null;
+  let streamingStatusState = null;
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
@@ -164,6 +166,8 @@
   let fileTreeUploadActive = false;
   let fileRefPickerExpandedDirs = new Set();
   let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+  let fileViewerImageState = { activePath: '', scale: 0, fitScale: 1, offsetX: 0, offsetY: 0, mode: 'fit' };
+  let fileViewerImageResizeObserver = null;
   let sideChatState = {
     open: false,
     ws: null,
@@ -3629,9 +3633,22 @@
     }
   }
 
+  function resetFileViewerImageState(activePath = '') {
+    fileViewerImageState = { activePath, scale: 0, fitScale: 1, offsetX: 0, offsetY: 0, mode: 'fit' };
+  }
+
+  function disconnectFileViewerImageObserver() {
+    if (fileViewerImageResizeObserver) {
+      try { fileViewerImageResizeObserver.disconnect(); } catch {}
+      fileViewerImageResizeObserver = null;
+    }
+  }
+
   function closeFileViewer() {
     handleFileViewerResizeEnd();
+    disconnectFileViewerImageObserver();
     clearFileViewerObjectUrl();
+    resetFileViewerImageState();
     fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
     if (fileViewerPanel) fileViewerPanel.classList.remove('visible');
     syncFileViewerResizerVisibility();
@@ -3766,7 +3783,17 @@
     }
     if (data.type === 'image') {
       if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载图片…</div>';
-      return `<div class="file-viewer-image-wrap"><img class="file-viewer-image" src="${escapeHtml(fileViewerState.objectUrl)}" alt="${escapeHtml(data.name || 'image')}"></div>`;
+      return `
+        <div class="file-viewer-image-wrap" data-image-viewer="1">
+          <div class="file-viewer-image-toolbar" aria-label="图片缩放工具">
+            <button type="button" class="file-viewer-image-btn" data-image-action="zoom-out" title="缩小">−</button>
+            <button type="button" class="file-viewer-image-scale" data-image-action="actual" title="按原始像素显示">100%</button>
+            <button type="button" class="file-viewer-image-btn" data-image-action="zoom-in" title="放大">＋</button>
+            <button type="button" class="file-viewer-image-fit" data-image-action="fit" title="适应窗口">适应</button>
+          </div>
+          <div class="file-viewer-image-hint">滚轮缩放 · 拖拽移动 · 双击切换 100%/适应</div>
+          <img class="file-viewer-image" draggable="false" src="${escapeHtml(fileViewerState.objectUrl)}" alt="${escapeHtml(data.name || 'image')}">
+        </div>`;
     }
     if (data.type === 'pdf') {
       if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载 PDF…</div>';
@@ -3834,6 +3861,196 @@
     });
   }
 
+  function clampFileViewerImageScale(value, fitScale = fileViewerImageState.fitScale || 1) {
+    const min = Math.max(0.05, Math.min(fitScale || 1, 1) * 0.35);
+    const max = 12;
+    return Math.min(max, Math.max(min, Number(value) || fitScale || 1));
+  }
+
+  function getFileViewerImageElements() {
+    const wrap = fileViewerBody?.querySelector('.file-viewer-image-wrap[data-image-viewer="1"]');
+    const img = wrap?.querySelector('.file-viewer-image');
+    const scaleLabel = wrap?.querySelector('.file-viewer-image-scale');
+    return { wrap, img, scaleLabel };
+  }
+
+  function measureFileViewerImageFitScale(wrap, img) {
+    const naturalWidth = img?.naturalWidth || 0;
+    const naturalHeight = img?.naturalHeight || 0;
+    if (!wrap || !naturalWidth || !naturalHeight) return 1;
+    const toolbarSafeHeight = 76;
+    const availableWidth = Math.max(80, (wrap.clientWidth || 0) - 32);
+    const availableHeight = Math.max(80, (wrap.clientHeight || 0) - toolbarSafeHeight);
+    return Math.min(1, availableWidth / naturalWidth, availableHeight / naturalHeight);
+  }
+
+  function applyFileViewerImageTransform() {
+    const { wrap, img, scaleLabel } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const activePath = fileViewerState.data?.path || fileViewerState.activePath || '';
+    if (activePath && fileViewerImageState.activePath !== activePath) resetFileViewerImageState(activePath);
+    const naturalWidth = img.naturalWidth || 0;
+    const naturalHeight = img.naturalHeight || 0;
+    if (!naturalWidth || !naturalHeight) return;
+    const fitScale = measureFileViewerImageFitScale(wrap, img);
+    const shouldFit = !fileViewerImageState.scale || fileViewerImageState.mode === 'fit';
+    fileViewerImageState.fitScale = fitScale;
+    if (shouldFit) {
+      fileViewerImageState.scale = fitScale;
+      fileViewerImageState.offsetX = 0;
+      fileViewerImageState.offsetY = 0;
+      fileViewerImageState.mode = 'fit';
+    } else {
+      fileViewerImageState.scale = clampFileViewerImageScale(fileViewerImageState.scale, fitScale);
+    }
+    img.style.width = `${naturalWidth}px`;
+    img.style.height = `${naturalHeight}px`;
+    img.style.transform = `translate(-50%, -50%) translate(${fileViewerImageState.offsetX}px, ${fileViewerImageState.offsetY}px) scale(${fileViewerImageState.scale})`;
+    if (scaleLabel) scaleLabel.textContent = `${Math.round(fileViewerImageState.scale * 100)}%`;
+    wrap.classList.toggle('is-actual-size', Math.abs(fileViewerImageState.scale - 1) < 0.01);
+  }
+
+  function zoomFileViewerImage(nextScale, origin = null) {
+    const { wrap, img } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const currentScale = fileViewerImageState.scale || fileViewerImageState.fitScale || measureFileViewerImageFitScale(wrap, img);
+    const scale = clampFileViewerImageScale(nextScale, fileViewerImageState.fitScale);
+    const rect = wrap.getBoundingClientRect();
+    const pointX = origin ? origin.clientX - rect.left : rect.width / 2;
+    const pointY = origin ? origin.clientY - rect.top : rect.height / 2;
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const imageX = (pointX - centerX - fileViewerImageState.offsetX) / currentScale;
+    const imageY = (pointY - centerY - fileViewerImageState.offsetY) / currentScale;
+    fileViewerImageState.scale = scale;
+    fileViewerImageState.offsetX = pointX - centerX - imageX * scale;
+    fileViewerImageState.offsetY = pointY - centerY - imageY * scale;
+    fileViewerImageState.mode = Math.abs(scale - fileViewerImageState.fitScale) < 0.01 ? 'fit' : 'manual';
+    applyFileViewerImageTransform();
+  }
+
+  function fitFileViewerImage() {
+    fileViewerImageState.mode = 'fit';
+    fileViewerImageState.scale = fileViewerImageState.fitScale || 1;
+    fileViewerImageState.offsetX = 0;
+    fileViewerImageState.offsetY = 0;
+    applyFileViewerImageTransform();
+  }
+
+  function setFileViewerImageActualSize() {
+    fileViewerImageState.mode = 'manual';
+    fileViewerImageState.scale = 1;
+    fileViewerImageState.offsetX = 0;
+    fileViewerImageState.offsetY = 0;
+    applyFileViewerImageTransform();
+  }
+
+  function bindFileViewerImageControls() {
+    disconnectFileViewerImageObserver();
+    const { wrap, img } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const activePath = fileViewerState.data?.path || fileViewerState.activePath || '';
+    if (activePath && fileViewerImageState.activePath !== activePath) resetFileViewerImageState(activePath);
+    const init = () => requestAnimationFrame(applyFileViewerImageTransform);
+    if (img.complete) init();
+    else img.addEventListener('load', init, { once: true });
+
+    if (typeof ResizeObserver !== 'undefined') {
+      fileViewerImageResizeObserver = new ResizeObserver(() => applyFileViewerImageTransform());
+      fileViewerImageResizeObserver.observe(wrap);
+    }
+
+    wrap.querySelectorAll('[data-image-action]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const action = button.dataset.imageAction;
+        if (action === 'zoom-in') zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) * 1.25);
+        else if (action === 'zoom-out') zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) / 1.25);
+        else if (action === 'fit') fitFileViewerImage();
+        else if (action === 'actual') setFileViewerImageActualSize();
+      });
+    });
+
+    wrap.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+      zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) * factor, event);
+    }, { passive: false });
+
+    wrap.addEventListener('dblclick', (event) => {
+      if (event.target.closest('[data-image-action]')) return;
+      event.preventDefault();
+      if (Math.abs((fileViewerImageState.scale || 0) - 1) < 0.03) fitFileViewerImage();
+      else zoomFileViewerImage(1, event);
+    });
+
+    const pointers = new Map();
+    let dragStart = null;
+    let pinchStart = null;
+    const pointerDistance = () => {
+      const values = Array.from(pointers.values());
+      if (values.length < 2) return 0;
+      return Math.hypot(values[0].clientX - values[1].clientX, values[0].clientY - values[1].clientY);
+    };
+    const pointerCenter = () => {
+      const values = Array.from(pointers.values());
+      if (!values.length) return null;
+      return {
+        clientX: values.reduce((sum, point) => sum + point.clientX, 0) / values.length,
+        clientY: values.reduce((sum, point) => sum + point.clientY, 0) / values.length,
+      };
+    };
+
+    wrap.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('[data-image-action]')) return;
+      pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      wrap.setPointerCapture?.(event.pointerId);
+      if (pointers.size === 1) {
+        dragStart = { clientX: event.clientX, clientY: event.clientY, offsetX: fileViewerImageState.offsetX, offsetY: fileViewerImageState.offsetY };
+        pinchStart = null;
+        wrap.classList.add('is-dragging');
+      } else if (pointers.size === 2) {
+        pinchStart = { distance: pointerDistance(), scale: fileViewerImageState.scale || fileViewerImageState.fitScale || 1, center: pointerCenter() };
+        dragStart = null;
+      }
+    });
+
+    wrap.addEventListener('pointermove', (event) => {
+      if (!pointers.has(event.pointerId)) return;
+      pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      if (pointers.size >= 2 && pinchStart?.distance) {
+        event.preventDefault();
+        const distance = pointerDistance();
+        const center = pointerCenter() || pinchStart.center;
+        zoomFileViewerImage(pinchStart.scale * (distance / pinchStart.distance), center);
+        return;
+      }
+      if (!dragStart) return;
+      event.preventDefault();
+      fileViewerImageState.offsetX = dragStart.offsetX + event.clientX - dragStart.clientX;
+      fileViewerImageState.offsetY = dragStart.offsetY + event.clientY - dragStart.clientY;
+      fileViewerImageState.mode = Math.abs((fileViewerImageState.scale || 0) - fileViewerImageState.fitScale) < 0.01 ? 'fit' : 'manual';
+      applyFileViewerImageTransform();
+    });
+
+    const endPointer = (event) => {
+      pointers.delete(event.pointerId);
+      if (pointers.size === 0) {
+        dragStart = null;
+        pinchStart = null;
+        wrap.classList.remove('is-dragging');
+      } else if (pointers.size === 1) {
+        const point = Array.from(pointers.values())[0];
+        dragStart = { clientX: point.clientX, clientY: point.clientY, offsetX: fileViewerImageState.offsetX, offsetY: fileViewerImageState.offsetY };
+        pinchStart = null;
+      }
+    };
+    wrap.addEventListener('pointerup', endPointer);
+    wrap.addEventListener('pointercancel', endPointer);
+    wrap.addEventListener('lostpointercapture', endPointer);
+  }
+
   async function fetchFileViewerBlob(data) {
     if (!data?.rawUrl || !['image', 'pdf'].includes(data.type)) return;
     const expectedPath = data.path || fileViewerState.activePath;
@@ -3855,6 +4072,7 @@
 
   function renderFileViewer() {
     if (!fileViewerPanel || !fileViewerBody) return;
+    disconnectFileViewerImageObserver();
     fileViewerPanel.classList.toggle('visible', !!fileViewerState.open);
     syncFileViewerResizerVisibility();
     const data = fileViewerState.data;
@@ -3895,6 +4113,7 @@
     });
     bindFileEditorEvents();
     bindFileViewerPreviewIframeOverflow();
+    bindFileViewerImageControls();
   }
 
   function bindFileEditorEvents() {
@@ -3988,6 +4207,7 @@
     if (!activePath || !cwd) return;
     const preferredTab = fileViewerState.activeTab;
     clearFileViewerObjectUrl();
+    resetFileViewerImageState(activePath);
     fileViewerState = { ...fileViewerState, open: true, loading: true, error: '', activePath, objectUrl: '' };
     if (fileViewerPanel) fileViewerPanel.classList.add('visible');
     renderFileViewer();
@@ -4021,6 +4241,7 @@
     if (!file?.path || !cwd) return;
     if (sideChatState.open) closeSideChat();
     clearFileViewerObjectUrl();
+    resetFileViewerImageState(file.path);
     fileViewerState = { open: true, loading: true, error: '', data: null, activePath: file.path, activeTab: 'preview', objectUrl: '' };
     if (fileViewerPanel) fileViewerPanel.classList.add('visible');
     syncFileViewerWidthForViewport();
@@ -4060,6 +4281,39 @@
       appendError('文件引用数据无效。');
       return true;
     }
+  }
+
+  function isComposeDropData(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes('Files') || types.includes(FILE_REF_TRANSFER_TYPE);
+  }
+
+  function setComposeDropActive(active) {
+    inputWrapper?.classList.toggle('drag-active', Boolean(active));
+    messagesWrap?.classList.toggle('drag-active', Boolean(active));
+  }
+
+  function bindComposeDropTarget(target) {
+    if (!target || target.dataset.composeDropBound === '1') return;
+    target.dataset.composeDropBound = '1';
+    target.addEventListener('dragover', (e) => {
+      if (!isComposeDropData(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      setComposeDropActive(true);
+    });
+    target.addEventListener('dragleave', (e) => {
+      const related = e.relatedTarget;
+      if (related instanceof Node && target.contains(related)) return;
+      setComposeDropActive(false);
+    });
+    target.addEventListener('drop', (e) => {
+      if (!isComposeDropData(e.dataTransfer)) return;
+      e.preventDefault();
+      setComposeDropActive(false);
+      if (handleDroppedFileRef(e.dataTransfer)) return;
+      handleSelectedAttachmentFiles(e.dataTransfer?.files);
+    });
   }
 
   async function uploadAttachmentFile(file, { kind = 'image' } = {}) {
@@ -5664,6 +5918,7 @@
 
   function handleTextDeltaMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
     clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     composeState.pendingText += msg.text;
@@ -5672,6 +5927,7 @@
 
   function handleToolStartMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
     clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
@@ -5713,6 +5969,7 @@
 
   function handleImageDeltaMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
     clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
@@ -6030,6 +6287,7 @@
     image_delta: handleImageDeltaMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
+    runtime_status: handleRuntimeStatusMessage,
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId, msg.completedAt || new Date().toISOString()); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     runtime_warning: (msg) => { if (isMessageForCurrentSession(msg)) appendError(msg.message, { type: 'warning', icon: '⚠️', dismissible: true, style: 'border-color:var(--yellow);color:var(--text-primary);background:rgba(245,158,11,0.08)' }); },
@@ -6163,6 +6421,7 @@
   function ensurePendingPlaceholder(bubble) {
     if (!bubble || bubbleHasRenderableContent(bubble) || bubble.querySelector('.msg-segment-pending')) return;
     bubble.appendChild(createStreamingPlaceholder());
+    refreshStreamingStatusText();
   }
 
   function removeStaleEmptyAssistantPlaceholders(keepEl = null) {
@@ -6222,11 +6481,102 @@
     return created;
   }
 
+  function formatStreamingElapsed(ms) {
+    const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+  }
+
+  function getStreamingStatusElement() {
+    return document.querySelector('#streaming-msg .msg-segment-pending .streaming-status');
+  }
+
+  function buildStreamingStatusText(now = Date.now()) {
+    const state = streamingStatusState || {};
+    const startedAt = Number(state.startedAt || now) || now;
+    const lastActivityAt = Number(state.lastActivityAt || startedAt) || startedAt;
+    const elapsed = formatStreamingElapsed(now - startedAt);
+    const idleMs = Math.max(0, now - lastActivityAt);
+    const mode = state.mode || 'waiting';
+    const retryText = state.retryCount ? `第 ${state.retryCount}${state.maxRetries ? `/${state.maxRetries}` : ''} 次` : '';
+    if (mode === 'stopping') return { text: state.message || '正在停止当前任务…', level: 'warn' };
+    if (mode === 'retry') {
+      if (idleMs >= 90000) return { text: `自动重试后已等待 ${formatStreamingElapsed(idleMs)} 暂无输出，可能仍在恢复…`, level: 'warn' };
+      return { text: state.message || `模型连接中断，正在自动重试${retryText ? retryText : ''}…`, level: 'warn' };
+    }
+    if (mode === 'bridge') {
+      if (idleMs >= 90000) return { text: `本地桥接服务重连已等待 ${formatStreamingElapsed(idleMs)}，可能卡住…`, level: 'warn' };
+      return { text: state.message || '本地桥接服务重连中，正在恢复任务…', level: 'info' };
+    }
+    if (idleMs >= 90000) return { text: `已 ${formatStreamingElapsed(idleMs)} 没有新内容，可能卡住；可以继续等待或点击停止。`, level: 'warn' };
+    if (idleMs >= 60000) return { text: `已等待 ${formatStreamingElapsed(idleMs)} 暂无输出，仍在处理中…`, level: 'warn' };
+    if (idleMs >= 15000) return { text: `仍在处理中，暂无输出… ${elapsed}`, level: 'info' };
+    return { text: state.message || `正在等待模型响应… ${elapsed}`, level: 'info' };
+  }
+
+  function refreshStreamingStatusText() {
+    const statusEl = getStreamingStatusElement();
+    if (!statusEl) return;
+    const { text, level } = buildStreamingStatusText();
+    statusEl.textContent = text;
+    statusEl.dataset.level = level || 'info';
+  }
+
+  function startStreamingStatus(mode = 'waiting', options = {}) {
+    const now = Date.now();
+    streamingStatusState = {
+      mode,
+      message: options.message || '',
+      retryCount: Number(options.retryCount || 0) || 0,
+      maxRetries: Number(options.maxRetries || 0) || 0,
+      startedAt: options.startedAt || streamingStatusState?.startedAt || now,
+      lastActivityAt: now,
+    };
+    refreshStreamingStatusText();
+    if (!streamingStatusTimer) {
+      streamingStatusTimer = setInterval(refreshStreamingStatusText, 1000);
+    }
+  }
+
+  function stopStreamingStatusTimer() {
+    if (streamingStatusTimer) {
+      clearInterval(streamingStatusTimer);
+      streamingStatusTimer = null;
+    }
+  }
+
+  function resetStreamingStatus() {
+    stopStreamingStatusTimer();
+    streamingStatusState = null;
+  }
+
+  function markStreamingRuntimeActivity() {
+    if (streamingStatusState) streamingStatusState.lastActivityAt = Date.now();
+    refreshStreamingStatusText();
+  }
+
+  function handleRuntimeStatusMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
+    if (!composeState.isGenerating) startGenerating();
+    const code = String(msg.code || msg.status || 'waiting');
+    const mode = code === 'retry' || code === 'stream_disconnect' ? 'retry'
+      : (code === 'bridge' || code === 'bridge_reconnect' || code === 'bridge_wait' ? 'bridge'
+        : (code === 'stopping' || code === 'abort' ? 'stopping' : 'waiting'));
+    startStreamingStatus(mode, {
+      message: msg.message || '',
+      retryCount: msg.retryCount,
+      maxRetries: msg.maxRetries,
+    });
+  }
+
   function startGenerating() {
     composeState.isGenerating = true;
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
+    startStreamingStatus(streamingStatusState?.mode || 'waiting', { message: streamingStatusState?.message || '' });
     updateComposerActionButtons();
     // 不禁用输入框：生成中继续输入会进入本地发送队列，可在发送前撤销。
 
@@ -6239,6 +6589,7 @@
 
   function finishGenerating(sessionId, completedAt = null) {
     clearAwaitingRuntimeStart();
+    resetStreamingStatus();
     composeState.isGenerating = false;
     updateComposerActionButtons();
     setCurrentSessionRunningState(false);
@@ -6301,7 +6652,7 @@
   function createStreamingPlaceholder() {
     const placeholder = document.createElement('div');
     placeholder.className = 'msg-segment msg-segment-pending';
-    placeholder.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+    placeholder.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div><div class="streaming-status" data-level="info">正在等待模型响应…</div>';
     return placeholder;
   }
 
@@ -6333,7 +6684,10 @@
 
   function clearStreamingPlaceholder(bubble) {
     const placeholder = bubble?.querySelector('.msg-segment-pending');
-    if (placeholder) placeholder.remove();
+    if (placeholder) {
+      placeholder.remove();
+      stopStreamingStatusTimer();
+    }
   }
 
   function ensureStreamingTextSegment() {
@@ -6859,6 +7213,7 @@
       return;
     }
     clearFileViewerObjectUrl();
+    resetFileViewerImageState(imagePath);
     fileViewerState = { open: true, loading: true, error: '', data: null, activePath: imagePath, activeTab: 'preview', objectUrl: '' };
     if (fileViewerPanel) fileViewerPanel.classList.add('visible');
     syncFileViewerWidthForViewport();
@@ -9978,24 +10333,8 @@
     closeAttachMenu();
     closeFileRefPicker();
   });
-  if (inputWrapper) {
-    inputWrapper.addEventListener('dragover', (e) => {
-      const types = Array.from(e.dataTransfer?.types || []);
-      if (!types.includes('Files') && !types.includes(FILE_REF_TRANSFER_TYPE)) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-      inputWrapper.classList.add('drag-active');
-    });
-    inputWrapper.addEventListener('dragleave', (e) => {
-      if (e.target === inputWrapper) inputWrapper.classList.remove('drag-active');
-    });
-    inputWrapper.addEventListener('drop', (e) => {
-      e.preventDefault();
-      inputWrapper.classList.remove('drag-active');
-      if (handleDroppedFileRef(e.dataTransfer)) return;
-      handleSelectedAttachmentFiles(e.dataTransfer?.files);
-    });
-  }
+  bindComposeDropTarget(inputWrapper);
+  bindComposeDropTarget(messagesWrap);
 
   // Mode selector (hidden select kept for legacy sync)
   modeSelect.value = sessionState.currentMode;

@@ -1048,6 +1048,39 @@ function runClaudeNativeHistoryToolResultSourceRegressionCase() {
   );
 }
 
+function runCodexGeneratedImageRecoverySourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const appendSource = extractFunctionSource(serverSource, 'appendCodexRolloutImagesToEntry');
+  const collectSessionSource = extractFunctionSource(serverSource, 'collectSessionImageIdentities');
+  const collectAssistantSource = extractFunctionSource(serverSource, 'collectAssistantImageSegments');
+
+  assert(
+    appendSource.includes('collectSessionImageIdentities(session)')
+      && appendSource.includes('collectEntryImageIdentities(entry)'),
+    'Codex rollout image recovery must de-dupe against already persisted session images and current entry images',
+  );
+  assert(
+    appendSource.includes('earliestImageTimestampMs')
+      && appendSource.includes('record.timestampMs < earliestImageTimestampMs'),
+    'Codex rollout image recovery must not scan and append old images from earlier turns',
+  );
+  assert(
+    appendSource.includes('known.has(identity)')
+      && appendSource.includes('known.add(identity)'),
+    'Codex rollout image recovery must track appended image identities to prevent duplicate image_delta events',
+  );
+  assert(
+    collectSessionSource.includes('session?.messages')
+      && collectSessionSource.includes('message?.segments'),
+    'Session image identity collection must inspect persisted message segments',
+  );
+  assert(
+    collectAssistantSource.includes('timestampMs')
+      && collectAssistantSource.includes('image: segment'),
+    'Assistant image collection must keep image timestamps for per-turn recovery filtering',
+  );
+}
+
 function createTestRunner() {
   const results = [];
   return {
@@ -4056,6 +4089,7 @@ async function main() {
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
+  await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
   sourceRunner.finish();
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));

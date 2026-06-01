@@ -5564,12 +5564,35 @@ function imageSegmentIdentity(segment) {
   return String(segment.id || segment.path || segment.rawUrl || segment.src || '').trim();
 }
 
+function addImageSegmentIdentities(target, segments) {
+  if (!target || !Array.isArray(segments)) return target;
+  for (const segment of segments) {
+    if (!segment || segment.type !== 'image') continue;
+    const identity = imageSegmentIdentity(segment);
+    if (identity) target.add(identity);
+  }
+  return target;
+}
+
+function collectSessionImageIdentities(session) {
+  const identities = new Set();
+  for (const message of Array.isArray(session?.messages) ? session.messages : []) {
+    addImageSegmentIdentities(identities, message?.segments);
+  }
+  return identities;
+}
+
+function collectEntryImageIdentities(entry) {
+  return addImageSegmentIdentities(new Set(), entry?.segments);
+}
+
 function collectAssistantImageSegments(messages) {
   const images = [];
   for (const message of Array.isArray(messages) ? messages : []) {
     if (!message || message.role !== 'assistant') continue;
+    const timestampMs = Date.parse(message.timestamp || message.completedAt || message.createdAt || '') || 0;
     for (const segment of Array.isArray(message.segments) ? message.segments : []) {
-      if (segment && segment.type === 'image') images.push(segment);
+      if (segment && segment.type === 'image') images.push({ image: segment, timestampMs });
     }
   }
   return images;
@@ -5603,13 +5626,18 @@ function appendCodexRolloutImagesToEntry(sessionId, entry) {
   if (threadIds.size === 0) return 0;
 
   entry.segments = Array.isArray(entry.segments) ? entry.segments : [];
-  const known = new Set(entry.segments.filter((segment) => segment?.type === 'image').map(imageSegmentIdentity).filter(Boolean));
+  const known = collectSessionImageIdentities(session);
+  for (const identity of collectEntryImageIdentities(entry)) known.add(identity);
+  const startedAtMs = Number(entry.startedAtMs || 0) || 0;
+  const earliestImageTimestampMs = startedAtMs > 0 ? Math.max(0, startedAtMs - 10 * 1000) : 0;
   let appended = 0;
 
   for (const threadId of threadIds) {
     const rollout = findLatestCodexRolloutForThread(threadId, entry.startedAtMs || 0);
-    const images = collectAssistantImageSegments(rollout?.parsed?.messages || []);
-    for (const image of images) {
+    const imageRecords = collectAssistantImageSegments(rollout?.parsed?.messages || []);
+    for (const record of imageRecords) {
+      if (earliestImageTimestampMs && record.timestampMs && record.timestampMs < earliestImageTimestampMs) continue;
+      const image = record.image;
       const identity = imageSegmentIdentity(image);
       if (identity && known.has(identity)) continue;
       const segment = { type: 'image', ...image };
@@ -5750,7 +5778,14 @@ function tryRetryCodexTransientFailure(sessionId, entry, transientErrorKind) {
   if (currentRetryCount >= CODEX_CAPACITY_RETRY_MAX) return false;
   const nextRetryCount = currentRetryCount + 1;
   const retryWs = getPrimaryProcessWs(entry) || entry.ws || createClosedQueueWs();
-  sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: codexTransientRetryMessage(transientErrorKind, nextRetryCount) });
+  sendRuntimeMessage(entry, {
+    type: 'runtime_status',
+    sessionId,
+    code: 'retry',
+    message: codexTransientRetryMessage(transientErrorKind, nextRetryCount),
+    retryCount: nextRetryCount,
+    maxRetries: CODEX_CAPACITY_RETRY_MAX,
+  });
   plog('INFO', 'codex_transient_auto_retry', {
     sessionId: sessionId.slice(0, 8),
     pid: entry.pid || null,
@@ -8428,7 +8463,7 @@ function handleAbort(ws, msg = {}) {
   entry.abortRequested = true;
   entry.abortRequestedAt = new Date().toISOString();
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
-  sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '正在停止当前任务…' });
+  sendRuntimeMessage(entry, { type: 'runtime_status', sessionId, code: 'stopping', message: '正在停止当前任务…' });
   killProcess(entry.pid);
   setTimeout(() => {
     const activeEntry = activeProcesses.get(sessionId);
@@ -8814,6 +8849,14 @@ function handleMessage(ws, msg, options = {}) {
   }
   sendSessionList(ws);
 
+  if (!isClaudeSession(session)) {
+    wsSend(ws, {
+      type: 'runtime_status',
+      sessionId: currentSessionId,
+      code: 'bridge',
+      message: '正在准备模型连接/本地桥接服务…',
+    });
+  }
   const spawnSpec = isClaudeSession(session)
     ? buildClaudeSpawnSpec(session, { attachments: resolvedImageAttachments })
     : buildCodexSpawnSpec(session, { attachments: resolvedImageAttachments });
@@ -8912,6 +8955,13 @@ function handleMessage(ws, msg, options = {}) {
 
   fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
   proc.unref(); // Process survives Node.js exit
+
+  wsSend(ws, {
+    type: 'runtime_status',
+    sessionId: currentSessionId,
+    code: 'waiting',
+    message: '已连接模型，正在等待首个响应…',
+  });
 
   plog('INFO', 'process_spawn', {
     sessionId: currentSessionId.slice(0, 8),
