@@ -1081,6 +1081,55 @@ function runCodexGeneratedImageRecoverySourceRegressionCase() {
   );
 }
 
+function runProcessWithInput(command, args, { input = '', env = {}, cwd = REPO_DIR, timeoutMs = 8000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      reject(new Error(`process timeout: ${command} ${args.join(' ')}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function runCodexNativeGoalContinuationRegressionCase() {
+  const runtimePath = path.join(REPO_DIR, 'lib', 'codex-native-runtime.js');
+  const result = await runProcessWithInput(process.execPath, [runtimePath], {
+    input: '/goal trigger codex active goal auto continuation',
+    env: {
+      CODEX_PATH: MOCK_CODEX,
+      WEBCODING_CODEX_PATH: MOCK_CODEX,
+      WEBCODING_CODEX_APP_SERVER_ARGS: JSON.stringify(['app-server', '--listen', 'stdio://']),
+      WEBCODING_CODEX_GOAL_AUTO_WAIT_MS: '10',
+      WEBCODING_CODEX_GOAL_MAX_CONTINUATIONS: '3',
+      WEBCODING_CODEX_REQUEST_TIMEOUT_MS: '4000',
+    },
+    timeoutMs: 10000,
+  });
+  assert(result.code === 0, `native goal continuation runtime should exit 0, got code=${result.code} signal=${result.signal}\nstderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert(/mock goal step 1 done/.test(result.stdout), 'native /goal should run the first goal turn');
+  assert(/mock goal step 2 complete/.test(result.stdout), 'native /goal should automatically run a continuation turn while goal remains active');
+  assert(/thread\.goal\.runner\.continuing/.test(result.stdout), 'native goal runner should emit an explicit continuation event for fallback turns');
+  assert(/"status":"complete"/.test(result.stdout) || /"status":"complete"/.test(result.stderr), 'native goal continuation should stop after the mock marks the goal complete');
+  assert(!/isConservativeNaturalGoal|shouldNaturalGoal/.test(readRepoText('lib', 'codex-native-runtime.js')), 'Codex native goal continuation must not restore natural-language triggers');
+}
+
 function createTestRunner() {
   const results = [];
   return {
@@ -1563,8 +1612,8 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
       (msg) => msg.agent === 'codex' && msg.title === 'trigger codex silent exit',
     );
     await client.waitForType('text_delta', (msg) => /silent exit/.test(msg.text || ''), 8000);
-    const silentCodexError = await client.waitForType('error', (msg) => /Codex 任务异常结束（退出码 1）/.test(msg.message || ''), 8000);
-    assert(/Codex 任务异常结束（退出码 1）/.test(silentCodexError.message || ''), 'Codex silent non-zero exit should surface a generic failure message');
+    const silentCodexError = await client.waitForType('error', (msg) => /Codex (?:任务异常结束|任务失败).*process exited with non-zero status 1/.test(msg.message || ''), 8000);
+    assert(/process exited with non-zero status 1/.test(silentCodexError.message || ''), 'Codex native silent non-zero exit should surface the app-server/runtime failure message');
     await client.waitForType('done', (msg) => msg.sessionId === silentCodexSession.sessionId, 8000);
     const silentCodexProcessCompleteLine = findProcessLogLine(logsDir, silentCodexSession.sessionId, 'process_complete');
     assert(silentCodexProcessCompleteLine.includes('process exited with non-zero status 1 but returned no stderr'), 'Codex silent exit should be explicit in process_complete log');
@@ -3054,7 +3103,7 @@ async function runCodexLocalConfigFingerprintRegressionCase({ tempRoot }) {
       const latestSpawnLine = spawnLines[spawnLines.length - 1] || '';
       assert(spawnLines.length >= 2, 'Codex local fingerprint regression should produce at least two spawn records');
       assert(latestSpawnLine && latestSpawnLine.includes('"resume":true'), 'Codex local fingerprint change should keep resume on the next run by default');
-      assert(latestSpawnLine.includes('exec resume'), 'Codex local fingerprint change should keep exec resume on the next run by default');
+      assert(latestSpawnLine.includes('codex-native-runtime.js'), 'Codex local fingerprint change should use native app-server runtime on the next run by default');
       const secondStoredSession = readStoredSessionFile(sessionsDir, session.sessionId);
       const secondThreadId = getActiveStoredRuntimeId(secondStoredSession, 'codex');
       assert(secondThreadId && secondThreadId === firstThreadId, 'Codex local fingerprint change should keep the original thread id by default');
@@ -3392,7 +3441,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
       const resumedCodexSpawnLines = findProcessLogLines(logsDir, session.sessionId, 'process_spawn');
       const resumedCodexSpawn = resumedCodexSpawnLines[resumedCodexSpawnLines.length - 1] || '';
       assert(resumedCodexSpawn.includes('"resume":true'), 'Codex carryover unified model change should resume the existing thread');
-      assert(resumedCodexSpawn.includes('exec resume'), 'Codex carryover unified model change should include exec resume');
+      assert(resumedCodexSpawn.includes('codex-native-runtime.js'), 'Codex carryover unified model change should use native app-server runtime');
 
       await saveConfigAndWait(
         client,
@@ -3433,7 +3482,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
       const restoredSpawnLines = findProcessLogLines(logsDir, session.sessionId, 'process_spawn');
       const restoredSpawn = restoredSpawnLines[restoredSpawnLines.length - 1] || '';
       assert(restoredSpawn.includes('"resume":true'), 'Codex carryover switch back to local should resume the original local thread');
-      assert(restoredSpawn.includes('exec resume'), 'Codex carryover switch back to local should include exec resume');
+      assert(restoredSpawn.includes('codex-native-runtime.js'), 'Codex carryover switch back to local should use native app-server runtime');
     });
   });
 }
@@ -3570,7 +3619,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
       const spawnLines = findProcessLogLines(logsDir, session.sessionId, 'process_spawn');
       const latestSpawnLine = spawnLines[spawnLines.length - 1] || '';
       assert(latestSpawnLine.includes('"resume":true'), 'Codex sticky unified resume should keep resume enabled after channel switch');
-      assert(latestSpawnLine.includes('exec resume'), 'Codex sticky unified resume should include exec resume after channel switch');
+      assert(latestSpawnLine.includes('codex-native-runtime.js'), 'Codex sticky unified resume should use native app-server runtime after channel switch');
     });
   });
 }
@@ -3922,7 +3971,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId);
     const spawnLine = findProcessLogLine(logsDir, firstMessageSession.sessionId, 'process_spawn');
     const spawnArgs = spawnLine ? (JSON.parse(spawnLine).args || '') : '';
-    assert(spawnLine && !spawnLine.includes('--search') && spawnLine.includes('--image'), 'Codex exec should attach images and not append unsupported --search flag');
+    assert(spawnLine && !spawnLine.includes('--search') && spawnLine.includes('--local-image'), 'Codex native runtime should attach images as app-server localImage input and not append unsupported --search flag');
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex unified runtime should write isolated runtime auth mode');
     assert(runtimeToml.includes('name = "Regression Unified API"'), 'Codex unified runtime should point at the active unified API template');
@@ -3931,6 +3980,20 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(/# bridge_api_key = "/.test(runtimeToml), 'Codex unified runtime should expose local bridge token in generated config comments');
     assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Codex spawn should force openai_compat provider via CLI overrides');
     assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex spawn should force bridge base_url via CLI overrides');
+    const nativeRuntimeSource = readRepoText('lib', 'codex-native-runtime.js');
+    const parseGoalSource = extractFunctionSource(nativeRuntimeSource, 'parseGoalCommand');
+    assert(nativeRuntimeSource.includes('开始执行该 goal'), 'Codex native /goal set should tell the user it is starting execution');
+    assert(nativeRuntimeSource.includes('turnInputText = action.objective || inputText'), 'Codex native /goal set should continue with turn/start using the goal objective');
+    assert(!/查看|进度|继续|恢复|暂停|清除|清空/.test(parseGoalSource), 'Codex native /goal parser must not hard-code Chinese natural-language semantics');
+    assert(parseGoalSource.includes('/^(get|status)$/i.test(arg)'), 'Codex native /goal parser should only map explicit get/status subcommands to get');
+    assert(parseGoalSource.includes('/^(resume|active)$/i.test(arg)'), 'Codex native /goal parser should only map explicit resume/active subcommands to resume');
+    assert(!nativeRuntimeSource.includes('isConservativeNaturalGoal'), 'Codex native goal should only be triggered by explicit /goal commands');
+    assert(!nativeRuntimeSource.includes('shouldNaturalGoal'), 'Codex native runtime must not trigger goal from natural language');
+    assert(!/if \(!goalCommand\) \{\s*turnDone = true;\s*legacyEvent\('turn\.completed',[\s\S]{0,180}?return;\s*\}/.test(nativeRuntimeSource), 'Codex native /goal set must not return immediately after thread/goal/set');
+    const serverSource = readRepoText('server.js');
+    assert(serverSource.includes('abortedByUser'), 'Server should distinguish user abort from runtime failure');
+    assert(/const hasNonZeroExit = !abortedByUser &&/.test(serverSource), 'User abort exit code 130 should not be mapped to task failure');
+    assert(serverSource.includes('已停止当前任务。'), 'User abort should surface a stop confirmation instead of an error');
 
     const slashPassthroughStart = messages.length;
     const slashPrompt = '/cp 规划一个长需求\n这里模拟用户写了很多内容，不能因为未知指令丢失。';
@@ -4090,6 +4153,7 @@ async function main() {
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
   await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
+  await sourceRunner.run('codex native goal continuation runner', runCodexNativeGoalContinuationRegressionCase);
   sourceRunner.finish();
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));

@@ -4960,8 +4960,22 @@ function getBridgeScriptFingerprint() {
   }
 }
 
+
+function getProcessBridgeStatePath(pid) {
+  if (IS_WIN) return '';
+  const env = readProcEnvMap(pid);
+  return env.get('CC_WEB_BRIDGE_STATE_PATH') || '';
+}
+
+function bridgeStateBelongsToThisInstance(state) {
+  if (!state?.pid || !isProcessRunning(state.pid)) return false;
+  const runningStatePath = getProcessBridgeStatePath(state.pid);
+  return !!runningStatePath && path.resolve(runningStatePath) === path.resolve(BRIDGE_STATE_PATH);
+}
+
 function canReuseBridgeState(state) {
   if (!state?.pid || !state.port || !isProcessRunning(state.pid)) return false;
+  if (!bridgeStateBelongsToThisInstance(state)) return false;
   const currentFingerprint = getBridgeScriptFingerprint();
   if (!currentFingerprint) return true;
   return !!state.scriptFingerprint && state.scriptFingerprint === currentFingerprint;
@@ -5062,13 +5076,13 @@ function ensureLocalBridgeRunning() {
   if (reusableExisting) {
     return existing;
   }
-  if (existing?.pid && isProcessRunning(existing.pid)) {
+  const existingBelongsHere = bridgeStateBelongsToThisInstance(existing);
+  if (existingBelongsHere && existing?.pid && isProcessRunning(existing.pid)) {
     killProcess(existing.pid, true);
     sleepSync(100);
   }
-  if (existing?.pid || fs.existsSync(BRIDGE_STATE_PATH)) {
-    deleteCachedJsonConfig(BRIDGE_STATE_PATH);
-  }
+  // Do not kill or delete state that was copied from another Webcoding instance.
+  // The new local bridge will overwrite this experiment copy's state file.
 
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
     detached: true,
@@ -5086,10 +5100,13 @@ function ensureLocalBridgeRunning() {
   const start = Date.now();
   while (Date.now() - start < BRIDGE_START_TIMEOUT_MS) {
     const state = readBridgeState();
-    if (state?.pid && isProcessRunning(state.pid) && state.port) {
+    if (canReuseBridgeState(state)) {
       cleanupStaleLocalBridgeProcesses({ statePath: BRIDGE_STATE_PATH, keepPids: [state.pid] });
       return state;
     }
+    // A freshly copied experiment may still contain the production bridge-state.json.
+    // Wait until the newly spawned experiment bridge overwrites it instead of
+    // reusing another Webcoding instance's PID/port/token combination.
     sleepSync(50);
   }
   throw new Error('本地 API 桥接服务启动超时');
@@ -5507,13 +5524,14 @@ function readProcessStderrSnippet(sessionId) {
 function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
   const completeTime = new Date().toISOString();
   const wsConnected = isProcessRealtimeConnected(entry);
+  const abortedByUser = !!entry.abortRequested;
   const disconnectGap = entry.wsDisconnectTime
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
   const stderrSnippet = readProcessStderrSnippet(sessionId);
-  const hasNonZeroExit = typeof exitCode === 'number' && exitCode !== 0;
-  const hasUnexpectedSignal = !!signal && signal !== 'SIGTERM';
+  const hasNonZeroExit = !abortedByUser && typeof exitCode === 'number' && exitCode !== 0;
+  const hasUnexpectedSignal = !abortedByUser && !!signal && signal !== 'SIGTERM';
   const rawCompletionError = entry.lastError || (
     (hasNonZeroExit || hasUnexpectedSignal)
       ? (stderrSnippet || null)
@@ -5535,12 +5553,13 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
       : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
-  plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
+  plog(abortedByUser || exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
     sessionId: sessionId.slice(0, 8),
     pid: entry.pid,
     agent: entry.agent || 'claude',
     exitCode,
     signal,
+    abortedByUser,
     wsConnected,
     wsDisconnectTime: entry.wsDisconnectTime || null,
     disconnectToDeathGap: disconnectGap,
@@ -5555,7 +5574,7 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     transientErrorKind: codexTransientErrorKind || null,
   });
 
-  return { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError };
+  return { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError, abortedByUser };
 }
 
 
@@ -5855,7 +5874,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
-  const { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
+  const { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError, abortedByUser } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
 
   removeActiveProcess(sessionId);
   cleanRunDir(sessionId);
@@ -5866,6 +5885,18 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   }
 
   const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
+
+  if (abortedByUser) {
+    if (isProcessRealtimeConnected(entry)) {
+      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '已停止当前任务。' });
+      sendRuntimeMessage(entry, { type: 'done', sessionId, costUsd: entry.lastCost ?? null, completedAt: entry.completedAt || new Date().toISOString() });
+      sendSessionListToProcessClients(entry);
+    } else {
+      broadcastSessionListRefresh();
+    }
+    setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
+    return;
+  }
 
   const { shouldReturnForFollowup, shouldAutoCompact } = isProcessRealtimeConnected(entry)
     ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
