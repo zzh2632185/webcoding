@@ -1002,6 +1002,70 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   );
 }
 
+function runMessageEditSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const serverSource = readRepoText('server.js');
+  const htmlSource = readRepoText('public', 'index.html');
+  const styleSource = readRepoText('public', 'style.css');
+  const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const sendMessageSource = extractFunctionSource(appSource, 'sendMessage');
+  const submitEditedSource = extractFunctionSource(appSource, 'submitEditedMessage');
+  const handleEditSource = extractFunctionSource(serverSource, 'handleEditMessage');
+  const clearRuntimeSource = extractFunctionSource(serverSource, 'clearRuntimeForEditedMessage');
+  const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
+
+  assert(
+    htmlSource.includes('id="edit-message-bar"')
+      && styleSource.includes('.edit-message-bar')
+      && styleSource.includes('.msg-edit-btn'),
+    'Message edit UI must expose a quiet edit bar and a dedicated pencil action style',
+  );
+  assert(
+    createMessageActionsSource.includes("role === 'user'")
+      && createMessageActionsSource.includes('msg-edit-btn')
+      && createMessageActionsSource.includes('beginEditMessageFromButton(editBtn)'),
+    'User message actions must include a pencil edit button wired to edit mode',
+  );
+  assert(
+    sendMessageSource.includes('editingMessageState')
+      && sendMessageSource.includes('submitEditedMessage(text)'),
+    'Composer send must route editing drafts through edit_message instead of normal send/enqueue',
+  );
+  assert(
+    submitEditedSource.includes("type: 'edit_message'")
+      && submitEditedSource.includes('messageIndex')
+      && submitEditedSource.includes('pendingEditResetSessionId = editingMessageState.sessionId')
+      && submitEditedSource.includes('Do not optimistically start the streaming placeholder here'),
+    'Edited message submit must call the backend edit_message path and wait for the editReset snapshot before rerendering',
+  );
+  assert(
+    sessionInfoSource.includes('msg.editReset === true')
+      && sessionInfoSource.includes('!isEditResetSnapshot')
+      && sessionInfoSource.includes('pendingEditResetSessionId = null'),
+    'editReset session_info snapshots must force rerender instead of preserving stale streaming DOM',
+  );
+  assert(
+    serverSource.includes("case 'edit_message'")
+      && serverSource.includes('handleEditMessage(ws, msg)'),
+    'WebSocket router must expose edit_message to the backend handler',
+  );
+  assert(
+    handleEditSource.includes('activeProcesses.has(sessionId)')
+      && handleEditSource.includes('session.messages = historyBefore')
+      && handleEditSource.includes('session.queuedMessages = []')
+      && handleEditSource.includes('clearRuntimeForEditedMessage(session)')
+      && handleEditSource.includes('handleMessage(ws')
+      && handleEditSource.includes('editReset: true'),
+    'Backend edit must reject running sessions, truncate following history, clear queued messages/runtime, emit editReset, and restart via handleMessage',
+  );
+  assert(
+    clearRuntimeSource.includes('clearRuntimeSessionId(session')
+      && clearRuntimeSource.includes('session.codexThreadId = null')
+      && clearRuntimeSource.includes('session.claudeSessionId = null'),
+    'Edited message reset must clear Codex and Claude runtime thread mirrors, not just visible messages',
+  );
+}
+
 function runClaudeRuntimeToolResultAndRetrySourceRegressionCase() {
   const runtimeSource = readRepoText('lib', 'agent-runtime.js');
   const appSource = readRepoText('public', 'app.js');
@@ -4150,6 +4214,7 @@ async function main() {
   await cleanupRegressionBridgeProcesses((info) => /\/tmp\/webcoding-regression-[^/]+\//.test(info.statePath || ''));
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  await sourceRunner.run('message edit reset source guard', runMessageEditSourceRegressionCase);
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
   await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);

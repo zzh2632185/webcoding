@@ -3403,6 +3403,24 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
 .msg-jump-top-btn {
   color: var(--blue);
 }
+.msg-edit-btn {
+  min-width: 26px;
+  padding-inline: 7px;
+  color: var(--text-secondary);
+}
+.msg-edit-btn:hover,
+.msg-edit-btn:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.msg.editing-source .msg-bubble {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 3px;
+}
+.msg.editing-source .msg-edit-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 .msg-completion-time {
   align-self: center;
   color: var(--text-muted);
@@ -4195,6 +4213,46 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   gap: 6px;
   max-width: min(920px, 100%);
   margin: 0 auto 8px;
+}
+.edit-message-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  max-width: min(920px, 100%);
+  margin: 0 auto 8px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--input-border));
+  border-radius: var(--button-radius);
+  background: color-mix(in srgb, var(--accent) 9%, var(--input-shell-background));
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.edit-message-bar[hidden] { display: none; }
+.edit-message-bar span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.edit-message-bar button {
+  flex: 0 0 auto;
+  border: 1px solid var(--input-border);
+  border-radius: 999px;
+  background: var(--surface-strong);
+  color: var(--text-secondary);
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.edit-message-bar button:hover,
+.edit-message-bar button:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  outline: none;
 }
 .queued-message-item {
   display: flex;

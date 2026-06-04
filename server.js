@@ -4356,6 +4356,8 @@ function buildThreadCarryoverPayload(session, text, attachments, historyMessages
     reasonText = '检测到这是旧版线程，当前必须按最新配置重建底层线程。';
   } else if (threadReset?.reason === 'channel_changed') {
     reasonText = '检测到当前会话切换到了新的渠道或模型，当前会在该渠道下建立新线程。';
+  } else if (threadReset?.reason === 'edited_message') {
+    reasonText = '用户修改了前面的一条消息，当前会丢弃旧回答并在新底层线程中重新生成。';
   }
   const prompt = [
     '[webcoding 自动上下文续接]',
@@ -6735,6 +6737,9 @@ wss.on('connection', (ws, req) => {
           handleMessage(ws, msg);
         }
         break;
+      case 'edit_message':
+        handleEditMessage(ws, msg);
+        break;
       case 'enqueue_message':
         handleEnqueueMessage(ws, msg);
         break;
@@ -8701,9 +8706,111 @@ function buildSideConversationRuntimePrompt(session, userText) {
 }
 
 // === Runtime Message Handler ===
+function editedMessageError(ws, sessionId, message) {
+  return wsSend(ws, { type: 'error', sessionId: sessionId || undefined, message });
+}
+
+function editedMessageTitle(text, fallback = 'Edited Chat') {
+  const title = String(text || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+  return title || fallback;
+}
+
+function buildEditedMessageRuntimeInput(session, text, attachments, historyMessages) {
+  const history = Array.isArray(historyMessages) ? historyMessages.filter(Boolean) : [];
+  if (history.length === 0) return null;
+  const carryover = buildThreadCarryoverPayload(session, text, attachments, history, { reason: 'edited_message' });
+  return carryover?.prompt || null;
+}
+
+function clearRuntimeForEditedMessage(session) {
+  const agent = getSessionAgent(session);
+  clearRuntimeSessionId(session, { agent, allChannels: true });
+  if (agent === 'codex') {
+    session.codexThreadId = null;
+    session.codexRuntimeFingerprint = null;
+  } else {
+    session.claudeSessionId = null;
+    session.claudeRuntimeFingerprint = null;
+  }
+  delete session.lastUsage;
+  delete session.contextWindowTokens;
+  delete session.currentUsage;
+}
+
+function handleEditMessage(ws, msg = {}) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  if (!sessionId) return editedMessageError(ws, null, '缺少会话 ID，无法修改消息。');
+  if (activeProcesses.has(sessionId)) {
+    return editedMessageError(ws, sessionId, '当前任务仍在运行，请先停止后再修改上一条消息。');
+  }
+
+  const session = loadSession(sessionId);
+  if (!session) return editedMessageError(ws, sessionId, '会话不存在，无法修改消息。');
+  normalizeSession(session);
+
+  const messageIndex = Number(msg.messageIndex);
+  if (!Number.isInteger(messageIndex) || messageIndex < 0 || messageIndex >= session.messages.length) {
+    return editedMessageError(ws, sessionId, '消息位置无效，无法修改。');
+  }
+  const original = session.messages[messageIndex];
+  if (!original || original.role !== 'user') {
+    return editedMessageError(ws, sessionId, '只能修改用户消息。');
+  }
+
+  const textValue = typeof msg.text === 'string' ? msg.text : '';
+  const normalizedText = textValue.trim();
+  const originalAttachments = normalizeMessageAttachments(original.attachments || []);
+  const originalFileRefs = Array.isArray(original.fileRefs) ? original.fileRefs.map((ref) => ({ ...ref })) : [];
+  if (!normalizedText && originalAttachments.length === 0 && originalFileRefs.length === 0) {
+    return editedMessageError(ws, sessionId, '修改后的消息不能为空。');
+  }
+  if (originalAttachments.length > 0 && resolveMessageAttachments(originalAttachments).length === 0) {
+    return editedMessageError(ws, sessionId, '原消息附件已过期，请重新发送新消息并重新上传附件。');
+  }
+  const fileRefCheck = normalizeContextFileRefs(originalFileRefs, session.cwd || process.cwd());
+  if (fileRefCheck.error) {
+    return editedMessageError(ws, sessionId, `原消息引用的文件无法复用：${fileRefCheck.error}`);
+  }
+
+  const historyBefore = session.messages.slice(0, messageIndex);
+  session.messages = historyBefore;
+  session.queuedMessages = [];
+  session.updated = new Date().toISOString();
+  if (messageIndex === 0) session.title = editedMessageTitle(textValue, session.title || 'Edited Chat');
+  clearRuntimeForEditedMessage(session);
+  pendingCompactRetries.delete(sessionId);
+  clearPendingSlashCommand(sessionId);
+  saveSession(session);
+
+  plog('INFO', 'message_edit_restart', {
+    sessionId: sessionId.slice(0, 8),
+    messageIndex,
+    agent: getSessionAgent(session),
+    historyBefore: historyBefore.length,
+    attachments: originalAttachments.length,
+    fileRefs: originalFileRefs.length,
+  });
+
+  const runtimeInputText = buildEditedMessageRuntimeInput(session, textValue, originalAttachments, historyBefore);
+  return handleMessage(ws, {
+    type: 'message',
+    sessionId,
+    text: textValue,
+    attachments: originalAttachments,
+    fileRefs: originalFileRefs,
+    mode: msg.mode || session.permissionMode || 'yolo',
+    agent: msg.agent || getSessionAgent(session),
+    reasoningEffort: Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort') ? msg.reasoningEffort : session.reasoningEffort,
+  }, {
+    runtimeInputText,
+    emitSessionInfo: true,
+    sessionInfoExtra: { editReset: true, editedMessageIndex: messageIndex },
+  });
+}
+
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false, runtimeInputText = null, emitSessionInfo = false } = options;
+  const { hideInHistory = false, runtimeInputText = null, emitSessionInfo = false, sessionInfoExtra = null } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -8876,6 +8983,7 @@ function handleMessage(ws, msg, options = {}) {
       isRunning: false,
       handoffPending: getActiveHandoffPending(session),
       ...buildSessionRuntimeMeta(session),
+      ...(sessionInfoExtra && typeof sessionInfoExtra === 'object' ? sessionInfoExtra : {}),
     });
   }
   sendSessionList(ws);

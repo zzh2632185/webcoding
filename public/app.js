@@ -161,6 +161,8 @@
   let streamingStatusState = null;
   let awaitingRuntimeStart = false;
   let awaitingRuntimeStartAt = 0;
+  let editingMessageState = null;
+  let pendingEditResetSessionId = null;
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
   let fileTreeUploadTargetRow = null;
   let fileTreeUploadActive = false;
@@ -349,6 +351,9 @@
   const costDisplay = $('#topbar-cost-display');
   const attachmentTray = $('#attachment-tray');
   const queuedMessageList = $('#queued-message-list');
+  const editMessageBar = $('#edit-message-bar');
+  const editMessageLabel = $('#edit-message-label');
+  const editMessageCancel = $('#edit-message-cancel');
   const fileUploadInput = $('#file-upload-input');
   const attachBtn = $('#attach-btn');
   const attachMenu = $('#attach-menu');
@@ -4653,6 +4658,7 @@
     composeState.pendingAttachments = [];
     composeState.uploadingAttachments = [];
     composeState.pendingFileRefs = [];
+    clearEditingMessageState({ clearInput: true });
     contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
     renderContextUsageIndicator();
     clearFileTree();
@@ -4688,6 +4694,9 @@
       composeState.activeToolCalls.clear();
     }
     const previousSessionId = sessionState.currentSessionId;
+    if (editingMessageState && previousSessionId && previousSessionId !== snapshot.sessionId) {
+      clearEditingMessageState();
+    }
     sessionState.currentSessionId = snapshot.sessionId;
     if ((!previousSessionId || composeState.isGenerating) && snapshot.sessionId) {
       bindUnassignedQueuedMessagesToSession(snapshot.sessionId);
@@ -5864,12 +5873,14 @@
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
       sessionState.activeSessionLoad.snapshot = snapshot;
     }
+    const isEditResetSnapshot = msg.editReset === true || (pendingEditResetSessionId && pendingEditResetSessionId === msg.sessionId);
     applySessionSnapshot(snapshot, {
-      immediate: isBlockingSessionLoad(msg.sessionId),
+      immediate: isBlockingSessionLoad(msg.sessionId) || !!isEditResetSnapshot,
       suppressUnreadToast: false,
-      preserveStreaming: msg.sessionId === sessionState.currentSessionId
+      preserveStreaming: !isEditResetSnapshot && msg.sessionId === sessionState.currentSessionId
         && (msg.isRunning || composeState.isGenerating || sessionState.currentSessionRunning),
     });
+    if (isEditResetSnapshot) pendingEditResetSessionId = null;
     if (msg.historyPending) return;
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
       finalizeLoadedSession(msg.sessionId);
@@ -6357,8 +6368,9 @@
     abortBtn.disabled = busy ? isBlockingSessionLoad() : false;
     abortBtn.title = handoffPending ? '停止接力分析' : '停止';
     abortBtn.setAttribute('aria-label', handoffPending ? '停止接力分析' : '停止');
-    sendBtn.title = busy ? '加入发送队列' : '发送';
-    sendBtn.setAttribute('aria-label', busy ? '加入发送队列' : '发送');
+    const sendLabel = editingMessageState ? '发送修改并重置后续回答' : (busy ? '加入发送队列' : '发送');
+    sendBtn.title = sendLabel;
+    sendBtn.setAttribute('aria-label', sendLabel);
     if (composerStatus) {
       composerStatus.hidden = !handoffPending;
       composerStatus.textContent = handoffPending ? (handoffPending.message || '接力分析中') : '';
@@ -6809,7 +6821,109 @@
     scrollMessageToTop(msgEl);
   }
 
-  function createMessageActions(role, completedAt = null) {
+  function clearEditingMessageState(options = {}) {
+    editingMessageState = null;
+    if (editMessageBar) editMessageBar.hidden = true;
+    messagesDiv?.querySelectorAll('.msg.editing-source').forEach((el) => el.classList.remove('editing-source'));
+    if (options.clearInput) {
+      msgInput.value = '';
+      autoResize();
+      renderContextBar();
+    }
+    updateComposerActionButtons();
+  }
+
+  function renderEditingMessageState() {
+    const active = !!editingMessageState;
+    if (editMessageBar) {
+      editMessageBar.hidden = !active;
+      if (editMessageLabel && active) {
+        const displayIndex = Number(editingMessageState.messageIndex || 0) + 1;
+        editMessageLabel.textContent = `正在修改第 ${displayIndex} 条消息；发送后会重置后续回答`;
+      }
+    }
+    messagesDiv?.querySelectorAll('.msg.editing-source').forEach((el) => el.classList.remove('editing-source'));
+    if (active) {
+      const source = messagesDiv?.querySelector(`.msg.user[data-message-index="${editingMessageState.messageIndex}"]`);
+      if (source) source.classList.add('editing-source');
+    }
+    updateComposerActionButtons();
+  }
+
+  function beginEditMessageFromButton(btn) {
+    const msgEl = btn?.closest('.msg.user');
+    if (!msgEl) return;
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开会话');
+      return;
+    }
+    if (composeState.isGenerating || sessionState.currentSessionRunning) {
+      showToast('请先停止当前任务，再修改上一条消息');
+      return;
+    }
+    const messageIndex = Number(msgEl.dataset.messageIndex);
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+      showToast('这条消息暂时不能修改，请刷新会话后重试');
+      return;
+    }
+    const draft = msgInput.value.trim();
+    if (draft && !editingMessageState && !window.confirm('输入框里已有草稿，是否用这条历史消息覆盖草稿？')) return;
+    const text = msgEl.dataset.copyText || getMessageCopyTextFromElement(msgEl);
+    editingMessageState = {
+      sessionId: sessionState.currentSessionId,
+      messageIndex,
+      originalText: text,
+    };
+    msgInput.value = text;
+    hideCmdMenu();
+    hideOptionPicker();
+    autoResize();
+    renderContextBar();
+    renderEditingMessageState();
+    msgInput.focus();
+    scrollMessageToTop(msgEl);
+  }
+
+  function submitEditedMessage(text) {
+    if (!editingMessageState) return false;
+    if (composeState.isGenerating || sessionState.currentSessionRunning) {
+      showToast('请先停止当前任务，再提交修改');
+      return true;
+    }
+    const edited = String(text || '').trim();
+    if (!edited) {
+      showToast('修改后的消息不能为空');
+      return true;
+    }
+    const payload = {
+      type: 'edit_message',
+      sessionId: editingMessageState.sessionId,
+      messageIndex: editingMessageState.messageIndex,
+      text,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      agent: sessionState.currentAgent,
+    };
+    markAwaitingRuntimeStart();
+    const sent = send(payload);
+    if (!sent) return true;
+    pendingEditResetSessionId = editingMessageState.sessionId;
+    msgInput.value = '';
+    composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
+    renderPendingAttachments();
+    renderContextBar();
+    autoResize();
+    clearEditingMessageState();
+    showToast('已按修改内容重置后续回答');
+    // Do not optimistically start the streaming placeholder here. The backend
+    // first sends a fresh session_info with truncated history; if we mark the
+    // composer as generating too early, applySessionSnapshot() preserves the
+    // stale DOM and old assistant/tool cards remain visible until refresh.
+    return true;
+  }
+
+  function createMessageActions(role, completedAt = null, messageMeta = {}) {
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     if (role === 'assistant') {
@@ -6837,6 +6951,20 @@
       handleMessageCopyClick(copyBtn);
     });
     actions.appendChild(copyBtn);
+    if (role === 'user' && Number.isInteger(Number(messageMeta.messageIndex))) {
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'msg-action-btn msg-edit-btn';
+      editBtn.textContent = '✎';
+      editBtn.title = '修改这条消息并重置后续回答';
+      editBtn.setAttribute('aria-label', '修改这条消息并重置后续回答');
+      editBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        beginEditMessageFromButton(editBtn);
+      });
+      actions.appendChild(editBtn);
+    }
     if (role === 'assistant') {
       const completedTime = createMessageCompletionTimeElement(completedAt);
       if (completedTime) actions.appendChild(completedTime);
@@ -6895,9 +7023,13 @@
     else actions.appendChild(nextTime);
   }
 
-  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null) {
+  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null, messageMeta = {}) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
+    div.dataset.messageRole = role;
+    if (Number.isInteger(Number(messageMeta.messageIndex))) {
+      div.dataset.messageIndex = String(Number(messageMeta.messageIndex));
+    }
     if (role === 'user' || role === 'assistant') {
       div.dataset.copyText = typeof content === 'string' ? content : '';
     }
@@ -6955,7 +7087,7 @@
       contentWrap.appendChild(timeEl);
     }
     contentWrap.appendChild(bubble);
-    contentWrap.appendChild(createMessageActions(role, completedAt));
+    contentWrap.appendChild(createMessageActions(role, completedAt, messageMeta));
 
     div.appendChild(avatar);
     div.appendChild(contentWrap);
@@ -7350,10 +7482,11 @@
     };
   }
 
-  function buildMsgElement(m, previousUserTimestamp = null) {
+  function buildMsgElement(m, previousUserTimestamp = null, messageIndex = null) {
     const displayTimes = resolveMessageDisplayTimes(m, previousUserTimestamp);
-    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt);
-    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt);
+    const messageMeta = Number.isInteger(Number(messageIndex)) ? { messageIndex: Number(messageIndex) } : {};
+    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt, null, messageMeta);
+    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt, messageMeta);
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
@@ -7373,8 +7506,8 @@
     if (options.immediate) {
       const frag = document.createDocumentFragment();
       let latestUserTimestamp = null;
-      messages.forEach((message) => {
-        frag.appendChild(buildMsgElement(message, latestUserTimestamp));
+      messages.forEach((message, index) => {
+        frag.appendChild(buildMsgElement(message, latestUserTimestamp, index));
         if (message?.role === 'user') latestUserTimestamp = message.timestamp || message.createdAt || latestUserTimestamp;
       });
       messagesDiv.appendChild(frag);
@@ -7412,7 +7545,7 @@
     }
 
     const frag0 = document.createDocumentFragment();
-    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null));
+    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
     messagesDiv.appendChild(frag0);
     scrollToBottom();
     requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
@@ -7429,7 +7562,7 @@
       const prevScrollTop = messagesDiv.scrollTop;
       
       const frag = document.createDocumentFragment();
-      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null));
+      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       
       // Compensate scrollTop so visible area stays unchanged
@@ -9890,7 +10023,12 @@
   function sendMessage() {
     const text = msgInput.value.trim();
     const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
-    if ((!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) || isBlockingSessionLoad()) return;
+    if (isBlockingSessionLoad()) return;
+    if (editingMessageState) {
+      submitEditedMessage(text);
+      return;
+    }
+    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) return;
     if (composeState.isGenerating && !isPlanModeActive) {
       enqueueCurrentDraft();
       return;
@@ -10279,6 +10417,7 @@
     }
   });
   sendBtn.addEventListener('click', sendMessage);
+  if (editMessageCancel) editMessageCancel.addEventListener('click', () => clearEditingMessageState({ clearInput: true }));
   if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
   abortBtn.addEventListener('click', () => {
     if (abortBtn.disabled) return;
