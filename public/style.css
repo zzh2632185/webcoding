@@ -3709,6 +3709,21 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   display: block;
   min-width: max-content;
 }
+.streaming-plain-text {
+  margin: 8px 0;
+  padding: 12px;
+  border: 2px solid var(--line);
+  background: var(--code-bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 60vh;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
 /* HTML/SVG preview pane */
 .code-preview-pane {
   display: none;

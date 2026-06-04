@@ -4,7 +4,8 @@
   window.addEventListener('error', (e) => { console.error('[WEBCODING-INIT-ERROR]', e.message, e.filename, e.lineno); });
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-  const RENDER_DEBOUNCE = 100;
+  const RENDER_DEBOUNCE = 180;
+  const STREAMING_PLAIN_TEXT_THRESHOLD = 120_000;
 
   // Claude Code model entries — matches real /model output
   const CLAUDE_MODEL_ENTRIES = [
@@ -4985,6 +4986,7 @@
   const RENDER_LANGS = new Set(['md', 'markdown', 'json', 'csv']);
   const _previewCodeMap = new Map();
   let _previewCodeId = 0;
+  let markdownRenderMode = 'final';
   const PREVIEW_SRCDOC_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:; media-src data:; script-src 'none';">`;
 
   function sanitizePreviewMarkup(markup) {
@@ -5048,18 +5050,21 @@
   };
   renderer.code = function (code, language) {
     const lang = (language || 'plaintext').toLowerCase();
+    const isStreamingRender = markdownRenderMode === 'streaming';
     let highlighted;
     try {
-      if (hljs.getLanguage(lang)) {
+      if (!isStreamingRender && window.hljs && hljs.getLanguage(lang)) {
         highlighted = hljs.highlight(code, { language: lang }).value;
       } else {
-        highlighted = hljs.highlightAuto(code).value;
+        // highlightAuto is very expensive on long/partial streaming code blocks.
+        // Unknown languages are kept as escaped text instead of guessing.
+        highlighted = escapeHtml(code);
       }
     } catch {
       highlighted = escapeHtml(code);
     }
-    const canPreview = PREVIEW_LANGS.has(lang);
-    const canRender = RENDER_LANGS.has(lang);
+    const canPreview = !isStreamingRender && PREVIEW_LANGS.has(lang);
+    const canRender = !isStreamingRender && RENDER_LANGS.has(lang);
     const hasAction = canPreview || canRender;
     const btnLabel = canRender ? 'View' : 'Preview';
     const renderType = canPreview ? 'html' : ((['md','markdown'].includes(lang)) ? 'md' : lang);
@@ -6612,6 +6617,7 @@
     }
 
     if (composeState.pendingText) flushRender();
+    finalizeStreamingMarkdown();
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) {
@@ -6650,15 +6656,33 @@
     if (!textDiv) return;
     const nextText = `${textDiv.dataset.rawText || ''}${composeState.pendingText}`;
     textDiv.dataset.rawText = nextText;
-    textDiv.innerHTML = renderMarkdown(nextText);
+    textDiv.innerHTML = renderMarkdown(nextText, { streaming: true });
     composeState.pendingText = '';
     scrollToBottom({ onlyIfFollowing: true });
   }
 
-  function renderMarkdown(text) {
+  function finalizeStreamingMarkdown() {
+    const bubble = document.querySelector('#streaming-msg .msg-bubble');
+    if (!bubble) return;
+    bubble.querySelectorAll('.msg-segment-text').forEach((textDiv) => {
+      const raw = textDiv.dataset.rawText || '';
+      if (!raw) return;
+      textDiv.innerHTML = renderMarkdown(raw, { streaming: false });
+    });
+  }
+
+  function renderMarkdown(text, options = {}) {
     if (!text) return '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-    try { return marked.parse(text); }
+    const previousMode = markdownRenderMode;
+    markdownRenderMode = options.streaming ? 'streaming' : 'final';
+    try {
+      if (options.streaming && String(text).length > STREAMING_PLAIN_TEXT_THRESHOLD) {
+        return `<pre class="streaming-plain-text">${escapeHtml(text)}</pre>`;
+      }
+      return marked.parse(text);
+    }
     catch { return escapeHtml(text); }
+    finally { markdownRenderMode = previousMode; }
   }
 
   function createStreamingPlaceholder() {
