@@ -10304,7 +10304,10 @@
         pressActive: !!voiceInputState.pressActive,
         stopWhenReady: shouldStopImmediately,
       };
-      recorder.start();
+      // Ask MediaRecorder to emit data periodically so stopping the recording
+      // does not need to wait for one large final dataavailable event. The chunks
+      // are still uploaded as one complete audio Blob to preserve ASR accuracy.
+      recorder.start(500);
       updateVoiceInputButton();
       if (shouldStopImmediately) {
         setTimeout(stopVoiceInputRecording, 0);
