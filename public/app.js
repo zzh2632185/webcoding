@@ -164,6 +164,17 @@
   let awaitingRuntimeStartAt = 0;
   let editingMessageState = null;
   let pendingEditResetSessionId = null;
+  let voiceInputState = {
+    recorder: null,
+    stream: null,
+    chunks: [],
+    recording: false,
+    transcribing: false,
+    startedAt: 0,
+    mimeType: '',
+    pressActive: false,
+    stopWhenReady: false,
+  };
   let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
   let fileTreeUploadTargetRow = null;
   let fileTreeUploadActive = false;
@@ -360,6 +371,7 @@
   const attachMenu = $('#attach-menu');
   const attachUploadFile = $('#attach-upload-file');
   const attachReferenceFile = $('#attach-reference-file');
+  const voiceInputBtn = $('#voice-input-btn');
   const messagesDiv = $('#messages');
   const messagesWrap = messagesDiv?.closest('.messages-wrap');
   const jumpToLatestBtn = document.createElement('button');
@@ -6210,6 +6222,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || [], item.fileRefs || [], item.createdAt || new Date().toISOString()));
+    refreshRenderedMessageIndexes();
     scrollToBottom();
     if (!composeState.isGenerating) startGenerating();
   }
@@ -6629,6 +6642,7 @@
       }
     }
     removeStaleEmptyAssistantPlaceholders();
+    refreshRenderedMessageIndexes();
 
     if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
       sessionState.currentSessionId = sessionId;
@@ -7506,6 +7520,35 @@
     };
   }
 
+  function refreshRenderedMessageIndexes() {
+    if (!messagesDiv) return;
+    const messageEls = Array.from(messagesDiv.querySelectorAll(':scope > .msg'))
+      .filter((el) => !el.classList.contains('welcome-msg'));
+    messageEls.forEach((el, index) => {
+      el.dataset.messageIndex = String(index);
+      const role = el.classList.contains('user') ? 'user'
+        : (el.classList.contains('assistant') ? 'assistant'
+          : (el.classList.contains('system') ? 'system' : ''));
+      if (role) el.dataset.messageRole = role;
+      if (role === 'user' && !el.querySelector('.msg-edit-btn')) {
+        const actions = el.querySelector('.msg-actions');
+        if (!actions) return;
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'msg-action-btn msg-edit-btn';
+        editBtn.textContent = '✎';
+        editBtn.title = '修改这条消息并重置后续回答';
+        editBtn.setAttribute('aria-label', '修改这条消息并重置后续回答');
+        editBtn.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          beginEditMessageFromButton(editBtn);
+        });
+        actions.appendChild(editBtn);
+      }
+    });
+  }
+
   function buildMsgElement(m, previousUserTimestamp = null, messageIndex = null) {
     const displayTimes = resolveMessageDisplayTimes(m, previousUserTimestamp);
     const messageMeta = Number.isInteger(Number(messageIndex)) ? { messageIndex: Number(messageIndex) } : {};
@@ -7535,6 +7578,7 @@
         if (message?.role === 'user') latestUserTimestamp = message.timestamp || message.createdAt || latestUserTimestamp;
       });
       messagesDiv.appendChild(frag);
+      refreshRenderedMessageIndexes();
       scrollToBottom();
       requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
       return;
@@ -7571,6 +7615,7 @@
     const frag0 = document.createDocumentFragment();
     for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
     messagesDiv.appendChild(frag0);
+    refreshRenderedMessageIndexes();
     scrollToBottom();
     requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
 
@@ -7588,6 +7633,7 @@
       const frag = document.createDocumentFragment();
       for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+      refreshRenderedMessageIndexes();
       
       // Compensate scrollTop so visible area stays unchanged
       messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
@@ -10098,7 +10144,8 @@
     const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
     const payloadAttachments = attachmentTransportPayloads(composeState.pendingAttachments);
     const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs, new Date().toISOString()));
+    messagesDiv.appendChild(createMsgElement('user', text, attachments, fileRefs, new Date().toISOString(), null, { messageIndex: messagesDiv.querySelectorAll(':scope > .msg').length }));
+    refreshRenderedMessageIndexes();
     scrollToBottom();
 
     sendUserMessage({ text, attachments: payloadAttachments, fileRefs });
@@ -10114,6 +10161,240 @@
   function autoResize() {
     msgInput.style.height = 'auto';
     msgInput.style.height = Math.min(msgInput.scrollHeight, cachedInputMaxHeight) + 'px';
+  }
+
+  function preferredVoiceMimeType() {
+    if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return '';
+    const candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/ogg',
+      'audio/mp4',
+    ];
+    return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+  }
+
+  function updateVoiceInputButton() {
+    if (!voiceInputBtn) return;
+    voiceInputBtn.classList.toggle('recording', !!voiceInputState.recording);
+    voiceInputBtn.classList.toggle('transcribing', !!voiceInputState.transcribing);
+    voiceInputBtn.disabled = !!voiceInputState.transcribing;
+    const label = voiceInputState.transcribing
+      ? '正在转文字…'
+      : (voiceInputState.recording ? '松手转文字' : '按住说话');
+    voiceInputBtn.title = label;
+    voiceInputBtn.setAttribute('aria-label', label);
+  }
+
+  function cleanupVoiceInputStream() {
+    if (voiceInputState.stream) {
+      for (const track of voiceInputState.stream.getTracks()) {
+        try { track.stop(); } catch {}
+      }
+    }
+    voiceInputState.stream = null;
+  }
+
+  function insertVoiceTextAtCursor(text) {
+    const clean = String(text || '').trim();
+    if (!clean) return;
+    const start = Number.isInteger(msgInput.selectionStart) ? msgInput.selectionStart : msgInput.value.length;
+    const end = Number.isInteger(msgInput.selectionEnd) ? msgInput.selectionEnd : start;
+    const before = msgInput.value.slice(0, start);
+    const after = msgInput.value.slice(end);
+    msgInput.value = before + clean + after;
+    const cursor = before.length + clean.length;
+    try { msgInput.setSelectionRange(cursor, cursor); } catch {}
+    msgInput.focus();
+    renderContextBar();
+    autoResize();
+    if (msgInput.value.startsWith('/') && !msgInput.value.includes('\n')) {
+      showCmdMenu(msgInput.value);
+    } else {
+      hideCmdMenu();
+    }
+  }
+
+  async function transcribeVoiceChunks(chunks, mimeType) {
+    const usableChunks = Array.isArray(chunks) ? chunks.filter((chunk) => chunk && chunk.size > 0) : [];
+    if (!usableChunks.length) {
+      showToast('没有录到声音');
+      return;
+    }
+    if (!connectionState.authToken) {
+      showToast('登录状态已失效，请刷新后重新登录');
+      return;
+    }
+    const blobType = mimeType || usableChunks[0]?.type || 'audio/webm';
+    const blob = new Blob(usableChunks, { type: blobType });
+    voiceInputState.transcribing = true;
+    updateVoiceInputButton();
+    try {
+      const response = await fetch('/api/asr/transcribe?language=zh', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${connectionState.authToken}`,
+          'Content-Type': blob.type || 'audio/webm',
+        },
+        body: blob,
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) {
+        throw new Error(data?.message || `HTTP ${response.status}`);
+      }
+      const text = String(data.text || '').trim();
+      if (!text) {
+        showToast('没有识别到文字');
+        return;
+      }
+      insertVoiceTextAtCursor(text);
+      showToast('语音已转成文字');
+    } catch (err) {
+      showToast(err?.message || '语音转文字失败');
+    } finally {
+      voiceInputState.transcribing = false;
+      updateVoiceInputButton();
+    }
+  }
+
+  async function startVoiceInputRecording() {
+    if (!voiceInputBtn || voiceInputState.recording || voiceInputState.transcribing) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      showToast('当前浏览器不支持网页录音');
+      return;
+    }
+    let acquiredStream = null;
+    try {
+      acquiredStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const stream = acquiredStream;
+      const mimeType = preferredVoiceMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks = [];
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data && event.data.size > 0) chunks.push(event.data);
+      });
+      recorder.addEventListener('stop', () => {
+        const stoppedChunks = chunks.slice();
+        const stoppedMime = recorder.mimeType || mimeType || 'audio/webm';
+        voiceInputState.recorder = null;
+        voiceInputState.chunks = [];
+        voiceInputState.recording = false;
+        voiceInputState.mimeType = '';
+        voiceInputState.stopWhenReady = false;
+        cleanupVoiceInputStream();
+        updateVoiceInputButton();
+        transcribeVoiceChunks(stoppedChunks, stoppedMime);
+      }, { once: true });
+      const shouldStopImmediately = !!voiceInputState.stopWhenReady;
+      voiceInputState = {
+        recorder,
+        stream,
+        chunks,
+        recording: true,
+        transcribing: false,
+        startedAt: Date.now(),
+        mimeType: recorder.mimeType || mimeType || 'audio/webm',
+        pressActive: !!voiceInputState.pressActive,
+        stopWhenReady: shouldStopImmediately,
+      };
+      recorder.start();
+      updateVoiceInputButton();
+      if (shouldStopImmediately) {
+        setTimeout(stopVoiceInputRecording, 0);
+      } else {
+        showToast('按住说话，松手转文字');
+      }
+    } catch (err) {
+      if (acquiredStream && acquiredStream !== voiceInputState.stream) {
+        for (const track of acquiredStream.getTracks()) {
+          try { track.stop(); } catch {}
+        }
+      }
+      cleanupVoiceInputStream();
+      voiceInputState.recording = false;
+      voiceInputState.pressActive = false;
+      voiceInputState.stopWhenReady = false;
+      updateVoiceInputButton();
+      const name = err?.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        showToast('浏览器拒绝了麦克风权限');
+      } else {
+        showToast(`无法开始录音：${err?.message || err}`);
+      }
+    }
+  }
+
+  function stopVoiceInputRecording() {
+    const recorder = voiceInputState.recorder;
+    if (!recorder || !voiceInputState.recording) return;
+    try {
+      if (recorder.state !== 'inactive') recorder.stop();
+    } catch (err) {
+      cleanupVoiceInputStream();
+      voiceInputState = { recorder: null, stream: null, chunks: [], recording: false, transcribing: false, startedAt: 0, mimeType: '', pressActive: false, stopWhenReady: false };
+      updateVoiceInputButton();
+      showToast(`停止录音失败：${err?.message || err}`);
+    }
+  }
+
+  function toggleVoiceInputRecording() {
+    if (voiceInputState.transcribing) return;
+    if (voiceInputState.recording) stopVoiceInputRecording();
+    else startVoiceInputRecording();
+  }
+
+  function beginVoicePress(event) {
+    if (!voiceInputBtn || voiceInputState.transcribing) return;
+    if (event && typeof event.button === 'number' && event.button !== 0) return;
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        if (typeof event.pointerId === 'number' && voiceInputBtn.setPointerCapture) {
+          voiceInputBtn.setPointerCapture(event.pointerId);
+        }
+      } catch {}
+    }
+    voiceInputState.pressActive = true;
+    voiceInputState.stopWhenReady = false;
+    startVoiceInputRecording();
+  }
+
+  function endVoicePress(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        if (typeof event.pointerId === 'number' && voiceInputBtn?.releasePointerCapture) {
+          voiceInputBtn.releasePointerCapture(event.pointerId);
+        }
+      } catch {}
+    }
+    if (!voiceInputState.pressActive && !voiceInputState.recording) return;
+    voiceInputState.pressActive = false;
+    if (voiceInputState.recording) {
+      stopVoiceInputRecording();
+    } else {
+      voiceInputState.stopWhenReady = true;
+    }
+  }
+
+  function beginVoiceKeyPress(event) {
+    if (event.repeat) return;
+    if (event.key !== ' ' && event.key !== 'Enter') return;
+    beginVoicePress(event);
+  }
+
+  function endVoiceKeyPress(event) {
+    if (event.key !== ' ' && event.key !== 'Enter') return;
+    endVoicePress(event);
   }
 
   function isMobileInputMode() {
@@ -10441,6 +10722,18 @@
     }
   });
   sendBtn.addEventListener('click', sendMessage);
+  if (voiceInputBtn) {
+    voiceInputBtn.addEventListener('pointerdown', beginVoicePress);
+    voiceInputBtn.addEventListener('pointerup', endVoicePress);
+    voiceInputBtn.addEventListener('pointercancel', endVoicePress);
+    voiceInputBtn.addEventListener('lostpointercapture', () => {
+      if (voiceInputState.pressActive) endVoicePress();
+    });
+    voiceInputBtn.addEventListener('keydown', beginVoiceKeyPress);
+    voiceInputBtn.addEventListener('keyup', endVoiceKeyPress);
+    voiceInputBtn.addEventListener('click', (event) => event.preventDefault());
+    voiceInputBtn.addEventListener('contextmenu', (event) => event.preventDefault());
+  }
   if (editMessageCancel) editMessageCancel.addEventListener('click', () => clearEditingMessageState({ clearInput: true }));
   if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
   abortBtn.addEventListener('click', () => {
