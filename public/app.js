@@ -3680,7 +3680,7 @@
 
   function fileCanPreview(data) {
     if (!data) return false;
-    if (['markdown', 'csv', 'tsv', 'xlsx', 'docx', 'image', 'pdf', 'json'].includes(data.type)) return true;
+    if (['markdown', 'csv', 'tsv', 'xlsx', 'docx', 'pptx', 'image', 'pdf', 'json'].includes(data.type)) return true;
     if (data.type === 'code') return ['html', 'svg'].includes(String(data.language || '').toLowerCase());
     return false;
   }
@@ -3816,6 +3816,10 @@
     if (data.type === 'pdf') {
       if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载 PDF…</div>';
       return `<iframe class="file-viewer-iframe" src="${escapeHtml(fileViewerState.objectUrl)}" title="${escapeHtml(data.name || 'PDF')}"></iframe>`;
+    }
+    if (data.type === 'pptx') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在转换 PPT 预览…</div>';
+      return `<iframe class="file-viewer-iframe" src="${escapeHtml(fileViewerState.objectUrl)}" title="${escapeHtml(data.name || 'PPT 预览')}"></iframe>`;
     }
     if (data.type === 'code' && ['html', 'svg'].includes(String(data.language || '').toLowerCase())) {
       return `<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildSafePreviewSrcdoc(data.content || ''))}"></iframe>`;
@@ -4070,11 +4074,15 @@
   }
 
   async function fetchFileViewerBlob(data) {
-    if (!data?.rawUrl || !['image', 'pdf'].includes(data.type)) return;
+    const blobUrl = data?.type === 'pptx' ? data?.previewUrl : data?.rawUrl;
+    if (!blobUrl || !['image', 'pdf', 'pptx'].includes(data?.type)) return;
     const expectedPath = data.path || fileViewerState.activePath;
     try {
-      const response = await fetch(data.rawUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
-      if (!response.ok) throw new Error(`读取原始文件失败 (${response.status})`);
+      const response = await fetch(blobUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`${data.type === 'pptx' ? '转换 PPT 预览失败' : '读取原始文件失败'} (${response.status})${detail ? `：${detail}` : ''}`);
+      }
       const blob = await response.blob();
       if (fileViewerState.activePath !== expectedPath) return;
       clearFileViewerObjectUrl();
@@ -4082,7 +4090,7 @@
       renderFileViewer();
     } catch (err) {
       if (fileViewerState.activePath === expectedPath) {
-        fileViewerState.error = err.message || '读取原始文件失败';
+        fileViewerState.error = err.message || (data?.type === 'pptx' ? '转换 PPT 预览失败' : '读取原始文件失败');
         renderFileViewer();
       }
     }

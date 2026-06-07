@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { pathToFileURL } = require('url');
 const { Blob } = require('buffer');
 const { spawn, execFile, execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
@@ -60,6 +61,7 @@ const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
 const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
 const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
 const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
+const FILE_VIEW_OFFICE_PREVIEW_MAX_SIZE = 50 * 1024 * 1024;
 const FILE_UPLOAD_MAX_SIZE = ONE_GB_BYTES;
 const ASR_UPLOAD_MAX_SIZE = parseInt(process.env.CC_WEB_ASR_UPLOAD_MAX_BYTES || '', 10) || (50 * 1024 * 1024);
 const ASR_TRANSCRIBE_URL = process.env.CC_WEB_ASR_TRANSCRIBE_URL || 'http://127.0.0.1:8788/v1/audio/transcriptions';
@@ -70,12 +72,14 @@ const FILE_VIEW_TABLE_MAX_COLS = 50;
 const FILE_TREE_MAX_DEPTH = 3;
 const FILE_TREE_MAX_ENTRIES = 800;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.ppt', '.pptx', '.csv', '.tsv', '.json', '.jsonl', '.log']);
 const TEXT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log']);
 const DOCUMENT_ATTACHMENT_MIME_TYPES = new Set([
   'text/plain', 'text/markdown', 'text/csv', 'text/tab-separated-values', 'application/json', 'application/pdf', 'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint',
   'application/vnd.ms-excel',
 ]);
 const FILE_TREE_IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.venv', 'venv', '__pycache__', '.pytest_cache', '.cache']);
@@ -91,7 +95,7 @@ const FILE_VIEW_CODE_EXTENSIONS = new Set([
   '.go', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.rb', '.swift', '.sql', '.dockerfile'
 ]);
 const FILE_VIEW_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.avif']);
-const FILE_VIEW_BINARY_EXTENSIONS = new Set(['.pdf', '.xlsx', '.xls', '.docx']);
+const FILE_VIEW_BINARY_EXTENSIONS = new Set(['.pdf', '.xlsx', '.xls', '.docx', '.ppt', '.pptx']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
@@ -140,7 +144,7 @@ const SECURITY_HEADERS = {
   'Permissions-Policy': 'camera=(), microphone=(self), geolocation=()',
   'X-XSS-Protection': '0',
   'Cross-Origin-Resource-Policy': 'same-origin',
-  'Content-Security-Policy': "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; frame-ancestors 'none'; base-uri 'none'",
+  'Content-Security-Policy': "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; frame-ancestors 'none'; base-uri 'none'",
 };
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -2357,6 +2361,8 @@ function getFileMime(filePath) {
   if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
   if (ext === '.xls') return 'application/vnd.ms-excel';
+  if (ext === '.pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  if (ext === '.ppt') return 'application/vnd.ms-powerpoint';
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
   if (ext === '.bmp') return 'image/bmp';
   if (ext === '.webp') return 'image/webp';
@@ -2374,6 +2380,7 @@ function getFileViewType(filePath, stat) {
   if (ext === '.xlsx' || ext === '.xls') return 'xlsx';
   if (ext === '.doc') return 'doc';
   if (ext === '.docx') return 'docx';
+  if (ext === '.pptx' || ext === '.ppt') return 'pptx';
   if (ext === '.pdf') return 'pdf';
   if (FILE_VIEW_IMAGE_EXTENSIONS.has(ext)) return 'image';
   if (ext === '.json') return 'json';
@@ -2489,6 +2496,68 @@ async function buildDocxView(filePath, stat) {
     html: result?.value || '',
     messages: Array.isArray(result?.messages) ? result.messages.map((m) => String(m.message || '')).filter(Boolean) : [],
   };
+}
+
+function buildOfficePdfPreview(filePath, stat) {
+  if (stat.size > FILE_VIEW_OFFICE_PREVIEW_MAX_SIZE) {
+    const err = new Error('Office 文件超过 50MB，不能直接转换预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-office-preview-'));
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-soffice-profile-'));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
+    };
+    const args = [
+      `-env:UserInstallation=${pathToFileURL(profileDir).href}`,
+      '--headless',
+      '--nologo',
+      '--nofirststartwizard',
+      '--convert-to',
+      'pdf',
+      '--outdir',
+      tmpDir,
+      filePath,
+    ];
+    execFile('soffice', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 90000 }, (err, stdout, stderr) => {
+      try {
+        if (err) {
+          const detail = String(stderr || stdout || err.message || err).trim();
+          const wrapped = new Error(`PPT 转 PDF 失败${detail ? `：${detail}` : ''}`);
+          wrapped.statusCode = 500;
+          reject(wrapped);
+          return;
+        }
+        const expected = path.join(tmpDir, `${path.basename(filePath).replace(/\.[^.]+$/, '')}.pdf`);
+        const candidates = [];
+        if (fs.existsSync(expected)) candidates.push(expected);
+        try {
+          for (const name of fs.readdirSync(tmpDir)) {
+            if (name.toLowerCase().endsWith('.pdf')) candidates.push(path.join(tmpDir, name));
+          }
+        } catch {}
+        const target = candidates.find((candidate) => {
+          try { return fs.statSync(candidate).isFile(); } catch { return false; }
+        });
+        if (!target) {
+          const wrapped = new Error('PPT 转 PDF 失败：LibreOffice 未生成 PDF 文件');
+          wrapped.statusCode = 500;
+          reject(wrapped);
+          return;
+        }
+        resolve(fs.readFileSync(target));
+      } catch (readErr) {
+        const wrapped = new Error(`PPT 转 PDF 失败：${readErr.message || readErr}`);
+        wrapped.statusCode = 500;
+        reject(wrapped);
+      } finally {
+        cleanup();
+      }
+    });
+  });
 }
 
 function jsonErrorResponse(res, err, fallbackMessage = '请求失败') {
@@ -2647,6 +2716,8 @@ function extFromMime(mime) {
     case 'application/msword': return '.doc';
     case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': return '.docx';
     case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': return '.xlsx';
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': return '.pptx';
+    case 'application/vnd.ms-powerpoint': return '.ppt';
     case 'application/vnd.ms-excel': return '.xls';
     default: return '';
   }
@@ -2712,6 +2783,8 @@ function inferDocumentAttachmentType(filename, mime = '') {
     if (ext === '.docx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', type: 'docx' };
     if (ext === '.xlsx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type: 'xlsx' };
     if (ext === '.xls') return { ext, mime: normalizedMime || 'application/vnd.ms-excel', type: 'xlsx' };
+    if (ext === '.pptx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.presentationml.presentation', type: 'pptx' };
+    if (ext === '.ppt') return { ext, mime: normalizedMime || 'application/vnd.ms-powerpoint', type: 'pptx' };
   }
   if (DOCUMENT_ATTACHMENT_MIME_TYPES.has(normalizedMime)) {
     const inferredExt = extFromMime(normalizedMime);
@@ -2740,7 +2813,7 @@ function validateDocumentAttachmentBuffer(buffer, filename, mime) {
     if (buffer.length < 5 || buffer.toString('ascii', 0, 5) !== '%PDF-') return { error: 'PDF 文件内容与扩展名不一致或已损坏' };
     return { ...info, mime: 'application/pdf' };
   }
-  if (info.type === 'doc' || info.type === 'docx' || info.type === 'xlsx') {
+  if (info.type === 'doc' || info.type === 'docx' || info.type === 'xlsx' || info.type === 'pptx') {
     const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
     const isOle = buffer.length >= 8 && buffer[0] === 0xd0 && buffer[1] === 0xcf && buffer[2] === 0x11 && buffer[3] === 0xe0;
     if (!isZip && !isOle) return { error: 'Office 文档内容与扩展名不一致或已损坏' };
@@ -6588,6 +6661,15 @@ const server = http.createServer((req, res) => {
         if (viewType === 'docx') {
           return jsonResponse(res, 200, { ...base, ...(await buildDocxView(resolved, stat)), rawUrl });
         }
+        if (viewType === 'pptx') {
+          const previewParams = new URLSearchParams({ cwd: root, path: path.relative(root, resolved) || path.basename(resolved) });
+          return jsonResponse(res, 200, {
+            ...base,
+            rawUrl,
+            previewUrl: `/api/file-preview-pdf?${previewParams.toString()}`,
+            previewMime: 'application/pdf',
+          });
+        }
         if (viewType === 'image' || viewType === 'pdf' || viewType === 'binary') {
           return jsonResponse(res, 200, { ...base, rawUrl });
         }
@@ -6645,6 +6727,45 @@ const server = http.createServer((req, res) => {
     req.on('error', () => {
       if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '保存请求中断' });
     });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-preview-pdf') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    (async () => {
+      try {
+        const cwd = url.searchParams.get('cwd') || '';
+        const requestedPath = url.searchParams.get('path') || '';
+        const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) {
+          writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('Target is not a file');
+        }
+        const viewType = getFileViewType(resolved, stat);
+        if (viewType !== 'pptx') {
+          writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('Only PPT/PPTX preview conversion is supported');
+        }
+        const pdfBuffer = await buildOfficePdfPreview(resolved, stat);
+        const pdfName = `${path.basename(resolved).replace(/\.[^.]+$/, '') || 'preview'}.pdf`;
+        const asciiFilename = pdfName.replace(/[^A-Za-z0-9._-]+/g, '_') || 'preview.pdf';
+        writeHeadWithSecurity(res, 200, {
+          'Content-Type': 'application/pdf',
+          'Content-Length': String(pdfBuffer.length),
+          'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(pdfName)}`,
+          'Cache-Control': 'no-cache',
+        });
+        return res.end(pdfBuffer);
+      } catch (err) {
+        writeHeadWithSecurity(res, err?.statusCode || 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end(err?.message || 'Unable to convert preview');
+      }
+    })();
     return;
   }
 
