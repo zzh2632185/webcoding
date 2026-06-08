@@ -2975,6 +2975,36 @@ function isGeneratedImageExtension(filePath) {
   return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
 }
 
+function localImageInfoForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!absPath || absPath.includes('\0')) return null;
+  let stat;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    return null;
+  }
+  if (!stat.isFile()) return null;
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) return null;
+  let fd = null;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const sniff = Buffer.alloc(Math.min(MAX_ATTACHMENT_SNIFF_BYTES, Math.max(1, stat.size)));
+    const bytes = fs.readSync(fd, sniff, 0, sniff.length, 0);
+    const magicMime = detectMimeFromMagic(sniff.subarray(0, bytes));
+    const extMime = getFileMime(absPath).split(';')[0].trim().toLowerCase();
+    const mime = IMAGE_MIME_TYPES.has(magicMime) ? magicMime : (IMAGE_MIME_TYPES.has(extMime) ? extMime : '');
+    if (!mime) return null;
+    return { path: absPath, stat, mime };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
 function generatedImageRootEntries() {
   return [
     ['codex', GENERATED_IMAGES_ROOT],
@@ -6226,6 +6256,25 @@ const server = http.createServer((req, res) => {
         jsonResponse(res, err?.statusCode || 500, { ok: false, message: err?.message || '语音转文字失败' });
       }
     });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/local-image') {
+    const requestedPath = url.searchParams.get('path') || '';
+    const info = localImageInfoForFile(requestedPath);
+    if (!info) {
+      writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Local image not found or not an allowed image file');
+    }
+    writeHeadWithSecurity(res, 200, {
+      'Content-Type': info.mime,
+      'Content-Length': String(info.stat.size),
+      'Content-Disposition': `inline; filename="${path.basename(info.path).replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
+      'Cache-Control': 'private, max-age=86400',
+    });
+    fs.createReadStream(info.path).on('error', () => {
+      try { res.destroy(); } catch {}
+    }).pipe(res);
     return;
   }
 

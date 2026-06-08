@@ -5063,10 +5063,18 @@
     return `<a href="${escapeHtml(safeHref)}"${safeTitle}${externalAttrs}>${text || ''}</a>`;
   };
   renderer.image = function (href, title, text) {
-    const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: false, allowDataImage: true });
+    const rawHref = String(href || '').trim();
+    const isAllowedLocalImageApi = rawHref.startsWith('/api/local-image?') || rawHref.startsWith('/api/generated-image/');
+    const safeHref = isAllowedLocalImageApi
+      ? rawHref
+      : normalizeSafeHref(href, { externalOnly: false, allowRelative: false, allowDataImage: true });
     if (!safeHref) return '';
     const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
-    return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text || '')}"${safeTitle}>`;
+    const alt = escapeHtml(text || '');
+    if (isAllowedLocalImageApi) {
+      return `<a href="${escapeHtml(safeHref)}" class="markdown-local-image-link" data-full-src="${escapeHtml(safeHref)}" title="点击查看大图"><img class="markdown-local-image" src="${escapeHtml(safeHref)}" alt="${alt}"${safeTitle}></a>`;
+    }
+    return `<img src="${escapeHtml(safeHref)}" alt="${alt}"${safeTitle}>`;
   };
   renderer.code = function (code, language) {
     const lang = (language || 'plaintext').toLowerCase();
@@ -12984,6 +12992,50 @@
     return '';
   }
 
+  function closeImageLightbox() {
+    document.getElementById('image-lightbox-overlay')?.remove();
+    document.body.classList.remove('image-lightbox-open');
+  }
+
+  function openImageLightbox(src, alt = '') {
+    const safeSrc = String(src || '').trim();
+    if (!safeSrc) return;
+    closeImageLightbox();
+    const overlay = document.createElement('div');
+    overlay.id = 'image-lightbox-overlay';
+    overlay.className = 'image-lightbox-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', '图片预览');
+    overlay.innerHTML = `
+      <div class="image-lightbox-window">
+        <button type="button" class="image-lightbox-close" aria-label="关闭图片预览">×</button>
+        <img class="image-lightbox-img" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(alt || '图片预览')}">
+      </div>
+    `;
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) closeImageLightbox();
+    });
+    overlay.querySelector('.image-lightbox-close')?.addEventListener('click', closeImageLightbox);
+    document.body.appendChild(overlay);
+    document.body.classList.add('image-lightbox-open');
+    overlay.querySelector('.image-lightbox-close')?.focus({ preventScroll: true });
+  }
+
+  function handleMarkdownLocalImageClick(event) {
+    const link = event.target?.closest?.('.markdown-local-image-link');
+    if (!link) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const src = link.getAttribute('data-full-src') || link.getAttribute('href') || '';
+    const alt = link.querySelector('img')?.getAttribute('alt') || '';
+    openImageLightbox(src, alt);
+  }
+
+  function handleImageLightboxKeydown(event) {
+    if (event.key === 'Escape') closeImageLightbox();
+  }
+
   function buildUpdateStatusHtml(info) {
     const latestVersion = escapeHtml(info?.latestVersion || '');
     const localVersion = escapeHtml(info?.localVersion || '');
@@ -13015,6 +13067,8 @@
   setSelectedAgent(selectedAgent, { syncMode: true });
   resetChatView(selectedAgent);
   connect();
+  document.addEventListener('click', handleMarkdownLocalImageClick);
+  document.addEventListener('keydown', handleImageLightboxKeydown);
   window.addEventListener('resize', updateCwdBadge);
   window.addEventListener('online', () => {
     connectionState.reconnectAttempts = 0;
