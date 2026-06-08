@@ -1145,6 +1145,71 @@ function runCodexGeneratedImageRecoverySourceRegressionCase() {
   );
 }
 
+function runCodexFastModeSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const indexSource = readRepoText('public', 'index.html');
+  const serverSource = readRepoText('server.js');
+  const agentRuntimeSource = readRepoText('lib', 'agent-runtime.js');
+  const bridgeSource = readRepoText('lib', 'local-api-bridge.js');
+  const spawnSource = extractFunctionSource(agentRuntimeSource, 'buildCodexSpawnSpec');
+  const normalizeTierSource = extractFunctionSource(bridgeSource, 'normalizeOpenAiServiceTier');
+
+  assert(
+    indexSource.includes('desktop-speed-select')
+      && indexSource.includes('mobile-speed-select')
+      && appSource.includes("type: 'set_fast_mode'")
+      && appSource.includes('showFastModePicker')
+      && appSource.includes("cmd === '/fast'"),
+    'Frontend must expose a Codex Fast/Standard selector and /fast command wired to set_fast_mode',
+  );
+  assert(
+    serverSource.includes('function normalizeCodexFastMode')
+      && serverSource.includes("case 'set_fast_mode'")
+      && serverSource.includes('handleSetFastMode')
+      && serverSource.includes('clearRuntimeSessionId(session)')
+      && serverSource.includes('fastMode: !!session.fastMode'),
+    'Server must persist Codex fastMode, clear runtime session on changes, and send it in session metadata',
+  );
+  assert(
+    spawnSource.includes('session.fastMode === true')
+      && spawnSource.includes('features.fast_mode=true')
+      && spawnSource.includes("service_tier=${quoted('fast')}")
+      && !spawnSource.includes("service_tier=${quoted('standard')}"),
+    'Codex app-server spawn must only pass Fast mode overrides when session.fastMode is true',
+  );
+  assert(
+    normalizeTierSource.includes("serviceTier !== 'fast'")
+      && normalizeTierSource.includes("service_tier: 'priority'"),
+    'Local OpenAI-compatible bridge must normalize Codex service_tier fast to priority for CPAP compatibility',
+  );
+  assert(
+    bridgeSource.includes('function shouldRetryWithoutServiceTier')
+      && bridgeSource.includes('stripOpenAiServiceTier')
+      && bridgeSource.includes('responses_service_tier_retry_standard')
+      && bridgeSource.includes('chat_completions_fallback_service_tier_retry_standard'),
+    'Local bridge must retry without service_tier if upstream rejects Fast/priority, so Fast cannot make Codex unusable',
+  );
+}
+
+function runHandoffRemovalSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const indexSource = readRepoText('public', 'index.html');
+  const styleSource = readRepoText('public', 'style.css');
+  const serverSource = readRepoText('server.js');
+  assert(
+    !/handoff_session|handleHandoffSession|generateAiHandoffSummary|handoff_status|activeHandoffProcesses|handoffPending/.test(serverSource),
+    'Server handoff session feature must remain removed',
+  );
+  assert(
+    !/sendHandoffMessage|handleHandoffStatusMessage|handoff_status|handoffPending|currentHandoffPending|handoffBtn/.test(appSource),
+    'Frontend handoff session feature must remain removed',
+  );
+  assert(
+    !/handoff-btn/.test(indexSource) && !/handoff-btn/.test(styleSource),
+    'Handoff button markup/styles must remain removed',
+  );
+}
+
 function runProcessWithInput(command, args, { input = '', env = {}, cwd = REPO_DIR, timeoutMs = 8000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -4218,6 +4283,8 @@ async function main() {
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
   await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
+  await sourceRunner.run('codex fast mode source guard', runCodexFastModeSourceRegressionCase);
+  await sourceRunner.run('handoff removal source guard', runHandoffRemovalSourceRegressionCase);
   await sourceRunner.run('codex native goal continuation runner', runCodexNativeGoalContinuationRegressionCase);
   sourceRunner.finish();
 

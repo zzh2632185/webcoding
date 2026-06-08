@@ -21,6 +21,7 @@
     { cmd: '/model', desc: '查看/切换模型' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
     { cmd: '/reasoning', desc: '查看/切换 Codex 思考级别' },
+    { cmd: '/fast', desc: '查看/切换 Codex Fast 模式' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/help', desc: '显示帮助' },
@@ -117,6 +118,24 @@
     acc[item.value] = item.label;
     return acc;
   }, {});
+  const CODEX_SPEED_OPTIONS = [
+    { value: 'standard', label: 'Standard', desc: '不传 service_tier，使用默认速度和默认消耗' },
+    { value: 'fast', label: 'Fast', desc: '请求 Codex Fast 模式：更快，消耗更高' },
+  ];
+
+  function normalizeCodexFastMode(value) {
+    if (value === true) return true;
+    const raw = String(value || '').trim().toLowerCase();
+    return raw === 'fast' || raw === 'on' || raw === 'true' || raw === '1';
+  }
+
+  function getCodexSpeedValue(value) {
+    return normalizeCodexFastMode(value) ? 'fast' : 'standard';
+  }
+
+  function getCodexSpeedLabel(value) {
+    return normalizeCodexFastMode(value) ? 'Fast' : 'Standard';
+  }
 
 
   // --- State ---
@@ -139,6 +158,7 @@
   let currentMode = DEFAULT_AGENT_MODES[DEFAULT_AGENT];
   let currentModel = '';
   let currentReasoningEffort = '';
+  let currentFastMode = false;
   let currentActiveRuntime = null;
   let currentRuntimeCount = 0;
   const savedAgent = localStorage.getItem('webcoding-agent');
@@ -198,13 +218,13 @@
     agent: null,
     mode: null,
     reasoningEffort: '',
+    fastMode: false,
   };
   let sideChatSelectionPopover = null;
   let sideChatSelectionTimer = null;
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
-  let currentHandoffPending = null;
   let skipDeleteConfirm = localStorage.getItem('webcoding-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
@@ -264,6 +284,8 @@
     set currentModel(value) { currentModel = value; },
     get currentReasoningEffort() { return currentReasoningEffort; },
     set currentReasoningEffort(value) { currentReasoningEffort = value; },
+    get currentFastMode() { return currentFastMode; },
+    set currentFastMode(value) { currentFastMode = value === true; },
     get currentActiveRuntime() { return currentActiveRuntime; },
     set currentActiveRuntime(value) { currentActiveRuntime = value; },
     get currentRuntimeCount() { return currentRuntimeCount; },
@@ -280,8 +302,6 @@
     set currentCwd(value) { currentCwd = value; },
     get currentSessionRunning() { return currentSessionRunning; },
     set currentSessionRunning(value) { currentSessionRunning = value; },
-    get currentHandoffPending() { return currentHandoffPending; },
-    set currentHandoffPending(value) { currentHandoffPending = value; },
   };
 
   const composeState = {
@@ -383,7 +403,6 @@
   const msgInput = $('#msg-input');
   const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
-  const handoffBtn = $('#handoff-btn');
   const composerStatus = $('#composer-status');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
@@ -809,7 +828,7 @@
     const visibleSessions = getVisibleSessions();
     const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     const activeProject = getCurrentProjectContext();
-    const runningCount = visibleSessions.filter((session) => session.isRunning || normalizeHandoffPending(session.handoffPending)).length;
+    const runningCount = visibleSessions.filter((session) => session.isRunning).length;
     const currentMessageCount = getCurrentMessageCount();
     const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
@@ -819,13 +838,16 @@
     const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent;
-    const runtimeLabel = sessionState.currentHandoffPending ? '接力分析中' : (sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始');
+    const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : (currentMeta ? '待命中' : '未开始');
     const projectSessionCount = getCurrentProjectSessionCount(activeProject);
     const actionButtons = buildWorkspaceActionButtons([
       { action: 'new-session', label: '新建会话', primary: true },
       { action: 'import-session', label: '导入历史' },
       { action: 'switch-model', label: '切换模型' },
-      ...(sessionState.currentAgent === 'codex' ? [{ action: 'switch-reasoning', label: '切换思考' }] : []),
+      ...(sessionState.currentAgent === 'codex' ? [
+        { action: 'switch-reasoning', label: '切换思考' },
+        { action: 'switch-speed', label: getCodexSpeedLabel(sessionState.currentFastMode) },
+      ] : []),
       { action: 'switch-mode', label: '切换模式' },
       ...(activeProject ? [{ action: 'focus-project', label: '定位项目', projectId: activeProject.id }] : []),
       { action: 'open-settings', label: '打开设置' },
@@ -1706,6 +1728,7 @@
     const sessionCount = typeof getVisibleSessions === 'function' ? getVisibleSessions().length : 0;
     const projectCount = Array.isArray(projects) ? projects.length : 0;
     const reasoningLabel = normalizeAgent(agent) === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '';
+    const speedLabel = normalizeAgent(agent) === 'codex' ? getCodexSpeedLabel(sessionState.currentFastMode) : '';
     return `
       <div class="welcome-msg">
         <div class="welcome-header">
@@ -1730,6 +1753,10 @@
             <strong>${escapeHtml(reasoningLabel)}</strong>
             <span>思考</span>
           </div>
+          <div class="welcome-stat">
+            <strong>${escapeHtml(speedLabel)}</strong>
+            <span>速度</span>
+          </div>
           ` : ''}
         </div>
         <div class="welcome-actions">
@@ -1737,7 +1764,10 @@
             { action: 'new-session', label: '新建会话', primary: true },
             { action: 'import-session', label: '导入历史' },
             { action: 'switch-model', label: '切换模型' },
-            ...(normalizeAgent(agent) === 'codex' ? [{ action: 'switch-reasoning', label: '切换思考' }] : []),
+            ...(normalizeAgent(agent) === 'codex' ? [
+              { action: 'switch-reasoning', label: '切换思考' },
+              { action: 'switch-speed', label: getCodexSpeedLabel(sessionState.currentFastMode) },
+            ] : []),
           ], { compact: true })}
         </div>
         <div class="welcome-panels">
@@ -1745,7 +1775,7 @@
             <div class="welcome-panel-kicker">常用指令</div>
             <ul class="welcome-list">
               <li><code>/model</code> 查看或切换模型</li>
-              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li>' : ''}
+              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li><li><code>/fast</code> 切换 Fast/Standard 速度</li>' : ''}
               <li><code>/mode</code> 切换权限模式</li>
               <li><code>/compact</code> 压缩上下文</li>
             </ul>
@@ -1777,6 +1807,10 @@
     return `webcoding-reasoning-effort-${normalizeAgent(agent)}`;
   }
 
+  function getAgentFastModeStorageKey(agent) {
+    return `webcoding-fast-mode-${normalizeAgent(agent)}`;
+  }
+
   function getLastSessionForAgent(agent) {
     return localStorage.getItem(getAgentSessionStorageKey(agent));
   }
@@ -1802,11 +1836,13 @@
         reasoningEffort: Object.prototype.hasOwnProperty.call(snapshot || {}, 'reasoningEffort')
           ? normalizeCodexReasoningEffort(snapshot.reasoningEffort)
           : session.reasoningEffort,
+        fastMode: Object.prototype.hasOwnProperty.call(snapshot || {}, 'fastMode')
+          ? normalizeCodexFastMode(snapshot.fastMode)
+          : normalizeCodexFastMode(session.fastMode),
         cwd: Object.prototype.hasOwnProperty.call(snapshot || {}, 'cwd') ? snapshot.cwd : session.cwd,
         projectId: Object.prototype.hasOwnProperty.call(snapshot || {}, 'projectId') ? snapshot.projectId : session.projectId,
         updated: snapshot?.updated || session.updated,
         isRunning: Object.prototype.hasOwnProperty.call(snapshot || {}, 'isRunning') ? !!snapshot.isRunning : !!session.isRunning,
-        handoffPending: Object.prototype.hasOwnProperty.call(snapshot || {}, 'handoffPending') ? normalizeHandoffPending(snapshot.handoffPending) : normalizeHandoffPending(session.handoffPending),
         hasUnread: false,
       };
     });
@@ -2019,7 +2055,7 @@
       const title = getChatTabTitle(sessionLike);
       const active = sessionId === sessionState.currentSessionId;
       const tabEl = document.createElement('div');
-      const tabBusy = !!sessionLike?.isRunning || !!normalizeHandoffPending(sessionLike?.handoffPending);
+      const tabBusy = !!sessionLike?.isRunning;
       tabEl.className = `chat-tab${active ? ' active' : ''}${tabBusy ? ' is-running' : ''}${sessionLike?.hasUnread ? ' has-unread' : ''}`;
       tabEl.dataset.sessionId = sessionId;
       tabEl.setAttribute('role', 'button');
@@ -2189,19 +2225,6 @@
     };
   }
 
-  function normalizeHandoffPending(value) {
-    if (!value || typeof value !== 'object') return null;
-    if (value.status && value.status !== 'analyzing') return null;
-    return {
-      id: value.id || null,
-      status: 'analyzing',
-      message: value.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
-      startedAt: value.startedAt || null,
-      updatedAt: value.updatedAt || null,
-      newTaskPreview: value.newTaskPreview || '',
-    };
-  }
-
   function normalizeSessionSnapshot(payload, options = {}) {
     const normalizedAgent = normalizeAgent(payload.agent);
     const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, normalizedAgent, payload.model || '');
@@ -2212,6 +2235,7 @@
       title: payload.title || '新会话',
       mode: normalizeMode(payload.mode) || getDefaultModeForAgent(normalizedAgent),
       reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort),
+      fastMode: normalizeCodexFastMode(payload.fastMode),
       model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
       activeRuntime: normalizedRuntime,
       activeChannelKey: payload.activeChannelKey || normalizedRuntime?.channelKey || null,
@@ -2230,7 +2254,6 @@
       queuedMessages: normalizeQueuedMessages(payload.queuedMessages || []),
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
-      handoffPending: normalizeHandoffPending(payload.handoffPending),
       historyPending: !!payload.historyPending,
       complete: options.complete !== undefined ? !!options.complete : !payload.historyPending,
     };
@@ -2311,7 +2334,7 @@
     const entry = sessionState.sessionCache.get(sessionId);
     const meta = getSessionMeta(sessionId);
     if (!entry?.snapshot?.complete || !meta) return 'miss';
-    if (entry.version === (meta.updated || null) && !meta.hasUnread && !meta.isRunning && !normalizeHandoffPending(meta.handoffPending)) {
+    if (entry.version === (meta.updated || null) && !meta.hasUnread && !meta.isRunning) {
       return 'strong';
     }
     return 'weak';
@@ -2326,6 +2349,7 @@
       snapshot.title = meta.title || snapshot.title;
       snapshot.agent = normalizeAgent(meta.agent || snapshot.agent);
       snapshot.reasoningEffort = normalizeCodexReasoningEffort(meta.reasoningEffort || snapshot.reasoningEffort);
+      snapshot.fastMode = normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(meta, 'fastMode') ? meta.fastMode : snapshot.fastMode);
       snapshot.hasUnread = !!meta.hasUnread;
       snapshot.updated = meta.updated || snapshot.updated;
       snapshot.isRunning = !!meta.isRunning;
@@ -4486,21 +4510,19 @@
     return Date.now() - awaitingRuntimeStartAt < 5000;
   }
 
-  function setCurrentSessionRunningState(isRunning, label = '运行中', handoffPendingValue = null) {
-    const handoffPending = normalizeHandoffPending(handoffPendingValue);
-    let running = !!isRunning || !!handoffPending;
+  function setCurrentSessionRunningState(isRunning, label = '运行中') {
+    let running = !!isRunning;
     if (shouldHoldOptimisticRunningState(running)) {
       running = true;
-    } else if (running && !handoffPending) {
+    } else if (running) {
       clearAwaitingRuntimeStart();
     }
     const wasRunning = !!sessionState.currentSessionRunning;
     if (running && queuedMessagesRestoredAt) queuedMessagesRestoredSawRunning = true;
     sessionState.currentSessionRunning = running;
-    sessionState.currentHandoffPending = handoffPending;
     if (chatRuntimeState) {
       chatRuntimeState.hidden = !running;
-      chatRuntimeState.textContent = running ? (handoffPending ? (handoffPending.message || '接力分析中') : label) : '';
+      chatRuntimeState.textContent = running ? label : '';
     }
     updateComposerActionButtons();
     updateCwdBadge();
@@ -4513,8 +4535,9 @@
   function updateAgentScopedUI() {
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = sessionState.currentSessionId ? (AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent) : '未开始';
-    if (sessionState.currentAgent !== 'codex' && selectedAgent !== 'codex' && sessionState.currentReasoningEffort) {
-      sessionState.currentReasoningEffort = '';
+    if (sessionState.currentAgent !== 'codex' && selectedAgent !== 'codex') {
+      if (sessionState.currentReasoningEffort) sessionState.currentReasoningEffort = '';
+      if (sessionState.currentFastMode) sessionState.currentFastMode = false;
     }
     // Sync agent tabs
     document.querySelectorAll('.agent-tab').forEach((btn) => {
@@ -4529,6 +4552,8 @@
     const mms = document.getElementById('mobile-mode-select');
     const mrs = document.getElementById('mobile-reasoning-select');
     const drs = document.getElementById('desktop-reasoning-select');
+    const mss = document.getElementById('mobile-speed-select');
+    const dss = document.getElementById('desktop-speed-select');
     if (mas) mas.value = selectedAgent;
     if (mms) mms.value = sessionState.currentMode;
     if (mrs) {
@@ -4538,6 +4563,14 @@
     if (drs) {
       drs.value = sessionState.currentReasoningEffort;
       drs.hidden = selectedAgent !== 'codex';
+    }
+    if (mss) {
+      mss.value = getCodexSpeedValue(sessionState.currentFastMode);
+      mss.hidden = selectedAgent !== 'codex';
+    }
+    if (dss) {
+      dss.value = getCodexSpeedValue(sessionState.currentFastMode);
+      dss.hidden = selectedAgent !== 'codex';
     }
     if (importSessionBtn) {
       importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
@@ -4587,9 +4620,10 @@
     const targetAgent = normalizeAgent(agent);
     const targetMode = saveModeForAgent(targetAgent, mode);
     const reasoningEffort = getSavedReasoningEffortForAgent(targetAgent);
+    const fastMode = getSavedFastModeForAgent(targetAgent);
     return isVirtualCwd
-      ? { type: 'new_session', cwd: project.path, agent: targetAgent, mode: targetMode, reasoningEffort }
-      : { type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort };
+      ? { type: 'new_session', cwd: project.path, agent: targetAgent, mode: targetMode, reasoningEffort, fastMode }
+      : { type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort, fastMode };
   }
 
   function normalizeCodexReasoningEffort(value) {
@@ -4608,12 +4642,19 @@
       : '';
   }
 
+  function getSavedFastModeForAgent(agent) {
+    return normalizeAgent(agent) === 'codex'
+      ? normalizeCodexFastMode(localStorage.getItem(getAgentFastModeStorageKey(agent)))
+      : false;
+  }
+
   function setSelectedAgent(agent, options = {}) {
     selectedAgent = normalizeAgent(agent);
     localStorage.setItem('webcoding-agent', selectedAgent);
     if (options.syncMode) {
       sessionState.currentMode = getSavedModeForAgent(selectedAgent);
       sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(selectedAgent);
+      sessionState.currentFastMode = getSavedFastModeForAgent(selectedAgent);
       modeSelect.value = sessionState.currentMode;
     }
     updateAgentScopedUI();
@@ -4669,7 +4710,6 @@
     sessionState.loadedHistorySessionId = null;
     clearSessionLoading();
     setCurrentSessionRunningState(false);
-    sessionState.currentHandoffPending = null;
     sessionState.currentCwd = null;
     sessionState.currentModel = '';
     sessionState.currentActiveRuntime = null;
@@ -4689,6 +4729,7 @@
     updateComposerActionButtons();
     sessionState.currentMode = getSavedModeForAgent(baseAgent);
     sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(baseAgent);
+    sessionState.currentFastMode = getSavedFastModeForAgent(baseAgent);
     modeSelect.value = sessionState.currentMode;
     updateAgentScopedUI();
     chatTitle.textContent = '新会话';
@@ -4732,11 +4773,10 @@
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
     const snapshotRunning = !!snapshot.isRunning;
-    const snapshotHandoffPending = normalizeHandoffPending(snapshot.handoffPending);
     const effectiveSnapshotRunning = preserveStreaming && composeState.isGenerating
-      ? (snapshotRunning || !!snapshotHandoffPending || sessionState.currentSessionRunning || composeState.isGenerating)
-      : (snapshotRunning || !!snapshotHandoffPending);
-    setCurrentSessionRunningState(effectiveSnapshotRunning, snapshotHandoffPending ? '接力分析中' : '运行中', snapshotHandoffPending);
+      ? (snapshotRunning || sessionState.currentSessionRunning || composeState.isGenerating)
+      : snapshotRunning;
+    setCurrentSessionRunningState(effectiveSnapshotRunning, '运行中');
     setStatsDisplay(snapshot);
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
@@ -4755,7 +4795,9 @@
       saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     }
     sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(snapshot.reasoningEffort);
+    sessionState.currentFastMode = normalizeCodexFastMode(snapshot.fastMode);
     localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(sessionState.currentFastMode));
     updateAgentScopedUI();
     sessionState.currentModel = snapshot.model || '';
     sessionState.currentActiveRuntime = snapshot.activeRuntime ? deepClone(snapshot.activeRuntime) : null;
@@ -4796,7 +4838,6 @@
     msgInput.disabled = showOverlay;
     modeSelect.disabled = showOverlay;
     sendBtn.disabled = showOverlay;
-    if (handoffBtn) handoffBtn.disabled = showOverlay;
     abortBtn.disabled = showOverlay;
     if (showOverlay && document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
@@ -4920,6 +4961,7 @@
       sessionId: sessionState.currentSessionId,
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
       agent: sessionState.currentAgent,
     });
   }
@@ -4931,74 +4973,10 @@
       sessionId: sessionState.currentSessionId,
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
       agent: sessionState.currentAgent,
       ...payload,
     });
-  }
-
-  function sendHandoffMessage() {
-    const text = msgInput.value.trim();
-    if (isBlockingSessionLoad()) return;
-    if (composeState.uploadingAttachments.length > 0) {
-      appendError('附件还在上传中，请等待上传完成后再接力。');
-      return;
-    }
-    if (composeState.isGenerating || sessionState.currentSessionRunning) {
-      showToast('当前窗口运行中，请等待完成或停止后再接力');
-      return;
-    }
-    if (!sessionState.currentSessionId) {
-      sendMessage();
-      return;
-    }
-    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) {
-      appendError('请输入要在新窗口继续的新任务。');
-      return;
-    }
-    if (text.startsWith('/')) {
-      appendError('接力新窗口暂不支持斜杠命令，请输入普通任务内容。');
-      return;
-    }
-
-    const attachments = attachmentTransportPayloads(composeState.pendingAttachments);
-    const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
-    hideCmdMenu();
-    hideOptionPicker();
-    markAwaitingRuntimeStart();
-    const optimisticHandoffPending = normalizeHandoffPending({
-      id: `local-${Date.now()}`,
-      status: 'analyzing',
-      message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      newTaskPreview: text.slice(0, 120),
-    });
-    sessionState.sessions = sessionState.sessions.map((session) => (
-      session.id === sessionState.currentSessionId
-        ? { ...session, handoffPending: optimisticHandoffPending }
-        : session
-    ));
-    setCurrentSessionRunningState(true, '接力分析中', optimisticHandoffPending);
-    renderSessionList();
-    renderChatTabs();
-    renderWorkspaceInsights();
-    send({
-      type: 'handoff_session',
-      sourceSessionId: sessionState.currentSessionId,
-      newTask: text,
-      attachments,
-      fileRefs,
-      mode: sessionState.currentMode,
-      reasoningEffort: sessionState.currentReasoningEffort,
-      agent: sessionState.currentAgent,
-    });
-    msgInput.value = '';
-    composeState.pendingAttachments = [];
-    composeState.pendingFileRefs = [];
-    renderPendingAttachments();
-    renderContextBar();
-    autoResize();
-    showToast('正在整理当前窗口，并创建接力新窗口…');
   }
 
   // --- marked config ---
@@ -5438,6 +5416,7 @@
       agent,
       mode,
       reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort || sessionState.currentReasoningEffort) : '',
+      fastMode: agent === 'codex' ? normalizeCodexFastMode(sideChatState.fastMode) : false,
       parentContext: sideChatState.parentContext || null,
       anchor: {
         type: 'selection',
@@ -5586,6 +5565,7 @@
       agent: sessionState.currentAgent,
       mode: getSideChatDefaultMode(sessionState.currentAgent),
       reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
     };
     setSideChatVisible(true);
     renderSideChatContext();
@@ -5619,6 +5599,7 @@
       agent: sideChatState.agent || sessionState.currentAgent,
       mode: sideChatState.mode || getSideChatDefaultMode(sideChatState.agent || sessionState.currentAgent),
       reasoningEffort: sideChatState.agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort) : '',
+      fastMode: sideChatState.agent === 'codex' ? normalizeCodexFastMode(sideChatState.fastMode) : false,
     });
   }
 
@@ -5849,8 +5830,8 @@
     sessionState.sessions = (msg.sessions || []).map((session) => ({
       ...session,
       reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
+      fastMode: normalizeCodexFastMode(session.fastMode),
       hasUnread: session.id === sessionState.currentSessionId ? false : !!session.hasUnread,
-      handoffPending: normalizeHandoffPending(session.handoffPending),
     }));
     reconcileSessionCacheWithSessions();
     reconcileOpenChatTabsWithSessions();
@@ -5858,12 +5839,11 @@
     if (sessionState.currentSessionId) {
       const currentMeta = getSessionMeta(sessionState.currentSessionId);
       const currentMetaRunning = !!currentMeta?.isRunning;
-      const currentHandoff = normalizeHandoffPending(currentMeta?.handoffPending);
-      setCurrentSessionRunningState(currentMetaRunning || !!currentHandoff, currentHandoff ? '接力分析中' : '运行中', currentHandoff);
+      setCurrentSessionRunningState(currentMetaRunning, '运行中');
       if (currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))) {
         startGenerating();
       }
-      if (!shouldHoldOptimisticRunningState(currentMetaRunning || !!currentHandoff)) {
+      if (!shouldHoldOptimisticRunningState(currentMetaRunning)) {
         scheduleQueuedMessageFollowupAfterIdle();
       }
     }
@@ -6083,6 +6063,20 @@
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.reasoningEffort = effort; });
     }
+    updateAgentScopedUI();
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  function handleFastModeChangedMessage(msg) {
+    const fastMode = normalizeCodexFastMode(msg.fastMode);
+    sessionState.currentFastMode = fastMode;
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(fastMode));
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.fastMode = fastMode; });
+    }
+    updateAgentScopedUI();
     renderWorkspaceInsights();
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
@@ -6096,6 +6090,10 @@
       sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
       localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
     }
+    if (Object.prototype.hasOwnProperty.call(msg, 'fastMode')) {
+      sessionState.currentFastMode = normalizeCodexFastMode(msg.fastMode);
+      localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(sessionState.currentFastMode));
+    }
     sessionState.currentActiveRuntime = normalizedRuntime;
     sessionState.currentRuntimeCount = Number.isFinite(msg.runtimeCount)
       ? msg.runtimeCount
@@ -6104,6 +6102,7 @@
       updateCachedSession(sessionState.currentSessionId, (snapshot) => {
         snapshot.model = msg.model || '';
         if (Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) snapshot.reasoningEffort = sessionState.currentReasoningEffort;
+        if (Object.prototype.hasOwnProperty.call(msg, 'fastMode')) snapshot.fastMode = sessionState.currentFastMode;
         snapshot.activeRuntime = normalizedRuntime ? deepClone(normalizedRuntime) : null;
         snapshot.activeChannelKey = msg.activeChannelKey || normalizedRuntime?.channelKey || null;
         snapshot.runtimeCount = Number.isFinite(msg.runtimeCount)
@@ -6187,14 +6186,6 @@
   function handleErrorMessage(msg) {
     if (!isMessageForCurrentSession(msg)) return;
     clearAwaitingRuntimeStart();
-    if (sessionState.currentHandoffPending) {
-      sessionState.currentHandoffPending = null;
-      sessionState.sessions = sessionState.sessions.map((session) => (
-        session.id === sessionState.currentSessionId ? { ...session, handoffPending: null } : session
-      ));
-      renderSessionList();
-      renderChatTabs();
-    }
     const errorMsg = msg.message || '发生未知错误';
     appendError(errorMsg);
     // Also show toast for critical errors to ensure user notice
@@ -6204,8 +6195,7 @@
     clearSessionLoading();
     if (!composeState.isGenerating && sessionState.currentSessionId) {
       const meta = getSessionMeta(sessionState.currentSessionId);
-      const handoffPending = normalizeHandoffPending(meta?.handoffPending);
-      setCurrentSessionRunningState(!!meta?.isRunning || !!handoffPending, handoffPending ? '接力分析中' : '运行中', handoffPending);
+      setCurrentSessionRunningState(!!meta?.isRunning, '运行中');
     }
     if (composeState.isGenerating) finishGenerating();
   }
@@ -6300,26 +6290,6 @@
     emitWsEvent('git_result', msg);
   }
 
-  function handleHandoffStatusMessage(msg) {
-    const sessionId = String(msg.sessionId || '').trim();
-    if (!sessionId) return;
-    const pending = normalizeHandoffPending(msg.handoffPending);
-    sessionState.sessions = sessionState.sessions.map((session) => (
-      session.id === sessionId ? { ...session, handoffPending: pending, isRunning: !!session.isRunning } : session
-    ));
-    const cacheEntry = sessionState.sessionCache.get(sessionId);
-    if (cacheEntry?.meta) cacheEntry.meta.handoffPending = pending;
-    if (cacheEntry?.snapshot) cacheEntry.snapshot.handoffPending = pending;
-    if (sessionId === sessionState.currentSessionId) {
-      const meta = getSessionMeta(sessionId);
-      setCurrentSessionRunningState(!!meta?.isRunning || !!pending, pending ? '接力分析中' : '运行中', pending);
-      if (pending) showToast(pending.message || '接力分析中');
-    }
-    renderSessionList();
-    renderChatTabs();
-    renderWorkspaceInsights();
-  }
-
   const SERVER_MESSAGE_HANDLERS = Object.freeze({
     auth_result: handleAuthResultMessage,
     session_list: handleSessionListMessage,
@@ -6336,9 +6306,9 @@
     done: (msg) => { if (isMessageForCurrentSession(msg)) finishGenerating(msg.sessionId, msg.completedAt || new Date().toISOString()); },
     system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
     runtime_warning: (msg) => { if (isMessageForCurrentSession(msg)) appendError(msg.message, { type: 'warning', icon: '⚠️', dismissible: true, style: 'border-color:var(--yellow);color:var(--text-primary);background:rgba(245,158,11,0.08)' }); },
-    handoff_status: handleHandoffStatusMessage,
     mode_changed: handleModeChangedMessage,
     reasoning_effort_changed: handleReasoningEffortChangedMessage,
+    fast_mode_changed: handleFastModeChangedMessage,
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
     resume_generating: handleResumeGeneratingMessage,
@@ -6395,26 +6365,19 @@
 
   // --- Generating State ---
   function updateComposerActionButtons() {
-    const handoffPending = normalizeHandoffPending(sessionState.currentHandoffPending);
-    const busy = composeState.isGenerating || !!handoffPending;
+    const busy = composeState.isGenerating;
     sendBtn.hidden = false;
     abortBtn.hidden = !busy;
     abortBtn.disabled = busy ? isBlockingSessionLoad() : false;
-    abortBtn.title = handoffPending ? '停止接力分析' : '停止';
-    abortBtn.setAttribute('aria-label', handoffPending ? '停止接力分析' : '停止');
+    abortBtn.title = '停止';
+    abortBtn.setAttribute('aria-label', '停止');
     const sendLabel = editingMessageState ? '发送修改并重置后续回答' : (busy ? '加入发送队列' : '发送');
     sendBtn.title = sendLabel;
     sendBtn.setAttribute('aria-label', sendLabel);
     if (composerStatus) {
-      composerStatus.hidden = !handoffPending;
-      composerStatus.textContent = handoffPending ? (handoffPending.message || '接力分析中') : '';
-      composerStatus.title = handoffPending ? (handoffPending.message || '接力分析中') : '';
-    }
-    if (handoffBtn) {
-      handoffBtn.disabled = isBlockingSessionLoad() || composeState.isGenerating || sessionState.currentSessionRunning;
-      handoffBtn.title = (composeState.isGenerating || sessionState.currentSessionRunning)
-        ? '当前窗口运行中，请等待完成或停止后再接力'
-        : '总结当前窗口并接力到新窗口';
+      composerStatus.hidden = true;
+      composerStatus.textContent = '';
+      composerStatus.title = '';
     }
   }
 
@@ -6956,6 +6919,7 @@
       text,
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
       agent: sessionState.currentAgent,
     };
     markAwaitingRuntimeStart();
@@ -8287,8 +8251,7 @@
 
   function buildSessionItem(s) {
     const item = document.createElement('div');
-    const handoffPending = normalizeHandoffPending(s.handoffPending);
-    const sessionBusy = !!s.isRunning || !!handoffPending;
+    const sessionBusy = !!s.isRunning;
     item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${sessionBusy ? ' is-running' : ''}`;
     item.dataset.id = s.id;
     item.setAttribute('tabindex', '0');
@@ -8323,7 +8286,7 @@
     if (sessionBusy) {
       const status = document.createElement('span');
       status.className = 'session-item-status';
-      status.textContent = handoffPending ? '接力中' : '运行中';
+      status.textContent = '运行中';
       right.appendChild(status);
     }
 
@@ -8711,7 +8674,7 @@
     const isSelectedProject = selectedProject?.id === project.id
       || (!!selectedProject?.path && !!project.path && normalizeComparablePath(selectedProject.path) === normalizeComparablePath(project.path));
     const isCollapsed = collapsedProjects.has(project.id);
-    const runningCount = groupSessions.reduce((count, session) => count + ((session.isRunning || normalizeHandoffPending(session.handoffPending)) ? 1 : 0), 0);
+    const runningCount = groupSessions.reduce((count, session) => count + (session.isRunning ? 1 : 0), 0);
     const unreadCount = groupSessions.reduce((count, session) => count + (session.hasUnread ? 1 : 0), 0);
 
     const group = document.createElement('section');
@@ -9517,6 +9480,12 @@
       showReasoningEffortPicker();
       return;
     }
+    if (cmd === '/fast' || cmd === '/speed') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showFastModePicker();
+      return;
+    }
     // For non-core commands (CLI-native/skills), just insert the command text
     // so it gets sent as a regular message to the CLI process
     msgInput.value = `${cmd} `;
@@ -9819,15 +9788,17 @@
       return;
     }
     showOptionPicker('选择 Codex 思考级别', CODEX_REASONING_EFFORT_OPTIONS, sessionState.currentReasoningEffort, (value) => {
-      const effort = normalizeCodexReasoningEffort(value);
-      sessionState.currentReasoningEffort = effort;
-      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
-      if (sessionState.currentSessionId) {
-        send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
-      }
-      renderWorkspaceInsights();
-      const welcome = messagesDiv.querySelector('.welcome-msg');
-      if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+      applyReasoningEffortSelection(value);
+    });
+  }
+
+  function showFastModePicker() {
+    if (sessionState.currentAgent !== 'codex') {
+      appendSystemMessage('Fast 模式仅对 Codex 会话生效。');
+      return;
+    }
+    showOptionPicker('选择 Codex 速度', CODEX_SPEED_OPTIONS, getCodexSpeedValue(sessionState.currentFastMode), (value) => {
+      applyFastModeSelection(value);
     });
   }
 
@@ -9858,6 +9829,7 @@
         fileRefs,
         mode: typeof raw.mode === 'string' ? raw.mode : '',
         reasoningEffort: typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort : '',
+        fastMode: normalizeCodexFastMode(raw.fastMode),
         agent: normalizeAgent(raw.agent || sessionState.currentAgent || selectedAgent),
         createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : (Date.parse(raw.createdAt || '') || Date.now()),
         serverQueued: raw.serverQueued === true,
@@ -9907,6 +9879,7 @@
       fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
       mode: item.mode || sessionState.currentMode,
       reasoningEffort: item.reasoningEffort || sessionState.currentReasoningEffort || '',
+      fastMode: normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(item, 'fastMode') ? item.fastMode : sessionState.currentFastMode),
       agent: item.agent || sessionState.currentAgent,
     });
   }
@@ -10059,6 +10032,7 @@
       fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
       mode: sessionState.currentMode,
       reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
       agent: sessionState.currentAgent,
       createdAt: Date.now(),
       serverQueued: false,
@@ -10144,6 +10118,12 @@
       }
       if (text === '/reasoning' || text === '/reasoning ' || text === '/effort' || text === '/effort ') {
         showReasoningEffortPicker();
+        msgInput.value = '';
+        autoResize();
+        return;
+      }
+      if (text === '/fast' || text === '/fast ' || text === '/speed' || text === '/speed ') {
+        showFastModePicker();
         msgInput.value = '';
         autoResize();
         return;
@@ -10523,11 +10503,27 @@
     if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
   }
 
-  // Topbar agent/reasoning selectors
+  function applyFastModeSelection(value) {
+    if (sessionState.currentAgent !== 'codex') return;
+    const fastMode = normalizeCodexFastMode(value);
+    sessionState.currentFastMode = fastMode;
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(fastMode));
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_fast_mode', sessionId: sessionState.currentSessionId, fastMode });
+    }
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  // Topbar agent/reasoning/speed selectors
   const mobileAgentSelect = document.getElementById('mobile-agent-select');
   const mobileModeSelect = document.getElementById('mobile-mode-select');
   const mobileReasoningSelect = document.getElementById('mobile-reasoning-select');
   const desktopReasoningSelect = document.getElementById('desktop-reasoning-select');
+  const mobileSpeedSelect = document.getElementById('mobile-speed-select');
+  const desktopSpeedSelect = document.getElementById('desktop-speed-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -10555,6 +10551,16 @@
       applyReasoningEffortSelection(desktopReasoningSelect.value);
     });
   }
+  if (mobileSpeedSelect) {
+    mobileSpeedSelect.addEventListener('change', () => {
+      applyFastModeSelection(mobileSpeedSelect.value);
+    });
+  }
+  if (desktopSpeedSelect) {
+    desktopSpeedSelect.addEventListener('change', () => {
+      applyFastModeSelection(desktopSpeedSelect.value);
+    });
+  }
 
   function handleWorkspaceActionClick(actionBtn, event) {
     if (!actionBtn) return;
@@ -10578,6 +10584,10 @@
     }
     if (action === 'switch-reasoning') {
       showReasoningEffortPicker();
+      return;
+    }
+    if (action === 'switch-speed') {
+      showFastModePicker();
       return;
     }
     if (action === 'switch-mode') {
@@ -10754,7 +10764,6 @@
     voiceInputBtn.addEventListener('contextmenu', (event) => event.preventDefault());
   }
   if (editMessageCancel) editMessageCancel.addEventListener('click', () => clearEditingMessageState({ clearInput: true }));
-  if (handoffBtn) handoffBtn.addEventListener('click', sendHandoffMessage);
   abortBtn.addEventListener('click', () => {
     if (abortBtn.disabled) return;
     abortBtn.disabled = true;
@@ -12626,7 +12635,7 @@
         getSessionCount: (project) => getCurrentProjectSessionCount(project),
         onProjectSelect: (project) => {
           close();
-          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
+          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent), fastMode: getSavedFastModeForAgent(targetAgent) });
         },
       });
       if (projects.length === 0) {
@@ -12743,7 +12752,7 @@
       send(existingProject
         ? { type: 'save_project', id: projectId, path: cwd }
         : { type: 'save_project', id: projectId, path: cwd, name: getPathLeaf(cwd) || cwd });
-      send({ type: 'new_session', cwd, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent) });
+      send({ type: 'new_session', cwd, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent), fastMode: getSavedFastModeForAgent(targetAgent) });
     });
 
     // Initialize — default directly into directory browser

@@ -842,7 +842,6 @@ const MAX_SERVER_QUEUED_MESSAGES = 10;
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, segments, lastCost, tailer }
 const activeProcesses = new Map();
-const activeHandoffProcesses = new Map();
 
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
@@ -1122,6 +1121,12 @@ const CODEX_REASONING_EFFORTS = ['xhigh', 'high', 'medium', 'low', 'minimal', 'n
 function normalizeCodexReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
   return CODEX_REASONING_EFFORTS.includes(normalized) ? normalized : '';
+}
+
+function normalizeCodexFastMode(value) {
+  if (value === true) return true;
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'fast' || normalized === 'on' || normalized === 'true' || normalized === '1';
 }
 
 function codexReasoningEffortLabel(value) {
@@ -3365,10 +3370,6 @@ const CONTEXT_REPLAY_MAX_COMPLETED_ITEMS = 3;
 const CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS = 4;
 const CONTEXT_REPLAY_MAX_EXACT_ITEMS = 4;
 const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
-const HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET = 90000;
-const HANDOFF_AI_MESSAGE_CHAR_LIMIT = 2400;
-const HANDOFF_AI_SUMMARY_MAX_CHARS = 12000;
-const HANDOFF_AI_TIMEOUT_MS = 300000;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
@@ -3915,6 +3916,7 @@ function normalizeQueuedMessagesForSession(session, value) {
       fileRefs,
       mode: typeof raw.mode === 'string' ? raw.mode : (session?.permissionMode || 'yolo'),
       reasoningEffort: normalizeCodexReasoningEffort(raw.reasoningEffort),
+      fastMode: normalizeCodexFastMode(raw.fastMode),
       agent: normalizeAgent(raw.agent || session?.agent),
       createdAt: typeof raw.createdAt === 'string'
         ? raw.createdAt
@@ -3935,6 +3937,7 @@ function buildQueuedMessagesPayload(session) {
     fileRefs: item.fileRefs || [],
     mode: item.mode || session?.permissionMode || 'yolo',
     reasoningEffort: item.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(item.fastMode),
     agent: normalizeAgent(item.agent || session?.agent),
     createdAt: item.createdAt || new Date().toISOString(),
     serverQueued: true,
@@ -4030,6 +4033,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeFingerprint')) session.codexRuntimeFingerprint = null;
   session.reasoningEffort = normalizeCodexReasoningEffort(session.reasoningEffort);
+  session.fastMode = getSessionAgent(session) === 'codex' ? normalizeCodexFastMode(session.fastMode) : false;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
@@ -5390,40 +5394,6 @@ function cleanRunDir(sessionId) {
   } catch {}
 }
 
-function getActiveHandoffPending(session) {
-  const pending = session && typeof session === 'object' ? session.handoffPending : null;
-  if (!pending || pending.status !== 'analyzing') return null;
-  const expiresAt = pending.expiresAt ? Date.parse(pending.expiresAt) : 0;
-  if (expiresAt && expiresAt < Date.now()) return null;
-  return {
-    id: pending.id || null,
-    status: 'analyzing',
-    message: pending.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
-    startedAt: pending.startedAt || null,
-    updatedAt: pending.updatedAt || null,
-    newTaskPreview: pending.newTaskPreview || '',
-  };
-}
-
-function setSessionHandoffPending(session, pending) {
-  if (!session) return null;
-  session.handoffPending = pending;
-  session.updated = new Date().toISOString();
-  saveSession(session);
-  sessionListCache.expiresAt = 0;
-  return getActiveHandoffPending(session);
-}
-
-function clearSessionHandoffPending(sessionId) {
-  const session = loadSession(sessionId);
-  if (!session || !session.handoffPending) return null;
-  delete session.handoffPending;
-  session.updated = new Date().toISOString();
-  saveSession(session);
-  sessionListCache.expiresAt = 0;
-  return session;
-}
-
 function broadcastSessionListRefresh() {
   const sessions = getSessionListSnapshot({ forceRefresh: true });
   for (const client of wss.clients) {
@@ -5453,9 +5423,9 @@ function collectSessionListSnapshot() {
         hasUnread: !!s.hasUnread,
         agent: getSessionAgent(s),
         reasoningEffort: s.reasoningEffort || '',
+        fastMode: !!s.fastMode,
         queuedCount: Array.isArray(s.queuedMessages) ? s.queuedMessages.length : 0,
         isRunning: activeProcesses.has(s.id),
-        handoffPending: getActiveHandoffPending(s),
         projectId: s.projectId || null,
         cwd: s.cwd || localMeta?.cwd || null,
         importedFrom: s.importedFrom || localMeta?.projectDir || null,
@@ -6054,6 +6024,7 @@ function tryRetryCodexTransientFailure(sessionId, entry, transientErrorKind) {
         fileRefs: Array.isArray(retryMessage.fileRefs) ? retryMessage.fileRefs : [],
         agent: 'codex',
         reasoningEffort: retryMessage.reasoningEffort || '',
+        fastMode: !!retryMessage.fastMode,
         __capacityRetryCount: nextRetryCount,
       }, {
         hideInHistory: true,
@@ -7057,11 +7028,6 @@ wss.on('connection', (ws, req) => {
       case 'new_session':
         handleNewSession(ws, msg);
         break;
-      case 'handoff_session':
-        handleHandoffSession(ws, msg).catch((error) => {
-          wsSend(ws, { type: 'error', sessionId: msg.sessionId || msg.sourceSessionId || undefined, message: `接力失败：${error?.message || String(error)}` });
-        });
-        break;
       case 'load_session':
         handleLoadSession(ws, msg.sessionId);
         break;
@@ -7076,6 +7042,9 @@ wss.on('connection', (ws, req) => {
         break;
       case 'set_reasoning_effort':
         handleSetReasoningEffort(ws, msg.sessionId, msg.reasoningEffort);
+        break;
+      case 'set_fast_mode':
+        handleSetFastMode(ws, msg.sessionId, msg.fastMode);
         break;
       case 'list_sessions':
         sendSessionList(ws);
@@ -7578,6 +7547,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
           title: session.title,
           mode: session.permissionMode || 'yolo',
           reasoningEffort: session.reasoningEffort || '',
+          fastMode: !!session.fastMode,
           model: sessionModelLabel(session),
           agent: getSessionAgent(session),
           cwd: session.cwd || null,
@@ -7625,6 +7595,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
           type: 'model_changed',
           model: normalizedInput === 'default' ? '' : modelInput,
           reasoningEffort: session?.reasoningEffort || '',
+          fastMode: !!session?.fastMode,
           ...(session ? buildSessionRuntimeMeta(session) : {}),
           });
           wsSend(ws, {
@@ -7665,6 +7636,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
             type: 'model_changed',
             model: '',
             reasoningEffort: session?.reasoningEffort || '',
+            fastMode: !!session?.fastMode,
             ...(session ? buildSessionRuntimeMeta(session) : {}),
           });
           wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
@@ -7682,6 +7654,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
           type: 'model_changed',
           model: resolvedAlias,
           reasoningEffort: session?.reasoningEffort || '',
+          fastMode: !!session?.fastMode,
           ...(session ? buildSessionRuntimeMeta(session) : {}),
         });
         wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
@@ -7789,6 +7762,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
           wsSend(ws, {
             type: 'reasoning_effort_changed',
             reasoningEffort: effort,
+            fastMode: !!session?.fastMode,
             ...(session ? buildSessionRuntimeMeta(session) : {}),
           });
           wsSend(ws, {
@@ -7804,6 +7778,43 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
       break;
     }
 
+    case '/fast':
+    case '/speed': {
+      if (agent !== 'codex') {
+        wsSend(ws, { type: 'system_message', message: 'Fast 模式仅对 Codex 会话生效。' });
+        break;
+      }
+      const speedInput = String(parts[1] || '').trim().toLowerCase();
+      if (!speedInput || speedInput === 'status') {
+        wsSend(ws, {
+          type: 'system_message',
+          message: `当前 Codex 速度: ${session?.fastMode ? 'Fast' : 'Standard'}\n可选: fast/on, standard/off/default`,
+        });
+        break;
+      }
+      let fastMode;
+      if (['fast', 'on', 'true', '1'].includes(speedInput)) fastMode = true;
+      else if (['standard', 'off', 'false', '0', 'default', 'auto'].includes(speedInput)) fastMode = false;
+      else {
+        wsSend(ws, { type: 'system_message', message: `无效速度: ${parts[1]}\n可选: fast/on, standard/off/default` });
+        break;
+      }
+      if (session) {
+        session.fastMode = fastMode;
+        clearRuntimeSessionId(session);
+        session.updated = new Date().toISOString();
+        saveSession(session);
+        sendSessionList(ws, { forceRefresh: true });
+      }
+      wsSend(ws, {
+        type: 'fast_mode_changed',
+        fastMode,
+        ...(session ? buildSessionRuntimeMeta(session) : {}),
+      });
+      wsSend(ws, { type: 'system_message', message: `Codex 速度已切换为: ${fastMode ? 'Fast' : 'Standard'}` });
+      break;
+    }
+
     case '/help': {
       const base = '可用指令:\n' +
         '/clear — 清除当前会话（含上下文）\n' +
@@ -7813,7 +7824,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/reasoning [级别] — 查看/切换 Codex 思考级别\n/compact — 执行 Codex /compact 压缩上下文'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/reasoning [级别] — 查看/切换 Codex 思考级别\n/fast [fast|standard] — 查看/切换 Codex Fast 模式\n/compact — 执行 Codex /compact 压缩上下文'
           : base + '\n/model [名称] — 查看/切换模型（支持别名或完整模型 ID）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）',
       });
       break;
@@ -7847,6 +7858,7 @@ function handleNewSession(ws, msg) {
   const resolvedMode = resolvePermissionModeForAgent(agent, msg?.mode);
   const requestedMode = resolvedMode.mode;
   const requestedReasoningEffort = agent === 'codex' ? normalizeCodexReasoningEffort(msg?.reasoningEffort) : '';
+  const requestedFastMode = agent === 'codex' ? normalizeCodexFastMode(msg?.fastMode) : false;
   let projectId = msg?.projectId || null;
   let resolvedCwd = cwd;
   if (!resolvedCwd && projectId) {
@@ -7897,6 +7909,7 @@ function handleNewSession(ws, msg) {
     runtimeContexts: { claude: {}, codex: {} },
     model: null,
     reasoningEffort: requestedReasoningEffort,
+    fastMode: requestedFastMode,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -7921,6 +7934,7 @@ function handleNewSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent,
     cwd: session.cwd,
@@ -7944,536 +7958,6 @@ function handleNewSession(ws, msg) {
 }
 
 
-
-function handoffRoleLabel(role) {
-  if (role === 'assistant') return '助手';
-  if (role === 'system') return '系统';
-  return '用户';
-}
-
-function messageTextForAiHandoff(message) {
-  if (!message || typeof message !== 'object') return '';
-  const parts = [];
-  if (typeof message.content === 'string' && message.content.trim()) {
-    parts.push(message.content.trim());
-  }
-  if (Array.isArray(message.segments) && message.segments.length > 0) {
-    const segmentText = message.segments
-      .map((segment) => {
-        if (!segment || typeof segment !== 'object') return '';
-        if (typeof segment.text === 'string' && segment.text.trim()) return segment.text.trim();
-        if (segment.type === 'tool_call') {
-          const name = segment.name || 'Tool';
-          const status = segment.done === false ? 'running' : 'done';
-          const result = typeof segment.result === 'string' ? truncateReplayText(segment.result, 500) : '';
-          return `[工具 ${name} ${status}]${result ? ` ${result}` : ''}`;
-        }
-        if (segment.type === 'image') return `[图片] ${segment.prompt || segment.alt || ''}`.trim();
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-    if (segmentText) parts.push(segmentText);
-  }
-  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
-  if (attachments.length > 0) {
-    parts.push(`附件: ${attachments.map((item) => item?.filename || item?.id || 'image').filter(Boolean).join(', ')}`);
-  }
-  const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
-  if (fileRefs.length > 0) {
-    parts.push(`引用文件: ${fileRefs.map((item) => item?.relativePath || item?.path || '').filter(Boolean).join(', ')}`);
-  }
-  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
-  if (toolCalls.length > 0 && !parts.some((part) => /\[工具 /.test(part))) {
-    parts.push(`工具调用: ${toolCalls.map((tool) => tool?.name || tool?.type || 'tool').filter(Boolean).join(', ')}`);
-  }
-  return truncateReplayText(parts.join('\n'), HANDOFF_AI_MESSAGE_CHAR_LIMIT);
-}
-
-function buildAiHandoffTranscript(messages) {
-  const blocks = (Array.isArray(messages) ? messages : [])
-    .map((message, index) => {
-      const text = messageTextForAiHandoff(message);
-      if (!text) return '';
-      const ts = message.timestamp ? ` @ ${message.timestamp}` : '';
-      return `#${index + 1} [${handoffRoleLabel(message.role)}${ts}]\n${text}`;
-    })
-    .filter(Boolean);
-  const full = blocks.join('\n\n');
-  if (full.length <= HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET) return full;
-
-  const headBudget = Math.min(18000, Math.floor(HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET * 0.25));
-  const tailBudget = HANDOFF_AI_TRANSCRIPT_CHAR_BUDGET - headBudget - 240;
-  const head = [];
-  let headChars = 0;
-  for (const block of blocks) {
-    const next = block.length + 2;
-    if (headChars + next > headBudget) break;
-    head.push(block);
-    headChars += next;
-  }
-  const tail = [];
-  let tailChars = 0;
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    const next = block.length + 2;
-    if (tailChars + next > tailBudget) break;
-    tail.unshift(block);
-    tailChars += next;
-  }
-  const skipped = Math.max(0, blocks.length - head.length - tail.length);
-  return [
-    ...head,
-    `[中间有 ${skipped} 条较早消息因长度限制省略；请主要依据首尾上下文，尤其是最近消息判断当前状态。]`,
-    ...tail,
-  ].join('\n\n');
-}
-
-function buildAiHandoffSummaryPrompt(sourceSession, newTask, attachments = []) {
-  const transcript = buildAiHandoffTranscript(sourceSession?.messages || []);
-  const sourceTitle = sourceSession?.title || '旧窗口';
-  const taskText = formatCurrentInputForCarryover(newTask, attachments);
-  return [
-    '你是 Webcoding 的“新窗口接力分析器”。你的任务不是聊天回复，而是阅读旧窗口记录，并针对用户输入的新任务生成一份交接分析文档。',
-    '',
-    '重要要求：',
-    '- 不要直接复制聊天记录。',
-    '- 必须根据“新任务”判断哪些旧上下文重要、哪些可以忽略。',
-    '- 重点还原当前进度、已确定方案、未完成事项、风险/坑、下一步可执行计划。',
-    '- 如果旧记录里有冲突，以最新消息和新任务为准。',
-    '- 写给即将在新窗口继续工作的 AI，要求它能不问用户就继续干活。',
-    '- 使用中文，结构清晰，尽量精炼但不要遗漏关键事实。',
-    '',
-    '请严格输出以下 Markdown 结构：',
-    '## 接力目标',
-    '## 与新任务最相关的旧窗口结论',
-    '## 当前进度和状态',
-    '## 已修改/涉及的文件、接口或命令',
-    '## 未完成事项和下一步执行计划',
-    '## 风险、坑和不要重复做的事',
-    '## 给新窗口 AI 的执行指令',
-    '',
-    '[来源窗口元信息]',
-    `标题: ${sourceTitle}`,
-    `Agent: ${getSessionAgent(sourceSession)}`,
-    sourceSession?.cwd ? `工作目录: ${sourceSession.cwd}` : '工作目录: 未记录',
-    sourceSession?.projectId ? `项目ID: ${sourceSession.projectId}` : '',
-    '',
-    '[用户输入的新任务]',
-    taskText,
-    '',
-    '[旧窗口聊天记录]',
-    transcript || '旧窗口没有可用聊天记录。',
-  ].filter((line) => line !== '').join('\n');
-}
-
-function runAgentOnceForText(session, inputText, options = {}) {
-  return new Promise((resolve, reject) => {
-    const agent = getSessionAgent(session);
-    const spawnSpec = agent === 'codex'
-      ? buildCodexSpawnSpec(session, { attachments: [] })
-      : buildClaudeSpawnSpec(session, { attachments: [] });
-    if (spawnSpec?.error) return reject(new Error(spawnSpec.error));
-
-    let proc;
-    const entry = {
-      pid: 0,
-      ws: null,
-      clients: new Set(),
-      agent,
-      fullText: '',
-      toolCalls: [],
-      segments: [],
-      lastCost: null,
-      lastUsage: null,
-      lastError: null,
-      errorSent: false,
-      claudeRuntimeFingerprint: agent === 'claude' ? (spawnSpec.runtimeFingerprint || null) : null,
-      codexRuntimeFingerprint: agent === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
-      runtimeChannelKey: spawnSpec.channelKey || null,
-      runtimeChannelDescriptor: spawnSpec.channelDescriptor || null,
-    };
-    let stdoutBuffer = '';
-    let stderr = '';
-    let settled = false;
-    const timeoutMs = Number(options.timeoutMs || HANDOFF_AI_TIMEOUT_MS) || HANDOFF_AI_TIMEOUT_MS;
-    const abortSignal = options.abortSignal || options.signal || null;
-    let abortHandler = null;
-
-    function handoffAbortError() {
-      const error = new Error('AI 交接分析已停止');
-      error.code = 'HANDOFF_ABORTED';
-      return error;
-    }
-
-    function settle(fn, value) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (abortSignal && abortHandler) abortSignal.removeEventListener('abort', abortHandler);
-      fn(value);
-    }
-
-    function consumeLine(line) {
-      const trimmed = String(line || '').trim();
-      if (!trimmed) return;
-      try {
-        const event = JSON.parse(trimmed);
-        processRuntimeEvent(entry, event, session.id);
-      } catch {
-        entry.fullText += `${trimmed}\n`;
-      }
-    }
-
-    const timer = setTimeout(() => {
-      try { if (proc?.pid) killProcess(proc.pid, true); } catch {}
-      settle(reject, new Error('AI 交接分析超时'));
-    }, timeoutMs);
-
-    if (abortSignal?.aborted) {
-      clearTimeout(timer);
-      return reject(handoffAbortError());
-    }
-
-    try {
-      proc = spawn(spawnSpec.command, spawnSpec.args, {
-        env: spawnSpec.env,
-        cwd: spawnSpec.cwd,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: false,
-        windowsHide: true,
-        shell: !!spawnSpec.useShell,
-      });
-    } catch (error) {
-      clearTimeout(timer);
-      return reject(error);
-    }
-    entry.pid = proc.pid;
-    if (typeof options.onProcess === 'function') {
-      try { options.onProcess(proc, entry, spawnSpec); } catch {}
-    }
-    if (abortSignal) {
-      abortHandler = () => {
-        try { if (proc?.pid) killProcess(proc.pid, true); } catch {}
-        settle(reject, handoffAbortError());
-      };
-      abortSignal.addEventListener('abort', abortHandler, { once: true });
-    }
-
-    proc.stdout.setEncoding('utf8');
-    proc.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() || '';
-      for (const line of lines) consumeLine(line);
-    });
-    proc.stderr.setEncoding('utf8');
-    proc.stderr.on('data', (chunk) => { stderr += chunk; });
-    proc.on('error', (error) => settle(reject, error));
-    proc.on('exit', (code, signal) => {
-      if (stdoutBuffer.trim()) consumeLine(stdoutBuffer);
-      const text = normalizeReplayText(entry.fullText);
-      if (code === 0 && text) return settle(resolve, text);
-      if (text) return settle(resolve, text);
-      const reason = entry.lastError || stderr.trim() || `AI 交接分析进程退出：${code ?? signal ?? 'unknown'}`;
-      settle(reject, new Error(reason));
-    });
-    proc.stdin.end(inputText);
-  });
-}
-
-async function generateAiHandoffSummary(sourceSession, newTask, attachments = [], options = {}) {
-  const agent = normalizeAgent(options.agent || sourceSession?.agent);
-  const requestedMode = resolvePermissionModeForAgent(agent, 'plan').mode;
-  const scratchSession = {
-    id: `handoff-ai-${crypto.randomUUID()}`,
-    title: 'handoff-ai-summary',
-    created: new Date().toISOString(),
-    updated: new Date().toISOString(),
-    agent,
-    claudeSessionId: null,
-    codexThreadId: null,
-    codexRuntimeFingerprint: null,
-    runtimeContexts: { claude: {}, codex: {} },
-    model: sourceSession?.model || null,
-    reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(sourceSession?.reasoningEffort) : '',
-    permissionMode: requestedMode,
-    totalCost: 0,
-    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-    messages: [],
-    cwd: sourceSession?.cwd || null,
-    projectId: sourceSession?.projectId || null,
-  };
-  const prompt = buildAiHandoffSummaryPrompt(sourceSession, newTask, attachments);
-  const summary = await runAgentOnceForText(scratchSession, prompt, {
-    timeoutMs: HANDOFF_AI_TIMEOUT_MS,
-    abortSignal: options.abortSignal || options.signal || null,
-    onProcess: options.onProcess,
-  });
-  const normalized = normalizeReplayText(summary);
-  if (!normalized) throw new Error('AI 没有返回交接分析');
-  return normalized.length > HANDOFF_AI_SUMMARY_MAX_CHARS
-    ? `${normalized.slice(0, HANDOFF_AI_SUMMARY_MAX_CHARS - 16).trimEnd()}\n[AI 交接分析已截断]`
-    : normalized;
-}
-
-function buildHandoffRuntimePrompt(sourceSession, newTask, attachments = []) {
-  const history = Array.isArray(sourceSession?.messages) ? sourceSession.messages.filter(Boolean) : [];
-  const recentBlocks = collectRecentCarryoverMessages(history);
-  const summary = buildCarryoverSummary(sourceSession, history, newTask, attachments);
-  const sourceTitle = sourceSession?.title || '旧窗口';
-  const sourceCwd = sourceSession?.cwd || '';
-  const taskText = formatCurrentInputForCarryover(newTask, attachments);
-  const lines = [
-    '[webcoding 接力新窗口]',
-    '当前会话是从另一个旧窗口自动接力创建的。旧窗口上下文较长，下面是系统整理出的交接内容。',
-    '请先吸收这些内容，不要逐段复述，不要让用户重新整理进度；直接基于交接内容继续完成“新任务”。',
-    '如果交接摘要、最近对话和新任务之间有冲突，以“新任务”和用户最近明确要求为准。',
-    '',
-    '[来源窗口]',
-    `标题: ${sourceTitle}`,
-    sourceCwd ? `工作目录: ${sourceCwd}` : '',
-    `Agent: ${getSessionAgent(sourceSession)}`,
-    '',
-    '[结构化交接摘要]',
-    summary.text,
-  ].filter((line) => line !== '');
-
-  if (recentBlocks.length > 0) {
-    lines.push('', '[最近对话原文]', recentBlocks.join('\n\n'));
-  }
-
-  lines.push('', '[新任务]', taskText);
-  return {
-    prompt: lines.join('\n'),
-    summaryText: summary.text,
-    summaryDetailed: summary.detailed,
-    recentCount: recentBlocks.length,
-    historyCount: history.length,
-  };
-}
-
-function handoffSessionTitle(newTask, sourceSession) {
-  const lead = extractCarryoverLead(newTask) || sourceSession?.title || '继续当前任务';
-  return `接力: ${lead}`.slice(0, 80);
-}
-
-async function handleHandoffSession(ws, msg) {
-  const sourceSessionId = String(msg?.sourceSessionId || msg?.sessionId || '').trim();
-  const sourceSession = loadSession(sourceSessionId);
-  if (!sourceSession) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId || undefined, message: '接力失败：找不到来源会话。' });
-  }
-  if (activeProcesses.has(sourceSessionId)) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：当前窗口仍在运行，请等待完成或停止后再接力。' });
-  }
-
-  const sourceAgent = getSessionAgent(sourceSession);
-  const requestedAgent = normalizeAgent(msg?.agent || sourceAgent);
-  const agent = requestedAgent || sourceAgent;
-  const resolvedMode = resolvePermissionModeForAgent(agent, msg?.mode || sourceSession.permissionMode || 'yolo');
-  const requestedReasoningEffort = agent === 'codex'
-    ? normalizeCodexReasoningEffort(Object.prototype.hasOwnProperty.call(msg || {}, 'reasoningEffort') ? msg.reasoningEffort : sourceSession.reasoningEffort)
-    : '';
-  const newTask = typeof msg?.newTask === 'string'
-    ? msg.newTask
-    : (typeof msg?.text === 'string' ? msg.text : '');
-  const normalizedTask = normalizeReplayText(newTask);
-  const attachments = Array.isArray(msg?.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
-  const resolvedAttachments = resolveMessageAttachments(attachments);
-  if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：附件已过期或不可用，请重新上传后再接力。' });
-  }
-  const cwdForFileRefs = sourceSession.cwd || process.cwd();
-  const resolvedFileRefResult = normalizeContextFileRefs(msg?.fileRefs, cwdForFileRefs);
-  if (resolvedFileRefResult.error) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: `接力失败：${resolvedFileRefResult.error}` });
-  }
-  if (!normalizedTask && resolvedAttachments.length === 0 && resolvedFileRefResult.refs.length === 0) {
-    return wsSend(ws, { type: 'error', sessionId: sourceSessionId, message: '接力失败：请输入要在新窗口继续的新任务。' });
-  }
-
-  const pendingHandoff = setSessionHandoffPending(sourceSession, {
-    id: crypto.randomUUID(),
-    status: 'analyzing',
-    message: '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
-    newTaskPreview: truncateReplayText(normalizedTask || '请继续处理接力任务。', 120),
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + HANDOFF_AI_TIMEOUT_MS + 60000).toISOString(),
-  });
-  wsSend(ws, {
-    type: 'system_message',
-    sessionId: sourceSessionId,
-    message: pendingHandoff?.message || '正在调用 AI 分析旧窗口，并根据新任务生成交接文档…',
-  });
-  broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: pendingHandoff });
-  broadcastSessionListRefresh();
-  const handoffAbortController = new AbortController();
-  const activeHandoffEntry = {
-    controller: handoffAbortController,
-    pid: null,
-    proc: null,
-    sourceSessionId,
-    pendingId: pendingHandoff?.id || null,
-    startedAt: pendingHandoff?.startedAt || new Date().toISOString(),
-  };
-  activeHandoffProcesses.set(sourceSessionId, activeHandoffEntry);
-  plog('INFO', 'handoff_ai_summary_start', {
-    sourceSessionId: sourceSessionId.slice(0, 8),
-    agent,
-    historyCount: Array.isArray(sourceSession.messages) ? sourceSession.messages.length : 0,
-  });
-
-  let aiSummary = '';
-  let handoffSummarySource = 'ai';
-  try {
-    aiSummary = await generateAiHandoffSummary(sourceSession, normalizedTask, resolvedAttachments, {
-      agent,
-      abortSignal: handoffAbortController.signal,
-      onProcess: (proc) => {
-        activeHandoffEntry.proc = proc;
-        activeHandoffEntry.pid = proc?.pid || null;
-      },
-    });
-    plog('INFO', 'handoff_ai_summary_complete', {
-      sourceSessionId: sourceSessionId.slice(0, 8),
-      chars: aiSummary.length,
-    });
-  } catch (error) {
-    if (handoffAbortController.signal.aborted || error?.code === 'HANDOFF_ABORTED') {
-      activeHandoffProcesses.delete(sourceSessionId);
-      clearSessionHandoffPending(sourceSessionId);
-      broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: null });
-      broadcastSessionListRefresh();
-      wsSend(ws, { type: 'system_message', sessionId: sourceSessionId, message: '已停止接力 AI 交接分析。' });
-      plog('INFO', 'handoff_ai_summary_aborted', { sourceSessionId: sourceSessionId.slice(0, 8), pid: activeHandoffEntry.pid || null });
-      return;
-    }
-    handoffSummarySource = 'fallback';
-    const fallback = buildHandoffRuntimePrompt(sourceSession, normalizedTask, resolvedAttachments);
-    const reason = error?.message || String(error);
-    aiSummary = [
-      `AI 交接分析未能在限定时间内完成（${reason}）。`,
-      '为避免接力中断，已自动改用系统结构化摘要继续创建新窗口。',
-      '',
-      fallback.summaryText || '系统未能生成结构化摘要，请参考最近对话和新任务继续。',
-    ].join('\n');
-    wsSend(ws, {
-      type: 'system_message',
-      sessionId: sourceSessionId,
-      message: `AI 交接分析未完成（${reason}），已改用系统摘要继续创建接力新窗口…`,
-    });
-    plog('WARN', 'handoff_ai_summary_fallback', {
-      sourceSessionId: sourceSessionId.slice(0, 8),
-      reason,
-      fallbackChars: aiSummary.length,
-    });
-  }
-
-  activeHandoffProcesses.delete(sourceSessionId);
-  const refreshedSourceAfterSummary = clearSessionHandoffPending(sourceSessionId);
-  broadcastToSessionViewers(sourceSessionId, { type: 'handoff_status', sessionId: sourceSessionId, handoffPending: null });
-  if (refreshedSourceAfterSummary) broadcastSessionListRefresh();
-
-  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
-
-  const now = new Date().toISOString();
-  const id = crypto.randomUUID();
-  const sourceTitle = sourceSession.title || '旧窗口';
-  const taskText = formatCurrentInputForCarryover(normalizedTask, resolvedAttachments);
-  const handoff = {
-    prompt: [
-      '[webcoding 接力新窗口]',
-      handoffSummarySource === 'ai'
-        ? '这是 AI 已经根据旧窗口聊天记录和用户新任务分析出的交接文档。'
-        : 'AI 交接分析未完成，下面是系统结构化摘要和旧窗口关键信息。',
-      '请不要再要求用户重新整理进度；直接基于交接文档和新任务继续执行。',
-      '',
-      '[来源窗口]',
-      `标题: ${sourceTitle}`,
-      sourceSession.cwd ? `工作目录: ${sourceSession.cwd}` : '',
-      `Agent: ${getSessionAgent(sourceSession)}`,
-      '',
-      '[AI 交接分析文档]',
-      aiSummary,
-      '',
-      '[新任务]',
-      taskText,
-    ].filter((line) => line !== '').join('\n'),
-    summaryText: aiSummary,
-    summaryDetailed: handoffSummarySource === 'ai',
-    recentCount: 0,
-    historyCount: Array.isArray(sourceSession.messages) ? sourceSession.messages.length : 0,
-  };
-  const handoffNotice = handoffSummarySource === 'ai'
-    ? `已创建接力新窗口：AI 已根据新任务分析 ${handoff.historyCount} 条旧窗口消息，并生成交接文档。`
-    : `已创建接力新窗口：AI 交接分析未完成，已使用系统摘要接力 ${handoff.historyCount} 条旧窗口消息。`;
-  const handoffSummaryMessage = [
-    `接力来源：${sourceTitle}`,
-    sourceSession.cwd ? `工作目录：${sourceSession.cwd}` : '',
-    '',
-    '自动交接摘要：',
-    handoff.summaryText || '已自动生成交接摘要。',
-    '',
-    '新任务：',
-    normalizedTask || '请继续处理接力任务。',
-  ].filter((line) => line !== '').join('\n');
-  const session = {
-    id,
-    title: handoffSessionTitle(normalizedTask, sourceSession),
-    created: now,
-    updated: now,
-    agent,
-    claudeSessionId: null,
-    codexThreadId: null,
-    codexRuntimeFingerprint: null,
-    runtimeContexts: { claude: {}, codex: {} },
-    model: sourceSession.model || null,
-    reasoningEffort: requestedReasoningEffort,
-    permissionMode: resolvedMode.mode,
-    totalCost: 0,
-    totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-    messages: [{ role: 'system', content: handoffSummaryMessage, timestamp: now }],
-    cwd: sourceSession.cwd || null,
-    projectId: sourceSession.projectId || null,
-    handoff: {
-      sourceSessionId,
-      sourceTitle: sourceSession.title || '',
-      createdAt: now,
-    },
-  };
-  saveSession(session);
-  wsSessionMap.set(ws, id);
-
-  handleMessage(ws, {
-    type: 'message',
-    sessionId: id,
-    text: normalizedTask || '请继续处理接力任务。',
-    attachments,
-    fileRefs: msg?.fileRefs,
-    mode: resolvedMode.mode,
-    reasoningEffort: requestedReasoningEffort,
-    agent,
-  }, {
-    runtimeInputText: handoff.prompt,
-    emitSessionInfo: true,
-  });
-
-  wsSend(ws, { type: 'system_message', sessionId: id, message: handoffNotice });
-  broadcastSessionListRefresh();
-
-  if (resolvedMode.downgraded) {
-    wsSend(ws, { type: 'system_message', sessionId: id, message: resolvedMode.message });
-    wsSend(ws, { type: 'mode_changed', sessionId: id, mode: resolvedMode.mode });
-  }
-  plog('INFO', 'handoff_session_created', {
-    sourceSessionId: sourceSessionId.slice(0, 8),
-    sessionId: id.slice(0, 8),
-    summarySource: handoffSummarySource,
-    historyCount: handoff.historyCount,
-  });
-}
 
 function handleLoadSession(ws, sessionId) {
   const session = loadSession(sessionId);
@@ -8528,6 +8012,7 @@ function handleLoadSession(ws, sessionId) {
     title: session.title,
     mode: session.permissionMode || 'yolo',
     reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     hasUnread: hadUnread,
@@ -8543,7 +8028,6 @@ function handleLoadSession(ws, sessionId) {
     historyPending: olderChunks.length > 0,
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
-    handoffPending: getActiveHandoffPending(session),
     ...buildSessionRuntimeMeta(session),
   });
 
@@ -8746,6 +8230,21 @@ function handleSetReasoningEffort(ws, sessionId, rawEffort) {
   wsSend(ws, { type: 'reasoning_effort_changed', reasoningEffort: effort });
 }
 
+function handleSetFastMode(ws, sessionId, rawFastMode) {
+  const fastMode = normalizeCodexFastMode(rawFastMode);
+  if (sessionId) {
+    const session = loadSession(sessionId);
+    if (session && getSessionAgent(session) === 'codex') {
+      session.fastMode = fastMode;
+      clearRuntimeSessionId(session);
+      session.updated = new Date().toISOString();
+      saveSession(session);
+      sendSessionList(ws, { forceRefresh: true });
+    }
+  }
+  wsSend(ws, { type: 'fast_mode_changed', fastMode });
+}
+
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];
   for (const [sid, entry] of activeProcesses) {
@@ -8788,21 +8287,7 @@ function handleAbort(ws, msg = {}) {
   const sessionId = requestedSessionId || wsSessionMap.get(ws);
   if (!sessionId) return;
   const entry = activeProcesses.get(sessionId);
-  if (!entry) {
-    const handoffEntry = activeHandoffProcesses.get(sessionId);
-    if (!handoffEntry) return;
-    plog('INFO', 'user_abort_handoff', { sessionId: sessionId.slice(0, 8), pid: handoffEntry.pid || null });
-    try { handoffEntry.controller?.abort(); } catch {}
-    try { if (handoffEntry.pid) killProcess(handoffEntry.pid, true); } catch {}
-    clearSessionHandoffPending(sessionId);
-    broadcastToSessionViewers(sessionId, { type: 'handoff_status', sessionId, handoffPending: null });
-    broadcastSessionListRefresh();
-    wsSend(ws, { type: 'system_message', sessionId, message: '正在停止接力 AI 交接分析…' });
-    return;
-  }
 
-  entry.abortRequested = true;
-  entry.abortRequestedAt = new Date().toISOString();
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
   sendRuntimeMessage(entry, { type: 'runtime_status', sessionId, code: 'stopping', message: '正在停止当前任务…' });
   killProcess(entry.pid);
@@ -8853,6 +8338,7 @@ function buildQueueItemFromClientMessage(session, msg) {
       fileRefs: resolvedFileRefs.map(fileRefHistoryMeta),
       mode: typeof msg.mode === 'string' ? msg.mode : (session.permissionMode || 'yolo'),
       reasoningEffort: normalizeCodexReasoningEffort(msg.reasoningEffort),
+      fastMode: normalizeCodexFastMode(msg.fastMode),
       agent: normalizeAgent(msg.agent || session.agent),
       createdAt: new Date().toISOString(),
     },
@@ -8923,6 +8409,7 @@ function dispatchNextServerQueuedMessage(sessionId) {
     type: 'message',
     mode: item.mode || session.permissionMode || 'yolo',
     reasoningEffort: item.reasoningEffort || session.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(item, 'fastMode') ? item.fastMode : session.fastMode),
     agent: normalizeAgent(item.agent || session.agent),
   };
   const text = String(payload.text || '').trim();
@@ -9106,6 +8593,7 @@ function handleEditMessage(ws, msg = {}) {
     mode: msg.mode || session.permissionMode || 'yolo',
     agent: msg.agent || getSessionAgent(session),
     reasoningEffort: Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort') ? msg.reasoningEffort : session.reasoningEffort,
+    fastMode: Object.prototype.hasOwnProperty.call(msg, 'fastMode') ? msg.fastMode : session.fastMode,
   }, {
     runtimeInputText,
     emitSessionInfo: true,
@@ -9203,6 +8691,7 @@ function handleMessage(ws, msg, options = {}) {
       runtimeContexts: { claude: {}, codex: {} },
       model: null,
       reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(msg.reasoningEffort) : '',
+      fastMode: agent === 'codex' ? normalizeCodexFastMode(msg.fastMode) : false,
       permissionMode: resolvePermissionModeForAgent(agent, mode).mode,
       totalCost: 0,
       totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -9233,6 +8722,13 @@ function handleMessage(ws, msg, options = {}) {
   }
   if (getSessionAgent(session) === 'codex' && Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) {
     session.reasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
+  }
+  if (getSessionAgent(session) === 'codex' && Object.prototype.hasOwnProperty.call(msg, 'fastMode')) {
+    const nextFastMode = normalizeCodexFastMode(msg.fastMode);
+    if (session.fastMode !== nextFastMode) {
+      session.fastMode = nextFastMode;
+      clearRuntimeSessionId(session);
+    }
   }
 
   if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {
@@ -9273,6 +8769,7 @@ function handleMessage(ws, msg, options = {}) {
       title: session.title,
       mode: session.permissionMode || 'yolo',
       reasoningEffort: session.reasoningEffort || '',
+      fastMode: !!session.fastMode,
       model: sessionModelLabel(session),
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
@@ -9286,8 +8783,7 @@ function handleMessage(ws, msg, options = {}) {
       hasUnread: false,
       historyPending: false,
       isRunning: false,
-      handoffPending: getActiveHandoffPending(session),
-      ...buildSessionRuntimeMeta(session),
+        ...buildSessionRuntimeMeta(session),
       ...(sessionInfoExtra && typeof sessionInfoExtra === 'object' ? sessionInfoExtra : {}),
     });
   }
@@ -9479,6 +8975,7 @@ function handleMessage(ws, msg, options = {}) {
       attachments: savedAttachments,
       fileRefs: savedFileRefs,
       reasoningEffort: getSessionAgent(session) === 'codex' ? (session.reasoningEffort || '') : '',
+      fastMode: getSessionAgent(session) === 'codex' ? !!session.fastMode : false,
       retryCount: Math.max(0, Number(msg.__capacityRetryCount || 0)),
     },
     attachments: resolvedAttachments,
@@ -9961,6 +9458,7 @@ function handleImportNativeSession(ws, msg) {
     importedFrom: projectDir,
     model: existingSession?.model || null,
     reasoningEffort: existingSession?.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(existingSession?.fastMode),
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -9980,6 +9478,7 @@ function handleImportNativeSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,
@@ -10087,6 +9586,7 @@ function handleImportCodexSession(ws, msg) {
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
     reasoningEffort: existingSession?.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(existingSession?.fastMode),
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -10108,6 +9608,7 @@ function handleImportCodexSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,

@@ -797,7 +797,6 @@ html[data-theme="night"] .welcome-icon {
 }
 
 html[data-theme="night"] .send-btn,
-html[data-theme="night"] .handoff-btn,
 html[data-theme="night"] .settings-actions .btn-save,
 html[data-theme="night"] .login-box button,
 html[data-theme="night"] .fc-submit-btn,
@@ -1323,7 +1322,6 @@ html[data-theme="localhost"] #tunnel-copy-btn:hover,
 html[data-theme="localhost"] .settings-actions button:hover,
 html[data-theme="localhost"] .attach-btn:hover,
 html[data-theme="localhost"] .send-btn:hover,
-html[data-theme="localhost"] .handoff-btn:hover,
 html[data-theme="localhost"] .abort-btn:hover,
 html[data-theme="localhost"] .tpl-fetch-toolbar-btn:hover,
 html[data-theme="localhost"] .project-picker-item:hover,
@@ -1626,16 +1624,6 @@ html[data-theme="localhost"] .attach-btn,
 html[data-theme="localhost"] .send-btn,
 html[data-theme="localhost"] .abort-btn {
   width: 30px;
-  height: 30px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  box-shadow: none;
-  transform: none;
-}
-html[data-theme="localhost"] .handoff-btn {
-  background: #ffffff;
-  width: auto;
-  min-width: 42px;
   height: 30px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -4522,35 +4510,6 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   flex: 0 0 auto;
 }
 
-.handoff-btn {
-  min-width: 42px;
-  height: var(--btn-icon-size);
-  border: 2px solid var(--line);
-  border-radius: var(--button-radius);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  padding: 0 9px;
-  background: var(--surface);
-  color: var(--text-primary);
-  box-shadow: 2px 2px 0 var(--line);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
-}
-.handoff-btn:hover {
-  background: var(--yellow);
-  box-shadow: var(--button-shadow-soft);
-}
-.handoff-btn:active {
-  transform: translate(2px, 2px);
-  box-shadow: none;
-}
-.handoff-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
 .send-btn, .abort-btn {
   width: var(--btn-icon-size);
   height: var(--btn-icon-size);
@@ -4782,7 +4741,8 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   display: none;
   flex-shrink: 0;
 }
-.desktop-reasoning-select {
+.desktop-reasoning-select,
+.desktop-speed-select {
   --compact-text-control-size: 11px;
 
   appearance: none;
@@ -4892,7 +4852,8 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   .agent-tabs, .mode-tabs {
     display: none;
   }
-  .desktop-reasoning-select {
+  .desktop-reasoning-select,
+  .desktop-speed-select {
     display: none;
   }
   .mobile-topbar-bar {
@@ -4916,6 +4877,9 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   }
   #mobile-reasoning-select {
     width: 92px;
+  }
+  #mobile-speed-select {
+    width: 72px;
   }
   .cmd-menu { left: var(--space-md); right: var(--space-md); transform: none; min-width: auto; bottom: 72px; }
   .option-picker { left: var(--space-md); right: var(--space-md); transform: none; min-width: auto; max-width: none; bottom: 72px; }
@@ -4947,7 +4911,6 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   .send-btn, .abort-btn { width: 34px;
   height: 34px; }
   .composer-status { max-width: 42vw; height: 34px; min-height: 34px; font-size: 11px; padding: 0 8px; }
-  .handoff-btn { min-width: 40px; height: 34px; padding: 0 8px; font-size: 11px; }
   .new-chat-btn,
   .new-chat-arrow { min-height: 40px; }
   .new-chat-arrow { width: 44px; }
@@ -4995,6 +4958,9 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   }
   #mobile-reasoning-select {
     width: 84px;
+  }
+  #mobile-speed-select {
+    width: 62px;
   }
 }
 
