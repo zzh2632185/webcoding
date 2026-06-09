@@ -12,6 +12,7 @@ const XLSX = require('xlsx');
 const mammoth = require('mammoth');
 const { createAgentRuntime, buildCliSpawnCommand } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const { CodexAppServerClient } = require('./lib/codex-app-server-client');
 const IS_WIN = process.platform === 'win32';
 
 // Load .env
@@ -4266,6 +4267,50 @@ function splitHistoryMessages(messages) {
   return { recentMessages, olderChunks };
 }
 
+function buildLatestSideConversationPayload(parentSessionId) {
+  const parentId = sanitizeId(parentSessionId || '');
+  if (!parentId) return null;
+  let latest = null;
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const session = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8')));
+        if (!session?.sidecar || session.kind !== 'side_conversation') continue;
+        if (sanitizeId(session.parentSessionId || '') !== parentId) continue;
+        if (!latest || String(session.updated || session.created || '') > String(latest.updated || latest.created || '')) {
+          latest = session;
+        }
+      } catch {}
+    }
+  } catch {
+    return null;
+  }
+  if (!latest) return null;
+  const { recentMessages } = splitHistoryMessages(latest.messages);
+  return {
+    sessionId: latest.id,
+    kind: latest.kind || 'side_conversation',
+    sidecar: true,
+    parentSessionId: latest.parentSessionId || parentId,
+    anchor: latest.anchor || null,
+    parentContext: latest.parentContext || null,
+    contextSnippet: latest.contextSnippet || '',
+    messages: recentMessages,
+    title: latest.title || '侧边聊天',
+    mode: latest.permissionMode || 'default',
+    reasoningEffort: latest.reasoningEffort || '',
+    fastMode: !!latest.fastMode,
+    model: sessionModelLabel(latest),
+    agent: getSessionAgent(latest),
+    cwd: latest.cwd || null,
+    projectId: latest.projectId || null,
+    updated: latest.updated || latest.created || null,
+    isRunning: activeProcesses.has(latest.id),
+    ...buildSessionRuntimeMeta(latest),
+  };
+}
+
 function normalizeReplayText(text) {
   return String(text || '')
     .replace(/\r\n?/g, '\n')
@@ -7028,6 +7073,11 @@ wss.on('connection', (ws, req) => {
       case 'new_session':
         handleNewSession(ws, msg);
         break;
+      case 'fork_session':
+        handleForkSession(ws, msg).catch((err) => {
+          wsSend(ws, { type: 'error', sessionId: msg.sessionId, message: `分叉失败：${err?.message || String(err)}` });
+        });
+        break;
       case 'load_session':
         handleLoadSession(ws, msg.sessionId);
         break;
@@ -7848,6 +7898,283 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
   }
 }
 
+function buildForkSessionTitle(sourceTitle, mode = 'normal') {
+  const base = String(sourceTitle || 'Untitled').trim() || 'Untitled';
+  const suffix = mode === 'worktree' ? ' · worktree 分叉' : ' · 分叉';
+  const maxBaseLen = Math.max(20, 80 - suffix.length);
+  const clipped = base.length > maxBaseLen ? `${base.slice(0, maxBaseLen - 1)}…` : base;
+  return `${clipped}${suffix}`;
+}
+
+function normalizeForkMessageIndex(value) {
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function getCompletedMessagesForFork(session, throughMessageIndex = null) {
+  const messages = Array.isArray(session?.messages) ? cloneJson(session.messages) : [];
+  const targetIndex = normalizeForkMessageIndex(throughMessageIndex);
+  if (targetIndex !== null) {
+    return messages.slice(0, Math.min(messages.length, targetIndex + 1));
+  }
+  if (!activeProcesses.has(session?.id)) return messages;
+  // The running turn is intentionally excluded. Webcoding persists the user's
+  // latest prompt before the runtime completes, and app-server `thread/fork`
+  // only forks completed native turns, so mirror that rule in Webcoding history.
+  while (messages.length > 0) {
+    const tail = messages[messages.length - 1];
+    if (tail?.role === 'assistant') break;
+    messages.pop();
+    if (tail?.role === 'user') break;
+  }
+  return messages;
+}
+
+function countCodexRollbackTurnsForFork(sourceSession, targetMessages) {
+  const sourceMessages = getCompletedMessagesForFork(sourceSession);
+  const targetLength = Array.isArray(targetMessages) ? targetMessages.length : 0;
+  if (targetLength <= 0 || targetLength >= sourceMessages.length) return 0;
+  return sourceMessages.slice(targetLength).filter((message) => message?.role === 'user').length;
+}
+
+function forkPermissionParamsForCodex(mode) {
+  const normalized = String(mode || 'yolo').trim().toLowerCase();
+  if (normalized === 'plan') {
+    return { approvalPolicy: 'on-request', sandbox: 'read-only' };
+  }
+  if (normalized === 'default') {
+    return { approvalPolicy: 'on-failure', sandbox: 'workspace-write' };
+  }
+  return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+}
+
+function runGitText(cwd, args, options = {}) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: options.stdio || ['ignore', 'pipe', 'pipe'],
+    timeout: options.timeoutMs || 30000,
+  }).trim();
+}
+
+function createGitWorktreeForFork(sourceCwd, sourceSessionId) {
+  const cwd = normalizeProjectPathKey(sourceCwd);
+  if (!cwd) throw new Error('当前会话没有项目目录，不能创建 worktree 分叉。');
+  try {
+    fs.statSync(cwd);
+  } catch {
+    throw new Error(`当前项目目录不存在：${cwd}`);
+  }
+  const repoRoot = runGitText(cwd, ['rev-parse', '--show-toplevel']);
+  if (!repoRoot) throw new Error('当前目录不是 Git 仓库，不能创建 worktree 分叉。');
+  const repoName = path.basename(repoRoot) || 'repo';
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+  const shortSession = sanitizeId(sourceSessionId || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
+  const branchName = `webcoding/fork-${shortSession}-${stamp}`;
+  const parentDir = path.dirname(repoRoot);
+  const targetPath = path.join(parentDir, `${repoName}-fork-${shortSession}-${stamp}`);
+  if (fs.existsSync(targetPath)) {
+    throw new Error(`worktree 目标目录已存在：${targetPath}`);
+  }
+  runGitText(repoRoot, ['worktree', 'add', '-b', branchName, targetPath, 'HEAD'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeoutMs: 120000,
+  });
+  return {
+    cwd: normalizeProjectPathKey(targetPath),
+    repoRoot: normalizeProjectPathKey(repoRoot),
+    branchName,
+  };
+}
+
+async function forkCodexNativeThread(sourceSession, newSession, options = {}) {
+  const sourceThreadId = getRuntimeSessionId(sourceSession, { agent: 'codex' }) || sourceSession.codexThreadId || null;
+  if (!sourceThreadId) return { forked: false, reason: 'source_thread_missing' };
+
+  const spawnSpec = buildCodexSpawnSpec(sourceSession, { attachments: [] });
+  if (spawnSpec?.error) throw new Error(spawnSpec.error);
+  const appServerArgs = (() => {
+    try {
+      const parsed = JSON.parse(spawnSpec.env?.WEBCODING_CODEX_APP_SERVER_ARGS || '[]');
+      return Array.isArray(parsed) && parsed.length > 0 ? parsed : ['app-server', '--listen', 'stdio://'];
+    } catch {
+      return ['app-server', '--listen', 'stdio://'];
+    }
+  })();
+  const client = new CodexAppServerClient({
+    codexPath: spawnSpec.env?.WEBCODING_CODEX_PATH || CODEX_PATH,
+    args: appServerArgs,
+    cwd: options.cwd || sourceSession.cwd || process.cwd(),
+    env: spawnSpec.env || process.env,
+    requestTimeoutMs: 45000,
+  });
+  try {
+    await client.initialize({
+      name: 'webcoding-fork',
+      title: 'Webcoding Fork',
+      version: '0.1.0',
+      timeoutMs: 45000,
+    });
+    const params = {
+      threadId: String(sourceThreadId),
+      cwd: options.cwd || sourceSession.cwd || null,
+      model: currentSessionModelOverride(sourceSession) || null,
+      threadSource: 'user',
+      ...forkPermissionParamsForCodex(sourceSession.permissionMode || 'yolo'),
+    };
+    const result = await client.request('thread/fork', params, 90000);
+    const forkedThreadId = result?.thread?.id || result?.threadId || result?.id || null;
+    if (!forkedThreadId) throw new Error('Codex thread/fork 未返回新 threadId。');
+    const rollbackTurns = Math.max(0, Number(options.rollbackTurns || 0) || 0);
+    if (rollbackTurns > 0) {
+      await client.request('thread/rollback', { threadId: String(forkedThreadId), numTurns: rollbackTurns }, 90000);
+    }
+    setRuntimeSessionState(newSession, {
+      runtimeId: forkedThreadId,
+      runtimeFingerprint: spawnSpec.runtimeFingerprint || null,
+    }, {
+      agent: 'codex',
+      channelKey: spawnSpec.channelKey || null,
+      channelDescriptor: spawnSpec.channelDescriptor || null,
+      codexConfig: loadCodexConfig(),
+    });
+    newSession.codexThreadId = forkedThreadId;
+    newSession.codexRuntimeFingerprint = spawnSpec.runtimeFingerprint || null;
+    return {
+      forked: true,
+      sourceThreadId: String(sourceThreadId),
+      threadId: String(forkedThreadId),
+      rollbackTurns,
+    };
+  } finally {
+    await client.shutdown().catch(() => {});
+  }
+}
+
+async function handleForkSession(ws, msg) {
+  const sourceId = sanitizeId(msg?.sessionId || '');
+  const sourceSession = loadSession(sourceId);
+  if (!sourceSession) {
+    return wsSend(ws, { type: 'error', sessionId: sourceId, message: 'Session not found' });
+  }
+
+  const requestedWorktree = msg?.worktree === true || msg?.mode === 'worktree';
+  const forkMode = requestedWorktree ? 'worktree' : 'normal';
+  const throughMessageIndex = normalizeForkMessageIndex(msg?.messageIndex);
+  let worktreeMeta = null;
+  let targetCwd = sourceSession.cwd || null;
+  let projectsChanged = false;
+
+  try {
+    if (requestedWorktree) {
+      worktreeMeta = createGitWorktreeForFork(sourceSession.cwd, sourceSession.id);
+      targetCwd = worktreeMeta.cwd;
+    }
+
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const completedMessages = getCompletedMessagesForFork(sourceSession, throughMessageIndex);
+    const newSession = {
+      ...cloneJson(sourceSession),
+      id,
+      kind: 'main',
+      sidecar: false,
+      parentSessionId: null,
+      anchor: undefined,
+      parentContext: null,
+      contextSnippet: '',
+      title: buildForkSessionTitle(sourceSession.title, forkMode),
+      created: now,
+      updated: now,
+      hasUnread: false,
+      queuedMessages: [],
+      messages: completedMessages,
+      cwd: targetCwd ? normalizeProjectPathKey(targetCwd) : null,
+      projectId: requestedWorktree ? null : (sourceSession.projectId || null),
+      forkedFromSessionId: sourceSession.id,
+      forkedFromRuntimeId: getRuntimeSessionId(sourceSession, { agent: getSessionAgent(sourceSession) }) || null,
+      forkedAt: now,
+      forkMode,
+      worktree: worktreeMeta || null,
+      totalCost: sourceSession.totalCost || 0,
+      totalUsage: cloneJson(sourceSession.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 }),
+      lastUsage: sourceSession.lastUsage || null,
+    };
+    delete newSession.importedRolloutPath;
+
+    // A fork must be independent. Native Codex threads are forked below; all
+    // other runtime ids are cleared so the new branch never resumes the parent.
+    newSession.claudeSessionId = null;
+    newSession.claudeRuntimeFingerprint = null;
+    newSession.codexThreadId = null;
+    newSession.codexRuntimeFingerprint = null;
+    newSession.runtimeContexts = { claude: {}, codex: {} };
+
+    if (newSession.cwd) {
+      const ensured = ensureProjectForPath(newSession.cwd, {
+        name: requestedWorktree ? `${path.basename(newSession.cwd)}（分叉）` : undefined,
+      });
+      if (ensured.project?.id) {
+        newSession.projectId = ensured.project.id;
+        projectsChanged = !!ensured.created;
+      }
+    }
+
+    let nativeFork = { forked: false };
+    if (getSessionAgent(sourceSession) === 'codex') {
+      nativeFork = await forkCodexNativeThread(sourceSession, newSession, {
+        cwd: newSession.cwd || null,
+        rollbackTurns: countCodexRollbackTurnsForFork(sourceSession, completedMessages),
+      });
+    }
+    newSession.nativeFork = nativeFork;
+    saveSession(newSession);
+
+    plog('INFO', 'session_forked', {
+      sourceId: sourceSession.id.slice(0, 8),
+      forkId: newSession.id.slice(0, 8),
+      agent: getSessionAgent(sourceSession),
+      forkMode,
+      throughMessageIndex,
+      sourceThreadId: nativeFork.sourceThreadId || null,
+      forkedThreadId: nativeFork.threadId || null,
+      rollbackTurns: nativeFork.rollbackTurns || 0,
+      cwd: newSession.cwd || null,
+    });
+
+    if (projectsChanged) {
+      wsSend(ws, { type: 'projects_config', projects: loadProjectsConfig().projects });
+    }
+    sendSessionList(ws, { forceRefresh: true });
+    wsSend(ws, {
+      type: 'session_forked',
+      sourceSessionId: sourceSession.id,
+      sessionId: newSession.id,
+      title: newSession.title,
+      mode: forkMode,
+      cwd: newSession.cwd,
+      nativeThreadForked: !!nativeFork.forked,
+      sourceThreadId: nativeFork.sourceThreadId || null,
+      threadId: nativeFork.threadId || null,
+      messageIndex: throughMessageIndex,
+      rollbackTurns: nativeFork.rollbackTurns || 0,
+      worktree: worktreeMeta || null,
+    });
+    handleLoadSession(ws, newSession.id);
+  } catch (error) {
+    plog('ERROR', 'session_fork_failed', {
+      sourceId: sourceSession.id.slice(0, 8),
+      forkMode,
+      error: error?.message || String(error),
+    });
+    wsSend(ws, {
+      type: 'error',
+      sessionId: sourceSession.id,
+      message: `分叉失败：${error?.message || String(error)}`,
+    });
+  }
+}
+
 // === Session Handlers ===
 function handleNewSession(ws, msg) {
   // Creating a new session changes what this browser is viewing. Make sure
@@ -8026,6 +8353,7 @@ function handleLoadSession(ws, sessionId) {
     historyTotal: session.messages.length,
     historyBuffered: recentMessages.length,
     historyPending: olderChunks.length > 0,
+    sideConversation: session.sidecar ? null : buildLatestSideConversationPayload(session.id),
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
     ...buildSessionRuntimeMeta(session),

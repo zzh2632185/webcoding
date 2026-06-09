@@ -2421,16 +2421,21 @@ body.project-touch-dragging {
 .project-group-header:not(.collapsed) .project-group-chevron {
   transform: rotate(90deg);
 }
-.project-group-running-dot {
+.project-group-status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: var(--blue);
   box-shadow: 0 0 0 3px rgba(111, 194, 255, 0.14);
   flex: 0 0 8px;
+}
+.project-group-status-dot.is-running {
   animation: pulse 1.5s ease-in-out infinite;
 }
-html[data-theme="localhost"] .project-group-running-dot {
+.project-group-status-dot.is-unread {
+  animation: none;
+}
+html[data-theme="localhost"] .project-group-status-dot {
   background: var(--accent);
   box-shadow: 0 0 0 4px rgba(15, 138, 167, 0.12);
 }
@@ -2841,6 +2846,38 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+.side-chat-restore-btn {
+  min-height: var(--btn-sm-min-h);
+  padding: var(--btn-sm-pad-y) 9px;
+  border: var(--toolbar-button-border);
+  border-radius: var(--toolbar-button-radius);
+  background: var(--toolbar-button-background);
+  color: var(--toolbar-button-color);
+  box-shadow: var(--toolbar-button-shadow);
+  font-family: var(--font-mono);
+  font-size: var(--btn-sm-font);
+  font-weight: 700;
+  letter-spacing: var(--btn-letter-spacing);
+  line-height: 1.2;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.side-chat-restore-btn:hover {
+  background: var(--toolbar-button-hover-background);
+  color: var(--toolbar-button-hover-color);
+  transform: translateY(-1px);
+}
+.side-chat-restore-btn.active {
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+  border-color: var(--accent);
+  box-shadow: none;
+}
+.side-chat-restore-btn.active:hover {
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+  transform: none;
 }
 .chat-agent-btn {
   appearance: none;
@@ -3390,6 +3427,14 @@ html[data-theme="night"] .chat-tab.is-running .chat-tab-status {
 }
 .msg-jump-top-btn {
   color: var(--blue);
+}
+.msg-fork-btn {
+  color: var(--text-secondary);
+}
+.msg-fork-btn:hover,
+.msg-fork-btn:focus-visible {
+  color: var(--blue);
+  border-color: var(--blue);
 }
 .msg-edit-btn {
   min-width: 26px;

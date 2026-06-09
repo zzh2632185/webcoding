@@ -1210,6 +1210,72 @@ function runHandoffRemovalSourceRegressionCase() {
   );
 }
 
+function runSessionForkSourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const appSource = readRepoText('public', 'app.js');
+  const styleSource = readRepoText('public', 'style.css');
+  const forkHandlerSource = extractFunctionSource(serverSource, 'handleForkSession');
+  const codexForkSource = extractFunctionSource(serverSource, 'forkCodexNativeThread');
+  const completedMessagesSource = extractFunctionSource(serverSource, 'getCompletedMessagesForFork');
+  const rollbackCountSource = extractFunctionSource(serverSource, 'countCodexRollbackTurnsForFork');
+  const worktreeSource = extractFunctionSource(serverSource, 'createGitWorktreeForFork');
+  const createActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const assistantForkSource = extractFunctionSource(appSource, 'beginForkFromAssistantButton');
+  const startForkSource = extractFunctionSource(appSource, 'startForkSession');
+
+  assert(
+    serverSource.includes("case 'fork_session'")
+      && serverSource.includes('handleForkSession(ws, msg)'),
+    'WebSocket router must expose fork_session to the backend fork handler',
+  );
+  assert(
+    codexForkSource.includes("client.request('thread/fork'")
+      && codexForkSource.includes("client.request('thread/rollback'")
+      && codexForkSource.includes('setRuntimeSessionState(newSession')
+      && codexForkSource.includes('sourceThreadId')
+      && codexForkSource.includes('threadSource'),
+    'Codex session fork must call native app-server thread/fork, rollback the forked thread when forking from an older answer, and bind the returned thread id to the new session',
+  );
+  assert(
+    completedMessagesSource.includes('throughMessageIndex')
+      && completedMessagesSource.includes('messages.slice(0')
+      && completedMessagesSource.includes('activeProcesses.has(session?.id)')
+      && completedMessagesSource.includes("tail?.role === 'assistant'")
+      && rollbackCountSource.includes("message?.role === 'user'"),
+    'Fork history must support assistant-message checkpoints, exclude the unfinished tail turn, and compute native rollback turns from later user turns',
+  );
+  assert(
+    forkHandlerSource.includes('runtimeContexts = { claude: {}, codex: {} }')
+      && forkHandlerSource.includes('forkedFromSessionId')
+      && forkHandlerSource.includes('nativeFork')
+      && forkHandlerSource.includes('handleLoadSession(ws, newSession.id)'),
+    'Forked Webcoding sessions must be independent, traceable to their parent, and opened through the normal session loader',
+  );
+  assert(
+    serverSource.includes("execFileSync('git', args")
+      && worktreeSource.includes("runGitText(repoRoot, ['worktree', 'add', '-b'")
+      && worktreeSource.includes('branchName')
+      && forkHandlerSource.includes("msg?.worktree === true || msg?.mode === 'worktree'"),
+    'Worktree fork mode must create a git worktree on a fresh branch and switch the fork cwd to that path',
+  );
+  assert(
+    !appSource.includes('session-item-btn fork')
+      && createActionsSource.includes('msg-fork-btn')
+      && createActionsSource.includes('beginForkFromAssistantButton(forkBtn, event)')
+      && assistantForkSource.includes('msg.assistant')
+      && assistantForkSource.includes('messageIndex')
+      && startForkSource.includes("type: 'fork_session'")
+      && startForkSource.includes("mode: 'normal'")
+      && startForkSource.includes('worktree: false')
+      && startForkSource.includes('messageIndex')
+      && !appSource.includes('window.prompt(')
+      && !appSource.includes('chooseForkModeForSession')
+      && appSource.includes('session_forked: handleSessionForkedMessage')
+      && styleSource.includes('.msg-fork-btn'),
+    'Frontend must expose fork only in assistant message actions beside Copy, send normal same-project fork_session with messageIndex without a chooser, and handle completion feedback',
+  );
+}
+
 function runProcessWithInput(command, args, { input = '', env = {}, cwd = REPO_DIR, timeoutMs = 8000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -4285,6 +4351,7 @@ async function main() {
   await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
   await sourceRunner.run('codex fast mode source guard', runCodexFastModeSourceRegressionCase);
   await sourceRunner.run('handoff removal source guard', runHandoffRemovalSourceRegressionCase);
+  await sourceRunner.run('session fork source guard', runSessionForkSourceRegressionCase);
   await sourceRunner.run('codex native goal continuation runner', runCodexNativeGoalContinuationRegressionCase);
   sourceRunner.finish();
 

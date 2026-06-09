@@ -79,6 +79,9 @@
   const SIDE_CHAT_PARENT_RECENT_LIMIT = 8;
   const SIDE_CHAT_PARENT_NEARBY_LIMIT = 2;
   const SIDE_CHAT_PARENT_MESSAGE_LIMIT = 1200;
+  const SIDE_CHAT_STATE_STORAGE_KEY = 'webcoding-side-chat-state-v1';
+  const SIDE_CHAT_MAX_PERSISTED_MESSAGES = 80;
+  const SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS = 60000;
   const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
@@ -220,6 +223,7 @@
     reasoningEffort: '',
     fastMode: false,
   };
+  let sideChatPersistTimer = null;
   let sideChatSelectionPopover = null;
   let sideChatSelectionTimer = null;
   let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
@@ -364,6 +368,7 @@
   const sideChatSend = $('#side-chat-send');
   const sideChatAbort = $('#side-chat-abort');
   const sideChatClose = $('#side-chat-close');
+  const sideChatRestoreBtn = $('#side-chat-restore-btn');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
@@ -4741,6 +4746,8 @@
     renderQueuedMessages();
     highlightActiveSession();
     renderWorkspaceInsights();
+    if (sideChatState.open) closeSideChat();
+    syncSideChatRestoreButton();
   }
 
   function applySessionSnapshot(snapshot, options = {}) {
@@ -4760,6 +4767,16 @@
       clearEditingMessageState();
     }
     sessionState.currentSessionId = snapshot.sessionId;
+    if (
+      previousSessionId &&
+      previousSessionId !== snapshot.sessionId &&
+      sideChatState.open &&
+      sideChatState.parentSessionId &&
+      sideChatState.parentSessionId !== snapshot.sessionId
+    ) {
+      closeSideChat();
+    }
+    syncSideChatRestoreButton();
     if ((!previousSessionId || composeState.isGenerating) && snapshot.sessionId) {
       bindUnassignedQueuedMessagesToSession(snapshot.sessionId);
     }
@@ -5318,6 +5335,7 @@
         ? '可以针对左侧选中的片段临时提问，不会写入主线程。'
         : '侧边聊天不会占用左侧主线程。';
       sideChatMessages.appendChild(empty);
+      schedulePersistSideChatState();
       return;
     }
     for (const item of list) {
@@ -5337,25 +5355,255 @@
       sideChatMessages.appendChild(row);
     }
     sideChatMessages.scrollTop = sideChatMessages.scrollHeight;
+    schedulePersistSideChatState();
+  }
+
+  function normalizeSideChatPersistedMessages(messages) {
+    return (Array.isArray(messages) ? messages : [])
+      .slice(-SIDE_CHAT_MAX_PERSISTED_MESSAGES)
+      .map((item) => ({
+        role: item?.role === 'user' || item?.role === 'assistant' || item?.role === 'system' ? item.role : 'assistant',
+        content: String(item?.content || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        streaming: !!item?.streaming,
+      }))
+      .filter((item) => item.content || item.streaming);
+  }
+
+  function buildPersistableSideChatState() {
+    const hasContent = !!(
+      sideChatState.sessionId ||
+      sideChatState.contextSnippet ||
+      sideChatState.parentSessionId ||
+      sideChatState.pendingSendText ||
+      (Array.isArray(sideChatState.messages) && sideChatState.messages.length > 0)
+    );
+    if (!hasContent) return null;
+    return {
+      version: 1,
+      savedAt: Date.now(),
+      open: !!sideChatState.open,
+      sessionId: sideChatState.sessionId || null,
+      parentSessionId: sideChatState.parentSessionId || null,
+      contextSnippet: String(sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext: sideChatState.parentContext || null,
+      pendingSendText: String(sideChatState.pendingSendText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+      messages: normalizeSideChatPersistedMessages(sideChatState.messages),
+      pendingText: String(sideChatState.pendingText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+      isGenerating: !!sideChatState.isGenerating,
+      agent: normalizeAgent(sideChatState.agent || sessionState.currentAgent),
+      mode: sideChatState.mode || getSideChatDefaultMode(sideChatState.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(sideChatState.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(sideChatState.fastMode),
+    };
+  }
+
+  function persistSideChatStateNow() {
+    if (sideChatPersistTimer) {
+      clearTimeout(sideChatPersistTimer);
+      sideChatPersistTimer = null;
+    }
+    try {
+      const snapshot = buildPersistableSideChatState();
+      if (!snapshot) {
+        localStorage.removeItem(SIDE_CHAT_STATE_STORAGE_KEY);
+      } else {
+        localStorage.setItem(SIDE_CHAT_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+      }
+    } catch (error) {
+      console.warn('[WEBCODING]', 'persist side chat failed', error);
+    }
+    syncSideChatRestoreButton();
+  }
+
+  function schedulePersistSideChatState() {
+    if (sideChatPersistTimer) return;
+    sideChatPersistTimer = setTimeout(persistSideChatStateNow, 180);
+  }
+
+  function loadPersistedSideChatState() {
+    try {
+      const raw = localStorage.getItem(SIDE_CHAT_STATE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return {
+        open: !!parsed.open,
+        sessionId: parsed.sessionId ? String(parsed.sessionId) : null,
+        parentSessionId: parsed.parentSessionId ? String(parsed.parentSessionId) : null,
+        contextSnippet: String(parsed.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+        parentContext: parsed.parentContext && typeof parsed.parentContext === 'object' ? parsed.parentContext : null,
+        pendingSendText: String(parsed.pendingSendText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        messages: normalizeSideChatPersistedMessages(parsed.messages),
+        pendingText: String(parsed.pendingText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        isGenerating: !!parsed.isGenerating,
+        agent: normalizeAgent(parsed.agent || sessionState.currentAgent),
+        mode: parsed.mode || getSideChatDefaultMode(parsed.agent || sessionState.currentAgent),
+        reasoningEffort: normalizeCodexReasoningEffort(parsed.reasoningEffort || ''),
+        fastMode: normalizeCodexFastMode(parsed.fastMode),
+      };
+    } catch (error) {
+      console.warn('[WEBCODING]', 'load side chat snapshot failed', error);
+      return null;
+    }
+  }
+
+  function hasRestorableSideChat(snapshot = loadPersistedSideChatState()) {
+    return !!(
+      snapshot &&
+      (snapshot.sessionId || snapshot.contextSnippet || snapshot.parentSessionId || (Array.isArray(snapshot.messages) && snapshot.messages.length > 0))
+    );
+  }
+
+  function getRestorableSideChatForCurrentSession(snapshot = loadPersistedSideChatState()) {
+    if (!hasRestorableSideChat(snapshot)) return null;
+    const parentId = snapshot.parentSessionId ? String(snapshot.parentSessionId) : '';
+    const currentId = sessionState.currentSessionId ? String(sessionState.currentSessionId) : '';
+    if (parentId && currentId && parentId !== currentId) return null;
+    if (parentId && !currentId) return null;
+    return snapshot;
+  }
+
+  function syncSideChatRestoreButton() {
+    if (!sideChatRestoreBtn) return;
+    const restorable = !!getRestorableSideChatForCurrentSession();
+    sideChatRestoreBtn.hidden = false;
+    sideChatRestoreBtn.classList.toggle('active', !!sideChatState.open);
+    sideChatRestoreBtn.setAttribute('aria-pressed', sideChatState.open ? 'true' : 'false');
+    sideChatRestoreBtn.title = sideChatState.open
+      ? '收起侧边聊天'
+      : (restorable ? '打开上次侧边聊天' : '打开空侧边聊天');
+    sideChatRestoreBtn.setAttribute('aria-label', sideChatRestoreBtn.title);
+  }
+
+  function restoreSideChatFromSnapshot(snapshot = loadPersistedSideChatState(), options = {}) {
+    if (!hasRestorableSideChat(snapshot)) {
+      syncSideChatRestoreButton();
+      return false;
+    }
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    sideChatState = {
+      open: options.open !== false,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: snapshot.sessionId || null,
+      parentSessionId: snapshot.parentSessionId || sessionState.currentSessionId || null,
+      contextSnippet: snapshot.contextSnippet || '',
+      parentContext: snapshot.parentContext || null,
+      pendingSendText: snapshot.pendingSendText || '',
+      messages: normalizeSideChatPersistedMessages(snapshot.messages),
+      pendingText: snapshot.pendingText || '',
+      isGenerating: !!snapshot.isGenerating,
+      agent: normalizeAgent(snapshot.agent || sessionState.currentAgent),
+      mode: snapshot.mode || getSideChatDefaultMode(snapshot.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(snapshot.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(snapshot.fastMode),
+    };
+    setSideChatVisible(sideChatState.open);
+    renderSideChatContext();
+    renderSideChatMessages();
+    if (sideChatState.open) {
+      connectSideChatSocket();
+      requestAnimationFrame(() => sideChatInput?.focus());
+    }
+    persistSideChatStateNow();
+    return true;
+  }
+
+  function openBlankSideChat() {
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开一个主线程，再使用侧边聊天');
+      return false;
+    }
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    hideSideChatSelectionPopover();
+    sideChatState = {
+      open: true,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: null,
+      parentSessionId: sessionState.currentSessionId,
+      contextSnippet: '',
+      parentContext: null,
+      pendingSendText: '',
+      messages: [],
+      pendingText: '',
+      isGenerating: false,
+      agent: sessionState.currentAgent,
+      mode: getSideChatDefaultMode(sessionState.currentAgent),
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+    };
+    setSideChatVisible(true);
+    renderSideChatContext();
+    renderSideChatMessages();
+    if (sideChatInput) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
+    requestAnimationFrame(() => sideChatInput?.focus());
+    return true;
+  }
+
+  function toggleSideChatPanel() {
+    if (sideChatState.open) {
+      closeSideChat();
+      return;
+    }
+    const snapshot = getRestorableSideChatForCurrentSession(loadPersistedSideChatState());
+    if (snapshot && restoreSideChatFromSnapshot(snapshot, { open: true })) return;
+    openBlankSideChat();
+  }
+
+  function rememberSideConversationFromServer(payload) {
+    if (!payload || !payload.sessionId || sideChatState.open) return;
+    const snapshot = {
+      version: 1,
+      savedAt: Date.now(),
+      open: false,
+      sessionId: String(payload.sessionId),
+      parentSessionId: payload.parentSessionId ? String(payload.parentSessionId) : (sessionState.currentSessionId || null),
+      contextSnippet: String(payload.anchor?.text || payload.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext: payload.parentContext && typeof payload.parentContext === 'object' ? payload.parentContext : null,
+      pendingSendText: '',
+      messages: normalizeSideChatPersistedMessages(payload.messages),
+      pendingText: '',
+      isGenerating: !!payload.isRunning,
+      agent: normalizeAgent(payload.agent || sessionState.currentAgent),
+      mode: payload.mode || getSideChatDefaultMode(payload.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(payload.fastMode),
+    };
+    try {
+      localStorage.setItem(SIDE_CHAT_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch (error) {
+      console.warn('[WEBCODING]', 'remember side conversation failed', error);
+    }
+    syncSideChatRestoreButton();
   }
 
   function setSideChatVisible(open) {
     sideChatState.open = !!open;
     if (sideChatPanel) sideChatPanel.classList.toggle('visible', sideChatState.open);
     updateSideChatButtons();
+    schedulePersistSideChatState();
+    syncSideChatRestoreButton();
   }
 
   function closeSideChat() {
     setSideChatVisible(false);
     closeSideChatSocket();
     hideSideChatSelectionPopover();
-    sideChatState.sessionId = null;
-    sideChatState.parentSessionId = null;
-    sideChatState.contextSnippet = '';
-    sideChatState.parentContext = null;
     sideChatState.pendingSendText = '';
-    sideChatState.messages = [];
-    resetSideChatRuntimeState();
+    sideChatState.creating = false;
+    sideChatState.authed = false;
+    updateSideChatButtons();
+    persistSideChatStateNow();
   }
 
   function pruneEmptySideChatStreamingPlaceholders() {
@@ -5472,7 +5720,11 @@
     if (msg.type === 'auth_result') {
       if (msg.success) {
         sideChatState.authed = true;
-        createSideChatSession();
+        if (sideChatState.sessionId) {
+          sideSend({ type: 'load_session', sessionId: sideChatState.sessionId });
+        } else {
+          createSideChatSession();
+        }
       } else {
         appendSideSystemMessage(msg.error || '侧边聊天认证失败。');
       }
@@ -5481,13 +5733,23 @@
     }
     if (msg.type === 'session_info') {
       if (msg.kind && msg.kind !== 'side_conversation' && !msg.sidecar) return;
+      const wasCreating = !!sideChatState.creating;
       sideChatState.sessionId = msg.sessionId || sideChatState.sessionId;
       sideChatState.creating = false;
-      if (Array.isArray(msg.messages) && msg.messages.length > 0 && sideChatState.messages.length === 0) {
+      sideChatState.parentSessionId = msg.parentSessionId || sideChatState.parentSessionId || null;
+      sideChatState.contextSnippet = String(msg.anchor?.text || msg.contextSnippet || sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT);
+      sideChatState.parentContext = msg.parentContext || sideChatState.parentContext || null;
+      sideChatState.agent = normalizeAgent(msg.agent || sideChatState.agent || sessionState.currentAgent);
+      sideChatState.mode = msg.mode || sideChatState.mode || getSideChatDefaultMode(sideChatState.agent);
+      sideChatState.reasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort || sideChatState.reasoningEffort || '');
+      sideChatState.fastMode = normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(msg, 'fastMode') ? msg.fastMode : sideChatState.fastMode);
+      if (Array.isArray(msg.messages) && (!wasCreating || msg.messages.length > 0) && !sideChatState.pendingSendText) {
         sideChatState.messages = msg.messages.map((item) => ({ role: item.role || 'assistant', content: item.content || '' }));
       }
       updateSideChatButtons();
+      renderSideChatContext();
       renderSideChatMessages();
+      persistSideChatStateNow();
       if (sideChatState.pendingSendText) {
         const pending = sideChatState.pendingSendText;
         sideChatState.pendingSendText = '';
@@ -5570,6 +5832,10 @@
     setSideChatVisible(true);
     renderSideChatContext();
     renderSideChatMessages();
+    if (sideChatInput) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
     connectSideChatSocket();
     requestAnimationFrame(() => sideChatInput?.focus());
   }
@@ -5857,6 +6123,15 @@
 
   function handleSessionInfoMessage(msg) {
     const snapshot = normalizeSessionSnapshot(msg);
+    if (!msg.sidecar && msg.sideConversation) {
+      rememberSideConversationFromServer(msg.sideConversation);
+    } else if (!msg.sidecar && !sideChatState.open) {
+      const existingSideChat = loadPersistedSideChatState();
+      if (existingSideChat?.parentSessionId && existingSideChat.parentSessionId !== msg.sessionId) {
+        localStorage.removeItem(SIDE_CHAT_STATE_STORAGE_KEY);
+        syncSideChatRestoreButton();
+      }
+    }
 
     // Imported sessions bypass the stale-response guard so the user always
     // sees the result of a deliberate import action, regardless of whether
@@ -6210,6 +6485,12 @@
     }
   }
 
+  function handleSessionForkedMessage(msg) {
+    const modeText = msg.mode === 'worktree' ? 'worktree 分叉' : '分叉';
+    const suffix = msg.cwd ? `：${msg.cwd}` : '';
+    showToast(`已创建${modeText}${suffix}`, msg.sessionId);
+  }
+
 
   function handleQueueUpdateMessage(msg) {
     if (msg.sessionId !== sessionState.currentSessionId) return;
@@ -6341,6 +6622,7 @@
     directory_listing: (msg) => { if (typeof _onDirectoryListing === 'function') _onDirectoryListing(msg); },
     update_info: (msg) => { if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg); },
     git_result: handleGitResultMessage,
+    session_forked: handleSessionForkedMessage,
     projects_config: handleProjectsConfigMessage,
     slash_commands_list: handleSlashCommandsListMessage,
   });
@@ -6817,6 +7099,26 @@
     });
   }
 
+  function beginForkFromAssistantButton(btn, event) {
+    const msgEl = btn?.closest('.msg.assistant');
+    if (!msgEl) return;
+    const session = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+    if (!session?.id) {
+      showToast('请先打开会话');
+      return;
+    }
+    if (sessionState.currentSessionRunning || composeState.isGenerating) {
+      showToast('请等当前回复完成后再分叉');
+      return;
+    }
+    const messageIndex = Number(msgEl.dataset.messageIndex);
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+      showToast('这条回复暂时不能分叉，请刷新会话后重试');
+      return;
+    }
+    startForkSession(session, event, { messageIndex });
+  }
+
   function scrollMessageToTop(msgEl) {
     if (!msgEl || !messagesDiv) return;
     const containerRect = messagesDiv.getBoundingClientRect();
@@ -6969,6 +7271,20 @@
       handleMessageCopyClick(copyBtn);
     });
     actions.appendChild(copyBtn);
+    if (role === 'assistant' && Number.isInteger(Number(messageMeta.messageIndex))) {
+      const forkBtn = document.createElement('button');
+      forkBtn.type = 'button';
+      forkBtn.className = 'msg-action-btn msg-fork-btn';
+      forkBtn.textContent = '分叉';
+      forkBtn.title = '从这条回复创建新分支';
+      forkBtn.setAttribute('aria-label', '从这条回复创建新分支');
+      forkBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        beginForkFromAssistantButton(forkBtn, event);
+      });
+      actions.appendChild(forkBtn);
+    }
     if (role === 'user' && Number.isInteger(Number(messageMeta.messageIndex))) {
       const editBtn = document.createElement('button');
       editBtn.type = 'button';
@@ -8360,6 +8676,21 @@
     return item;
   }
 
+  function startForkSession(session, event, options = {}) {
+    if (!session?.id) return;
+    const messageIndex = Number(options.messageIndex);
+    const sent = send({
+      type: 'fork_session',
+      sessionId: session.id,
+      mode: 'normal',
+      worktree: false,
+      ...(Number.isInteger(messageIndex) && messageIndex >= 0 ? { messageIndex } : {}),
+    });
+    if (sent) {
+      showToast('正在分叉会话…');
+    }
+  }
+
   function saveCollapsedProjects() {
     localStorage.setItem('webcoding-collapsed-projects', JSON.stringify([...collapsedProjects]));
   }
@@ -8711,12 +9042,11 @@
     const copy = document.createElement('div');
     copy.className = 'project-group-copy';
 
-    if (runningCount) {
-      const runningDot = document.createElement('span');
-      runningDot.className = 'project-group-running-dot';
-      runningDot.title = `${runningCount} 个运行中的聊天`;
-      runningDot.setAttribute('aria-hidden', 'true');
-      main.appendChild(runningDot);
+    if (runningCount || unreadCount) {
+      const statusDot = document.createElement('span');
+      statusDot.className = `project-group-status-dot ${runningCount ? 'is-running' : 'is-unread'}`;
+      statusDot.setAttribute('aria-hidden', 'true');
+      main.appendChild(statusDot);
     }
 
     const nameSpan = document.createElement('span');
@@ -10447,6 +10777,9 @@
   }
   if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
   if (sideChatClose) sideChatClose.addEventListener('click', closeSideChat);
+  if (sideChatRestoreBtn) {
+    sideChatRestoreBtn.addEventListener('click', toggleSideChatPanel);
+  }
   if (sideChatSend) sideChatSend.addEventListener('click', () => sendSideChatMessage());
   if (sideChatAbort) sideChatAbort.addEventListener('click', abortSideChat);
   if (sideChatInput) {
@@ -13075,13 +13408,35 @@
   loadPersistedQueuedMessages();
   setSelectedAgent(selectedAgent, { syncMode: true });
   resetChatView(selectedAgent);
+  const initialSideChatSnapshot = loadPersistedSideChatState();
+  if (hasRestorableSideChat(initialSideChatSnapshot)) {
+    restoreSideChatFromSnapshot(initialSideChatSnapshot, {
+      open: !!initialSideChatSnapshot.open && !!connectionState.authToken,
+    });
+  } else {
+    syncSideChatRestoreButton();
+  }
   connect();
   document.addEventListener('click', handleMarkdownLocalImageClick);
   document.addEventListener('keydown', handleImageLightboxKeydown);
   window.addEventListener('resize', updateCwdBadge);
+  window.addEventListener('pagehide', persistSideChatStateNow);
+  window.addEventListener('beforeunload', persistSideChatStateNow);
+  document.addEventListener('webcoding-auth-restored', () => {
+    const snapshot = loadPersistedSideChatState();
+    if (!sideChatState.open && snapshot?.open) {
+      restoreSideChatFromSnapshot(snapshot, { open: true });
+    } else if (sideChatState.open && !sideChatState.authed) {
+      connectSideChatSocket();
+    }
+    syncSideChatRestoreButton();
+  });
   window.addEventListener('online', () => {
     connectionState.reconnectAttempts = 0;
     if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) connect();
+    if (sideChatState.open && (!sideChatState.ws || sideChatState.ws.readyState > WebSocket.OPEN)) {
+      connectSideChatSocket();
+    }
   });
 
   // Register Service Worker for mobile push notifications
@@ -13098,10 +13453,17 @@
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      persistSideChatStateNow();
+      return;
+    }
     if (document.visibilityState !== 'visible') return;
     const now = Date.now();
     if (now - lastVisibilityResyncAt < VISIBILITY_RESYNC_THROTTLE_MS) return;
     lastVisibilityResyncAt = now;
+    if (sideChatState.open && (!sideChatState.ws || sideChatState.ws.readyState > WebSocket.OPEN)) {
+      connectSideChatSocket();
+    }
     if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) {
       // WS is dead, force reconnect
       connect();
