@@ -1155,27 +1155,30 @@ function runCodexFastModeSourceRegressionCase() {
   const normalizeTierSource = extractFunctionSource(bridgeSource, 'normalizeOpenAiServiceTier');
 
   assert(
-    indexSource.includes('desktop-speed-select')
-      && indexSource.includes('mobile-speed-select')
-      && appSource.includes("type: 'set_fast_mode'")
-      && appSource.includes('showFastModePicker')
-      && appSource.includes("cmd === '/fast'"),
-    'Frontend must expose a Codex Fast/Standard selector and /fast command wired to set_fast_mode',
+    !indexSource.includes('desktop-speed-select')
+      && !indexSource.includes('mobile-speed-select')
+      && appSource.includes('const CODEX_FAST_MODE_ENABLED = false')
+      && !appSource.includes('showFastModePicker')
+      && !appSource.includes("cmd === '/fast'")
+      && !appSource.includes("action === 'switch-speed'"),
+    'Frontend must keep Webcoding Codex Fast controls disabled and hide speed selectors',
   );
   assert(
     serverSource.includes('function normalizeCodexFastMode')
+      && serverSource.includes('function isCodexFastModeEnabled')
       && serverSource.includes("case 'set_fast_mode'")
       && serverSource.includes('handleSetFastMode')
       && serverSource.includes('clearRuntimeSessionId(session)')
-      && serverSource.includes('fastMode: !!session.fastMode'),
-    'Server must persist Codex fastMode, clear runtime session on changes, and send it in session metadata',
+      && serverSource.includes('Webcoding 内已关闭 Fast 速度选择'),
+    'Server must force Webcoding Fast mode off while preserving a compatibility handler',
   );
   assert(
-    spawnSource.includes('session.fastMode === true')
+    spawnSource.includes('CC_WEB_CODEX_FAST_MODE_ENABLED')
+      && spawnSource.includes('fastModeEnabled && session.fastMode === true')
       && spawnSource.includes('features.fast_mode=true')
       && spawnSource.includes("service_tier=${quoted('fast')}")
       && !spawnSource.includes("service_tier=${quoted('standard')}"),
-    'Codex app-server spawn must only pass Fast mode overrides when session.fastMode is true',
+    'Codex app-server spawn must only pass Fast mode overrides when the env gate and session flag are both enabled',
   );
   assert(
     normalizeTierSource.includes("serviceTier !== 'fast'")
