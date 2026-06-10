@@ -24,6 +24,7 @@
   --sidebar-width: 272px;
   --git-panel-width: 360px;
   --file-viewer-width: 520px;
+  --side-chat-width: 360px;
   --header-height: 44px;
   --input-max-height: 200px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -6818,11 +6819,45 @@ body.file-viewer-resizing * {
 /* === Workspace Insights === */
 
 /* === Side Conversation Panel === */
+.side-chat-resizer {
+  display: none;
+  width: 8px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+  position: relative;
+}
+.side-chat-resizer.visible {
+  display: block;
+}
+.side-chat-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--line);
+  opacity: 0.5;
+  transition: background 120ms ease, opacity 120ms ease;
+}
+.side-chat-resizer:hover::before,
+body.side-chat-resizing .side-chat-resizer::before {
+  background: var(--blue);
+  opacity: 1;
+}
+body.side-chat-resizing,
+body.side-chat-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
 .side-chat-panel {
   display: none;
-  width: var(--file-viewer-width);
-  min-width: var(--file-viewer-width);
-  max-width: var(--file-viewer-width);
+  width: var(--side-chat-width);
+  min-width: var(--side-chat-width);
+  max-width: var(--side-chat-width);
   border-left: 1px solid var(--line);
   background: var(--surface);
   flex-shrink: 0;
@@ -7035,6 +7070,9 @@ body.file-viewer-resizing * {
 }
 
 @media (max-width: 768px), (pointer: coarse) {
+  .side-chat-resizer {
+    display: none !important;
+  }
   .side-chat-panel {
     position: fixed;
     right: 0;

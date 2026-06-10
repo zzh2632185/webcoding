@@ -60,6 +60,10 @@
   const FILE_VIEWER_DEFAULT_WIDTH = 520;
   const FILE_VIEWER_MIN_WIDTH = 320;
   const FILE_VIEWER_MAX_WIDTH = 980;
+  const SIDE_CHAT_WIDTH_STORAGE_KEY = 'webcoding-side-chat-width';
+  const SIDE_CHAT_DEFAULT_WIDTH = 360;
+  const SIDE_CHAT_MIN_WIDTH = 280;
+  const SIDE_CHAT_MAX_WIDTH = 720;
   const DESKTOP_INSIGHTS_BREAKPOINT = 1280;
   const VISIBILITY_RESYNC_THROTTLE_MS = 2500;
   const INPUT_MAX_HEIGHT_FALLBACK = 200;
@@ -241,6 +245,7 @@
   let sidebarResizeState = null;
   let gitPanelResizeState = null;
   let fileViewerResizeState = null;
+  let sideChatResizeState = null;
   let lastVisibilityResyncAt = 0;
   let localIdCounter = 0;
   let cachedInputMaxHeight = INPUT_MAX_HEIGHT_FALLBACK;
@@ -369,6 +374,7 @@
   const sideChatAbort = $('#side-chat-abort');
   const sideChatClose = $('#side-chat-close');
   const sideChatRestoreBtn = $('#side-chat-restore-btn');
+  const sideChatResizer = $('#side-chat-resizer');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
@@ -709,6 +715,50 @@
     applyFileViewerWidth(savedWidth, { skipPersist: true });
   }
 
+  function getSideChatWidthLimit() {
+    const containerWidth = workspaceMain?.getBoundingClientRect().width || window.innerWidth || SIDE_CHAT_DEFAULT_WIDTH;
+    const insightsWidth = window.matchMedia(`(min-width: ${DESKTOP_INSIGHTS_BREAKPOINT}px)`).matches
+      ? (workspaceInsights?.getBoundingClientRect().width || 0)
+      : 0;
+    return Math.min(SIDE_CHAT_MAX_WIDTH, Math.max(SIDE_CHAT_MIN_WIDTH, containerWidth - insightsWidth - 360));
+  }
+
+  function clampSideChatWidth(width) {
+    const numericWidth = Number(width);
+    if (!Number.isFinite(numericWidth)) return SIDE_CHAT_DEFAULT_WIDTH;
+    return Math.max(SIDE_CHAT_MIN_WIDTH, Math.min(getSideChatWidthLimit(), Math.round(numericWidth)));
+  }
+
+  function applySideChatWidth(width, options = {}) {
+    const nextWidth = clampSideChatWidth(width);
+    document.documentElement.style.setProperty('--side-chat-width', `${nextWidth}px`);
+    if (!options.skipPersist) {
+      localStorage.setItem(SIDE_CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
+    }
+    return nextWidth;
+  }
+
+  function canResizeSideChat() {
+    return !!sideChatPanel && !!sideChatResizer && window.matchMedia('(min-width: 769px) and (pointer: fine)').matches;
+  }
+
+  function syncSideChatResizerVisibility() {
+    if (!sideChatResizer) return;
+    sideChatResizer.classList.toggle('visible', !!sideChatState.open && canResizeSideChat());
+  }
+
+  function syncSideChatWidthForViewport() {
+    syncSideChatResizerVisibility();
+    if (!canResizeSideChat()) {
+      document.body.classList.remove('side-chat-resizing');
+      sideChatResizeState = null;
+      document.documentElement.style.setProperty('--side-chat-width', `${SIDE_CHAT_DEFAULT_WIDTH}px`);
+      return;
+    }
+    const savedWidth = parseInt(localStorage.getItem(SIDE_CHAT_WIDTH_STORAGE_KEY) || `${SIDE_CHAT_DEFAULT_WIDTH}`, 10);
+    applySideChatWidth(savedWidth, { skipPersist: true });
+  }
+
   collapsedProjects = new Set(parseStoredCollapsedProjects());
   selectedProject = parseStoredSelectedProject();
 
@@ -777,6 +827,7 @@
   window.addEventListener('resize', syncSidebarWidthForViewport);
   window.addEventListener('resize', syncGitPanelWidthForViewport);
   window.addEventListener('resize', syncFileViewerWidthForViewport);
+  window.addEventListener('resize', syncSideChatWidthForViewport);
 
   function buildWorkspaceActionButtons(actions, options = {}) {
     const className = options.compact ? 'workspace-action-row' : 'workspace-action-grid';
@@ -5590,6 +5641,7 @@
   function setSideChatVisible(open) {
     sideChatState.open = !!open;
     if (sideChatPanel) sideChatPanel.classList.toggle('visible', sideChatState.open);
+    syncSideChatWidthForViewport();
     updateSideChatButtons();
     schedulePersistSideChatState();
     syncSideChatRestoreButton();
@@ -9789,6 +9841,40 @@
     document.body.classList.remove('file-viewer-resizing');
   }
 
+  function handleSideChatResizeStart(e) {
+    if (!sideChatState.open || !canResizeSideChat()) return;
+    if (typeof e.button === 'number' && e.button !== 0) return;
+    sideChatResizeState = {
+      startX: e.clientX,
+      startWidth: sideChatPanel.getBoundingClientRect().width,
+    };
+    document.body.classList.add('side-chat-resizing');
+    if (typeof sideChatResizer?.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      sideChatResizer.setPointerCapture(e.pointerId);
+    }
+    e.preventDefault();
+  }
+
+  function handleSideChatResizeMove(e) {
+    if (!sideChatResizeState) return;
+    const deltaX = sideChatResizeState.startX - e.clientX;
+    applySideChatWidth(sideChatResizeState.startWidth + deltaX, { skipPersist: true });
+  }
+
+  function handleSideChatResizeEnd(e) {
+    if (!sideChatResizeState) return;
+    const releasedPointerId = e?.pointerId;
+    if (typeof sideChatResizer?.releasePointerCapture === 'function' && releasedPointerId !== undefined) {
+      try { sideChatResizer.releasePointerCapture(releasedPointerId); } catch {}
+    }
+    const currentWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--side-chat-width'), 10)
+      || sideChatPanel?.getBoundingClientRect().width
+      || SIDE_CHAT_DEFAULT_WIDTH;
+    applySideChatWidth(currentWidth);
+    sideChatResizeState = null;
+    document.body.classList.remove('side-chat-resizing');
+  }
+
   // --- Slash Command Menu ---
   function applySlashCommandSelection(cmd) {
     if (!cmd) return;
@@ -10774,6 +10860,13 @@
     window.addEventListener('pointermove', handleFileViewerResizeMove);
     window.addEventListener('pointerup', handleFileViewerResizeEnd);
     window.addEventListener('pointercancel', handleFileViewerResizeEnd);
+  }
+  if (sideChatResizer) {
+    sideChatResizer.addEventListener('pointerdown', handleSideChatResizeStart);
+    sideChatResizer.addEventListener('dblclick', () => applySideChatWidth(SIDE_CHAT_DEFAULT_WIDTH));
+    window.addEventListener('pointermove', handleSideChatResizeMove);
+    window.addEventListener('pointerup', handleSideChatResizeEnd);
+    window.addEventListener('pointercancel', handleSideChatResizeEnd);
   }
   if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
   if (sideChatClose) sideChatClose.addEventListener('click', closeSideChat);
