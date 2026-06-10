@@ -3234,7 +3234,7 @@
     renderFileTree();
     try {
       await ensureAuthenticatedWs();
-      const params = new URLSearchParams({ cwd, depth: '3' });
+      const params = new URLSearchParams({ cwd, depth: 'all' });
       const response = await fetch(`/api/files?${params.toString()}`, {
         headers: { Authorization: `Bearer ${connectionState.authToken}` },
       });

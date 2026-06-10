@@ -70,8 +70,8 @@ const ASR_SERVER_KEY_PATH = process.env.CC_WEB_ASR_SERVER_KEY_PATH || '/opt/code
 const ASR_REQUEST_TIMEOUT_MS = parseInt(process.env.CC_WEB_ASR_TIMEOUT_MS || '', 10) || 300000;
 const FILE_VIEW_TABLE_MAX_ROWS = 1000;
 const FILE_VIEW_TABLE_MAX_COLS = 50;
-const FILE_TREE_MAX_DEPTH = 3;
-const FILE_TREE_MAX_ENTRIES = 800;
+const FILE_TREE_MAX_DEPTH = Number.POSITIVE_INFINITY;
+const FILE_TREE_MAX_ENTRIES = parseInt(process.env.CC_WEB_FILE_TREE_MAX_ENTRIES || '', 10) || 800;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.ppt', '.pptx', '.csv', '.tsv', '.json', '.jsonl', '.log']);
 const TEXT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log']);
@@ -2575,6 +2575,16 @@ function jsonErrorResponse(res, err, fallbackMessage = '请求失败') {
   return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err?.message || fallbackMessage });
 }
 
+function normalizeFileTreeDepth(rawDepth) {
+  const text = String(rawDepth || '').trim().toLowerCase();
+  if (!text || text === 'all' || text === 'full' || text === 'infinite' || text === 'infinity' || text === 'unlimited') {
+    return FILE_TREE_MAX_DEPTH;
+  }
+  const parsed = Number.parseInt(text, 10);
+  if (!Number.isFinite(parsed)) return FILE_TREE_MAX_DEPTH;
+  return Math.max(1, Math.min(FILE_TREE_MAX_DEPTH, parsed));
+}
+
 function buildFileTree(root, currentPath, depth, state) {
   if (state.count >= FILE_TREE_MAX_ENTRIES) return [];
   let entries;
@@ -2596,23 +2606,24 @@ function buildFileTree(root, currentPath, depth, state) {
     let lst;
     try { lst = fs.lstatSync(abs); } catch { continue; }
     if (lst.isSymbolicLink()) continue;
+    const isDirectory = entry.isDirectory();
+    const isFile = entry.isFile();
+    if (!isDirectory && !isFile) continue;
+    state.count += 1;
     const rel = path.relative(root, abs) || entry.name;
     const item = {
       name: entry.name,
       path: abs,
       relativePath: rel,
-      type: entry.isDirectory() ? 'directory' : 'file',
+      type: isDirectory ? 'directory' : 'file',
     };
-    if (entry.isDirectory()) {
+    if (isDirectory) {
       item.children = depth > 1 ? buildFileTree(root, abs, depth - 1, state) : [];
-    } else if (entry.isFile()) {
+    } else {
       item.size = lst.size;
       item.isText = isLikelyTextFile(abs, lst.size);
       item.tooLarge = lst.size > MAX_CONTEXT_FILE_SIZE;
-    } else {
-      continue;
     }
-    state.count += 1;
     items.push(item);
   }
   return items;
@@ -6525,20 +6536,20 @@ const server = http.createServer((req, res) => {
     try {
       const cwd = url.searchParams.get('cwd') || '';
       const requestedPath = url.searchParams.get('path') || cwd;
-      const depthRaw = Number.parseInt(url.searchParams.get('depth') || '2', 10);
-      const depth = Math.max(1, Math.min(FILE_TREE_MAX_DEPTH, Number.isFinite(depthRaw) ? depthRaw : 2));
+      const depth = normalizeFileTreeDepth(url.searchParams.get('depth'));
       const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
       const stat = fs.statSync(resolved);
       if (!stat.isDirectory()) {
         return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
       }
       const state = { count: 0 };
+      const items = buildFileTree(root, resolved, depth, state);
       return jsonResponse(res, 200, {
         ok: true,
         cwd: root,
         path: resolved,
         truncated: state.count >= FILE_TREE_MAX_ENTRIES,
-        items: buildFileTree(root, resolved, depth, state),
+        items,
       });
     } catch (err) {
       return jsonResponse(res, 400, { ok: false, message: err.message || '无法读取目录' });
