@@ -21,7 +21,6 @@
     { cmd: '/model', desc: '查看/切换模型' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
     { cmd: '/reasoning', desc: '查看/切换 Codex 思考级别' },
-    { cmd: '/fast', desc: '查看/切换 Codex Fast 模式' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
     { cmd: '/help', desc: '显示帮助' },
@@ -125,12 +124,10 @@
     acc[item.value] = item.label;
     return acc;
   }, {});
-  const CODEX_SPEED_OPTIONS = [
-    { value: 'standard', label: 'Standard', desc: '不传 service_tier，使用默认速度和默认消耗' },
-    { value: 'fast', label: 'Fast', desc: '请求 Codex Fast 模式：更快，消耗更高' },
-  ];
+  const CODEX_FAST_MODE_ENABLED = false;
 
   function normalizeCodexFastMode(value) {
+    if (!CODEX_FAST_MODE_ENABLED) return false;
     if (value === true) return true;
     const raw = String(value || '').trim().toLowerCase();
     return raw === 'fast' || raw === 'on' || raw === 'true' || raw === '1';
@@ -139,11 +136,6 @@
   function getCodexSpeedValue(value) {
     return normalizeCodexFastMode(value) ? 'fast' : 'standard';
   }
-
-  function getCodexSpeedLabel(value) {
-    return normalizeCodexFastMode(value) ? 'Fast' : 'Standard';
-  }
-
 
   // --- State ---
   let ws = null;
@@ -902,7 +894,6 @@
       { action: 'switch-model', label: '切换模型' },
       ...(sessionState.currentAgent === 'codex' ? [
         { action: 'switch-reasoning', label: '切换思考' },
-        { action: 'switch-speed', label: getCodexSpeedLabel(sessionState.currentFastMode) },
       ] : []),
       { action: 'switch-mode', label: '切换模式' },
       ...(activeProject ? [{ action: 'focus-project', label: '定位项目', projectId: activeProject.id }] : []),
@@ -1784,7 +1775,6 @@
     const sessionCount = typeof getVisibleSessions === 'function' ? getVisibleSessions().length : 0;
     const projectCount = Array.isArray(projects) ? projects.length : 0;
     const reasoningLabel = normalizeAgent(agent) === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '';
-    const speedLabel = normalizeAgent(agent) === 'codex' ? getCodexSpeedLabel(sessionState.currentFastMode) : '';
     return `
       <div class="welcome-msg">
         <div class="welcome-header">
@@ -1809,10 +1799,6 @@
             <strong>${escapeHtml(reasoningLabel)}</strong>
             <span>思考</span>
           </div>
-          <div class="welcome-stat">
-            <strong>${escapeHtml(speedLabel)}</strong>
-            <span>速度</span>
-          </div>
           ` : ''}
         </div>
         <div class="welcome-actions">
@@ -1822,7 +1808,6 @@
             { action: 'switch-model', label: '切换模型' },
             ...(normalizeAgent(agent) === 'codex' ? [
               { action: 'switch-reasoning', label: '切换思考' },
-              { action: 'switch-speed', label: getCodexSpeedLabel(sessionState.currentFastMode) },
             ] : []),
           ], { compact: true })}
         </div>
@@ -1831,7 +1816,7 @@
             <div class="welcome-panel-kicker">常用指令</div>
             <ul class="welcome-list">
               <li><code>/model</code> 查看或切换模型</li>
-              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li><li><code>/fast</code> 切换 Fast/Standard 速度</li>' : ''}
+              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li>' : ''}
               <li><code>/mode</code> 切换权限模式</li>
               <li><code>/compact</code> 压缩上下文</li>
             </ul>
@@ -4608,8 +4593,6 @@
     const mms = document.getElementById('mobile-mode-select');
     const mrs = document.getElementById('mobile-reasoning-select');
     const drs = document.getElementById('desktop-reasoning-select');
-    const mss = document.getElementById('mobile-speed-select');
-    const dss = document.getElementById('desktop-speed-select');
     if (mas) mas.value = selectedAgent;
     if (mms) mms.value = sessionState.currentMode;
     if (mrs) {
@@ -4619,14 +4602,6 @@
     if (drs) {
       drs.value = sessionState.currentReasoningEffort;
       drs.hidden = selectedAgent !== 'codex';
-    }
-    if (mss) {
-      mss.value = getCodexSpeedValue(sessionState.currentFastMode);
-      mss.hidden = selectedAgent !== 'codex';
-    }
-    if (dss) {
-      dss.value = getCodexSpeedValue(sessionState.currentFastMode);
-      dss.hidden = selectedAgent !== 'codex';
     }
     if (importSessionBtn) {
       importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
@@ -9896,12 +9871,6 @@
       showReasoningEffortPicker();
       return;
     }
-    if (cmd === '/fast' || cmd === '/speed') {
-      hideCmdMenu();
-      msgInput.value = '';
-      showFastModePicker();
-      return;
-    }
     // For non-core commands (CLI-native/skills), just insert the command text
     // so it gets sent as a regular message to the CLI process
     msgInput.value = `${cmd} `;
@@ -10205,16 +10174,6 @@
     }
     showOptionPicker('选择 Codex 思考级别', CODEX_REASONING_EFFORT_OPTIONS, sessionState.currentReasoningEffort, (value) => {
       applyReasoningEffortSelection(value);
-    });
-  }
-
-  function showFastModePicker() {
-    if (sessionState.currentAgent !== 'codex') {
-      appendSystemMessage('Fast 模式仅对 Codex 会话生效。');
-      return;
-    }
-    showOptionPicker('选择 Codex 速度', CODEX_SPEED_OPTIONS, getCodexSpeedValue(sessionState.currentFastMode), (value) => {
-      applyFastModeSelection(value);
     });
   }
 
@@ -10534,12 +10493,6 @@
       }
       if (text === '/reasoning' || text === '/reasoning ' || text === '/effort' || text === '/effort ') {
         showReasoningEffortPicker();
-        msgInput.value = '';
-        autoResize();
-        return;
-      }
-      if (text === '/fast' || text === '/fast ' || text === '/speed' || text === '/speed ') {
-        showFastModePicker();
         msgInput.value = '';
         autoResize();
         return;
@@ -10948,8 +10901,6 @@
   const mobileModeSelect = document.getElementById('mobile-mode-select');
   const mobileReasoningSelect = document.getElementById('mobile-reasoning-select');
   const desktopReasoningSelect = document.getElementById('desktop-reasoning-select');
-  const mobileSpeedSelect = document.getElementById('mobile-speed-select');
-  const desktopSpeedSelect = document.getElementById('desktop-speed-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -10977,16 +10928,6 @@
       applyReasoningEffortSelection(desktopReasoningSelect.value);
     });
   }
-  if (mobileSpeedSelect) {
-    mobileSpeedSelect.addEventListener('change', () => {
-      applyFastModeSelection(mobileSpeedSelect.value);
-    });
-  }
-  if (desktopSpeedSelect) {
-    desktopSpeedSelect.addEventListener('change', () => {
-      applyFastModeSelection(desktopSpeedSelect.value);
-    });
-  }
 
   function handleWorkspaceActionClick(actionBtn, event) {
     if (!actionBtn) return;
@@ -11010,10 +10951,6 @@
     }
     if (action === 'switch-reasoning') {
       showReasoningEffortPicker();
-      return;
-    }
-    if (action === 'switch-speed') {
-      showFastModePicker();
       return;
     }
     if (action === 'switch-mode') {

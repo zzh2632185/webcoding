@@ -1124,7 +1124,12 @@ function normalizeCodexReasoningEffort(value) {
   return CODEX_REASONING_EFFORTS.includes(normalized) ? normalized : '';
 }
 
+function isCodexFastModeEnabled() {
+  return String(process.env.CC_WEB_CODEX_FAST_MODE_ENABLED || '').trim() === '1';
+}
+
 function normalizeCodexFastMode(value) {
+  if (!isCodexFastModeEnabled()) return false;
   if (value === true) return true;
   const normalized = String(value || '').trim().toLowerCase();
   return normalized === 'fast' || normalized === 'on' || normalized === 'true' || normalized === '1';
@@ -7830,38 +7835,15 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
 
     case '/fast':
     case '/speed': {
-      if (agent !== 'codex') {
-        wsSend(ws, { type: 'system_message', message: 'Fast 模式仅对 Codex 会话生效。' });
-        break;
-      }
-      const speedInput = String(parts[1] || '').trim().toLowerCase();
-      if (!speedInput || speedInput === 'status') {
-        wsSend(ws, {
-          type: 'system_message',
-          message: `当前 Codex 速度: ${session?.fastMode ? 'Fast' : 'Standard'}\n可选: fast/on, standard/off/default`,
-        });
-        break;
-      }
-      let fastMode;
-      if (['fast', 'on', 'true', '1'].includes(speedInput)) fastMode = true;
-      else if (['standard', 'off', 'false', '0', 'default', 'auto'].includes(speedInput)) fastMode = false;
-      else {
-        wsSend(ws, { type: 'system_message', message: `无效速度: ${parts[1]}\n可选: fast/on, standard/off/default` });
-        break;
-      }
-      if (session) {
-        session.fastMode = fastMode;
+      if (session && session.fastMode) {
+        session.fastMode = false;
         clearRuntimeSessionId(session);
         session.updated = new Date().toISOString();
         saveSession(session);
         sendSessionList(ws, { forceRefresh: true });
       }
-      wsSend(ws, {
-        type: 'fast_mode_changed',
-        fastMode,
-        ...(session ? buildSessionRuntimeMeta(session) : {}),
-      });
-      wsSend(ws, { type: 'system_message', message: `Codex 速度已切换为: ${fastMode ? 'Fast' : 'Standard'}` });
+      wsSend(ws, { type: 'fast_mode_changed', fastMode: false, ...(session ? buildSessionRuntimeMeta(session) : {}) });
+      wsSend(ws, { type: 'system_message', message: 'Webcoding 内已关闭 Fast 速度选择；当前固定使用 Standard。普通 Codex 配置仍可使用 service_tier="fast"。' });
       break;
     }
 
@@ -7874,7 +7856,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, originalMsg = {}
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/reasoning [级别] — 查看/切换 Codex 思考级别\n/fast [fast|standard] — 查看/切换 Codex Fast 模式\n/compact — 执行 Codex /compact 压缩上下文'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/reasoning [级别] — 查看/切换 Codex 思考级别\n/compact — 执行 Codex /compact 压缩上下文'
           : base + '\n/model [名称] — 查看/切换模型（支持别名或完整模型 ID）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）',
       });
       break;
@@ -8563,11 +8545,13 @@ function handleSetFastMode(ws, sessionId, rawFastMode) {
   if (sessionId) {
     const session = loadSession(sessionId);
     if (session && getSessionAgent(session) === 'codex') {
-      session.fastMode = fastMode;
-      clearRuntimeSessionId(session);
-      session.updated = new Date().toISOString();
-      saveSession(session);
-      sendSessionList(ws, { forceRefresh: true });
+      if (session.fastMode !== fastMode) {
+        session.fastMode = fastMode;
+        clearRuntimeSessionId(session);
+        session.updated = new Date().toISOString();
+        saveSession(session);
+        sendSessionList(ws, { forceRefresh: true });
+      }
     }
   }
   wsSend(ws, { type: 'fast_mode_changed', fastMode });
