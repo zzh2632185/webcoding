@@ -7877,6 +7877,10 @@
     const messageMeta = Number.isInteger(Number(messageIndex)) ? { messageIndex: Number(messageIndex) } : {};
     if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt, null, messageMeta);
     const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt, messageMeta);
+    if (m.streaming === true) {
+      el.id = 'streaming-msg';
+      el.dataset.streaming = 'true';
+    }
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }

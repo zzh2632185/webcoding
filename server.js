@@ -5940,24 +5940,52 @@ function appendCodexRolloutImagesToEntry(sessionId, entry) {
   return appended;
 }
 
+function findRuntimeDraftCompletionIndex(session, entry) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const draftId = entry?.draftMessageId || '';
+  if (draftId) {
+    const byId = messages.findIndex((message) => message?.role === 'assistant' && message.runtimeDraftId === draftId);
+    if (byId !== -1) return byId;
+  }
+  const lastUserIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === 'user') return index;
+    }
+    return -1;
+  })();
+  for (let index = messages.length - 1; index > lastUserIndex; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'assistant' && message.streaming === true) return index;
+  }
+  return -1;
+}
+
 function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   const session = loadSession(sessionId);
   const completedAt = new Date().toISOString();
-  if (entry) entry.completedAt = completedAt;
+  if (entry) {
+    entry.completedAt = completedAt;
+    entry.draftFinalized = true;
+  }
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || (entry.segments && entry.segments.length > 0))) {
-    const previousUserMessage = Array.isArray(session.messages)
-      ? [...session.messages].reverse().find((message) => message?.role === 'user')
-      : null;
-    const startedAt = previousUserMessage?.timestamp || previousUserMessage?.createdAt
+    session.messages = Array.isArray(session.messages) ? session.messages : [];
+    const previousUserMessage = [...session.messages].reverse().find((message) => message?.role === 'user') || null;
+    const startedAt = entry.draftMessageTimestamp || previousUserMessage?.timestamp || previousUserMessage?.createdAt
       || (Number(entry.startedAtMs || 0) ? new Date(entry.startedAtMs).toISOString() : completedAt);
-    session.messages.push({
+    const assistantMessage = {
       role: 'assistant',
       content: entry.fullText,
       toolCalls: entry.toolCalls || [],
       segments: entry.segments || [],
       timestamp: startedAt,
       completedAt,
-    });
+    };
+    const draftIndex = findRuntimeDraftCompletionIndex(session, entry);
+    if (draftIndex === -1) {
+      session.messages.push(assistantMessage);
+    } else {
+      session.messages[draftIndex] = assistantMessage;
+    }
     session.updated = completedAt;
     if (!isProcessRealtimeConnected(entry)) session.hasUnread = true;
     saveSession(session);
