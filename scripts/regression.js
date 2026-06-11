@@ -1194,6 +1194,30 @@ function runCodexFastModeSourceRegressionCase() {
   );
 }
 
+function runCodexGoalStatusAgentIsolationSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const agentRuntimeSource = readRepoText('lib', 'agent-runtime.js');
+  const runtimeStatusSource = extractFunctionSource(appSource, 'handleRuntimeStatusMessage');
+
+  assert(
+    agentRuntimeSource.includes('const baseSendEntryMessage')
+      && agentRuntimeSource.includes('? { ...data, agent: entry.agent }'),
+    'Runtime messages must carry the entry agent so Codex events cannot leak into Claude UI state',
+  );
+  assert(
+    appSource.includes('function isMessageForCurrentAgent')
+      && appSource.includes('msgAgent === sessionState.currentAgent'),
+    'Frontend must provide an agent guard for runtime messages',
+  );
+  assert(
+    runtimeStatusSource.includes('!isMessageForCurrentAgent(msg)')
+      && runtimeStatusSource.includes("code === 'codex_goal'")
+      && runtimeStatusSource.includes("if (code === 'codex_goal') return;")
+      && runtimeStatusSource.indexOf("code === 'codex_goal'") < runtimeStatusSource.indexOf('startGenerating()'),
+    'Frontend must silently drop Codex goal status before creating a streaming placeholder',
+  );
+}
+
 function runHandoffRemovalSourceRegressionCase() {
   const appSource = readRepoText('public', 'app.js');
   const indexSource = readRepoText('public', 'index.html');
@@ -4353,6 +4377,7 @@ async function main() {
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
   await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
   await sourceRunner.run('codex fast mode source guard', runCodexFastModeSourceRegressionCase);
+  await sourceRunner.run('codex goal status agent isolation source guard', runCodexGoalStatusAgentIsolationSourceRegressionCase);
   await sourceRunner.run('handoff removal source guard', runHandoffRemovalSourceRegressionCase);
   await sourceRunner.run('session fork source guard', runSessionForkSourceRegressionCase);
   await sourceRunner.run('codex native goal continuation runner', runCodexNativeGoalContinuationRegressionCase);

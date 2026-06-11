@@ -6232,6 +6232,11 @@
     return msg.sessionId === sessionState.currentSessionId;
   }
 
+  function isMessageForCurrentAgent(msg) {
+    const msgAgent = AGENT_LABELS[msg?.agent] ? msg.agent : '';
+    return !msgAgent || msgAgent === sessionState.currentAgent;
+  }
+
   function handleSessionRenamedMessage(msg) {
     sessionState.sessions = sessionState.sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
     updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
@@ -6876,9 +6881,10 @@
   }
 
   function handleRuntimeStatusMessage(msg) {
-    if (!isMessageForCurrentSession(msg)) return;
-    if (!composeState.isGenerating) startGenerating();
+    if (!isMessageForCurrentSession(msg) || !isMessageForCurrentAgent(msg)) return;
     const code = String(msg.code || msg.status || 'waiting');
+    if (code === 'codex_goal') return;
+    if (!composeState.isGenerating) startGenerating();
     const mode = code === 'retry' || code === 'stream_disconnect' ? 'retry'
       : (code === 'bridge' || code === 'bridge_reconnect' || code === 'bridge_wait' ? 'bridge'
         : (code === 'stopping' || code === 'abort' ? 'stopping' : 'waiting'));
