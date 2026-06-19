@@ -64,10 +64,6 @@ const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
 const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
 const FILE_VIEW_OFFICE_PREVIEW_MAX_SIZE = 50 * 1024 * 1024;
 const FILE_UPLOAD_MAX_SIZE = ONE_GB_BYTES;
-const ASR_UPLOAD_MAX_SIZE = parseInt(process.env.CC_WEB_ASR_UPLOAD_MAX_BYTES || '', 10) || (50 * 1024 * 1024);
-const ASR_TRANSCRIBE_URL = process.env.CC_WEB_ASR_TRANSCRIBE_URL || 'http://127.0.0.1:8788/v1/audio/transcriptions';
-const ASR_SERVER_KEY_PATH = process.env.CC_WEB_ASR_SERVER_KEY_PATH || '/opt/codex-asr/server_key';
-const ASR_REQUEST_TIMEOUT_MS = parseInt(process.env.CC_WEB_ASR_TIMEOUT_MS || '', 10) || 300000;
 const FILE_VIEW_TABLE_MAX_ROWS = 1000;
 const FILE_VIEW_TABLE_MAX_COLS = 50;
 const FILE_TREE_MAX_DEPTH = Number.POSITIVE_INFINITY;
@@ -3254,127 +3250,6 @@ function jsonResponse(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function readAsrServerKey() {
-  const fromEnv = String(process.env.CC_WEB_ASR_SERVER_KEY || process.env.CODEX_ASR_SERVER_KEY || '').trim();
-  if (fromEnv) return fromEnv;
-  try {
-    return fs.readFileSync(ASR_SERVER_KEY_PATH, 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
-
-function collectRequestBuffer(req, maxBytes) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    let done = false;
-    function fail(error) {
-      if (done) return;
-      done = true;
-      reject(error);
-    }
-    req.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        const err = new Error('录音太大，请缩短录音后重试');
-        err.statusCode = 413;
-        fail(err);
-        try { req.destroy(); } catch {}
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (done) return;
-      done = true;
-      resolve(Buffer.concat(chunks, total));
-    });
-    req.on('error', fail);
-    req.on('aborted', () => {
-      const err = new Error('录音上传已中断');
-      err.statusCode = 400;
-      fail(err);
-    });
-  });
-}
-
-function audioExtensionForMime(mime) {
-  const normalized = String(mime || '').toLowerCase().split(';')[0].trim();
-  if (normalized.includes('webm')) return 'webm';
-  if (normalized.includes('ogg') || normalized.includes('opus')) return 'ogg';
-  if (normalized.includes('mpeg') || normalized.includes('mp3')) return 'mp3';
-  if (normalized.includes('mp4') || normalized.includes('m4a') || normalized.includes('aac')) return 'm4a';
-  if (normalized.includes('flac')) return 'flac';
-  if (normalized.includes('wav') || normalized.includes('wave')) return 'wav';
-  return 'webm';
-}
-
-async function handleAsrTranscribeRequest(req, res, url) {
-  const token = extractBearerToken(req);
-  if (!token || !hasActiveToken(token)) {
-    return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
-  }
-
-  const asrKey = readAsrServerKey();
-  if (!asrKey) {
-    return jsonResponse(res, 503, { ok: false, message: 'ASR 服务未配置本地 API key' });
-  }
-
-  let audio;
-  try {
-    audio = await collectRequestBuffer(req, ASR_UPLOAD_MAX_SIZE);
-  } catch (err) {
-    return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err?.message || '读取录音失败' });
-  }
-  if (!audio.length) {
-    return jsonResponse(res, 400, { ok: false, message: '录音为空' });
-  }
-
-  const rawContentType = String(req.headers['content-type'] || 'audio/webm');
-  const contentType = rawContentType.split(';')[0].trim() || 'audio/webm';
-  const language = String(url.searchParams.get('language') || 'zh').trim() || 'zh';
-  const filename = `webcoding-voice-${Date.now()}.${audioExtensionForMime(contentType)}`;
-  const form = new FormData();
-  form.append('model', 'whisper-1');
-  form.append('language', language);
-  form.append('response_format', 'json');
-  form.append('file', new Blob([audio], { type: contentType }), filename);
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ASR_REQUEST_TIMEOUT_MS);
-  try {
-    const upstream = await fetch(ASR_TRANSCRIBE_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${asrKey}`,
-      },
-      body: form,
-      signal: controller.signal,
-    });
-    const bodyText = await upstream.text();
-    let bodyJson = null;
-    try { bodyJson = bodyText ? JSON.parse(bodyText) : null; } catch {}
-    if (!upstream.ok) {
-      const upstreamMessage = bodyJson?.error?.message || bodyJson?.message || bodyText.slice(0, 300) || `HTTP ${upstream.status}`;
-      return jsonResponse(res, upstream.status >= 500 ? 502 : upstream.status, {
-        ok: false,
-        message: `语音转文字失败：${upstreamMessage}`,
-      });
-    }
-    const text = String(bodyJson?.text ?? bodyJson?.data?.text ?? bodyText ?? '').trim();
-    return jsonResponse(res, 200, { ok: true, text });
-  } catch (err) {
-    const aborted = err?.name === 'AbortError';
-    return jsonResponse(res, aborted ? 504 : 502, {
-      ok: false,
-      message: aborted ? '语音转文字超时' : `语音转文字服务不可用：${err?.message || err}`,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 const INITIAL_HISTORY_COUNT = 12;
 const HISTORY_CHUNK_SIZE = 24;
 const CONTEXT_REPLAY_RECENT_MESSAGE_LIMIT = 6;
@@ -6310,14 +6185,6 @@ function recoverProcesses() {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  if (req.method === 'POST' && url.pathname === '/api/asr/transcribe') {
-    handleAsrTranscribeRequest(req, res, url).catch((err) => {
-      if (!res.headersSent) {
-        jsonResponse(res, err?.statusCode || 500, { ok: false, message: err?.message || '语音转文字失败' });
-      }
-    });
-    return;
-  }
 
   if (req.method === 'GET' && url.pathname === '/api/local-image') {
     const requestedPath = url.searchParams.get('path') || '';
@@ -8638,7 +8505,10 @@ function handleAbort(ws, msg = {}) {
   const sessionId = requestedSessionId || wsSessionMap.get(ws);
   if (!sessionId) return;
   const entry = activeProcesses.get(sessionId);
+  if (!entry) return;
 
+  entry.abortRequested = true;
+  entry.abortRequestedAt = new Date().toISOString();
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
   sendRuntimeMessage(entry, { type: 'runtime_status', sessionId, code: 'stopping', message: '正在停止当前任务…' });
   killProcess(entry.pid);

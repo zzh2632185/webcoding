@@ -4378,8 +4378,7 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   border-color: var(--blue);
   box-shadow: var(--input-drag-shadow);
 }
-.attach-btn,
-.voice-input-btn {
+.attach-btn {
   appearance: none;
   width: var(--btn-icon-size);
   height: var(--btn-icon-size);
@@ -4396,40 +4395,13 @@ html[data-theme="night"] .streaming-status[data-level="warn"] {
   box-shadow: none;
   transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
 }
-.attach-btn:hover,
-.voice-input-btn:hover {
+.attach-btn:hover {
   background: var(--yellow);
   box-shadow: var(--button-shadow-soft);
 }
-.attach-btn:disabled,
-.voice-input-btn:disabled {
+.attach-btn:disabled {
   opacity: 0.45;
   cursor: default;
-}
-.voice-input-btn.recording {
-  background: var(--danger-soft);
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 58%, var(--line));
-  animation: voicePulse 1s ease-in-out infinite;
-}
-.voice-input-btn.recording:hover {
-  background: var(--danger-soft);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent);
-}
-.voice-input-btn.transcribing {
-  background: color-mix(in srgb, var(--blue) 18%, var(--surface));
-  color: var(--text-primary);
-  cursor: wait;
-}
-.voice-input-btn {
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-  -webkit-touch-callout: none;
-}
-@keyframes voicePulse {
-  0%, 100% { transform: translateY(0); box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 22%, transparent); }
-  50% { transform: translateY(-1px); box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 10%, transparent); }
 }
 .input-wrapper:focus-within {
   box-shadow: var(--input-focus-shadow);
