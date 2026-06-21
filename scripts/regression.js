@@ -1002,6 +1002,52 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   );
 }
 
+function runMessageCopyContextSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const buildCopySource = extractFunctionSource(appSource, 'buildMessageCopyText');
+  const dataCopySource = extractFunctionSource(appSource, 'getMessageCopyTextFromData');
+  const createMessageSource = extractFunctionSource(appSource, 'createMsgElement');
+  const renderAssistantSource = extractFunctionSource(appSource, 'renderAssistantSegments');
+  const editSource = extractFunctionSource(appSource, 'beginEditMessageFromButton');
+
+  assert(
+    buildCopySource.includes('formatAttachmentCopyLines(attachments)')
+      && buildCopySource.includes('formatFileRefCopyLines(fileRefs)')
+      && buildCopySource.includes('附件：')
+      && buildCopySource.includes('引用：'),
+    'Message copy text must include existing attachment and file reference sections',
+  );
+  const attachmentCopySource = extractFunctionSource(appSource, 'formatAttachmentCopyLines');
+  assert(
+    attachmentCopySource.includes('attachmentRawUrl(id)')
+      && attachmentCopySource.includes('window.location.origin')
+      && attachmentCopySource.includes('服务器引用：')
+      && attachmentCopySource.includes('附件ID：'),
+    'Attachment copy text must include the server-side attachment reference instead of pretending to copy the original file',
+  );
+  assert(
+    dataCopySource.includes('getMessageBaseCopyTextFromData(message)')
+      && dataCopySource.includes('message.attachments || []')
+      && dataCopySource.includes('message.fileRefs || []'),
+    'Message copy text from stored data must preserve attachment and reference metadata',
+  );
+  assert(
+    createMessageSource.includes('div.dataset.rawText = rawText')
+      && createMessageSource.includes('div.dataset.copyText = buildMessageCopyText(rawText, attachments, fileRefs)'),
+    'Rendered user/assistant messages must keep raw text separate from the richer copy payload',
+  );
+  assert(
+    renderAssistantSource.includes('msgEl.dataset.rawText = getMessageBaseCopyTextFromData(message)')
+      && renderAssistantSource.includes('msgEl.dataset.copyText = getMessageCopyTextFromData(message)'),
+    'Assistant segment rendering must refresh both raw edit text and rich copy text',
+  );
+  assert(
+    editSource.includes('getMessageRawTextFromElement(msgEl)')
+      && !editSource.includes('msgEl.dataset.copyText || getMessageCopyTextFromElement(msgEl)'),
+    'Message edit must use raw text, not the attachment/reference-enriched copy payload',
+  );
+}
+
 function runMessageEditSourceRegressionCase() {
   const appSource = readRepoText('public', 'app.js');
   const serverSource = readRepoText('server.js');
@@ -3347,7 +3393,10 @@ async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
 
   const codexDir = path.join(homeDir, '.codex');
   mkdirp(codexDir);
-  fs.writeFileSync(path.join(codexDir, 'instruction.md'), 'local instruction should be copied');
+  fs.writeFileSync(path.join(codexDir, 'instruction.md'), 'local instruction should be linked');
+  fs.writeFileSync(path.join(codexDir, 'AGENTS.md'), 'local agents should be linked');
+  mkdirp(path.join(codexDir, 'skills', 'exa-search'));
+  fs.writeFileSync(path.join(codexDir, 'skills', 'exa-search', 'SKILL.md'), '# exa-search regression skill');
   fs.writeFileSync(path.join(codexDir, 'config.toml'), [
     'model_provider = "cliproxyapi"',
     'model = "gpt-5.5"',
@@ -3400,7 +3449,15 @@ async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
       assert(runtimeToml.includes('[mcp_servers.nocturne_memory]'), 'Local Codex bridge runtime should preserve local MCP config');
       assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Local Codex bridge runtime should rewrite active provider base_url to local bridge');
       assert(runtimeToml.includes('env_key = "CODEX_OPENAI_COMPAT_KEY"'), 'Local Codex bridge runtime should force dedicated bridge token env key');
-      assert(fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'instruction.md'), 'utf8') === 'local instruction should be copied', 'Local Codex bridge runtime should copy relative instruction file');
+      const runtimeInstructionPath = path.join(configDir, 'codex-runtime-home', 'instruction.md');
+      const runtimeAgentsPath = path.join(configDir, 'codex-runtime-home', 'AGENTS.md');
+      const runtimeSkillsPath = path.join(configDir, 'codex-runtime-home', 'skills');
+      assert(fs.lstatSync(runtimeInstructionPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink relative instruction file');
+      assert(fs.readFileSync(runtimeInstructionPath, 'utf8') === 'local instruction should be linked', 'Local Codex bridge runtime instruction symlink should read source content');
+      assert(fs.lstatSync(runtimeAgentsPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink local AGENTS.md');
+      assert(fs.readFileSync(runtimeAgentsPath, 'utf8') === 'local agents should be linked', 'Local Codex bridge runtime AGENTS symlink should read source content');
+      assert(fs.lstatSync(runtimeSkillsPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink local skills directory');
+      assert(fs.existsSync(path.join(runtimeSkillsPath, 'exa-search', 'SKILL.md')), 'Local Codex bridge runtime skills symlink should expose local skills');
 
       const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
       const bridgeEntry = bridgeRuntime?.runtimes
@@ -4372,6 +4429,7 @@ async function main() {
   await cleanupRegressionBridgeProcesses((info) => /\/tmp\/webcoding-regression-[^/]+\//.test(info.statePath || ''));
   const sourceRunner = createTestRunner();
   await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  await sourceRunner.run('message copy context source guard', runMessageCopyContextSourceRegressionCase);
   await sourceRunner.run('message edit reset source guard', runMessageEditSourceRegressionCase);
   await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
   await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);

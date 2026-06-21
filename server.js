@@ -1520,6 +1520,47 @@ function resolveCodexLocalBridgeSource() {
   };
 }
 
+function createBackupPath(targetPath) {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const dir = path.dirname(targetPath);
+  const base = path.basename(targetPath);
+  let candidate = path.join(dir, `${base}.bak.symlink-${stamp}`);
+  let index = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${base}.bak.symlink-${stamp}-${index}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function ensureCodexRuntimeSymlink(sourcePath, targetPath) {
+  try {
+    if (!fs.existsSync(sourcePath)) return;
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    try {
+      const current = fs.lstatSync(targetPath);
+      if (current.isSymbolicLink()) {
+        const linked = fs.readlinkSync(targetPath);
+        const resolved = path.resolve(path.dirname(targetPath), linked);
+        if (resolved === path.resolve(sourcePath)) return;
+      }
+      fs.renameSync(targetPath, createBackupPath(targetPath));
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') throw err;
+    }
+    const sourceStat = fs.statSync(sourcePath);
+    fs.symlinkSync(sourcePath, targetPath, sourceStat.isDirectory() ? 'dir' : 'file');
+  } catch (err) {
+    console.warn(`[codex-runtime] Failed to link ${targetPath} -> ${sourcePath}: ${err.message}`);
+  }
+}
+
+function linkCodexSharedRuntimeFiles(localCodexHome) {
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'instruction.md'), path.join(CODEX_RUNTIME_HOME, 'instruction.md'));
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'AGENTS.md'), path.join(CODEX_RUNTIME_HOME, 'AGENTS.md'));
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'skills'), path.join(CODEX_RUNTIME_HOME, 'skills'));
+}
+
 function writeCodexLocalBridgeConfig(source, bridge) {
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
   let configToml = String(source.configText || '');
@@ -1527,11 +1568,7 @@ function writeCodexLocalBridgeConfig(source, bridge) {
   configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'env_key', CODEX_OPENAI_COMPAT_ENV_KEY);
   configToml = `${configToml.replace(/\s*$/, '')}\n\n# webcoding_bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}\n`;
   fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
-  const localInstruction = path.join(path.dirname(CODEX_LOCAL_CONFIG_PATH), 'instruction.md');
-  const runtimeInstruction = path.join(CODEX_RUNTIME_HOME, 'instruction.md');
-  try {
-    if (fs.existsSync(localInstruction)) fs.copyFileSync(localInstruction, runtimeInstruction);
-  } catch {}
+  linkCodexSharedRuntimeFiles(path.dirname(CODEX_LOCAL_CONFIG_PATH));
 }
 
 function resolveCodexCustomProfile(config) {

@@ -2664,6 +2664,24 @@ html[data-theme="localhost"] .project-group-new-session-launch:hover {
   color: var(--text-muted);
   font-size: 11px;
 }
+.project-group-show-more {
+  display: block;
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--button-radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.project-group-show-more:hover {
+  background: var(--surface);
+  color: var(--text-primary);
+}
 
 /* === Chat Main === */
 .chat-main {

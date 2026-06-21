@@ -218,6 +218,8 @@
   let pendingInitialSessionLoad = false;
   let projects = [];
   let collapsedProjects = new Set();
+  let expandedProjectSessions = new Set();
+  const DEFAULT_VISIBLE_SESSIONS_PER_PROJECT = 5;
   let selectedProject = { id: null, path: null };
   let openChatTabs = loadPersistedOpenChatTabs();
   let projectDragState = null;
@@ -7062,7 +7064,7 @@
     return Promise.reject(new Error('clipboard unavailable'));
   }
 
-  function getMessageCopyTextFromData(message) {
+  function getMessageBaseCopyTextFromData(message) {
     if (!message) return '';
     if (typeof message.content === 'string' && message.content.trim()) return message.content;
     if (Array.isArray(message.segments)) {
@@ -7081,6 +7083,57 @@
     return '';
   }
 
+  function formatAttachmentCopyLines(attachments = []) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return [];
+    return attachments
+      .map((attachment) => {
+        if (!attachment) return '';
+        const id = String(attachment.id || '').trim();
+        const kindLabel = attachmentKindLabel(attachment);
+        const name = attachment.filename || attachmentDefaultName(attachment);
+        const meta = [
+          Number(attachment.size) ? formatFileSize(attachment.size) : '',
+          attachment.storageState === 'expired' ? '已过期' : '',
+        ].filter(Boolean).join('，');
+        const serverRef = id ? new URL(attachmentRawUrl(id), window.location.origin).href : '';
+        return `- ${kindLabel}：${name}${meta ? `（${meta}）` : ''}${serverRef ? `\n  服务器引用：${serverRef}` : ''}${id ? `\n  附件ID：${id}` : ''}`;
+      })
+      .filter((line) => line.trim());
+  }
+
+  function formatFileRefCopyLines(fileRefs = []) {
+    if (!Array.isArray(fileRefs) || fileRefs.length === 0) return [];
+    return fileRefs
+      .map((ref) => {
+        if (!ref) return '';
+        const isDir = ref.type === 'directory';
+        const name = ref.relativePath || ref.path || (isDir ? 'directory' : 'file');
+        const size = !isDir && Number(ref.size) ? `（${formatFileSize(ref.size)}）` : '';
+        return `- ${isDir ? '目录' : '文件'}：${name}${size}`;
+      })
+      .filter((line) => line.trim());
+  }
+
+  function buildMessageCopyText(baseText = '', attachments = [], fileRefs = []) {
+    const sections = [];
+    const text = String(baseText || '').trim();
+    if (text) sections.push(text);
+    const attachmentLines = formatAttachmentCopyLines(attachments);
+    if (attachmentLines.length > 0) sections.push(`附件：\n${attachmentLines.join('\n')}`);
+    const fileRefLines = formatFileRefCopyLines(fileRefs);
+    if (fileRefLines.length > 0) sections.push(`引用：\n${fileRefLines.join('\n')}`);
+    return sections.join('\n\n');
+  }
+
+  function getMessageCopyTextFromData(message) {
+    if (!message) return '';
+    return buildMessageCopyText(
+      getMessageBaseCopyTextFromData(message),
+      message.attachments || [],
+      message.fileRefs || [],
+    );
+  }
+
   function getMessageCopyTextFromElement(msgEl) {
     if (!msgEl) return '';
     const stored = msgEl.dataset.copyText || '';
@@ -7095,6 +7148,22 @@
       .filter((text) => text.trim());
     if (textParts.length > 0) return textParts.join('\n\n');
     return bubble.innerText || bubble.textContent || '';
+  }
+
+  function getMessageRawTextFromElement(msgEl) {
+    if (!msgEl) return '';
+    const stored = msgEl.dataset.rawText || '';
+    if (stored.trim()) return stored;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return '';
+    const textParts = Array.from(bubble.querySelectorAll('.msg-segment-text, .msg-text'))
+      .map((el) => {
+        if (typeof el.dataset.rawText === 'string') return el.dataset.rawText;
+        return el.innerText || el.textContent || '';
+      })
+      .filter((text) => text.trim());
+    if (textParts.length > 0) return textParts.join('\n\n');
+    return '';
   }
 
   function setMessageCopyButtonState(btn, label, copied = false) {
@@ -7208,7 +7277,7 @@
     }
     const draft = msgInput.value.trim();
     if (draft && !editingMessageState && !window.confirm('输入框里已有草稿，是否用这条历史消息覆盖草稿？')) return;
-    const text = msgEl.dataset.copyText || getMessageCopyTextFromElement(msgEl);
+    const text = getMessageRawTextFromElement(msgEl);
     editingMessageState = {
       sessionId: sessionState.currentSessionId,
       messageIndex,
@@ -7386,7 +7455,9 @@
       div.dataset.messageIndex = String(Number(messageMeta.messageIndex));
     }
     if (role === 'user' || role === 'assistant') {
-      div.dataset.copyText = typeof content === 'string' ? content : '';
+      const rawText = typeof content === 'string' ? content : '';
+      div.dataset.rawText = rawText;
+      div.dataset.copyText = buildMessageCopyText(rawText, attachments, fileRefs);
     }
 
     if (role === 'system') {
@@ -7795,7 +7866,10 @@
   function renderAssistantSegments(bubble, message) {
     if (!bubble) return;
     const msgEl = bubble.closest('.msg');
-    if (msgEl) msgEl.dataset.copyText = getMessageCopyTextFromData(message);
+    if (msgEl) {
+      msgEl.dataset.rawText = getMessageBaseCopyTextFromData(message);
+      msgEl.dataset.copyText = getMessageCopyTextFromData(message);
+    }
     bubble.innerHTML = '';
     normalizeMessageSegments(message).forEach((segment) => {
       const segmentEl = buildMessageSegmentElement(segment);
@@ -9402,10 +9476,36 @@
         const aTs = timestampCache?.get(a.id) ?? getSessionUpdatedTimestamp(a);
         return bTs - aTs;
       });
-      for (const s of sortedSessions) {
-        body.appendChild(buildSessionItem(s));
+      const totalCount = sortedSessions.length;
+      const limit = DEFAULT_VISIBLE_SESSIONS_PER_PROJECT;
+      const isExpanded = expandedProjectSessions.has(project.id);
+      // 选中的会话即便排在 5 条之外，也要保证可见，避免当前对话被折叠隐藏。
+      const activeIndex = sortedSessions.findIndex((s) => s.id === sessionState.currentSessionId);
+      const activeInTail = activeIndex >= limit;
+      const showAll = isExpanded || activeInTail;
+      const visibleCount = showAll ? totalCount : Math.min(limit, totalCount);
+      for (let i = 0; i < visibleCount; i += 1) {
+        body.appendChild(buildSessionItem(sortedSessions[i]));
       }
-      if (sortedSessions.length === 0) {
+      const hiddenCount = totalCount - visibleCount;
+      // 「强制展开」（当前对话排在尾部）撑开的列表不给收起按钮：点了也收不回去，只会让按钮闪没。
+      if (totalCount > limit && !activeInTail) {
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'project-group-show-more';
+        toggle.textContent = isExpanded ? '收起' : `查看更多（${hiddenCount}）`;
+        toggle.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (expandedProjectSessions.has(project.id)) {
+            expandedProjectSessions.delete(project.id);
+          } else {
+            expandedProjectSessions.add(project.id);
+          }
+          renderSessionList();
+        });
+        body.appendChild(toggle);
+      }
+      if (totalCount === 0) {
         const empty = document.createElement('div');
         empty.className = 'project-group-empty';
         empty.textContent = '这个项目下还没有对话。';
