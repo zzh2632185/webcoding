@@ -15,15 +15,9 @@
     { alias: 'haiku', value: 'haiku', label: 'Haiku', desc: 'Haiku 4.5，响应最快，适合快速问答', pricing: '输入/输出 $1 / $5 / 百万 Token' },
   ];
 
-  const DEFAULT_SLASH_COMMANDS = [
-    { cmd: '/clear', desc: '清除当前会话' },
-    { cmd: '/model', desc: '查看/切换模型' },
-    { cmd: '/mode', desc: '查看/切换权限模式' },
-    { cmd: '/cost', desc: '查看会话费用' },
-    { cmd: '/compact', desc: '压缩上下文' },
-    { cmd: '/help', desc: '显示帮助' },
-  ];
-  let currentSlashCommands = [...DEFAULT_SLASH_COMMANDS];
+  // Slash menu is populated only from CLI discovery (get_slash_commands).
+  // No hard-coded core subset — empty until the server responds.
+  let currentSlashCommands = [];
 
   const MODE_LABELS = {
     default: '默认',
@@ -2384,15 +2378,6 @@
     }
   }
 
-  const LOCAL_SLASH_COMMANDS = new Set([
-    '/clear', '/model', '/mode', '/cost', '/compact', '/help',
-  ]);
-
-  function isLocalSlashCommandText(text) {
-    const base = String(text || '').trim().split(/\s+/)[0].toLowerCase();
-    return LOCAL_SLASH_COMMANDS.has(base);
-  }
-
   function handleMessageAcceptedMessage(msg) {
     const clientMessageId = msg?.clientMessageId;
     if (!clientMessageId) return;
@@ -2439,10 +2424,9 @@
         showToast(`「${title}」排队消息已发送`);
       }
     } else {
+      // All slash commands are CLI-passthrough now — show generating immediately.
       removeQueuedBubble(item.id);
-      // Non-local slash commands spawn a CLI turn — show generating UI immediately
-      // so "/goal" etc. never look like a no-op while waiting for the first delta.
-      if (forCurrent && !isLocalSlashCommandText(item.text) && !composeState.isGenerating) {
+      if (forCurrent && !composeState.isGenerating) {
         startGenerating();
       }
     }
@@ -6037,20 +6021,7 @@
   // --- Slash Command Menu ---
   function applySlashCommandSelection(cmd) {
     if (!cmd) return;
-    if (cmd === '/model') {
-      hideCmdMenu();
-      msgInput.value = '';
-      showModelPicker();
-      return;
-    }
-    if (cmd === '/mode') {
-      hideCmdMenu();
-      msgInput.value = '';
-      showModePicker();
-      return;
-    }
-    // For non-core commands (CLI-native/skills), just insert the command text
-    // so it gets sent as a regular message to the CLI process
+    // Insert command text only — all slash commands are sent to the CLI as-is.
     msgInput.value = `${cmd} `;
     hideCmdMenu();
     msgInput.focus();
@@ -6067,8 +6038,17 @@
   }
 
   function showCmdMenu(filter) {
+    if (!Array.isArray(currentSlashCommands) || currentSlashCommands.length === 0) {
+      // Discovery not ready yet — ask server and show a lightweight placeholder.
+      requestSlashCommands(sessionState.currentAgent);
+      cmdMenuIndex = 0;
+      cmdMenu.innerHTML = `<div class="cmd-item active"><span class="cmd-item-cmd">/</span><span class="cmd-item-desc">正在从 CLI 加载斜杠命令…</span></div>`;
+      cmdMenu.hidden = false;
+      ensureCmdMenuDelegation();
+      return;
+    }
     const filtered = currentSlashCommands.filter(c =>
-      c.cmd.startsWith(filter) || c.desc.includes(filter.slice(1))
+      c.cmd.startsWith(filter) || (c.desc && c.desc.includes(filter.slice(1)))
     );
     // Exact match first (fixes /mode vs /model ambiguity)
     filtered.sort((a, b) => (b.cmd === filter ? 1 : 0) - (a.cmd === filter ? 1 : 0));
@@ -6353,24 +6333,10 @@
     hideCmdMenu();
     hideOptionPicker();
 
-    // Slash commands: don't show as user bubble
+    // Slash commands: all passthrough to CLI (no hard-coded local subset).
     if (text.startsWith('/')) {
       if (composeState.pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
-        return;
-      }
-      // /model without argument → show interactive picker
-      if (text === '/model' || text === '/model ') {
-        showModelPicker();
-        msgInput.value = '';
-        autoResize();
-        return;
-      }
-      // /mode without argument → show interactive picker
-      if (text === '/mode' || text === '/mode ') {
-        showModePicker();
-        msgInput.value = '';
-        autoResize();
         return;
       }
       const commandItem = {
@@ -6381,15 +6347,11 @@
         agent: sessionState.currentAgent,
         reason: isWsOpen() ? 'queued' : 'offline',
       };
-      // Commands always go through the ack-gated queue (no user bubble).
       if (!enqueueSendItem(commandItem, { toast: !isWsOpen() })) return;
-      // Local client tip for non-core slash so UX is never a silent no-op even if
-      // a later session_info re-render races a server system_message.
-      if (!isLocalSlashCommandText(text)) {
-        const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
-        const baseCmd = text.split(/\s+/)[0];
-        appendSystemMessage(`正在将 ${baseCmd} 交给 ${label} CLI 执行…`);
-      }
+      // Immediate local tip (server also sends one after session is ready).
+      const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
+      const baseCmd = text.split(/\s+/)[0];
+      appendSystemMessage(`正在将 ${baseCmd} 交给 ${label} CLI 执行…`);
       msgInput.value = '';
       autoResize();
       if (isWsOpen()) flushSendQueue();

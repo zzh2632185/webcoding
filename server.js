@@ -568,15 +568,6 @@ const slashCommandsCache = {
   codex: { commands: null },
 };
 
-const WEBCODING_CORE_SLASH_COMMANDS = [
-  { cmd: '/clear', desc: SLASH_COMMAND_DESCRIPTIONS.clear, source: 'webcoding' },
-  { cmd: '/model', desc: SLASH_COMMAND_DESCRIPTIONS.model, source: 'webcoding' },
-  { cmd: '/mode', desc: SLASH_COMMAND_DESCRIPTIONS.mode, source: 'webcoding' },
-  { cmd: '/cost', desc: SLASH_COMMAND_DESCRIPTIONS.cost, source: 'webcoding' },
-  { cmd: '/compact', desc: SLASH_COMMAND_DESCRIPTIONS.compact, source: 'webcoding' },
-  { cmd: '/help', desc: SLASH_COMMAND_DESCRIPTIONS.help, source: 'webcoding' },
-];
-
 function normalizeSlashCommandName(raw) {
   if (raw == null) return '';
   if (typeof raw === 'object') {
@@ -624,28 +615,21 @@ function buildSlashCommandList(agent) {
   const cache = slashCommandsCache[normalizedAgent];
   const cliCommands = (cache && Array.isArray(cache.commands)) ? cache.commands : [];
   const isClaude = normalizedAgent === 'claude';
+  const source = isClaude ? 'claude-cli' : 'codex-cli';
 
-  // Webcoding core commands — always present, server-handled
-  const coreCmds = WEBCODING_CORE_SLASH_COMMANDS.map((item) => ({ ...item }));
-  const coreNames = new Set(coreCmds.map((c) => c.cmd));
-
-  // Build CLI / skill commands, skipping ones already in core
+  // Only CLI-discovered commands — no hard-coded Webcoding core list.
   const cliCmds = [];
+  const seen = new Set();
   for (const entry of cliCommands) {
     const name = entry?.name || normalizeSlashCommandName(entry);
-    if (!name) continue;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
     const cmd = `/${name}`;
-    if (coreNames.has(cmd)) continue;
     const desc = (entry && entry.desc) || SLASH_COMMAND_DESCRIPTIONS[name] || name;
-    cliCmds.push({
-      cmd,
-      desc,
-      source: isClaude ? 'claude-cli' : 'codex-cli',
-    });
+    cliCmds.push({ cmd, desc, source });
   }
   cliCmds.sort((a, b) => a.cmd.localeCompare(b.cmd));
-
-  return [...coreCmds, ...cliCmds];
+  return cliCmds;
 }
 
 function isKnownSlashCommand(agent, cmdOrName) {
@@ -657,24 +641,16 @@ function isKnownSlashCommand(agent, cmdOrName) {
 
 function formatSlashHelpMessage(agent) {
   const list = buildSlashCommandList(agent);
-  const core = list.filter((item) => item.source === 'webcoding');
-  const rest = list.filter((item) => item.source !== 'webcoding');
-  const lines = ['可用指令（Webcoding + 当前 CLI 发现）:'];
-  for (const item of core) {
-    lines.push(`${item.cmd} — ${item.desc || item.cmd}`);
+  const label = agent === 'codex' ? 'Codex' : 'Claude';
+  if (list.length === 0) {
+    return `${label} 斜杠命令列表为空。\n请确认本机 CLI 可用，或稍后重新打开会话以刷新发现结果。\n所有 / 命令都会原样交给 ${label} CLI 执行。`;
   }
-  if (rest.length > 0) {
-    lines.push('');
-    lines.push(agent === 'codex' ? 'Codex CLI / Skills / Plugins:' : 'Claude CLI / Skills / Plugins:');
-    for (const item of rest) {
-      lines.push(`${item.cmd} — ${item.desc || item.cmd}`);
-    }
-    lines.push('');
-    lines.push('提示：非 Webcoding 核心命令会转发给对应 CLI 执行。');
-  } else {
-    lines.push('');
-    lines.push('（尚未发现额外 CLI 命令；可稍后重试或检查本机 claude/codex 是否可用）');
-  }
+  const lines = [
+    `${label} CLI 已发现的斜杠命令（全部透传执行）:`,
+    ...list.map((item) => `${item.cmd} — ${item.desc || item.cmd}`),
+    '',
+    '说明：输入框中的 / 菜单来自 CLI 实时发现，不会硬编码固定子集。',
+  ];
   return lines.join('\n');
 }
 
@@ -5193,258 +5169,186 @@ function sendMessageAccepted(ws, sessionId, clientMessageId) {
 }
 
 // === Slash Command Handler ===
+// Slash *menu* is discovery-only (no hard-coded 6-command subset).
+// Execution: pass almost everything to the CLI. Only a few platform controls stay
+// local because they mutate Webcoding session state (model/mode) or orchestrate compact.
 function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null) {
-  const parts = text.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  const parts = String(text || '').trim().split(/\s+/);
+  const cmd = (parts[0] || '').toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
   const agent = session ? getSessionAgent(session) : normalizeAgent(fallbackAgent);
   const clientMessageId = normalizeClientMessageId(clientMessageIdRaw);
-  const effectiveSessionId = session?.id || sessionId || null;
+  const targetSessionId = session?.id || sessionId || null;
+  const label = agent === 'codex' ? 'Codex' : 'Claude';
 
-  // Ack only for commands fully handled inside this switch. Passthrough commands
-  // (skills / native CLI) must let handleMessage own accept + spawn lifecycle,
-  // otherwise idempotent accept would short-circuit the real execution.
-  function ackLocalSlashCommand() {
-    if (!clientMessageId) return;
-    if (effectiveSessionId && wasClientMessageAccepted(effectiveSessionId, clientMessageId)) {
-      sendMessageAccepted(ws, effectiveSessionId, clientMessageId);
-      return true; // already handled
+  function ackLocal() {
+    if (!clientMessageId) return false;
+    if (targetSessionId && wasClientMessageAccepted(targetSessionId, clientMessageId)) {
+      sendMessageAccepted(ws, targetSessionId, clientMessageId);
+      return true;
     }
-    if (effectiveSessionId) rememberAcceptedClientMessage(effectiveSessionId, clientMessageId);
-    sendMessageAccepted(ws, effectiveSessionId, clientMessageId);
+    if (targetSessionId) rememberAcceptedClientMessage(targetSessionId, clientMessageId);
+    sendMessageAccepted(ws, targetSessionId, clientMessageId);
     return false;
   }
 
-  switch (cmd) {
-    case '/clear': {
-      if (ackLocalSlashCommand()) break;
-      if (session) {
-        if (activeProcesses.has(sessionId)) {
-          const entry = activeProcesses.get(sessionId);
-          killProcess(entry.pid);
-          if (entry.tailer) entry.tailer.stop();
-          removeActiveProcess(sessionId);
-          cleanRunDir(sessionId);
+  // --- Platform controls (Webcoding session state) ---
+  if (cmd === '/model') {
+    if (ackLocal()) return;
+    const modelInput = parts.slice(1).join(' ').trim();
+    if (agent === 'codex') {
+      if (!modelInput) {
+        getCodexModelMenuPayload(session).then((payload) => {
+          wsSend(ws, payload);
+        }).catch((error) => {
+          plog('WARN', 'codex_model_menu_failed', { error: error.message });
+          wsSend(ws, {
+            type: 'model_list',
+            agent: 'codex',
+            entries: [{
+              value: 'default',
+              label: '默认模型（Codex）',
+              desc: '使用当前 Codex 默认模型',
+            }],
+            current: session?.model || 'default',
+            currentFull: session?.model || '',
+            source: null,
+          });
+        });
+      } else {
+        const normalizedInput = modelInput.toLowerCase();
+        if (session) {
+          session.model = normalizedInput === 'default' ? null : modelInput;
+          session.updated = new Date().toISOString();
+          saveSession(session);
         }
-        session.messages = [];
+        wsSend(ws, {
+          type: 'model_changed',
+          model: normalizedInput === 'default' ? '' : modelInput,
+          ...(session ? buildSessionRuntimeMeta(session) : {}),
+        });
+        wsSend(ws, {
+          type: 'system_message',
+          message: normalizedInput === 'default'
+            ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
+            : `Codex 模型已切换为: ${modelInput}`,
+        });
+      }
+      return;
+    }
+    if (!modelInput) {
+      const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
+      const currentFull = session?.model || '';
+      wsSend(ws, {
+        type: 'model_list',
+        agent: 'claude',
+        models: MODEL_MAP,
+        entries: getClaudeModelMenuEntries(),
+        current: currentAlias,
+        currentFull,
+        source: 'claude-cli',
+      });
+      return;
+    }
+    const resolved = resolveClaudeModelInput(modelInput);
+    if (!resolved) {
+      wsSend(ws, { type: 'system_message', message: '模型名称不能为空' });
+      return;
+    }
+    const { resolvedModel, resolvedAlias } = resolved;
+    if (!resolvedModel) {
+      if (session) {
+        session.model = null;
+        session.updated = new Date().toISOString();
+        saveSession(session);
+      }
+      wsSend(ws, {
+        type: 'model_changed',
+        model: '',
+        ...(session ? buildSessionRuntimeMeta(session) : {}),
+      });
+      wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
+      return;
+    }
+    if (session) {
+      session.model = resolvedModel;
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+    const displayName = getClaudeModelMenuLabel(resolvedModel) || getClaudeModelMenuLabel(resolvedAlias) || modelShortName(resolvedModel) || resolvedModel;
+    wsSend(ws, {
+      type: 'model_changed',
+      model: resolvedAlias,
+      ...(session ? buildSessionRuntimeMeta(session) : {}),
+    });
+    wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
+    return;
+  }
+
+  if (cmd === '/mode') {
+    if (ackLocal()) return;
+    const modeInput = parts[1];
+    const VALID_MODES = ['default', 'plan', 'yolo'];
+    const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
+    if (!modeInput) {
+      const cur = session?.permissionMode || 'yolo';
+      wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
+    } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
+      const mode = modeInput.toLowerCase();
+      if (session) {
+        session.permissionMode = mode;
         clearRuntimeSessionId(session);
         session.updated = new Date().toISOString();
         saveSession(session);
-        wsSend(ws, {
-          type: 'session_info',
-          sessionId: session.id,
-          messages: [],
-          title: session.title,
-          mode: session.permissionMode || 'yolo',
-          model: sessionModelLabel(session),
-          agent: getSessionAgent(session),
-          cwd: session.cwd || null,
-          totalCost: session.totalCost || 0,
-          totalUsage: session.totalUsage || null,
-          ...buildSessionRuntimeMeta(session),
-        });
       }
-      wsSend(ws, { type: 'system_message', message: '会话已清除，上下文已重置。' });
-      break;
+      wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
+      wsSend(ws, { type: 'mode_changed', mode });
+    } else {
+      wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
     }
-
-    case '/model': {
-      if (ackLocalSlashCommand()) break;
-      const modelInput = parts.slice(1).join(' ').trim();
-      if (agent === 'codex') {
-        if (!modelInput) {
-          getCodexModelMenuPayload(session).then((payload) => {
-            wsSend(ws, payload);
-          }).catch((error) => {
-            plog('WARN', 'codex_model_menu_failed', { error: error.message });
-            wsSend(ws, {
-              type: 'model_list',
-              agent: 'codex',
-              entries: [{
-                value: 'default',
-                label: '默认模型（Codex）',
-                desc: '使用当前 Codex 默认模型',
-              }],
-              current: session?.model || 'default',
-              currentFull: session?.model || '',
-              source: null,
-            });
-          });
-        } else {
-          const normalizedInput = modelInput.toLowerCase();
-          if (session) {
-            session.model = normalizedInput === 'default' ? null : modelInput;
-            session.updated = new Date().toISOString();
-            saveSession(session);
-          }
-          wsSend(ws, {
-            type: 'model_changed',
-            model: normalizedInput === 'default' ? '' : modelInput,
-            ...(session ? buildSessionRuntimeMeta(session) : {}),
-          });
-          wsSend(ws, {
-            type: 'system_message',
-            message: normalizedInput === 'default'
-              ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
-              : `Codex 模型已切换为: ${modelInput}`,
-          });
-        }
-      } else if (!modelInput) {
-        const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
-        const currentFull = session?.model || '';
-        wsSend(ws, {
-          type: 'model_list',
-          agent: 'claude',
-          models: MODEL_MAP,
-          entries: getClaudeModelMenuEntries(),
-          current: currentAlias,
-          currentFull,
-          source: 'claude-cli',
-        });
-      } else {
-        const resolved = resolveClaudeModelInput(modelInput);
-        if (!resolved) {
-          wsSend(ws, { type: 'system_message', message: '模型名称不能为空' });
-          break;
-        }
-        const { resolvedModel, resolvedAlias } = resolved;
-
-        // Handle 'default' — use CLI default (no --model flag)
-        if (!resolvedModel) {
-          if (session) {
-            session.model = null;
-            session.updated = new Date().toISOString();
-            saveSession(session);
-          }
-          wsSend(ws, {
-            type: 'model_changed',
-            model: '',
-            ...(session ? buildSessionRuntimeMeta(session) : {}),
-          });
-          wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
-          break;
-        }
-
-        if (session) {
-          session.model = resolvedModel;
-          session.updated = new Date().toISOString();
-          saveSession(session);
-        }
-        const displayName = getClaudeModelMenuLabel(resolvedModel) || getClaudeModelMenuLabel(resolvedAlias) || modelShortName(resolvedModel) || resolvedModel;
-        wsSend(ws, {
-          type: 'model_changed',
-          model: resolvedAlias,
-          ...(session ? buildSessionRuntimeMeta(session) : {}),
-        });
-        wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
-      }
-      break;
-    }
-
-    case '/cost': {
-      if (ackLocalSlashCommand()) break;
-      if (agent === 'codex') {
-        const usage = session?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
-        wsSend(ws, {
-          type: 'system_message',
-          message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}`,
-        });
-      } else {
-        const cost = session?.totalCost || 0;
-        wsSend(ws, { type: 'system_message', message: `当前会话累计费用: $${cost.toFixed(4)}` });
-      }
-      break;
-    }
-
-    case '/compact': {
-      if (ackLocalSlashCommand()) break;
-      if (!sessionId || !session) {
-        wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
-        break;
-      }
-      if (activeProcesses.has(sessionId)) {
-        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
-        break;
-      }
-      const runtimeId = getRuntimeSessionId(session);
-      if (!runtimeId) {
-        wsSend(ws, {
-          type: 'system_message',
-          message: agent === 'codex'
-            ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
-            : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
-        });
-        break;
-      }
-
-      wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
-      pendingSlashCommands.set(session.id, { kind: 'compact' });
-      handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
-      break;
-    }
-
-    case '/mode': {
-      if (ackLocalSlashCommand()) break;
-      const modeInput = parts[1];
-      const VALID_MODES = ['default', 'plan', 'yolo'];
-      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
-      if (!modeInput) {
-        const cur = session?.permissionMode || 'yolo';
-        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
-      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
-        const mode = modeInput.toLowerCase();
-        if (session) {
-          session.permissionMode = mode;
-          clearRuntimeSessionId(session);
-          session.updated = new Date().toISOString();
-          saveSession(session);
-        }
-        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
-        wsSend(ws, { type: 'mode_changed', mode });
-      } else {
-        wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
-      }
-      break;
-    }
-
-    case '/help': {
-      if (ackLocalSlashCommand()) break;
-      // Prefer fresh discovery for the help dump so the list is not stale.
-      if (agent === 'codex') {
-        try { discoverCodexSlashCommands(); } catch {}
-      }
-      wsSend(ws, {
-        type: 'system_message',
-        message: formatSlashHelpMessage(agent),
-      });
-      break;
-    }
-
-    default: {
-      // Always pass non-core slash commands to the agent CLI via handleMessage.
-      // Discovery list is only a UX helper — commands like Claude's /goal may be
-      // missing from cache briefly, and headless mode still needs a real spawn.
-      // Do NOT pre-ack here — handleMessage owns message_accepted + spawn.
-      const targetSessionId = session?.id || sessionId || null;
-      const label = agent === 'codex' ? 'Codex' : 'Claude';
-      // Spawn / create session FIRST. If we emit system_message before session_info
-      // on a brand-new chat, the client re-renders history and wipes the tip
-      // (Claude new-session path is especially prone to this race).
-      handleMessage(ws, {
-        text,
-        sessionId: targetSessionId,
-        mode: session?.permissionMode || 'yolo',
-        agent,
-        clientMessageId,
-      }, { hideInHistory: false });
-      const resolvedSessionId = wsSessionMap.get(ws) || targetSessionId || null;
-      wsSend(ws, {
-        type: 'system_message',
-        sessionId: resolvedSessionId,
-        message: `正在将 ${cmd} 交给 ${label} CLI 执行…`,
-      });
-    }
+    return;
   }
+
+  if (cmd === '/compact') {
+    if (ackLocal()) return;
+    if (!targetSessionId || !session) {
+      wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
+      return;
+    }
+    if (activeProcesses.has(targetSessionId)) {
+      wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
+      return;
+    }
+    const runtimeId = getRuntimeSessionId(session);
+    if (!runtimeId) {
+      wsSend(ws, {
+        type: 'system_message',
+        message: agent === 'codex'
+          ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
+          : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
+      });
+      return;
+    }
+    wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
+    pendingSlashCommands.set(session.id, { kind: 'compact' });
+    handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+    return;
+  }
+
+  // --- Everything else: full CLI passthrough (incl. /goal, /clear, /help, skills…) ---
+  handleMessage(ws, {
+    text,
+    sessionId: targetSessionId,
+    mode: session?.permissionMode || 'yolo',
+    agent,
+    clientMessageId,
+  }, { hideInHistory: false });
+  const resolvedSessionId = wsSessionMap.get(ws) || targetSessionId || null;
+  wsSend(ws, {
+    type: 'system_message',
+    sessionId: resolvedSessionId,
+    message: `正在将 ${cmd} 交给 ${label} CLI 执行…`,
+  });
 }
 
 // === Session Handlers ===
