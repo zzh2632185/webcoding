@@ -8,6 +8,7 @@ const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const { getStaticHeadlessCapabilities } = require('./lib/runtime-capabilities');
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -1806,6 +1807,7 @@ function ensureCodexRuntimeOverlays(runtimeHome) {
 
 /**
  * Honest headless capability snapshot (not a fake TUI feature matrix).
+ * Merges static protocol catalog (lib/runtime-capabilities.js) with live overlay state.
  */
 function getRuntimeCapabilities(agent) {
   const normalizedAgent = normalizeAgent(agent);
@@ -1822,13 +1824,7 @@ function getRuntimeCapabilities(agent) {
     markCodexOverlayLocal();
   }
   const overlay = codexOverlayState;
-  return {
-    agent: normalizedAgent,
-    headless: true,
-    interactiveApproval: false,
-    askUser: false,
-    planConfirmUi: false,
-    goalsStructured: false,
+  const extras = {
     codexMode: normalizedAgent === 'codex' ? codexMode : null,
     overlay: normalizedAgent === 'codex' ? {
       mode: overlay.mode,
@@ -1837,14 +1833,14 @@ function getRuntimeCapabilities(agent) {
       promptsOk: isCodexOverlayMountOk('prompts'),
       pluginsOk: isCodexOverlayMountOk('plugins'),
     } : null,
-    notes: [
-      'Webcoding 通过 headless CLI（stream-json / codex exec --json）运行，不是完整 TUI。',
-      '审批 / AskUser / 计划确认双向交互协议尚未适配。',
-      normalizedAgent === 'codex' && codexMode !== 'local'
-        ? 'Codex custom/unified 模式依赖 managed runtime 对 skills/prompts/plugins 的 overlay。'
-        : null,
-    ].filter(Boolean),
   };
+  if (normalizedAgent === 'codex' && codexMode !== 'local') {
+    extras.notes = [
+      ...(getStaticHeadlessCapabilities(normalizedAgent).notes || []),
+      'Codex custom/unified 模式依赖 managed runtime 对 skills/prompts/plugins 的 overlay。',
+    ];
+  }
+  return getStaticHeadlessCapabilities(normalizedAgent, extras);
 }
 
 function prepareCodexCustomRuntime(config) {

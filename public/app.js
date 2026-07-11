@@ -2579,15 +2579,20 @@
         chatRuntimeState.hidden = false;
         chatRuntimeState.textContent = '正在停止';
         chatRuntimeState.classList.add('is-aborting');
-        chatRuntimeState.classList.remove('is-interrupted');
+        chatRuntimeState.classList.remove('is-interrupted', 'is-waiting');
+      } else if (phase === 'waiting') {
+        chatRuntimeState.hidden = false;
+        chatRuntimeState.textContent = '等待交互';
+        chatRuntimeState.classList.add('is-waiting');
+        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
       } else if (running) {
         chatRuntimeState.hidden = false;
         chatRuntimeState.textContent = '运行中';
-        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
+        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted', 'is-waiting');
       } else {
         chatRuntimeState.hidden = true;
         chatRuntimeState.textContent = '';
-        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
+        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted', 'is-waiting');
       }
     }
     updateCwdBadge();
@@ -3766,6 +3771,8 @@
       if (!isEventForCurrentSession(msg)) return;
       appendSystemMessage(msg.message);
     },
+    interactive_request: handleInteractiveRequestMessage,
+    goal_update: handleGoalUpdateMessage,
     mode_changed: handleModeChangedMessage,
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
@@ -5082,6 +5089,44 @@
     });
     box.querySelector('#del-confirm-cancel').addEventListener('click', close);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  }
+
+  function handleInteractiveRequestMessage(msg) {
+    if (!isEventForCurrentSession(msg)) return;
+    // Structured card for headless-unsupported interactive protocols.
+    const host = document.createElement('div');
+    host.className = 'msg system interactive-request-msg';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble interactive-request-card';
+    const kind = msg.interactiveKind || 'interactive';
+    const title = document.createElement('div');
+    title.className = 'interactive-request-title';
+    title.textContent = `需要交互（${kind}）· 网页暂无法回应`;
+    const body = document.createElement('div');
+    body.className = 'interactive-request-body';
+    body.textContent = msg.message || msg.summary || 'CLI 发出了交互请求，headless 模式无法双向回应。';
+    const actions = document.createElement('div');
+    actions.className = 'interactive-request-actions';
+    const stopBtn = document.createElement('button');
+    stopBtn.type = 'button';
+    stopBtn.className = 'interactive-request-stop';
+    stopBtn.textContent = '停止本轮';
+    stopBtn.addEventListener('click', () => {
+      if (typeof abortBtn?.click === 'function') abortBtn.click();
+    });
+    actions.appendChild(stopBtn);
+    bubble.appendChild(title);
+    bubble.appendChild(body);
+    bubble.appendChild(actions);
+    host.appendChild(bubble);
+    messagesDiv.appendChild(host);
+    setCurrentSessionRunningState(true, { phase: 'waiting' });
+    forceScrollToBottom();
+  }
+
+  function handleGoalUpdateMessage(msg) {
+    if (!isEventForCurrentSession(msg)) return;
+    appendSystemMessage(msg.summary || msg.message || 'Goals 更新');
   }
 
   function appendSystemMessage(message) {
