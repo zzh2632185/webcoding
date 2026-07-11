@@ -519,7 +519,14 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   context: '查看上下文',
   heapdump: '堆内存快照',
   insights: '洞察分析',
+  goal: '设置目标条件（/goal <条件>）',
+  usage: '查看用量',
+  'reload-skills': '重新加载 skills',
+  run: '运行 skill',
+  verify: '验证结果',
   'team-onboarding': '团队引导',
+  // Codex goals
+  // (also listed under codex built-ins)
   // Claude skills (user-installed) — descriptions are best-effort; new skills show their raw name
   'update-config': '更新配置',
   loop: '循环执行',
@@ -788,9 +795,14 @@ function discoverCodexSlashCommands() {
   }
 
   // 1. Built-in interactive commands (from Codex binary analysis — stable across versions)
+  // Note: interactive-only TUI commands may still not fully work in headless exec mode.
   const builtIn = ['compact', 'model', 'status', 'review', 'fork', 'new',
-    'feedback', 'init', 'mcp', 'permissions', 'personality', 'rename', 'skills', 'statusline'];
-  builtIn.forEach((c) => addCommand(c, SLASH_COMMAND_DESCRIPTIONS[c] || c));
+    'feedback', 'init', 'mcp', 'permissions', 'personality', 'rename', 'skills', 'statusline',
+    // goals feature (stable in recent Codex) — headless may treat as normal prompt
+    'goal'];
+  builtIn.forEach((c) => addCommand(c, SLASH_COMMAND_DESCRIPTIONS[c] || (
+    c === 'goal' ? '设置/管理目标（Goals）' : c
+  )));
 
   // 2. User-installed skills (directories under ~/.codex/skills/, excluding .system)
   try {
@@ -5409,31 +5421,24 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
     }
 
     default: {
-      // Pass through discovered CLI/skill commands (and any active-process freeform
-      // slash) to the agent runtime. No longer requires an already-running process:
-      // handleMessage will spawn a new turn when needed.
+      // Always pass non-core slash commands to the agent CLI via handleMessage.
+      // Discovery list is only a UX helper — commands like Claude's /goal may be
+      // missing from cache briefly, and headless mode still needs a real spawn.
       // Do NOT pre-ack here — handleMessage owns message_accepted + spawn.
-      const known = isKnownSlashCommand(agent, cmd);
-      const hasLiveProcess = !!(sessionId && activeProcesses.has(sessionId));
-      if (known || hasLiveProcess) {
-        handleMessage(ws, {
-          text,
-          sessionId: session?.id || sessionId || null,
-          mode: session?.permissionMode || 'yolo',
-          agent,
-          clientMessageId,
-        }, { hideInHistory: false });
-      } else {
-        // Reject unknown commands but still ack so the client queue does not retry.
-        if (clientMessageId) {
-          if (effectiveSessionId) rememberAcceptedClientMessage(effectiveSessionId, clientMessageId);
-          sendMessageAccepted(ws, effectiveSessionId, clientMessageId);
-        }
-        wsSend(ws, {
-          type: 'system_message',
-          message: `未知指令: ${cmd}\n输入 /help 查看当前已发现的全部指令`,
-        });
-      }
+      const targetSessionId = session?.id || sessionId || null;
+      const label = agent === 'codex' ? 'Codex' : 'Claude';
+      wsSend(ws, {
+        type: 'system_message',
+        sessionId: targetSessionId,
+        message: `正在将 ${cmd} 交给 ${label} CLI 执行…`,
+      });
+      handleMessage(ws, {
+        text,
+        sessionId: targetSessionId,
+        mode: session?.permissionMode || 'yolo',
+        agent,
+        clientMessageId,
+      }, { hideInHistory: false });
     }
   }
 }

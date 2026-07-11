@@ -2384,6 +2384,15 @@
     }
   }
 
+  const LOCAL_SLASH_COMMANDS = new Set([
+    '/clear', '/model', '/mode', '/cost', '/compact', '/help',
+  ]);
+
+  function isLocalSlashCommandText(text) {
+    const base = String(text || '').trim().split(/\s+/)[0].toLowerCase();
+    return LOCAL_SLASH_COMMANDS.has(base);
+  }
+
   function handleMessageAcceptedMessage(msg) {
     const clientMessageId = msg?.clientMessageId;
     if (!clientMessageId) return;
@@ -2394,6 +2403,10 @@
     if (msg.sessionId) {
       rebindNullQueueItemsToSession(msg.sessionId);
       if (item && item.sessionId == null) item.sessionId = msg.sessionId;
+      // New chat: accept may create the session before session_info arrives.
+      if (!sessionState.currentSessionId) {
+        sessionState.currentSessionId = msg.sessionId;
+      }
     }
 
     // Remove from queue on confirmed accept.
@@ -2402,7 +2415,7 @@
 
     const forCurrent = item
       ? isQueueItemForCurrentView(item)
-      : (!!msg.sessionId && msg.sessionId === sessionState.currentSessionId);
+      : (!!msg.sessionId && (!sessionState.currentSessionId || msg.sessionId === sessionState.currentSessionId));
 
     if (!item) {
       // Late ack for already-handled item.
@@ -2427,6 +2440,11 @@
       }
     } else {
       removeQueuedBubble(item.id);
+      // Non-local slash commands spawn a CLI turn — show generating UI immediately
+      // so "/goal" etc. never look like a no-op while waiting for the first delta.
+      if (forCurrent && !isLocalSlashCommandText(item.text) && !composeState.isGenerating) {
+        startGenerating();
+      }
     }
 
     // Continue draining queue when possible.
