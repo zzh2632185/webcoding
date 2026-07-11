@@ -2526,9 +2526,99 @@ html[data-theme="localhost"] .localfile-pre {
   animation: pulse 1.1s infinite;
 }
 .cost-display {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.cost-display:empty,
+.cost-display[hidden] {
   display: none !important;
 }
-.cost-display:empty { display: none; }
+.topbar-chat-cwd {
+  display: inline-flex;
+  align-items: center;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.topbar-chat-cwd[hidden] {
+  display: none !important;
+}
+.chat-session-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  min-width: 0;
+}
+.chat-session-meta[hidden] {
+  display: none !important;
+}
+.chat-header-cwd {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.chat-runtime-state.is-aborting {
+  background: var(--orange, #f0c674);
+}
+.chat-runtime-state.is-interrupted {
+  background: var(--red-soft, #f8d7da);
+  animation: none;
+}
+.cmd-item-badge {
+  flex-shrink: 0;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  border: 1px solid var(--line);
+  color: var(--text-secondary);
+}
+.cmd-item-badge.is-platform {
+  color: var(--blue-strong, #2563eb);
+  border-color: currentColor;
+}
+.cmd-item-badge.is-tui-only {
+  color: var(--text-secondary);
+  opacity: 0.85;
+}
+.cmd-item-badge.is-prompt {
+  color: var(--accent, #0f766e);
+  border-color: currentColor;
+}
+.cmd-item.is-unavailable .cmd-item-cmd,
+.cmd-item.is-unavailable .cmd-item-desc {
+  opacity: 0.72;
+}
 
 /* Shared text control base (fields/selects/small text controls) */
 :where(

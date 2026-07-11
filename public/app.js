@@ -15,14 +15,21 @@
     { alias: 'haiku', value: 'haiku', label: 'Haiku', desc: 'Haiku 4.5，响应最快，适合快速问答', pricing: '输入/输出 $1 / $5 / 百万 Token' },
   ];
 
-  // Slash menu is populated only from CLI discovery (get_slash_commands).
-  // No hard-coded core subset — empty until the server responds.
+  // Slash menu is populated from server discovery (platform + CLI + filesystem).
+  // Empty until the server responds with slash_commands_list.
   let currentSlashCommands = [];
 
   const MODE_LABELS = {
     default: '默认',
     plan: 'Plan',
     yolo: 'YOLO',
+  };
+
+  // Honest mode descriptions — must match server PERMISSION_MODE_META / CLI flags.
+  const MODE_TOOLTIPS = {
+    yolo: 'YOLO：跳过审批与沙箱限制（Claude bypassPermissions / Codex dangerously-bypass）',
+    default: '默认：CLI 默认自动策略（Codex --full-auto；非网页人工审批）',
+    plan: 'Plan：规划/只读向（Claude plan / Codex read-only；非完整计划确认 UI）',
   };
 
   const AGENT_LABELS = {
@@ -64,9 +71,9 @@
   };
 
   const MODE_PICKER_OPTIONS = [
-    { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
-    { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
-    { value: 'default', label: '默认', desc: '标准权限审批' },
+    { value: 'yolo', label: 'YOLO', desc: '跳过审批与沙箱限制' },
+    { value: 'default', label: '默认', desc: 'CLI 默认自动策略（非网页审批）' },
+    { value: 'plan', label: 'Plan', desc: '规划/只读向（非完整计划确认 UI）' },
   ];
 
 
@@ -81,6 +88,8 @@
   let sessionCache = new Map();
   let isGenerating = false;
   let isAborting = false;
+  /** Permission mode snapshotted when the current CLI turn started (not next-turn selection). */
+  let activeTurnMode = null;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
   let pendingReconnectResync = false;
@@ -190,6 +199,8 @@
     set isGenerating(value) { isGenerating = value; },
     get isAborting() { return isAborting; },
     set isAborting(value) { isAborting = value; },
+    get activeTurnMode() { return activeTurnMode; },
+    set activeTurnMode(value) { activeTurnMode = value; },
     get stickToBottom() { return stickToBottom; },
     set stickToBottom(value) { stickToBottom = value; },
     get pendingText() { return pendingText; },
@@ -2317,6 +2328,14 @@
     return !!(connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN);
   }
 
+  function isActivePlanTurn() {
+    // Only the spawn-time mode allows mid-turn Plan confirm input.
+    const turnMode = composeState.isGenerating
+      ? (composeState.activeTurnMode || sessionState.currentMode)
+      : sessionState.currentMode;
+    return turnMode === 'plan' && sessionState.currentAgent === 'claude';
+  }
+
   function canDispatchQueueItem(item, options = {}) {
     if (!item || item.reason === 'sending') return false;
     if (!isWsOpen()) return false;
@@ -2325,7 +2344,7 @@
     const forCurrent = isQueueItemForCurrentView(item);
     const isCommand = String(item.text || '').startsWith('/');
     const allowWhileGenerating = options.allowWhileGenerating === true || isCommand;
-    const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
+    const isPlanModeActive = isActivePlanTurn();
 
     if (forCurrent) {
       if (composeState.isGenerating && !isPlanModeActive && !allowWhileGenerating) return false;
@@ -2344,7 +2363,7 @@
     if (!isWsOpen()) return false;
     if (isBlockingSessionLoad()) return false;
     const allowWhileGenerating = options.allowWhileGenerating === true;
-    const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
+    const isPlanModeActive = isActivePlanTurn();
     if (composeState.isGenerating && !isPlanModeActive && !allowWhileGenerating) return false;
     return true;
   }
@@ -2424,9 +2443,10 @@
         showToast(`「${title}」排队消息已发送`);
       }
     } else {
-      // All slash commands are CLI-passthrough now — show generating immediately.
+      // Slash: only start generating for real CLI turns (execution !== 'local').
       removeQueuedBubble(item.id);
-      if (forCurrent && !composeState.isGenerating) {
+      const isLocalExecution = msg.execution === 'local';
+      if (forCurrent && !composeState.isGenerating && !isLocalExecution) {
         startGenerating();
       }
     }
@@ -2511,25 +2531,64 @@
   }
 
   function updateCwdBadge() {
-    if (!chatCwd) return;
+    const headerCwd = document.getElementById('chat-header-cwd');
+    const headerMeta = document.getElementById('chat-session-meta');
+    let short = '';
     if (sessionState.currentCwd) {
       const parts = sessionState.currentCwd.replace(/\/+$/, '').split('/');
-      const short = parts.slice(-2).join('/') || sessionState.currentCwd;
-      chatCwd.textContent = '~/' + short;
-      chatCwd.title = sessionState.currentCwd;
-    } else {
-      chatCwd.textContent = '';
-      chatCwd.title = '';
+      short = '~/' + (parts.slice(-2).join('/') || sessionState.currentCwd);
     }
-    chatCwd.hidden = !sessionState.currentCwd || (sessionState.currentSessionRunning && shouldOverlayRuntimeBadge());
+    const hideForOverlay = sessionState.currentSessionRunning && shouldOverlayRuntimeBadge();
+    if (chatCwd) {
+      if (sessionState.currentCwd) {
+        chatCwd.textContent = short;
+        chatCwd.title = sessionState.currentCwd;
+      } else {
+        chatCwd.textContent = '';
+        chatCwd.title = '';
+      }
+      chatCwd.hidden = !sessionState.currentCwd || hideForOverlay;
+    }
+    if (headerCwd) {
+      headerCwd.textContent = short;
+      headerCwd.title = sessionState.currentCwd || '';
+    }
+    if (headerMeta) {
+      headerMeta.hidden = !sessionState.currentCwd;
+    }
   }
 
-  function setCurrentSessionRunningState(isRunning) {
+  function setCurrentSessionRunningState(isRunning, options = {}) {
     const running = !!isRunning;
     sessionState.currentSessionRunning = running;
     if (chatRuntimeState) {
-      chatRuntimeState.hidden = !running;
-      chatRuntimeState.textContent = running ? '运行中' : '';
+      const phase = options.phase || (running ? 'running' : '');
+      if (phase === 'interrupted') {
+        chatRuntimeState.hidden = false;
+        chatRuntimeState.textContent = '已中断';
+        chatRuntimeState.classList.add('is-interrupted');
+        chatRuntimeState.classList.remove('is-aborting');
+        // Brief flash then hide
+        setTimeout(() => {
+          if (!sessionState.currentSessionRunning && chatRuntimeState.textContent === '已中断') {
+            chatRuntimeState.hidden = true;
+            chatRuntimeState.classList.remove('is-interrupted');
+          }
+        }, 2200);
+      } else if (phase === 'aborting') {
+        chatRuntimeState.hidden = false;
+        chatRuntimeState.textContent = '正在停止';
+        chatRuntimeState.classList.add('is-aborting');
+        chatRuntimeState.classList.remove('is-interrupted');
+      } else if (running) {
+        chatRuntimeState.hidden = false;
+        chatRuntimeState.textContent = '运行中';
+        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
+      } else {
+        chatRuntimeState.hidden = true;
+        chatRuntimeState.textContent = '';
+        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
+      }
     }
     updateCwdBadge();
     renderWorkspaceInsights();
@@ -2542,10 +2601,19 @@
     document.querySelectorAll('.agent-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.agent === selectedAgent);
     });
-    // Sync mode tabs
+    // Sync mode tabs + honest tooltips
     document.querySelectorAll('.mode-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.mode === sessionState.currentMode);
+      const tip = MODE_TOOLTIPS[btn.dataset.mode];
+      if (tip) btn.title = tip;
     });
+    const mobileModeSelect = document.getElementById('mobile-mode-select');
+    if (mobileModeSelect) {
+      Array.from(mobileModeSelect.options || []).forEach((opt) => {
+        const tip = MODE_TOOLTIPS[opt.value];
+        if (tip) opt.title = tip;
+      });
+    }
     // Sync mobile selects
     const mas = document.getElementById('mobile-agent-select');
     const mms = document.getElementById('mobile-mode-select');
@@ -2820,19 +2888,23 @@
   }
 
   function setStatsDisplay(msg) {
+    if (!costDisplay) return;
     if (sessionState.currentAgent === 'codex' && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
         const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
         costDisplay.textContent = `in ${usage.inputTokens} · out ${usage.outputTokens}${cacheText}`;
+        costDisplay.hidden = false;
         return;
       }
     }
     if (msg && typeof msg.totalCost === 'number' && msg.totalCost > 0) {
       costDisplay.textContent = `$${msg.totalCost.toFixed(4)}`;
+      costDisplay.hidden = false;
       return;
     }
     costDisplay.textContent = '';
+    costDisplay.hidden = true;
   }
 
   function getCodexModelOptions() {
@@ -3425,7 +3497,10 @@
 
   function handleCostMessage(msg) {
     if (!isEventForCurrentSession(msg)) return;
-    costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
+    if (costDisplay && typeof msg.costUsd === 'number') {
+      costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
+      costDisplay.hidden = false;
+    }
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
     }
@@ -3436,7 +3511,10 @@
     if (!isEventForCurrentSession(msg)) return;
     if (msg.totalUsage) {
       const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-      costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+      if (costDisplay) {
+        costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
+        costDisplay.hidden = false;
+      }
       if (sessionState.currentSessionId) {
         updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
       }
@@ -3506,6 +3584,10 @@
       composeState.activeToolCalls.clear();
       const bubble = document.querySelector('#streaming-msg .msg-bubble');
       if (bubble) bubble.innerHTML = '';
+    }
+    // Prefer spawn-time mode from server run-meta; fall back to current UI selection.
+    if (msg.permissionMode && MODE_LABELS[msg.permissionMode]) {
+      composeState.activeTurnMode = msg.permissionMode;
     }
     const resumedSegments = Array.isArray(msg.segments) && msg.segments.length > 0 ? msg.segments : null;
     if (resumedSegments) {
@@ -3678,7 +3760,7 @@
     usage: handleUsageMessage,
     done: (msg) => {
       if (!isEventForCurrentSession(msg)) return;
-      finishGenerating(msg.sessionId);
+      finishGenerating(msg.sessionId, { interrupted: !!msg.interrupted });
     },
     system_message: (msg) => {
       if (!isEventForCurrentSession(msg)) return;
@@ -3741,6 +3823,8 @@
   function startGenerating() {
     composeState.isGenerating = true;
     composeState.isAborting = false;
+    // Snapshot turn mode at start so next-turn /mode changes don't open Plan mid-send.
+    composeState.activeTurnMode = sessionState.currentMode;
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
@@ -3763,7 +3847,7 @@
     forceScrollToBottom();
   }
 
-  function finishGenerating(sessionId) {
+  function finishGenerating(sessionId, options = {}) {
     // Ignore done events for other sessions so background completion cannot
     // clear the current view's generating state or steal the stream bubble.
     if (sessionId && sessionState.currentSessionId && sessionId !== sessionState.currentSessionId) {
@@ -3773,12 +3857,13 @@
 
     composeState.isGenerating = false;
     composeState.isAborting = false;
+    composeState.activeTurnMode = null;
     sendBtn.hidden = false;
     abortBtn.hidden = true;
     abortBtn.disabled = false;
     abortBtn.classList.remove('is-aborting');
     abortBtn.title = '停止生成';
-    setCurrentSessionRunningState(false);
+    setCurrentSessionRunningState(false, options.interrupted ? { phase: 'interrupted' } : {});
     // Avoid popping the mobile keyboard after every turn.
     if (!isMobileInputMode()) {
       msgInput.focus({ preventScroll: true });
@@ -6037,12 +6122,22 @@
     });
   }
 
+  function slashAvailabilityBadge(item) {
+    const availability = item?.availability || 'passthrough';
+    if (availability === 'platform') return { cls: 'is-platform', label: '平台' };
+    if (availability === 'tui-only') return { cls: 'is-tui-only', label: '仅TUI' };
+    if (item?.source === 'codex-prompts' || String(item?.cmd || '').startsWith('/prompts:')) {
+      return { cls: 'is-prompt', label: 'prompt' };
+    }
+    return null;
+  }
+
   function showCmdMenu(filter) {
     if (!Array.isArray(currentSlashCommands) || currentSlashCommands.length === 0) {
       // Discovery not ready yet — ask server and show a lightweight placeholder.
       requestSlashCommands(sessionState.currentAgent);
       cmdMenuIndex = 0;
-      cmdMenu.innerHTML = `<div class="cmd-item active"><span class="cmd-item-cmd">/</span><span class="cmd-item-desc">正在从 CLI 加载斜杠命令…</span></div>`;
+      cmdMenu.innerHTML = `<div class="cmd-item active"><span class="cmd-item-cmd">/</span><span class="cmd-item-desc">正在加载斜杠命令…</span></div>`;
       cmdMenu.hidden = false;
       ensureCmdMenuDelegation();
       return;
@@ -6050,19 +6145,38 @@
     const filtered = currentSlashCommands.filter(c =>
       c.cmd.startsWith(filter) || (c.desc && c.desc.includes(filter.slice(1)))
     );
-    // Exact match first (fixes /mode vs /model ambiguity)
-    filtered.sort((a, b) => (b.cmd === filter ? 1 : 0) - (a.cmd === filter ? 1 : 0));
+    // Exact match first (fixes /mode vs /model ambiguity); platform before tui-only
+    filtered.sort((a, b) => {
+      if (a.cmd === filter) return -1;
+      if (b.cmd === filter) return 1;
+      const rank = (item) => {
+        if (item.availability === 'platform') return 0;
+        if (item.availability === 'passthrough') return 1;
+        if (item.availability === 'tui-only') return 2;
+        return 3;
+      };
+      const d = rank(a) - rank(b);
+      if (d !== 0) return d;
+      return a.cmd.localeCompare(b.cmd);
+    });
     if (filtered.length === 0) {
       hideCmdMenu();
       return;
     }
     cmdMenuIndex = 0;
-    cmdMenu.innerHTML = filtered.map((c, i) =>
-      `<div class="cmd-item${i === 0 ? ' active' : ''}" data-cmd="${escapeHtml(c.cmd)}">
+    cmdMenu.innerHTML = filtered.map((c, i) => {
+      const badge = slashAvailabilityBadge(c);
+      const badgeHtml = badge
+        ? `<span class="cmd-item-badge ${badge.cls}">${escapeHtml(badge.label)}</span>`
+        : '';
+      const title = c.reason ? ` title="${escapeHtml(c.reason)}"` : '';
+      const tuiCls = c.availability === 'tui-only' ? ' is-unavailable' : '';
+      return `<div class="cmd-item${i === 0 ? ' active' : ''}${tuiCls}" data-cmd="${escapeHtml(c.cmd)}"${title}>
         <span class="cmd-item-cmd">${escapeHtml(c.cmd)}</span>
-        <span class="cmd-item-desc">${escapeHtml(c.desc)}</span>
-      </div>`
-    ).join('');
+        ${badgeHtml}
+        <span class="cmd-item-desc">${escapeHtml(c.desc || '')}</span>
+      </div>`;
+    }).join('');
     cmdMenu.hidden = false;
     ensureCmdMenuDelegation();
   }
@@ -6328,12 +6442,11 @@
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
-    const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
     if ((!text && composeState.pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
     hideCmdMenu();
     hideOptionPicker();
 
-    // Slash commands: all passthrough to CLI (no hard-coded local subset).
+    // Slash commands: platform local, TUI-blocked, or CLI passthrough (server decides).
     if (text.startsWith('/')) {
       if (composeState.pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
@@ -6348,10 +6461,17 @@
         reason: isWsOpen() ? 'queued' : 'offline',
       };
       if (!enqueueSendItem(commandItem, { toast: !isWsOpen() })) return;
-      // Immediate local tip (server also sends one after session is ready).
-      const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
+      // Local tip from menu metadata when available; server remains source of truth.
       const baseCmd = text.split(/\s+/)[0];
-      appendSystemMessage(`正在将 ${baseCmd} 交给 ${label} CLI 执行…`);
+      const meta = currentSlashCommands.find((c) => c.cmd === baseCmd || c.cmd === baseCmd.toLowerCase());
+      const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
+      if (meta?.availability === 'platform' || baseCmd === '/web-help' || baseCmd === '/webhelp') {
+        appendSystemMessage(`正在由 Webcoding 处理 ${baseCmd}…`);
+      } else if (meta?.availability === 'tui-only') {
+        appendSystemMessage(`${baseCmd} 可能仅 TUI 可用，正在确认…`);
+      } else {
+        appendSystemMessage(`正在将 ${baseCmd} 交给 ${label} CLI 执行…`);
+      }
       msgInput.value = '';
       autoResize();
       if (isWsOpen()) flushSendQueue();
@@ -6369,7 +6489,8 @@
     };
 
     // Busy generating (non-plan): queue for auto-send after current turn.
-    if (composeState.isGenerating && !isPlanModeActive) {
+    // Use spawn-time turn mode — not the next-turn mode selection.
+    if (composeState.isGenerating && !isActivePlanTurn()) {
       if (!enqueueSendItem({ ...item, reason: 'busy' })) return;
       msgInput.value = '';
       composeState.pendingAttachments = [];
@@ -6652,6 +6773,7 @@
     }
     if (!send({ type: 'abort' })) return;
     composeState.isAborting = true;
+    setCurrentSessionRunningState(true, { phase: 'aborting' });
     abortBtn.disabled = true;
     abortBtn.classList.add('is-aborting');
     abortBtn.title = '正在停止…';

@@ -502,14 +502,15 @@ const pendingSlashCommands = new Map();
 
 // Slash commands cache: per-agent discovered commands from CLI init events
 const SLASH_COMMAND_DESCRIPTIONS = {
-  // Webcoding core commands (server-side handled)
-  clear: '清除当前会话（含上下文）',
-  model: '查看/切换模型',
-  mode: '查看/切换权限模式',
-  cost: '查看会话费用/统计',
-  compact: '压缩上下文',
-  help: '显示帮助',
+  // Webcoding platform commands (server-side handled)
+  model: '查看/切换模型（Webcoding 平台）',
+  mode: '查看/切换权限模式（Webcoding 平台）',
+  compact: '压缩上下文（Webcoding 平台）',
+  'web-help': '显示 Webcoding 平台帮助与已发现的斜杠命令',
   // Claude CLI native commands
+  clear: '清除当前会话（含上下文）',
+  cost: '查看会话费用/统计',
+  help: '显示 CLI 帮助',
   debug: '调试模式',
   simplify: '精简代码',
   batch: '批量处理',
@@ -525,8 +526,6 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   run: '运行 skill',
   verify: '验证结果',
   'team-onboarding': '团队引导',
-  // Codex goals
-  // (also listed under codex built-ins)
   // Claude skills (user-installed) — descriptions are best-effort; new skills show their raw name
   'update-config': '更新配置',
   loop: '循环执行',
@@ -541,16 +540,16 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   'ralph-loop:cancel-ralph': '取消 Ralph Loop',
   'ralph-loop:ralph-loop': '启动 Ralph Loop',
   // Codex CLI built-in interactive commands
-  status: '查看当前模型、审批和 Token 使用量',
-  fork: '分支当前对话到新线程',
-  new: '开始新的对话',
-  feedback: '发送反馈日志给维护者',
+  status: '查看当前模型、审批和 Token 使用量（TUI）',
+  fork: '分支当前对话到新线程（TUI）',
+  new: '开始新的对话（TUI）',
+  feedback: '发送反馈日志给维护者（TUI）',
   mcp: '列出已配置的 MCP 工具',
-  permissions: '控制 Codex 何时请求确认',
-  personality: '自定义 Codex 的沟通风格',
-  rename: '重命名线程',
+  permissions: '控制 Codex 何时请求确认（TUI）',
+  personality: '自定义 Codex 的沟通风格（TUI）',
+  rename: '重命名线程（TUI）',
   skills: '列出可用技能',
-  statusline: '配置状态栏显示内容',
+  statusline: '配置状态栏显示内容（TUI）',
   // Codex skills (user-installed) — discovered at runtime from ~/.codex/skills/
   imagegen: 'AI 图像生成',
   'openai-docs': 'OpenAI 官方文档查询',
@@ -562,6 +561,47 @@ const SLASH_COMMAND_DESCRIPTIONS = {
   spreadsheets: 'Excel 电子表格',
   'computer-use': 'macOS 桌面控制',
 };
+
+/** Codex slash commands that only work in interactive TUI, not headless `codex exec`. */
+const CODEX_TUI_ONLY_COMMANDS = new Set([
+  'fork', 'new', 'permissions', 'personality', 'statusline', 'feedback', 'rename', 'status',
+]);
+
+/** Platform-handled slash commands (not CLI passthrough). */
+const PLATFORM_SLASH_COMMANDS = [
+  { name: 'model', desc: SLASH_COMMAND_DESCRIPTIONS.model },
+  { name: 'mode', desc: SLASH_COMMAND_DESCRIPTIONS.mode },
+  { name: 'compact', desc: SLASH_COMMAND_DESCRIPTIONS.compact },
+  { name: 'web-help', desc: SLASH_COMMAND_DESCRIPTIONS['web-help'] },
+];
+
+/** Honest labels for Webcoding permission modes (match actual CLI flags). */
+const PERMISSION_MODE_META = {
+  yolo: {
+    label: 'YOLO',
+    short: '跳过审批与沙箱限制',
+    claude: 'Claude: --permission-mode bypassPermissions',
+    codex: 'Codex: --dangerously-bypass-approvals-and-sandbox',
+  },
+  default: {
+    label: '默认',
+    short: 'CLI 默认自动策略（非浏览器人工审批）',
+    claude: 'Claude: 默认权限模式（无 bypass）',
+    codex: 'Codex: --full-auto（自动执行，非网页审批）',
+  },
+  plan: {
+    label: 'Plan',
+    short: '规划/只读向（非完整计划确认 UI）',
+    claude: 'Claude: --permission-mode plan',
+    codex: 'Codex: -s read-only（只读沙箱）',
+  },
+};
+
+function formatPermissionModeHelp(agent, mode) {
+  const meta = PERMISSION_MODE_META[mode] || PERMISSION_MODE_META.yolo;
+  const detail = agent === 'codex' ? meta.codex : meta.claude;
+  return `${meta.label} — ${meta.short}\n  ${detail}`;
+}
 
 const slashCommandsCache = {
   claude: { commands: null }, // normalized: [{ name, desc }]
@@ -602,12 +642,50 @@ function normalizeDiscoveredSlashCommands(commands) {
     const name = normalizeSlashCommandName(raw);
     if (!name || seen.has(name)) continue;
     seen.add(name);
+    const source = (raw && typeof raw === 'object' && raw.source)
+      ? String(raw.source)
+      : '';
     out.push({
       name,
       desc: extractSlashCommandDescription(raw, name),
+      ...(source ? { source } : {}),
     });
   }
   return out;
+}
+
+function classifySlashCommand(agent, name, sourceHint = '') {
+  const normalizedAgent = normalizeAgent(agent);
+  const key = normalizeSlashCommandName(name);
+  if (!key) {
+    return { availability: 'unknown', execution: 'passthrough', reason: '' };
+  }
+  if (PLATFORM_SLASH_COMMANDS.some((c) => c.name === key)) {
+    return {
+      availability: 'platform',
+      execution: 'platform',
+      reason: '由 Webcoding 平台处理，不透传 CLI',
+    };
+  }
+  if (normalizedAgent === 'codex' && CODEX_TUI_ONLY_COMMANDS.has(key)) {
+    return {
+      availability: 'tui-only',
+      execution: 'blocked',
+      reason: '仅 Codex 交互 TUI 可用，headless exec 不支持',
+    };
+  }
+  if (sourceHint === 'codex-prompts' || key.startsWith('prompts:')) {
+    return {
+      availability: 'passthrough',
+      execution: 'passthrough',
+      reason: 'Codex 自定义 prompt（~/.codex/prompts）',
+    };
+  }
+  return {
+    availability: 'passthrough',
+    execution: 'passthrough',
+    reason: '',
+  };
 }
 
 function buildSlashCommandList(agent) {
@@ -615,21 +693,63 @@ function buildSlashCommandList(agent) {
   const cache = slashCommandsCache[normalizedAgent];
   const cliCommands = (cache && Array.isArray(cache.commands)) ? cache.commands : [];
   const isClaude = normalizedAgent === 'claude';
-  const source = isClaude ? 'claude-cli' : 'codex-cli';
+  const defaultCliSource = isClaude ? 'claude-cli' : 'codex-cli';
 
-  // Only CLI-discovered commands — no hard-coded Webcoding core list.
-  const cliCmds = [];
+  const out = [];
   const seen = new Set();
+
+  // 1) Platform controls first (always available in Webcoding)
+  for (const entry of PLATFORM_SLASH_COMMANDS) {
+    const name = entry.name;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const classified = classifySlashCommand(normalizedAgent, name, 'webcoding');
+    out.push({
+      cmd: `/${name}`,
+      desc: entry.desc || SLASH_COMMAND_DESCRIPTIONS[name] || name,
+      source: 'webcoding',
+      availability: classified.availability,
+      execution: classified.execution,
+      reason: classified.reason,
+    });
+  }
+
+  // 2) CLI-discovered / filesystem-discovered commands
   for (const entry of cliCommands) {
     const name = entry?.name || normalizeSlashCommandName(entry);
     if (!name || seen.has(name)) continue;
+    // Platform handlers take precedence over same-named CLI entries
+    if (PLATFORM_SLASH_COMMANDS.some((c) => c.name === name)) continue;
     seen.add(name);
-    const cmd = `/${name}`;
-    const desc = (entry && entry.desc) || SLASH_COMMAND_DESCRIPTIONS[name] || name;
-    cliCmds.push({ cmd, desc, source });
+    const source = entry?.source || defaultCliSource;
+    const classified = classifySlashCommand(normalizedAgent, name, source);
+    let desc = (entry && entry.desc) || SLASH_COMMAND_DESCRIPTIONS[name] || name;
+    if (classified.availability === 'tui-only' && !/TUI|不支持|headless/i.test(desc)) {
+      desc = `${desc}（仅 TUI）`;
+    }
+    out.push({
+      cmd: `/${name}`,
+      desc,
+      source,
+      availability: classified.availability,
+      execution: classified.execution,
+      reason: classified.reason,
+    });
   }
-  cliCmds.sort((a, b) => a.cmd.localeCompare(b.cmd));
-  return cliCmds;
+
+  out.sort((a, b) => {
+    // platform first, then available passthrough, then tui-only last
+    const rank = (item) => {
+      if (item.availability === 'platform') return 0;
+      if (item.availability === 'passthrough') return 1;
+      if (item.availability === 'tui-only') return 2;
+      return 3;
+    };
+    const d = rank(a) - rank(b);
+    if (d !== 0) return d;
+    return a.cmd.localeCompare(b.cmd);
+  });
+  return out;
 }
 
 function isKnownSlashCommand(agent, cmdOrName) {
@@ -639,18 +759,54 @@ function isKnownSlashCommand(agent, cmdOrName) {
   return buildSlashCommandList(agent).some((item) => item.cmd === cmd);
 }
 
+function getSlashCommandMeta(agent, cmdOrName) {
+  const name = normalizeSlashCommandName(cmdOrName);
+  if (!name) return null;
+  const cmd = `/${name}`;
+  return buildSlashCommandList(agent).find((item) => item.cmd === cmd) || null;
+}
+
 function formatSlashHelpMessage(agent) {
   const list = buildSlashCommandList(agent);
   const label = agent === 'codex' ? 'Codex' : 'Claude';
-  if (list.length === 0) {
-    return `${label} 斜杠命令列表为空。\n请确认本机 CLI 可用，或稍后重新打开会话以刷新发现结果。\n所有 / 命令都会原样交给 ${label} CLI 执行。`;
-  }
   const lines = [
-    `${label} CLI 已发现的斜杠命令（全部透传执行）:`,
-    ...list.map((item) => `${item.cmd} — ${item.desc || item.cmd}`),
+    `## Webcoding 平台帮助`,
     '',
-    '说明：输入框中的 / 菜单来自 CLI 实时发现，不会硬编码固定子集。',
+    '平台命令（不透传 CLI）:',
+    '  /model — 查看/切换模型',
+    '  /mode — 查看/切换权限模式（真实 CLI 标志见描述）',
+    '  /compact — 压缩上下文',
+    '  /web-help — 显示本帮助',
+    '',
+    '会话能力: 多会话侧栏、发送队列与幂等 ACK、stick-to-bottom、thinking 折叠、图片附件、完成通知。',
+    '',
+    `权限模式说明（当前 Agent: ${label}）:`,
+    ...['yolo', 'default', 'plan'].map((m) => `  ${formatPermissionModeHelp(agent, m).replace(/\n/g, '\n  ')}`),
+    '',
   ];
+  if (list.length === 0) {
+    lines.push(`${label} 斜杠命令列表为空。请确认本机 CLI 可用，或稍后重新打开会话以刷新发现结果。`);
+    return lines.join('\n');
+  }
+  const platform = list.filter((i) => i.availability === 'platform');
+  const passthrough = list.filter((i) => i.availability === 'passthrough');
+  const tuiOnly = list.filter((i) => i.availability === 'tui-only');
+  if (platform.length) {
+    lines.push('平台命令:');
+    platform.forEach((item) => lines.push(`  ${item.cmd} — ${item.desc || item.cmd}`));
+    lines.push('');
+  }
+  if (passthrough.length) {
+    lines.push(`${label} 可透传命令（headless 执行）:`);
+    passthrough.forEach((item) => lines.push(`  ${item.cmd} — ${item.desc || item.cmd}`));
+    lines.push('');
+  }
+  if (tuiOnly.length) {
+    lines.push(`${label} 仅 TUI 命令（网页中会拦截并提示）:`);
+    tuiOnly.forEach((item) => lines.push(`  ${item.cmd} — ${item.desc || item.cmd}`));
+    lines.push('');
+  }
+  lines.push('说明：/ 菜单合并平台命令与 CLI/文件系统发现结果；TUI-only 不会伪装成可用。');
   return lines.join('\n');
 }
 
@@ -752,33 +908,51 @@ function discoverClaudeSlashCommands() {
 //   1. Built-in interactive commands (hardcoded from binary analysis)
 //   2. Skills from ~/.codex/skills/ (user-installed + .system/)
 //   3. Plugins from ~/.codex/.tmp/bundled-marketplaces/*/plugins/
+//   4. Custom prompts from ~/.codex/prompts/*.md → /prompts:<stem>
 function discoverCodexSlashCommands() {
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  // Menu discovery always reads the user-facing Codex home (where skills/prompts are installed).
+  // Custom/unified mode remaps CODEX_HOME to a managed runtime; prepareCodexCustomRuntime
+  // overlays skills/prompts into that home so execution stays consistent.
+  const codexHome = getUserCodexHome();
+  // Best-effort: keep managed runtime overlays fresh so /prompts:* and skills work in custom mode.
+  try {
+    const mode = normalizeCodexMode(loadCodexConfig()?.mode);
+    if (mode && mode !== 'local') ensureCodexRuntimeOverlays(CODEX_RUNTIME_HOME);
+  } catch {}
   const skillsDir = path.join(codexHome, 'skills');
   const marketplacesDir = path.join(codexHome, '.tmp', 'bundled-marketplaces');
-  /** @type {Map<string, string>} name -> desc */
+  const promptsDir = path.join(codexHome, 'prompts');
+  /** @type {Map<string, { desc: string, source: string }>} */
   const commands = new Map();
 
-  function addCommand(name, desc = '') {
+  function addCommand(name, desc = '', source = 'codex-cli') {
     const key = normalizeSlashCommandName(name);
     if (!key) return;
-    const existing = commands.get(key) || '';
+    const existing = commands.get(key);
     const nextDesc = String(desc || '').trim();
-    // Prefer richer descriptions when available
-    if (!existing || (nextDesc && nextDesc.length > existing.length)) {
-      commands.set(key, nextDesc || existing || SLASH_COMMAND_DESCRIPTIONS[key] || key);
+    const fallback = SLASH_COMMAND_DESCRIPTIONS[key] || key;
+    if (!existing) {
+      commands.set(key, { desc: nextDesc || fallback, source });
+      return;
+    }
+    // Prefer richer descriptions when available; keep first non-cli source if more specific
+    if (nextDesc && nextDesc.length > (existing.desc || '').length) {
+      existing.desc = nextDesc;
+    }
+    if (source && source !== 'codex-cli' && existing.source === 'codex-cli') {
+      existing.source = source;
     }
   }
 
   // 1. Built-in interactive commands (from Codex binary analysis — stable across versions)
-  // Note: interactive-only TUI commands may still not fully work in headless exec mode.
+  // Note: interactive-only TUI commands are marked tui-only in buildSlashCommandList.
   const builtIn = ['compact', 'model', 'status', 'review', 'fork', 'new',
     'feedback', 'init', 'mcp', 'permissions', 'personality', 'rename', 'skills', 'statusline',
     // goals feature (stable in recent Codex) — headless may treat as normal prompt
     'goal'];
   builtIn.forEach((c) => addCommand(c, SLASH_COMMAND_DESCRIPTIONS[c] || (
     c === 'goal' ? '设置/管理目标（Goals）' : c
-  )));
+  ), 'codex-cli'));
 
   // 2. User-installed skills (directories under ~/.codex/skills/, excluding .system)
   try {
@@ -848,7 +1022,7 @@ function discoverCodexSlashCommands() {
               const raw = fs.readFileSync(pluginJsonPath, 'utf8');
               const parsed = JSON.parse(raw);
               if (parsed.name) {
-                addCommand(parsed.name, parsed.description || parsed.summary || '');
+                addCommand(parsed.name, parsed.description || parsed.summary || '', 'codex-plugin');
               }
             }
           } catch {}
@@ -857,7 +1031,38 @@ function discoverCodexSlashCommands() {
     }
   } catch {}
 
-  const result = [...commands.entries()].map(([name, desc]) => ({ name, desc }));
+  // 5. Custom prompts (~/.codex/prompts/*.md) → official slash form /prompts:<stem>
+  // Docs: https://developers.openai.com/codex/custom-prompts
+  try {
+    if (fs.existsSync(promptsDir)) {
+      const promptEntries = fs.readdirSync(promptsDir, { withFileTypes: true });
+      for (const entry of promptEntries) {
+        if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+        if (entry.name.startsWith('.')) continue;
+        const stem = entry.name.slice(0, -3).trim();
+        if (!stem) continue;
+        const promptPath = path.join(promptsDir, entry.name);
+        let desc = readSkillDescriptionFromFile(promptPath);
+        if (!desc) {
+          // Fallback: first non-empty non-frontmatter line, truncated
+          try {
+            const raw = fs.readFileSync(promptPath, 'utf8');
+            const body = raw.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').trim();
+            const firstLine = body.split('\n').map((l) => l.trim()).find(Boolean) || '';
+            desc = firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
+          } catch {}
+        }
+        if (!desc) desc = `自定义 prompt: ${stem}`;
+        addCommand(`prompts:${stem}`, desc, 'codex-prompts');
+      }
+    }
+  } catch {}
+
+  const result = [...commands.entries()].map(([name, meta]) => ({
+    name,
+    desc: meta?.desc || SLASH_COMMAND_DESCRIPTIONS[name] || name,
+    source: meta?.source || 'codex-cli',
+  }));
   onSlashCommandsDiscovered('codex', result);
   return result;
 }
@@ -1441,6 +1646,60 @@ function getCodexRuntimeFingerprint(config) {
   });
 }
 
+/**
+ * User-facing Codex home (skills/prompts live here).
+ * Custom/unified mode spawns with CODEX_HOME=CODEX_RUNTIME_HOME, so we overlay
+ * skills + prompts from the user home into the managed runtime home.
+ */
+function getUserCodexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+/**
+ * Ensure managed runtime home can see the same skills/prompts as the user's Codex install.
+ * Uses directory symlinks (junction on Windows). Never deletes a real directory.
+ */
+function ensureCodexRuntimeOverlays(runtimeHome) {
+  const userHome = getUserCodexHome();
+  if (!runtimeHome || path.resolve(runtimeHome) === path.resolve(userHome)) return;
+  try {
+    fs.mkdirSync(runtimeHome, { recursive: true });
+  } catch {
+    return;
+  }
+  // skills/prompts: user-installed content. plugins live under .tmp/bundled-marketplaces.
+  const overlays = [
+    { name: 'skills', target: path.join(userHome, 'skills') },
+    { name: 'prompts', target: path.join(userHome, 'prompts') },
+    { name: path.join('.tmp', 'bundled-marketplaces'), target: path.join(userHome, '.tmp', 'bundled-marketplaces') },
+  ];
+  for (const { name, target } of overlays) {
+    const resolvedTarget = path.resolve(target);
+    if (!fs.existsSync(resolvedTarget)) continue;
+    const linkPath = path.join(runtimeHome, name);
+    try {
+      fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+      let st = null;
+      try { st = fs.lstatSync(linkPath); } catch { st = null; }
+      if (st) {
+        if (st.isSymbolicLink()) {
+          let current = '';
+          try { current = fs.readlinkSync(linkPath); } catch { current = ''; }
+          const resolved = path.resolve(path.isAbsolute(current) ? current : path.join(path.dirname(linkPath), current));
+          if (resolved === resolvedTarget) continue;
+          try { fs.unlinkSync(linkPath); } catch { continue; }
+        } else {
+          // Real dir/file already present — do not replace user data.
+          continue;
+        }
+      }
+      fs.symlinkSync(resolvedTarget, linkPath, IS_WIN ? 'junction' : 'dir');
+    } catch (err) {
+      plog('WARN', 'codex_runtime_overlay_failed', { name, error: err.message });
+    }
+  }
+}
+
 function prepareCodexCustomRuntime(config) {
   const source = resolveCodexActiveSource(config);
   if (source?.error) return source;
@@ -1454,6 +1713,8 @@ function prepareCodexCustomRuntime(config) {
   }
 
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
+  // Make user skills/prompts visible to the child (CODEX_HOME points here).
+  ensureCodexRuntimeOverlays(CODEX_RUNTIME_HOME);
   const configToml = [
     '# Generated by webcoding. Codex startup is also forced via CLI -c overrides.',
     `# bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}`,
@@ -3342,15 +3603,56 @@ function isProcessRunning(pid) {
 }
 
 function killProcess(pid, force = false) {
+  const nPid = Number(pid);
+  // Never signal pid <= 1 (init/system) even if a corrupt pid file is present.
+  if (!Number.isFinite(nPid) || nPid <= 1 || !Number.isInteger(nPid)) return;
   try {
     if (IS_WIN) {
-      const args = ['/T', '/PID', String(pid)];
+      // /T = kill child tree (Codex may spawn helpers)
+      const args = ['/T', '/PID', String(nPid)];
       if (force) args.unshift('/F');
       spawn('taskkill', args, { windowsHide: true, stdio: 'ignore' });
-    } else {
-      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
+      return;
     }
+    const sig = force ? 'SIGKILL' : 'SIGTERM';
+    // CLI processes are spawned detached → own process group. Kill the group first.
+    try {
+      process.kill(-nPid, sig);
+      return;
+    } catch {
+      // Fall through to single-pid kill (group may not exist / EPERM).
+    }
+    process.kill(nPid, sig);
   } catch {}
+}
+
+function writeRunMeta(sessionId, meta) {
+  try {
+    const dir = runDir(sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    const payload = {
+      pid: meta?.pid ?? null,
+      permissionMode: meta?.permissionMode || 'yolo',
+      agent: meta?.agent || 'claude',
+      detached: meta?.detached !== false && !IS_WIN,
+      startedAt: meta?.startedAt || new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(dir, 'run-meta.json'), JSON.stringify(payload, null, 2));
+  } catch (err) {
+    plog('WARN', 'run_meta_write_failed', { sessionId: String(sessionId || '').slice(0, 8), error: err.message });
+  }
+}
+
+function readRunMeta(sessionId) {
+  try {
+    const p = path.join(runDir(sessionId), 'run-meta.json');
+    if (!fs.existsSync(p)) return null;
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function sleepSync(ms) {
@@ -4166,6 +4468,26 @@ function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
 function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError) {
   let shouldReturnForFollowup = false;
   let shouldAutoCompact = false;
+  const aborted = !!entry.abortRequested;
+
+  if (aborted) {
+    // User abort terminates the whole workflow — no compact/retry follow-up.
+    pendingCompactRetries.delete(sessionId);
+    pendingSlashCommands.delete(sessionId);
+    wsSend(entry.ws, {
+      type: 'system_message',
+      sessionId,
+      message: '已中断当前任务。',
+    });
+    wsSend(entry.ws, {
+      type: 'done',
+      sessionId,
+      costUsd: entry.lastCost ?? null,
+      interrupted: true,
+    });
+    sendSessionList(entry.ws);
+    return { shouldReturnForFollowup: false, shouldAutoCompact: false };
+  }
 
   if (pendingSlash?.kind === 'compact') {
     const retry = pendingCompactRetries.get(sessionId);
@@ -4192,7 +4514,7 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     } else {
       pendingCompactRetries.set(sessionId, {
         text: pendingRetry?.text || '',
-        mode: pendingRetry?.mode || session.permissionMode || 'yolo',
+        mode: pendingRetry?.mode || entry.permissionMode || session.permissionMode || 'yolo',
         reason: 'auto',
         autoRetryCount: nextRetryCount,
       });
@@ -4206,7 +4528,12 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
     wsSend(entry.ws, { type: 'error', sessionId, message: completionError });
   }
 
-  wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost ?? null });
+  wsSend(entry.ws, {
+    type: 'done',
+    sessionId,
+    costUsd: entry.lastCost ?? null,
+    interrupted: false,
+  });
   sendSessionList(entry.ws);
   return { shouldReturnForFollowup, shouldAutoCompact };
 }
@@ -4215,6 +4542,11 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
   const session = loadSession(sessionId);
   const title = session?.title || 'Untitled';
   const sessions = getSessionListSnapshot();
+  const interrupted = !!entry.abortRequested;
+  if (interrupted) {
+    pendingCompactRetries.delete(sessionId);
+    pendingSlashCommands.delete(sessionId);
+  }
   for (const client of wss.clients) {
     if (client.readyState !== 1 || client.isAuthenticated !== true) continue;
     sendSessionList(client, { sessions });
@@ -4225,17 +4557,23 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
       title,
       costUsd: entry.lastCost ?? null,
       responseLen: (entry.fullText || '').length,
+      interrupted,
     });
   }
   const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
   const respLen = (entry.fullText || '').length;
   sendNotification(
-    'webcoding 任务完成',
-    `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
+    interrupted ? 'webcoding 任务已中断' : 'webcoding 任务完成',
+    `会话: ${title}\n字数: ${respLen}\n费用: ${cost}${interrupted ? '\n状态: 已中断' : ''}`
   );
 }
 
 function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, shouldReturnForFollowup, shouldAutoCompact) {
+  if (entry?.abortRequested) {
+    pendingCompactRetries.delete(sessionId);
+    pendingSlashCommands.delete(sessionId);
+    return;
+  }
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
     pendingCompactRetries.delete(sessionId);
   }
@@ -4333,8 +4671,24 @@ function recoverProcesses() {
 
       if (isProcessRunning(pid)) {
         console.log(`[recovery] Re-attaching to session ${sessionId} (PID ${pid})`);
-        plog('INFO', 'recovery_alive', { sessionId: sessionId.slice(0, 8), pid, agent });
-        const entry = { pid, ws: null, agent, fullText: '', toolCalls: [], segments: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
+        const runMeta = readRunMeta(sessionId);
+        const permissionMode = runMeta?.permissionMode || session?.permissionMode || 'yolo';
+        plog('INFO', 'recovery_alive', { sessionId: sessionId.slice(0, 8), pid, agent, permissionMode });
+        const entry = {
+          pid,
+          ws: null,
+          agent,
+          permissionMode,
+          abortRequested: false,
+          fullText: '',
+          toolCalls: [],
+          segments: [],
+          lastCost: null,
+          lastUsage: null,
+          lastError: null,
+          errorSent: false,
+          tailer: null,
+        };
         setActiveProcess(sessionId, entry);
 
         if (fs.existsSync(outputPath)) {
@@ -5159,12 +5513,13 @@ function normalizeClientMessageId(raw) {
   return value.slice(0, 120);
 }
 
-function sendMessageAccepted(ws, sessionId, clientMessageId) {
+function sendMessageAccepted(ws, sessionId, clientMessageId, extra = {}) {
   if (!clientMessageId) return;
   wsSend(ws, {
     type: 'message_accepted',
     sessionId: sessionId || null,
     clientMessageId,
+    ...extra,
   });
 }
 
@@ -5172,6 +5527,9 @@ function sendMessageAccepted(ws, sessionId, clientMessageId) {
 // Slash *menu* is discovery-only (no hard-coded 6-command subset).
 // Execution: pass almost everything to the CLI. Only a few platform controls stay
 // local because they mutate Webcoding session state (model/mode) or orchestrate compact.
+//
+// Local handlers ACK with execution:'local' so the client does NOT startGenerating.
+// They intentionally do NOT emit `done` (avoids racing a subsequent real CLI turn).
 function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null) {
   const parts = String(text || '').trim().split(/\s+/);
   const cmd = (parts[0] || '').toLowerCase();
@@ -5182,19 +5540,25 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
   const label = agent === 'codex' ? 'Codex' : 'Claude';
 
   function ackLocal() {
+    // Idempotent replay of a completed local slash.
     if (!clientMessageId) return false;
     if (targetSessionId && wasClientMessageAccepted(targetSessionId, clientMessageId)) {
-      sendMessageAccepted(ws, targetSessionId, clientMessageId);
+      sendMessageAccepted(ws, targetSessionId, clientMessageId, { execution: 'local' });
       return true;
     }
-    if (targetSessionId) rememberAcceptedClientMessage(targetSessionId, clientMessageId);
-    sendMessageAccepted(ws, targetSessionId, clientMessageId);
     return false;
+  }
+
+  function markLocalAccepted() {
+    if (!clientMessageId) return;
+    if (targetSessionId) rememberAcceptedClientMessage(targetSessionId, clientMessageId);
+    sendMessageAccepted(ws, targetSessionId, clientMessageId, { execution: 'local' });
   }
 
   // --- Platform controls (Webcoding session state) ---
   if (cmd === '/model') {
     if (ackLocal()) return;
+    markLocalAccepted();
     const modelInput = parts.slice(1).join(' ').trim();
     if (agent === 'codex') {
       if (!modelInput) {
@@ -5229,6 +5593,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
         });
         wsSend(ws, {
           type: 'system_message',
+          sessionId: targetSessionId,
           message: normalizedInput === 'default'
             ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
             : `Codex 模型已切换为: ${modelInput}`,
@@ -5252,7 +5617,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
     }
     const resolved = resolveClaudeModelInput(modelInput);
     if (!resolved) {
-      wsSend(ws, { type: 'system_message', message: '模型名称不能为空' });
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '模型名称不能为空' });
       return;
     }
     const { resolvedModel, resolvedAlias } = resolved;
@@ -5267,7 +5632,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
         model: '',
         ...(session ? buildSessionRuntimeMeta(session) : {}),
       });
-      wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '模型已切换为: 默认（使用 CLI 默认模型）' });
       return;
     }
     if (session) {
@@ -5281,61 +5646,124 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
       model: resolvedAlias,
       ...(session ? buildSessionRuntimeMeta(session) : {}),
     });
-    wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
+    wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: `模型已切换为: ${displayName} (${resolvedModel})` });
     return;
   }
 
   if (cmd === '/mode') {
     if (ackLocal()) return;
+    markLocalAccepted();
     const modeInput = parts[1];
     const VALID_MODES = ['default', 'plan', 'yolo'];
-    const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
     if (!modeInput) {
       const cur = session?.permissionMode || 'yolo';
-      wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
+      const lines = [
+        `当前模式: ${formatPermissionModeHelp(agent, cur)}`,
+        '',
+        '可选:',
+        ...VALID_MODES.map((m) => formatPermissionModeHelp(agent, m)),
+        '',
+        '说明: 模式映射为真实 CLI 参数；网页侧尚无人工审批卡片。运行中切换将在下一轮生效。',
+      ];
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: lines.join('\n') });
     } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
       const mode = modeInput.toLowerCase();
+      const running = !!(targetSessionId && activeProcesses.has(targetSessionId));
       if (session) {
         session.permissionMode = mode;
-        clearRuntimeSessionId(session);
+        // Do not clear runtime session id — mode only affects next spawn flags.
         session.updated = new Date().toISOString();
         saveSession(session);
       }
-      wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
-      wsSend(ws, { type: 'mode_changed', mode });
+      const timing = running ? '（当前轮次仍按原模式运行，下一轮生效）' : '';
+      wsSend(ws, {
+        type: 'system_message',
+        sessionId: targetSessionId,
+        message: `权限模式已切换为:\n${formatPermissionModeHelp(agent, mode)}${timing ? `\n${timing}` : ''}`,
+      });
+      wsSend(ws, { type: 'mode_changed', mode, sessionId: targetSessionId, appliesNextTurn: running });
     } else {
-      wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
     }
+    return;
+  }
+
+  if (cmd === '/web-help' || cmd === '/webhelp') {
+    if (ackLocal()) return;
+    markLocalAccepted();
+    wsSend(ws, {
+      type: 'system_message',
+      sessionId: targetSessionId,
+      message: formatSlashHelpMessage(agent),
+    });
     return;
   }
 
   if (cmd === '/compact') {
     if (ackLocal()) return;
     if (!targetSessionId || !session) {
-      wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
+      markLocalAccepted();
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
       return;
     }
     if (activeProcesses.has(targetSessionId)) {
-      wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
+      markLocalAccepted();
+      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
       return;
     }
     const runtimeId = getRuntimeSessionId(session);
     if (!runtimeId) {
+      markLocalAccepted();
       wsSend(ws, {
         type: 'system_message',
+        sessionId: targetSessionId,
         message: agent === 'codex'
           ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
           : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
       });
       return;
     }
-    wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
+    // Compact starts a real CLI turn.
+    if (clientMessageId) {
+      if (targetSessionId) rememberAcceptedClientMessage(targetSessionId, clientMessageId);
+      sendMessageAccepted(ws, targetSessionId, clientMessageId, { execution: 'turn' });
+    }
+    wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: compactStartMessage(agent) });
     pendingSlashCommands.set(session.id, { kind: 'compact' });
-    handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+    handleMessage(ws, {
+      text: '/compact',
+      sessionId: session.id,
+      mode: session.permissionMode || 'yolo',
+      clientMessageId: null, // already accepted above
+    }, { hideInHistory: true });
     return;
   }
 
-  // --- Everything else: full CLI passthrough (incl. /goal, /clear, /help, skills…) ---
+  // --- TUI-only commands: refuse before spawn (do not fake availability) ---
+  // Classify directly so interception works even before discovery cache is warm.
+  const cmdName = normalizeSlashCommandName(cmd);
+  const classified = classifySlashCommand(agent, cmdName);
+  const slashMeta = getSlashCommandMeta(agent, cmd) || {
+    availability: classified.availability,
+    execution: classified.execution,
+    reason: classified.reason,
+  };
+  if (classified.availability === 'tui-only' || classified.execution === 'blocked') {
+    if (ackLocal()) return;
+    markLocalAccepted();
+    wsSend(ws, {
+      type: 'system_message',
+      sessionId: targetSessionId,
+      message: [
+        `${cmd} 仅在 ${label} 交互式 TUI 中可用，Webcoding 的 headless 模式不支持。`,
+        slashMeta.reason || classified.reason || '',
+        '请在终端原生 CLI 中使用该命令，或改用网页侧等价能力（如 /mode、/model、侧栏新建会话）。',
+      ].filter(Boolean).join('\n'),
+    });
+    return;
+  }
+
+  // --- Everything else: full CLI passthrough (incl. /goal, /clear, /help, skills, prompts…) ---
   handleMessage(ws, {
     text,
     sessionId: targetSessionId,
@@ -5505,6 +5933,7 @@ function handleLoadSession(ws, sessionId) {
       text: entry.fullText || '',
       toolCalls: entry.toolCalls || [],
       segments: entry.segments || [],
+      permissionMode: entry.permissionMode || session?.permissionMode || 'yolo',
     });
   }
 }
@@ -5643,16 +6072,25 @@ function handleRenameSession(ws, sessionId, title) {
 function handleSetMode(ws, sessionId, mode) {
   const VALID_MODES = ['default', 'plan', 'yolo'];
   if (!mode || !VALID_MODES.includes(mode)) return;
-  if (sessionId) {
-    const session = loadSession(sessionId);
+  const safeSessionId = sessionId ? sanitizeId(sessionId) : null;
+  const running = !!(safeSessionId && activeProcesses.has(safeSessionId));
+  if (safeSessionId) {
+    const session = loadSession(safeSessionId);
     if (session) {
       session.permissionMode = mode;
-      clearRuntimeSessionId(session);
+      // Mode only affects next spawn flags; keep runtime id for resume continuity.
       session.updated = new Date().toISOString();
       saveSession(session);
+      if (running) {
+        wsSend(ws, {
+          type: 'system_message',
+          sessionId: safeSessionId,
+          message: `权限模式将切换为 ${PERMISSION_MODE_META[mode]?.label || mode}（当前轮次仍按原模式运行，下一轮生效）\n${formatPermissionModeHelp(getSessionAgent(session), mode)}`,
+        });
+      }
     }
   }
-  wsSend(ws, { type: 'mode_changed', mode });
+  wsSend(ws, { type: 'mode_changed', mode, sessionId: safeSessionId, appliesNextTurn: running });
 }
 
 function handleDisconnect(ws, wsId) {
@@ -5694,15 +6132,22 @@ function handleAbort(ws) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
 
+  entry.abortRequested = true;
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
+  wsSend(ws, {
+    type: 'system_message',
+    sessionId,
+    message: '正在停止当前任务…',
+  });
   killProcess(entry.pid);
   setTimeout(() => {
     const activeEntry = activeProcesses.get(sessionId);
     if (activeEntry && activeEntry.pid === entry.pid) {
+      activeEntry.abortRequested = true;
       killProcess(entry.pid, true);
     }
   }, 3000);
-  // handleProcessComplete will be triggered by the PID monitor
+  // handleProcessComplete will be triggered by the PID monitor / process close
 }
 
 // === Runtime Message Handler ===
@@ -5731,30 +6176,49 @@ function handleMessage(ws, msg, options = {}) {
 
   if (sessionId && activeProcesses.has(sessionId)) {
     const runningSession = loadSession(sessionId);
+    const runningEntry = activeProcesses.get(sessionId);
+    // Use the mode snapshotted at spawn — not session.permissionMode (may already be next-turn).
+    const activeTurnMode = runningEntry?.permissionMode || runningSession?.permissionMode || 'yolo';
     if (
       runningSession &&
+      runningEntry &&
       isClaudeSession(runningSession) &&
-      runningSession.permissionMode === 'plan' &&
+      activeTurnMode === 'plan' &&
       normalizedText &&
       resolvedAttachments.length === 0
     ) {
-      // Plan mode: forward user input to the waiting process via stdin (input.txt append)
+      // Plan mode: best-effort forward user input via input.txt append.
+      // Not a reliable bidirectional interactive channel — ACK only after write succeeds.
+      const clientMessageIdEarly = normalizeClientMessageId(msg.clientMessageId);
+      if (clientMessageIdEarly && wasClientMessageAccepted(sessionId, clientMessageIdEarly)) {
+        sendMessageAccepted(ws, sessionId, clientMessageIdEarly, { execution: 'local' });
+        return;
+      }
       const inputPath = path.join(runDir(sessionId), 'input.txt');
       try {
         fs.appendFileSync(inputPath, normalizedText + '\n');
+        if (clientMessageIdEarly) {
+          rememberAcceptedClientMessage(sessionId, clientMessageIdEarly);
+          sendMessageAccepted(ws, sessionId, clientMessageIdEarly, { execution: 'local' });
+        }
         if (!hideInHistory) {
           runningSession.messages.push({ role: 'user', content: textValue, attachments: [], timestamp: new Date().toISOString() });
           runningSession.updated = new Date().toISOString();
           saveSession(runningSession);
-          const entry = activeProcesses.get(sessionId);
-          if (entry) entry.ws = ws;
+          runningEntry.ws = ws;
         }
+        wsSend(ws, {
+          type: 'system_message',
+          sessionId,
+          message: '已写入 Plan 模式确认输入（best-effort；非完整交互协议）。',
+        });
       } catch (err) {
-        wsSend(ws, { type: 'error', message: '无法写入确认输入：' + err.message });
+        // Do not consume idempotency key on failure — client may retry.
+        wsSend(ws, { type: 'error', sessionId, message: '无法写入确认输入：' + err.message });
       }
       return;
     }
-    return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
+    return wsSend(ws, { type: 'error', sessionId, message: '正在处理中，请先点击停止按钮。' });
   }
 
   const derivedTitle = normalizedText
@@ -5964,6 +6428,13 @@ function handleMessage(ws, msg, options = {}) {
   });
 
   fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
+  writeRunMeta(currentSessionId, {
+    pid: proc.pid,
+    permissionMode: spawnSpec.mode || session.permissionMode || 'yolo',
+    agent: getSessionAgent(session),
+    detached: !IS_WIN,
+    startedAt: new Date().toISOString(),
+  });
   proc.unref(); // Process survives Node.js exit
 
   plog('INFO', 'process_spawn', {
@@ -6006,6 +6477,9 @@ function handleMessage(ws, msg, options = {}) {
     ws,
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
+    // Snapshot mode for this turn — session.permissionMode may change mid-run for next turn.
+    permissionMode: spawnSpec.mode || session.permissionMode || 'yolo',
+    abortRequested: false,
     claudeRuntimeFingerprint: isClaudeSession(session) ? (spawnSpec.runtimeFingerprint || null) : null,
     codexRuntimeFingerprint: getSessionAgent(session) === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
     runtimeChannelKey: spawnSpec.channelKey || null,
@@ -6109,6 +6583,7 @@ const {
   clearRuntimeSessionId,
   runtimeFingerprintsCompatible,
   onSlashCommandsDiscovered,
+  plog,
 });
 
 // === Check Update ===

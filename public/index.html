@@ -49,11 +49,12 @@
           <button type="button" class="agent-tab active" data-agent="claude">Claude</button>
           <button type="button" class="agent-tab" data-agent="codex">Codex</button>
         </div>
-        <div class="mode-tabs" id="topbar-mode-tabs" title="权限模式">
-          <button type="button" class="mode-tab active" data-mode="yolo" title="YOLO 模式：自动执行所有操作">YOLO</button>
-          <button type="button" class="mode-tab" data-mode="default" title="默认模式：执行前确认">默认</button>
-          <button type="button" class="mode-tab" data-mode="plan" title="Plan 模式：仅规划不执行">Plan</button>
+        <div class="mode-tabs" id="topbar-mode-tabs" title="权限模式（映射真实 CLI 标志，非网页审批）">
+          <button type="button" class="mode-tab active" data-mode="yolo" title="YOLO：跳过审批与沙箱限制（Claude bypassPermissions / Codex dangerously-bypass）">YOLO</button>
+          <button type="button" class="mode-tab" data-mode="default" title="默认：CLI 默认自动策略（Codex --full-auto；非网页人工审批）">默认</button>
+          <button type="button" class="mode-tab" data-mode="plan" title="Plan：规划/只读向（Claude plan / Codex read-only；非完整计划确认 UI）">Plan</button>
         </div>
+        <span id="topbar-chat-cwd" class="topbar-chat-cwd" hidden title=""></span>
         <span id="topbar-cost-display" class="cost-display" hidden></span>
         <select id="mobile-agent-select" class="mobile-topbar-select" title="切换 Agent">
           <option value="claude">Claude</option>
@@ -108,6 +109,9 @@
               <div class="chat-header-copy">
                 <span id="chat-title" class="chat-title">新会话</span>
                 <div id="chat-agent-context" class="chat-agent-context">当前对话：Claude · 新建默认：Claude</div>
+                <div id="chat-session-meta" class="chat-session-meta" hidden>
+                  <span id="chat-header-cwd" class="chat-header-cwd"></span>
+                </div>
               </div>
               <div class="chat-toolbar">
                 <span id="chat-runtime-state" class="chat-runtime-state" hidden>运行中</span>
