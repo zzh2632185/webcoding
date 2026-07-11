@@ -5427,11 +5427,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
       // Do NOT pre-ack here — handleMessage owns message_accepted + spawn.
       const targetSessionId = session?.id || sessionId || null;
       const label = agent === 'codex' ? 'Codex' : 'Claude';
-      wsSend(ws, {
-        type: 'system_message',
-        sessionId: targetSessionId,
-        message: `正在将 ${cmd} 交给 ${label} CLI 执行…`,
-      });
+      // Spawn / create session FIRST. If we emit system_message before session_info
+      // on a brand-new chat, the client re-renders history and wipes the tip
+      // (Claude new-session path is especially prone to this race).
       handleMessage(ws, {
         text,
         sessionId: targetSessionId,
@@ -5439,6 +5437,12 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
         agent,
         clientMessageId,
       }, { hideInHistory: false });
+      const resolvedSessionId = wsSessionMap.get(ws) || targetSessionId || null;
+      wsSend(ws, {
+        type: 'system_message',
+        sessionId: resolvedSessionId,
+        message: `正在将 ${cmd} 交给 ${label} CLI 执行…`,
+      });
     }
   }
 }

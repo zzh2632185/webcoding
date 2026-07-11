@@ -6383,6 +6383,13 @@
       };
       // Commands always go through the ack-gated queue (no user bubble).
       if (!enqueueSendItem(commandItem, { toast: !isWsOpen() })) return;
+      // Local client tip for non-core slash so UX is never a silent no-op even if
+      // a later session_info re-render races a server system_message.
+      if (!isLocalSlashCommandText(text)) {
+        const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
+        const baseCmd = text.split(/\s+/)[0];
+        appendSystemMessage(`正在将 ${baseCmd} 交给 ${label} CLI 执行…`);
+      }
       msgInput.value = '';
       autoResize();
       if (isWsOpen()) flushSendQueue();
