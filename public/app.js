@@ -115,6 +115,7 @@
   let flushQueueTimer = null;
   let thinkingRenderTimer = null;
   let pendingThinkingText = '';
+  let pendingThinkingSessionId = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
   let currentCwd = null;
@@ -2472,11 +2473,11 @@
       updateSendQueueIndicator();
       return;
     }
-    // Prefer current-view items, then any dispatchable background item.
-    let idx = pendingSendQueue.findIndex((item) => isQueueItemForCurrentView(item) && canDispatchQueueItem(item));
-    if (idx < 0) {
-      idx = pendingSendQueue.findIndex((item) => canDispatchQueueItem(item));
-    }
+    // Only dispatch the CURRENT view's queue. Background sessions must not steal
+    // the single WebSocket process attachment (entry.ws) from the foreground turn.
+    const idx = pendingSendQueue.findIndex((item) => (
+      isQueueItemForCurrentView(item) && canDispatchQueueItem(item)
+    ));
     if (idx < 0) {
       updateSendQueueIndicator();
       return;
@@ -2490,7 +2491,7 @@
       updateSendQueueIndicator();
       showStatusBanner({
         level: 'warn',
-        message: `有 ${pendingSendQueue.filter((i) => i.reason === 'offline' || i.reason === 'failed').length} 条消息等待连接恢复后发送。`,
+        message: `有 ${pendingSendQueue.filter((i) => isQueueItemForCurrentView(i) && (i.reason === 'offline' || i.reason === 'failed')).length} 条消息等待连接恢复后发送。`,
         actionLabel: '立即重连',
         onAction: () => {
           connectionState.reconnectAttempts = 0;
@@ -3343,16 +3344,19 @@
     return msg.sessionId === sessionState.currentSessionId;
   }
 
-  function handleTextDeltaMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
-    if (!composeState.isGenerating) startGenerating();
-    composeState.pendingText += msg.text;
-    scheduleRender();
-  }
-
   function flushThinkingRender() {
     thinkingRenderTimer = null;
     if (!pendingThinkingText) return;
+    // Drop buffered thinking if the user already switched away from its session.
+    if (
+      pendingThinkingSessionId
+      && sessionState.currentSessionId
+      && pendingThinkingSessionId !== sessionState.currentSessionId
+    ) {
+      pendingThinkingText = '';
+      pendingThinkingSessionId = null;
+      return;
+    }
     const chunk = pendingThinkingText;
     pendingThinkingText = '';
     const thinkingDiv = ensureStreamingThinkingSegment();
@@ -3364,21 +3368,41 @@
     maybeScrollToBottom();
   }
 
+  function drainThinkingBuffer() {
+    if (thinkingRenderTimer) {
+      clearTimeout(thinkingRenderTimer);
+      thinkingRenderTimer = null;
+    }
+    if (pendingThinkingText) flushThinkingRender();
+  }
+
   function handleThinkingDeltaMessage(msg) {
     if (!isEventForCurrentSession(msg)) return;
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
     const text = String(msg.text || '');
     if (!text) return;
+    pendingThinkingSessionId = msg.sessionId || sessionState.currentSessionId || null;
     pendingThinkingText += text;
     if (thinkingRenderTimer) return;
     thinkingRenderTimer = setTimeout(flushThinkingRender, THINKING_RENDER_DEBOUNCE);
+  }
+
+  function handleTextDeltaMessage(msg) {
+    if (!isEventForCurrentSession(msg)) return;
+    // Ensure any buffered thinking is committed before answer text arrives.
+    drainThinkingBuffer();
+    if (!composeState.isGenerating) startGenerating();
+    composeState.pendingText += msg.text;
+    scheduleRender();
   }
 
   function handleToolStartMessage(msg) {
     if (!isEventForCurrentSession(msg)) return;
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
+    // Flush thinking before tools so order stays: thinking → tool → answer.
+    drainThinkingBuffer();
     markStreamingProcessTextSegments();
     composeState.activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
     appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);

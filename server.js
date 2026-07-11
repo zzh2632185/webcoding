@@ -4539,7 +4539,7 @@ wss.on('connection', (ws, req) => {
     switch (msg.type) {
       case 'message':
         if (msg.text && msg.text.trim().startsWith('/')) {
-          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent);
+          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent, msg.clientMessageId);
         } else {
           handleMessage(ws, msg);
         }
@@ -5010,12 +5010,69 @@ function handleFetchModels(ws, msg) {
   req.end();
 }
 
+// === Client message idempotency (short-lived) ===
+const acceptedClientMessages = new Map(); // key -> ts
+const ACCEPTED_CLIENT_MESSAGE_TTL_MS = 10 * 60 * 1000;
+
+function rememberAcceptedClientMessage(sessionId, clientMessageId) {
+  if (!sessionId || !clientMessageId) return;
+  const key = `${sessionId}:${clientMessageId}`;
+  acceptedClientMessages.set(key, Date.now());
+  // Opportunistic cleanup
+  if (acceptedClientMessages.size > 2000) {
+    const cutoff = Date.now() - ACCEPTED_CLIENT_MESSAGE_TTL_MS;
+    for (const [k, ts] of acceptedClientMessages) {
+      if (ts < cutoff) acceptedClientMessages.delete(k);
+    }
+  }
+}
+
+function wasClientMessageAccepted(sessionId, clientMessageId) {
+  if (!sessionId || !clientMessageId) return false;
+  const key = `${sessionId}:${clientMessageId}`;
+  const ts = acceptedClientMessages.get(key);
+  if (!ts) return false;
+  if (Date.now() - ts > ACCEPTED_CLIENT_MESSAGE_TTL_MS) {
+    acceptedClientMessages.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function normalizeClientMessageId(raw) {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim();
+  if (!value) return null;
+  return value.slice(0, 120);
+}
+
+function sendMessageAccepted(ws, sessionId, clientMessageId) {
+  if (!clientMessageId) return;
+  wsSend(ws, {
+    type: 'message_accepted',
+    sessionId: sessionId || null,
+    clientMessageId,
+  });
+}
+
 // === Slash Command Handler ===
-function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
+function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
   const agent = session ? getSessionAgent(session) : normalizeAgent(fallbackAgent);
+  const clientMessageId = normalizeClientMessageId(clientMessageIdRaw);
+  const effectiveSessionId = session?.id || sessionId || null;
+
+  // Ack slash commands so the client queue does not mark them failed after timeout.
+  if (clientMessageId) {
+    if (effectiveSessionId && wasClientMessageAccepted(effectiveSessionId, clientMessageId)) {
+      sendMessageAccepted(ws, effectiveSessionId, clientMessageId);
+      return;
+    }
+    if (effectiveSessionId) rememberAcceptedClientMessage(effectiveSessionId, clientMessageId);
+    sendMessageAccepted(ws, effectiveSessionId, clientMessageId);
+  }
 
   switch (cmd) {
     case '/clear': {
@@ -5640,8 +5697,17 @@ function handleMessage(ws, msg, options = {}) {
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
     : `图片: ${savedAttachments[0]?.filename || 'image'}`;
 
+  const clientMessageId = normalizeClientMessageId(msg.clientMessageId);
+
   let session;
   if (sessionId) session = loadSession(sessionId);
+
+  // Idempotent accept BEFORE mutating history / spawning.
+  if (session && clientMessageId && wasClientMessageAccepted(session.id, clientMessageId)) {
+    sendMessageAccepted(ws, session.id, clientMessageId);
+    return;
+  }
+
   if (!session) {
     const id = crypto.randomUUID();
     const agent = normalizeAgent(msg.agent);
@@ -5693,24 +5759,15 @@ function handleMessage(ws, msg, options = {}) {
   saveSession(session);
 
   const currentSessionId = session.id;
-  const clientMessageId = typeof msg.clientMessageId === 'string' && msg.clientMessageId.trim()
-    ? msg.clientMessageId.trim().slice(0, 120)
-    : null;
+  if (clientMessageId) {
+    rememberAcceptedClientMessage(currentSessionId, clientMessageId);
+    sendMessageAccepted(ws, currentSessionId, clientMessageId);
+  }
 
   for (const [, entry] of activeProcesses) {
     if (entry.ws === ws) entry.ws = null;
   }
   wsSessionMap.set(ws, currentSessionId);
-
-  // Acknowledge persistence before spawn so the client can drop "sending" state
-  // even if CLI launch fails later.
-  if (clientMessageId) {
-    wsSend(ws, {
-      type: 'message_accepted',
-      sessionId: currentSessionId,
-      clientMessageId,
-    });
-  }
 
   if (!sessionId) {
     // Mark isRunning true before spawn so the client can preserve optimistic
