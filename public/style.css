@@ -1911,6 +1911,18 @@ html[data-theme="localhost"] .localfile-pre {
   background: var(--surface-strong);
   box-shadow: none;
 }
+.session-item-status {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  background: var(--yellow);
+  color: var(--text-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 .session-item.is-running .session-item-marker {
   background: var(--yellow);
   border-color: var(--line);

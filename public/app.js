@@ -37,8 +37,10 @@
   };
 
   const DEFAULT_AGENT = 'claude';
-  const SESSION_CACHE_LIMIT = 4;
-  const SESSION_CACHE_MAX_WEIGHT = 1_500_000;
+  const SESSION_CACHE_LIMIT = 8;
+  const SESSION_CACHE_MAX_WEIGHT = 3_000_000;
+  const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
+  const ALLOWED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
   const SIDEBAR_SWIPE_TRIGGER = 72;
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
   const SIDEBAR_WIDTH_STORAGE_KEY = 'webcoding-sidebar-width';
@@ -58,6 +60,7 @@
   const MAX_SEND_QUEUE = 5;
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
   const THEME_STORAGE_KEY = 'webcoding-theme';
+  const SEND_ON_ENTER_STORAGE_KEY = 'webcoding-send-on-enter';
   const DEFAULT_THEME = 'default';
   const THEME_LABELS = {
     default: '默认主题',
@@ -292,6 +295,31 @@
       localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
     }
     return nextTheme;
+  }
+
+  function getSendOnEnterMode() {
+    const raw = localStorage.getItem(SEND_ON_ENTER_STORAGE_KEY);
+    return raw === 'enter' ? 'enter' : 'modifier';
+  }
+
+  function setSendOnEnterMode(mode) {
+    const next = mode === 'enter' ? 'enter' : 'modifier';
+    localStorage.setItem(SEND_ON_ENTER_STORAGE_KEY, next);
+    updateSendShortcutHints();
+    return next;
+  }
+
+  function updateSendShortcutHints() {
+    const mode = getSendOnEnterMode();
+    const isEnter = mode === 'enter';
+    if (msgInput) {
+      msgInput.placeholder = isEnter
+        ? '输入消息… 输入 / 查看指令 · Enter 发送 · Shift+Enter 换行'
+        : '输入消息… 输入 / 查看指令 · ⌘/Ctrl+Enter 发送';
+    }
+    if (sendBtn) {
+      sendBtn.title = isEnter ? '发送（Enter）' : '发送（⌘/Ctrl+Enter）';
+    }
   }
 
   function parseStoredCollapsedProjects() {
@@ -1917,12 +1945,58 @@
     return data.attachment;
   }
 
+  function describeImageUploadError(file, error) {
+    const name = file?.name ? `「${file.name}」` : '图片';
+    const raw = String(error?.message || error || '').trim();
+    if (!file) return raw || '图片上传失败';
+    if (!file.type || !ALLOWED_IMAGE_TYPES.has(String(file.type).toLowerCase())) {
+      return `${name} 格式不支持，请使用 PNG / JPG / WEBP / GIF。`;
+    }
+    if (Number(file.size) > MAX_IMAGE_UPLOAD_BYTES) {
+      return `${name} 过大（${formatFileSize(file.size)}），请压缩到 10MB 以内。`;
+    }
+    if (/登录|401|未认证|auth/i.test(raw)) {
+      return `${name} 上传失败：登录状态已失效，请重新登录。`;
+    }
+    if (/413|过大|too large|limit/i.test(raw)) {
+      return `${name} 超过服务器上传限制，请压缩后重试。`;
+    }
+    if (/network|failed to fetch|timeout|断网/i.test(raw)) {
+      return `${name} 上传失败：网络异常，请检查连接后重试。`;
+    }
+    return raw ? `${name} 上传失败：${raw}` : `${name} 上传失败，请重试。`;
+  }
+
   async function handleSelectedImageFiles(fileList) {
-    const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
-    if (!files.length) return;
+    const rawFiles = Array.from(fileList || []).filter(Boolean);
+    if (!rawFiles.length) return;
+
+    const rejected = [];
+    const files = [];
+    for (const file of rawFiles) {
+      const mime = String(file.type || '').toLowerCase();
+      if (!ALLOWED_IMAGE_TYPES.has(mime)) {
+        rejected.push(describeImageUploadError(file, new Error('unsupported type')));
+        continue;
+      }
+      if (Number(file.size) > MAX_IMAGE_UPLOAD_BYTES) {
+        rejected.push(describeImageUploadError(file, new Error('too large')));
+        continue;
+      }
+      files.push(file);
+    }
+    if (rejected.length > 0) {
+      appendError(rejected[0]);
+    }
+    if (!files.length) {
+      if (imageUploadInput) imageUploadInput.value = '';
+      return;
+    }
+
     const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
     if (totalAttachments > 4) {
-      appendError('单条消息最多附带 4 张图片。');
+      appendError('单条消息最多附带 4 张图片。请先移除部分图片后再添加。');
+      if (imageUploadInput) imageUploadInput.value = '';
       return;
     }
     const batch = files.map((file, index) => ({
@@ -1938,18 +2012,21 @@
         return uploadImageFile(optimized);
       }));
       const errors = [];
-      for (const result of results) {
+      results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
           composeState.pendingAttachments.push(result.value);
         } else {
-          errors.push(result.reason?.message || '图片上传失败');
+          errors.push(describeImageUploadError(files[index], result.reason));
         }
-      }
+      });
       if (errors.length > 0) {
         appendError(errors[0]);
+        if (errors.length > 1) {
+          showToast(`另有 ${errors.length - 1} 张图片上传失败`);
+        }
       }
     } catch (err) {
-      appendError(err.message || '图片上传失败');
+      appendError(describeImageUploadError(null, err));
     } finally {
       composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
       renderPendingAttachments();
@@ -2701,7 +2778,7 @@
     const canPreview = PREVIEW_LANGS.has(lang);
     const canRender = RENDER_LANGS.has(lang);
     const hasAction = canPreview || canRender;
-    const btnLabel = canRender ? 'View' : 'Preview';
+    const btnLabel = canRender ? '查看' : '预览';
     const renderType = canPreview ? 'html' : ((['md','markdown'].includes(lang)) ? 'md' : lang);
     const actionBtn = hasAction
       ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">${btnLabel}</button>`
@@ -2716,7 +2793,7 @@
     return `<div class="code-block-wrapper${hasAction ? ' has-preview' : ''}"${hasAction ? ` data-cid="${cid}"` : ''}>
       <div class="code-block-header">
         <span>${escapeHtml(lang)}</span>
-        <div class="code-block-actions">${actionBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
+        <div class="code-block-actions">${actionBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">复制</button></div>
       </div>
       ${previewPane}<pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
     </div>`;
@@ -2744,8 +2821,8 @@
       }
     };
     const onCopied = () => {
-      btn.textContent = 'Copied!';
-      setTimeout(() => btn.textContent = 'Copy', 1500);
+      btn.textContent = '已复制';
+      setTimeout(() => { btn.textContent = '复制'; }, 1500);
     };
     const onFailed = () => {
       showToast('复制失败，请手动复制代码');
@@ -2768,7 +2845,7 @@
       wrapper.classList.remove('preview-mode');
       // restore original button label based on pane type
       const renderPane = wrapper.querySelector('.code-render-pane');
-      btn.textContent = renderPane ? 'View' : 'Preview';
+      btn.textContent = renderPane ? '查看' : '预览';
     } else {
       const iframe = wrapper.querySelector('.code-preview-iframe');
       const renderPane = wrapper.querySelector('.code-render-pane');
@@ -2802,7 +2879,7 @@
         renderPane.dataset.loaded = '1';
       }
       wrapper.classList.add('preview-mode');
-      btn.textContent = 'Source';
+      btn.textContent = '源码';
     }
   };
 
@@ -3809,7 +3886,15 @@
     inner.className = 'tool-group-inner';
     group.appendChild(inner);
 
-    toolItems.forEach((tool) => {
+    const items = Array.isArray(toolItems) ? toolItems : [];
+    const hasRunning = items.some((tool) => tool?.done === false);
+    // Expand group only while tools are still running.
+    group.open = hasRunning;
+    group.addEventListener('toggle', () => {
+      group.dataset.userToggled = '1';
+    });
+
+    items.forEach((tool) => {
       const details = createToolCallElement(tool.id || nextLocalId('saved'), tool, tool.done !== false);
       inner.appendChild(details);
     });
@@ -3893,8 +3978,9 @@
     
     // Adaptive batch sizing based on message count for better performance
     const len = messages.length;
-    const BATCH_SIZE = len > 100 ? 15 : (len > 50 ? 12 : 10);
-    const BATCH_DELAY = len > 100 ? 24 : (len > 50 ? 20 : 16);
+    // Larger first batch for long chats so the latest content appears sooner.
+    const BATCH_SIZE = len > 200 ? 24 : (len > 100 ? 18 : (len > 50 ? 14 : 10));
+    const BATCH_DELAY = len > 200 ? 18 : (len > 100 ? 16 : 12);
     
     // Calculate batches - render from newest to oldest
     const batches = [];
@@ -4190,6 +4276,12 @@
       details.dataset.toolKind = toolKind(tool);
       details.classList.add(`codex-${toolKind(tool).replace(/_/g, '-')}`);
     }
+    // Keep running tools expanded; collapse completed ones to reduce scroll noise.
+    details.open = !done;
+    details.addEventListener('toggle', () => {
+      // Remember manual open/close so auto-collapse doesn't fight the user.
+      details.dataset.userToggled = '1';
+    });
 
     const summary = document.createElement('summary');
     applyToolSummary(summary, tool, done);
@@ -4255,7 +4347,18 @@
       const content = el.querySelector('.tool-call-content');
       if (content) content.replaceWith(nextContent);
     }
-    refreshToolGroupSummary(el.closest('.tool-group'));
+    // Auto-collapse finished tools unless the user explicitly opened them.
+    if (!el.dataset.userToggled) {
+      el.open = false;
+    }
+    const group = el.closest('.tool-group');
+    if (group) {
+      refreshToolGroupSummary(group);
+      const stillRunning = group.querySelector('.tool-call-state.running');
+      if (!stillRunning && !group.dataset.userToggled) {
+        group.open = false;
+      }
+    }
   }
 
   function getDeleteConfirmMessage(agent) {
@@ -4900,6 +5003,7 @@
     body.className = 'project-group-body' + (isCollapsed ? ' collapsed' : '');
     if (!isCollapsed) {
       const sortedSessions = [...groupSessions].sort((a, b) => {
+        if (!!a.isRunning !== !!b.isRunning) return a.isRunning ? -1 : 1;
         const bTs = timestampCache?.get(b.id) ?? getSessionUpdatedTimestamp(b);
         const aTs = timestampCache?.get(a.id) ?? getSessionUpdatedTimestamp(a);
         return bTs - aTs;
@@ -5045,6 +5149,8 @@
     }
     if (ungrouped.length > 0) {
       const sortedUngrouped = [...ungrouped].sort((a, b) => {
+        // Running sessions float to the top for visibility.
+        if (!!a.isRunning !== !!b.isRunning) return a.isRunning ? -1 : 1;
         const bTs = sessionTimestampCache.get(b.id) ?? getSessionUpdatedTimestamp(b);
         const aTs = sessionTimestampCache.get(a.id) ?? getSessionUpdatedTimestamp(a);
         return bTs - aTs;
@@ -6101,7 +6207,14 @@
         e.preventDefault();
         // If menu is open and user presses Enter, select the item
         selectCmdMenuItem();
-      } else if (e.ctrlKey || e.metaKey) {
+        return;
+      }
+
+      const sendOnEnter = getSendOnEnterMode() === 'enter';
+      const modifierPressed = e.ctrlKey || e.metaKey;
+      if (sendOnEnter || modifierPressed) {
+        // Enter-send mode: plain Enter sends; modifier mode: only ⌘/Ctrl+Enter.
+        // In Enter-send mode, still allow modifier+Enter as send.
         e.preventDefault();
         sendMessage();
       }
@@ -6323,6 +6436,14 @@
           </select>
         </div>
         <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。</div>
+        <div class="settings-field" style="margin-top:14px">
+          <label>发送快捷键</label>
+          <select class="settings-select" id="send-on-enter-select">
+            <option value="modifier">⌘/Ctrl + Enter 发送（Enter 换行）</option>
+            <option value="enter">Enter 发送（Shift+Enter 换行）</option>
+          </select>
+        </div>
+        <div class="settings-inline-note">桌面端生效。移动端始终通过发送按钮发送。</div>
         <div class="settings-status" id="theme-status"></div>
       </div>
 
@@ -6902,6 +7023,17 @@
       themeSelect.value = nextTheme;
       showThemeStatus(`已切换为 ${THEME_LABELS[nextTheme]}`, 'success');
     });
+    const sendOnEnterSelect = panel.querySelector('#send-on-enter-select');
+    if (sendOnEnterSelect) {
+      sendOnEnterSelect.value = getSendOnEnterMode();
+      sendOnEnterSelect.addEventListener('change', () => {
+        const next = setSendOnEnterMode(sendOnEnterSelect.value);
+        showThemeStatus(
+          next === 'enter' ? '已切换为 Enter 发送' : '已切换为 ⌘/Ctrl+Enter 发送',
+          'success'
+        );
+      });
+    }
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
 
     unifiedSaveBtn.addEventListener('click', async () => {
@@ -8170,6 +8302,7 @@
   // --- Init ---
   setSelectedAgent(selectedAgent, { syncMode: true });
   resetChatView(selectedAgent);
+  updateSendShortcutHints();
   connect();
   window.addEventListener('resize', updateCwdBadge);
   window.addEventListener('online', () => {
