@@ -29,8 +29,100 @@ const PORT = parseInt(process.env.PORT) || 8001;
 // Ignore loopback-only HOST values (some cloud images set HOST=127.0.0.1 globally)
 const _HOST_ENV = process.env.HOST || '';
 const HOST = (_HOST_ENV && _HOST_ENV !== '127.0.0.1' && _HOST_ENV !== 'localhost') ? _HOST_ENV : '0.0.0.0';
-const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
-const CODEX_PATH = process.env.CODEX_PATH || 'codex';
+
+/**
+ * Resolve a CLI binary path robustly.
+ * Parent shells / IDE launchers sometimes set CLAUDE_PATH to a stale absolute path
+ * (e.g. missing ~/.volta/bin/claude) while the real binary lives in ~/.local/bin.
+ */
+function isExecutablePath(filePath) {
+  if (!filePath) return false;
+  try {
+    fs.accessSync(filePath, fs.constants.F_OK);
+    const st = fs.statSync(filePath);
+    // Accept regular files and symlinks-to-files (stat follows links).
+    if (!st.isFile()) return false;
+    // On Windows, X_OK is unreliable; existence is enough for spawn.
+    if (process.platform === 'win32') return true;
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function whichOnPath(commandName, pathEnv = process.env.PATH) {
+  const name = String(commandName || '').trim();
+  if (!name || name.includes('/') || name.includes('\\')) return null;
+  const dirs = String(pathEnv || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? (String(process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean))
+    : [''];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + (ext && !name.toLowerCase().endsWith(ext.toLowerCase()) ? ext : ''));
+      if (isExecutablePath(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveCliBinary(envValue, defaultName, extraCandidates = []) {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const requested = String(envValue || '').trim() || defaultName;
+  const baseName = path.basename(requested.replace(/\\/g, '/')) || defaultName;
+  const candidates = [];
+
+  // 1) Explicit env value (absolute or relative path)
+  if (requested) candidates.push(requested);
+
+  // 2) Well-known install locations (Claude Code installer uses ~/.local/bin)
+  if (home) {
+    candidates.push(
+      path.join(home, '.local', 'bin', baseName),
+      path.join(home, '.volta', 'bin', baseName),
+      path.join(home, '.npm-global', 'bin', baseName),
+      path.join(home, '.yarn', 'bin', baseName),
+      path.join(home, '.cargo', 'bin', baseName),
+    );
+  }
+  candidates.push(
+    path.join('/usr/local/bin', baseName),
+    path.join('/opt/homebrew/bin', baseName),
+  );
+  for (const extra of extraCandidates) {
+    if (extra) candidates.push(extra);
+  }
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const resolved = path.isAbsolute(candidate) ? candidate : null;
+    // Absolute candidates: check existence
+    if (resolved) {
+      if (seen.has(resolved)) continue;
+      seen.add(resolved);
+      if (isExecutablePath(resolved)) {
+        if (requested !== resolved && (path.isAbsolute(requested) || requested.includes('/'))) {
+          // Stale absolute env path — fall through quietly, log later at boot.
+        }
+        return resolved;
+      }
+      continue;
+    }
+  }
+
+  // 3) Search PATH for bare command name
+  const fromPath = whichOnPath(baseName, process.env.PATH);
+  if (fromPath) return fromPath;
+
+  // 4) Keep bare name so spawn can still try (and surface a clear ENOENT)
+  return baseName;
+}
+
+// Prefer env when valid; otherwise recover common real install locations.
+const CLAUDE_PATH = resolveCliBinary(process.env.CLAUDE_PATH, 'claude');
+const CODEX_PATH = resolveCliBinary(process.env.CODEX_PATH, 'codex');
+const PI_PATH = resolveCliBinary(process.env.PI_PATH, 'pi');
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
@@ -44,6 +136,7 @@ const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
+const PI_CONFIG_PATH = path.join(CONFIG_DIR, 'pi.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
 const BRIDGE_RUNTIME_PATH = path.join(CONFIG_DIR, 'bridge-runtime.json');
 const BRIDGE_STATE_PATH = path.join(CONFIG_DIR, 'bridge-state.json');
@@ -583,30 +676,46 @@ const PERMISSION_MODE_META = {
     short: '跳过审批与沙箱限制',
     claude: 'Claude: --permission-mode bypassPermissions',
     codex: 'Codex: --dangerously-bypass-approvals-and-sandbox',
+    pi: 'Pi: --approve（信任项目本地扩展/技能）',
   },
   default: {
     label: '默认',
     short: 'CLI 默认自动策略（非浏览器人工审批）',
     claude: 'Claude: 默认权限模式（无 bypass）',
     codex: 'Codex: --full-auto（自动执行，非网页审批）',
+    pi: 'Pi: --no-approve（忽略项目本地文件自动信任）',
   },
   plan: {
     label: 'Plan',
     short: '规划/只读向（非完整计划确认 UI）',
     claude: 'Claude: --permission-mode plan',
     codex: 'Codex: -s read-only（只读沙箱）',
+    pi: 'Pi: --tools read,grep,find,ls（只读工具集）',
   },
 };
 
+function agentDisplayName(agent) {
+  const normalized = normalizeAgent(agent);
+  if (normalized === 'codex') return 'Codex';
+  if (normalized === 'pi') return 'Pi';
+  return 'Claude';
+}
+
 function formatPermissionModeHelp(agent, mode) {
   const meta = PERMISSION_MODE_META[mode] || PERMISSION_MODE_META.yolo;
-  const detail = agent === 'codex' ? meta.codex : meta.claude;
+  const normalized = normalizeAgent(agent);
+  const detail = normalized === 'codex'
+    ? meta.codex
+    : normalized === 'pi'
+      ? meta.pi
+      : meta.claude;
   return `${meta.label} — ${meta.short}\n  ${detail}`;
 }
 
 const slashCommandsCache = {
   claude: { commands: null }, // normalized: [{ name, desc }]
   codex: { commands: null },
+  pi: { commands: null },
 };
 
 function normalizeSlashCommandName(raw) {
@@ -722,8 +831,11 @@ function buildSlashCommandList(agent) {
   const normalizedAgent = normalizeAgent(agent);
   const cache = slashCommandsCache[normalizedAgent];
   const cliCommands = (cache && Array.isArray(cache.commands)) ? cache.commands : [];
-  const isClaude = normalizedAgent === 'claude';
-  const defaultCliSource = isClaude ? 'claude-cli' : 'codex-cli';
+  const defaultCliSource = normalizedAgent === 'claude'
+    ? 'claude-cli'
+    : normalizedAgent === 'pi'
+      ? 'pi-cli'
+      : 'codex-cli';
 
   const out = [];
   const seen = new Set();
@@ -802,7 +914,7 @@ function getSlashCommandMeta(agent, cmdOrName) {
 
 function formatSlashHelpMessage(agent) {
   const list = buildSlashCommandList(agent);
-  const label = agent === 'codex' ? 'Codex' : 'Claude';
+  const label = agentDisplayName(agent);
   const lines = [
     `## Webcoding 平台帮助`,
     '',
@@ -1197,7 +1309,7 @@ const CLAUDE_MODEL_MENU_ENTRIES = [
   },
 ];
 
-const VALID_AGENTS = new Set(['claude', 'codex']);
+const VALID_AGENTS = new Set(['claude', 'codex', 'pi']);
 
 // === Models API fetch ===
 let _modelCache = null; // { models: [{id, display_name}], fetchedAt: number, source: 'anthropic'|'openai' }
@@ -1315,6 +1427,11 @@ const DEFAULT_CODEX_CONFIG = {
   profiles: [],
   enableSearch: false,
   supportsSearch: false,
+};
+
+const DEFAULT_PI_CONFIG = {
+  mode: 'local', // 'local' | 'unified'
+  sharedTemplate: '',
 };
 
 function normalizeModelTemplate(template) {
@@ -1557,6 +1674,159 @@ function getCodexConfigMasked() {
     enableSearch: false,
     supportsSearch: false,
     storedEnableSearch: !!config.storedEnableSearch,
+  };
+}
+
+function normalizePiMode(mode) {
+  return mode === 'unified' || mode === 'custom' ? 'unified' : 'local';
+}
+
+function loadPiConfig() {
+  const raw = readCachedJsonConfig(PI_CONFIG_PATH);
+  if (raw) {
+    return {
+      mode: normalizePiMode(raw.mode),
+      sharedTemplate: String(raw.sharedTemplate || '').trim(),
+    };
+  }
+  return cloneJson(DEFAULT_PI_CONFIG);
+}
+
+function savePiConfig(config) {
+  writeCachedJsonConfig(PI_CONFIG_PATH, {
+    mode: normalizePiMode(config?.mode),
+    sharedTemplate: String(config?.sharedTemplate || '').trim(),
+  });
+}
+
+function getPiSelectedTemplate(config, modelConfig = null) {
+  const cfg = config || loadPiConfig();
+  if (normalizePiMode(cfg.mode) !== 'unified') return null;
+  const models = modelConfig || loadModelConfig();
+  const templates = Array.isArray(models.templates) ? models.templates : [];
+  const named = String(cfg.sharedTemplate || '').trim();
+  if (named) {
+    const found = templates.find((t) => t.name === named);
+    if (found) return found;
+  }
+  return templates[0] || null;
+}
+
+function getPiConfigMasked() {
+  const config = loadPiConfig();
+  const effectiveTemplate = normalizePiMode(config.mode) === 'unified'
+    ? getPiSelectedTemplate(config, loadModelConfig())
+    : null;
+  return {
+    mode: normalizePiMode(config.mode),
+    sharedTemplate: effectiveTemplate?.name || config.sharedTemplate || '',
+  };
+}
+
+function resolvePiActiveSource(config) {
+  const cfg = config || loadPiConfig();
+  if (normalizePiMode(cfg.mode) === 'local') return { mode: 'local' };
+  const template = getPiSelectedTemplate(cfg);
+  if (!template) {
+    return { error: 'Pi 渠道选择了 AI 提供商，但当前没有可用的提供商配置。请先在设置中创建至少一个 AI 提供商。' };
+  }
+  if (!template.apiKey || !template.apiBase) {
+    return { error: `Pi 渠道「${template.name}」缺少 API Key 或 API Base URL。` };
+  }
+  return {
+    mode: 'unified',
+    name: template.name,
+    apiKey: template.apiKey,
+    apiBase: String(template.apiBase || '').trim().replace(/\/+$/, ''),
+    upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+    defaultModel: String(template.defaultModel || '').trim(),
+  };
+}
+
+const PI_RUNTIME_HOME = path.join(CONFIG_DIR, 'pi-runtime-home');
+const PI_MANAGED_PROVIDER_ID = 'webcoding';
+
+function getPiRuntimeFingerprint(config) {
+  const source = resolvePiActiveSource(config || loadPiConfig());
+  if (!source || source.mode === 'local') {
+    const piDir = process.env.PI_CODING_AGENT_DIR
+      || path.join(process.env.HOME || process.env.USERPROFILE || '', '.pi', 'agent');
+    return JSON.stringify({
+      runtimeVersion: 1,
+      mode: 'local',
+      modelsFingerprint: fileContentFingerprint(path.join(piDir, 'models.json')),
+      settingsFingerprint: fileContentFingerprint(path.join(piDir, 'settings.json')),
+      authFingerprint: fileContentFingerprint(path.join(piDir, 'auth.json')),
+    });
+  }
+  if (source.error) return `error:${source.error}`;
+  return JSON.stringify({
+    runtimeVersion: 1,
+    mode: 'remote',
+    sourceName: String(source.name || '').trim(),
+    apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
+    upstreamType: String(source.upstreamType || 'openai').toLowerCase(),
+    defaultModel: String(source.defaultModel || '').trim(),
+  });
+}
+
+/**
+ * Build a managed PI_CODING_AGENT_DIR so Pi uses the selected AI provider
+ * without mutating the user's ~/.pi/agent.
+ */
+function preparePiCustomRuntime(config) {
+  const source = resolvePiActiveSource(config || loadPiConfig());
+  if (source?.error) return source;
+  if (!source || source.mode === 'local') {
+    return { mode: 'local' };
+  }
+
+  const modelId = source.defaultModel || 'default';
+  const api = source.upstreamType === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  const modelsJson = {
+    providers: {
+      [PI_MANAGED_PROVIDER_ID]: {
+        baseUrl: source.apiBase,
+        api,
+        apiKey: '$WEBCODING_PI_API_KEY',
+        models: [
+          {
+            id: modelId,
+            name: modelId,
+            contextWindow: 200000,
+            maxTokens: 16384,
+            input: ['text', 'image'],
+          },
+        ],
+      },
+    },
+  };
+  const settingsJson = {
+    defaultProvider: PI_MANAGED_PROVIDER_ID,
+    defaultModel: modelId,
+  };
+
+  try {
+    fs.mkdirSync(PI_RUNTIME_HOME, { recursive: true });
+    writeJsonAtomic(path.join(PI_RUNTIME_HOME, 'models.json'), modelsJson);
+    writeJsonAtomic(path.join(PI_RUNTIME_HOME, 'settings.json'), settingsJson);
+    // Keep an empty auth file so Pi doesn't fall back to host auth unexpectedly.
+    if (!fs.existsSync(path.join(PI_RUNTIME_HOME, 'auth.json'))) {
+      writeJsonAtomic(path.join(PI_RUNTIME_HOME, 'auth.json'), {});
+    }
+  } catch (error) {
+    return { error: `写入 Pi 运行时配置失败: ${error.message || error}` };
+  }
+
+  return {
+    mode: 'custom',
+    homeDir: PI_RUNTIME_HOME,
+    provider: PI_MANAGED_PROVIDER_ID,
+    apiKey: source.apiKey,
+    apiBase: source.apiBase,
+    defaultModel: modelId,
+    profileName: source.name,
+    upstreamType: source.upstreamType,
   };
 }
 
@@ -2804,13 +3074,14 @@ function runtimeChannelDescriptorsCompatible(agent, left, right) {
 
 function ensureRuntimeContextStore(session) {
   if (!session || typeof session !== 'object') {
-    return { claude: {}, codex: {} };
+    return { claude: {}, codex: {}, pi: {} };
   }
   const store = session.runtimeContexts && typeof session.runtimeContexts === 'object' && !Array.isArray(session.runtimeContexts)
     ? session.runtimeContexts
     : {};
   if (!store.claude || typeof store.claude !== 'object' || Array.isArray(store.claude)) store.claude = {};
   if (!store.codex || typeof store.codex !== 'object' || Array.isArray(store.codex)) store.codex = {};
+  if (!store.pi || typeof store.pi !== 'object' || Array.isArray(store.pi)) store.pi = {};
   session.runtimeContexts = store;
   return store;
 }
@@ -2866,9 +3137,39 @@ function buildCodexRuntimeChannelDescriptor(session, options = {}) {
   };
 }
 
+function buildPiRuntimeChannelDescriptor(session, options = {}) {
+  const piConfig = options.piConfig || loadPiConfig();
+  const explicitModel = currentSessionModelOverride(session);
+  const source = resolvePiActiveSource(piConfig);
+  if (!source || source.mode === 'local') {
+    return {
+      mode: 'local',
+      explicitModel,
+      provider: String(session?.piProvider || '').trim() || null,
+    };
+  }
+  if (source.error) {
+    return {
+      mode: 'error',
+      error: String(source.error || ''),
+      explicitModel,
+    };
+  }
+  return {
+    mode: 'unified',
+    sourceName: String(source.name || ''),
+    apiBase: String(source.apiBase || ''),
+    upstreamType: String(source.upstreamType || 'openai'),
+    defaultModel: String(source.defaultModel || ''),
+    explicitModel,
+    provider: PI_MANAGED_PROVIDER_ID,
+  };
+}
+
 function buildRuntimeChannelDescriptor(session, agent, options = {}) {
   const normalizedAgent = normalizeAgent(agent || session?.agent);
   if (normalizedAgent === 'codex') return buildCodexRuntimeChannelDescriptor(session, options);
+  if (normalizedAgent === 'pi') return buildPiRuntimeChannelDescriptor(session);
   return buildClaudeRuntimeChannelDescriptor(session, options);
 }
 
@@ -2916,6 +3217,9 @@ function currentAgentRuntimeFingerprint(agent, options = {}) {
   const normalizedAgent = normalizeAgent(agent);
   if (normalizedAgent === 'codex') {
     return getCodexRuntimeFingerprint(options.codexConfig);
+  }
+  if (normalizedAgent === 'pi') {
+    return getPiRuntimeFingerprint(options.piConfig);
   }
   return getClaudeRuntimeFingerprint(options.modelConfig);
 }
@@ -3180,7 +3484,7 @@ function normalizeSession(session) {
     });
   }
   const runtimeContexts = ensureRuntimeContextStore(session);
-  for (const agentName of ['claude', 'codex']) {
+  for (const agentName of ['claude', 'codex', 'pi']) {
     const store = runtimeContexts[agentName];
     for (const [key, rawEntry] of Object.entries(store)) {
       const normalized = normalizeRuntimeContextEntry(rawEntry);
@@ -3199,6 +3503,14 @@ function getSessionAgent(session) {
 
 function isClaudeSession(session) {
   return getSessionAgent(session) === 'claude';
+}
+
+function isCodexSession(session) {
+  return getSessionAgent(session) === 'codex';
+}
+
+function isPiSession(session) {
+  return getSessionAgent(session) === 'pi';
 }
 
 function loadSession(id) {
@@ -3301,9 +3613,59 @@ function resolveClaudeModelInput(modelInput) {
   return { resolvedModel: normalized, resolvedAlias: modelShortName(normalized) || normalized };
 }
 
+/** Session-level model field for WS payloads — only explicit overrides, never invent defaults. */
 function sessionModelLabel(session) {
   if (!session?.model) return null;
   return isClaudeSession(session) ? (modelShortName(session.model) || session.model) : session.model;
+}
+
+/**
+ * Resolve a concrete model id for spawn / message labels (never "default" placeholder).
+ * Order: session override → channel/provider default → agent built-in fallback.
+ * Do NOT use this for session.model persistence on new_session.
+ */
+function resolveEffectiveModelId(session) {
+  const agent = getSessionAgent(session);
+  const explicit = String(session?.model || '').trim();
+  if (explicit && !/^default$/i.test(explicit)) {
+    return agent === 'claude' ? (modelShortName(explicit) || explicit) : explicit;
+  }
+
+  try {
+    if (agent === 'claude') {
+      const config = loadModelConfig();
+      if (config.mode === 'custom') {
+        const tpl = getClaudeSelectedTemplate(config);
+        const fromTpl = String(tpl?.defaultModel || tpl?.sonnetModel || tpl?.opusModel || '').trim();
+        if (fromTpl) return fromTpl;
+      }
+      const local = readClaudeSettingsCredentials();
+      if (local?.defaultModel) return String(local.defaultModel).trim();
+      // Runtime map sonnet is the Claude Code default.
+      return String(MODEL_MAP.sonnet || DEFAULT_CLAUDE_MODEL_MAP.sonnet || '').trim() || null;
+    }
+    if (agent === 'codex') {
+      const source = resolveCodexActiveSource(loadCodexConfig());
+      if (source?.defaultModel) return String(source.defaultModel).trim();
+      return null;
+    }
+    if (agent === 'pi') {
+      const source = resolvePiActiveSource(loadPiConfig());
+      if (source?.defaultModel) return String(source.defaultModel).trim();
+      // Local Pi defaults from ~/.pi/agent/settings.json
+      try {
+        const piDir = process.env.PI_CODING_AGENT_DIR
+          || path.join(process.env.HOME || process.env.USERPROFILE || '', '.pi', 'agent');
+        const settings = JSON.parse(fs.readFileSync(path.join(piDir, 'settings.json'), 'utf8'));
+        const model = String(settings?.defaultModel || '').trim();
+        const provider = String(settings?.defaultProvider || '').trim();
+        if (model && provider) return `${provider}/${model}`;
+        if (model) return model;
+      } catch {}
+      return null;
+    }
+  } catch {}
+  return null;
 }
 
 function getRuntimeContextCount(session, agent) {
@@ -3317,6 +3679,16 @@ function formatRuntimeChannelLabel(agent, descriptor) {
     if (mode === 'custom') return descriptor?.templateName ? `Claude · ${descriptor.templateName}` : 'Claude · AI 提供商';
     if (mode === 'legacy') return 'Claude · 旧线程';
     return 'Claude · 本地配置';
+  }
+  if (normalizedAgent === 'pi') {
+    if (mode === 'unified' || mode === 'custom') {
+      return descriptor?.sourceName ? `Pi · ${descriptor.sourceName}` : 'Pi · AI 提供商';
+    }
+    if (mode === 'error') return 'Pi · 配置异常';
+    if (descriptor?.provider && descriptor.provider !== PI_MANAGED_PROVIDER_ID) {
+      return `Pi · ${descriptor.provider}`;
+    }
+    return 'Pi · 本地配置';
   }
   if (mode === 'unified' || mode === 'custom') {
     return descriptor?.sourceName ? `Codex · ${descriptor.sourceName}` : 'Codex · AI 提供商';
@@ -3536,10 +3908,36 @@ function buildCodexCarryoverConfigLines(session) {
   return lines;
 }
 
+function buildPiCarryoverConfigLines(session) {
+  const lines = [];
+  const config = loadPiConfig();
+  if (normalizePiMode(config.mode) === 'local') {
+    lines.push('Pi 当前运行配置: local');
+    lines.push('Pi 本地配置目录: ~/.pi/agent（可用 PI_CODING_AGENT_DIR 覆盖）');
+  } else {
+    const source = resolvePiActiveSource(config);
+    if (source?.error) {
+      lines.push(`Pi 当前运行配置异常: ${source.error}`);
+    } else {
+      lines.push(`Pi 当前运行配置: unified${source?.name ? ` (${source.name})` : ''}`);
+      if (source?.apiBase) lines.push(`Pi API Base: ${source.apiBase}`);
+      if (source?.defaultModel) lines.push(`Pi 默认模型: ${source.defaultModel}`);
+      if (source?.upstreamType) lines.push(`Pi 上游类型: ${source.upstreamType}`);
+    }
+    if (config.sharedTemplate) lines.push(`Pi 激活提供商: ${config.sharedTemplate}`);
+  }
+  lines.push(`Pi CLI: ${PI_PATH}`);
+  if (session?.model) lines.push(`当前会话模型覆盖: ${session.model}`);
+  if (session?.piProvider) lines.push(`当前 Provider: ${session.piProvider}`);
+  lines.push(`当前权限模式: ${session?.permissionMode || 'yolo'}`);
+  if (session?.cwd) lines.push(`当前工作目录: ${session.cwd}`);
+  return lines;
+}
+
 function buildCarryoverConfigLines(session) {
-  return isClaudeSession(session)
-    ? buildClaudeCarryoverConfigLines(session)
-    : buildCodexCarryoverConfigLines(session);
+  if (isCodexSession(session)) return buildCodexCarryoverConfigLines(session);
+  if (isPiSession(session)) return buildPiCarryoverConfigLines(session);
+  return buildClaudeCarryoverConfigLines(session);
 }
 
 function collectCarryoverExactLines(messages, currentInputText, configLines) {
@@ -4292,6 +4690,17 @@ function cleanRunDir(sessionId) {
   } catch {}
 }
 
+function piSessionDir(sessionId) {
+  return path.join(SESSIONS_DIR, '_pi-sessions', sanitizeId(sessionId));
+}
+
+function deletePiLocalSession(sessionId) {
+  const dir = piSessionDir(sessionId);
+  try {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+  } catch {}
+}
+
 function collectSessionListSnapshot() {
   const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
   const sessions = [];
@@ -4443,10 +4852,9 @@ function condenseRuntimeError(raw) {
 function formatRuntimeError(agent, raw, context = {}) {
   const condensed = condenseRuntimeError(raw);
   const exitInfo = typeof context.exitCode === 'number' ? `（退出码 ${context.exitCode}）` : '';
+  const label = agentDisplayName(agent);
   if (!condensed) {
-    return agent === 'codex'
-      ? `Codex 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`
-      : `Claude 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`;
+    return `${label} 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`;
   }
 
   if (agent === 'codex') {
@@ -4474,8 +4882,30 @@ function formatRuntimeError(agent, raw, context = {}) {
     return `Codex 任务失败${exitInfo}：${condensed}`;
   }
 
+  if (agent === 'pi') {
+    if (/ENOENT|not found|No such file/i.test(condensed)) {
+      return '找不到 Pi CLI。请检查 `PI_PATH` 环境变量，或确认系统 PATH 中可直接运行 `pi`（npm i -g @earendil-works/pi-coding-agent）。';
+    }
+    if (/unexpected argument|unexpected option|Usage:\s*pi/i.test(raw || '')) {
+      return `Pi CLI 参数不兼容：${firstMeaningfulLine(condensed)}。建议检查当前 Pi 版本与 webcoding 的参数约定是否匹配。`;
+    }
+    if (/permission denied|EACCES|EPERM/i.test(condensed)) {
+      return 'Pi CLI 启动失败：当前环境没有足够权限执行该命令或访问目标目录。';
+    }
+    if (/authentication|unauthorized|forbidden|login|api key|credential|no api key|missing.*key/i.test(condensed)) {
+      return 'Pi 鉴权失败。请确认 `~/.pi/agent` 中已配置模型 Provider，或已设置对应 API Key 环境变量。';
+    }
+    if (/rate limit|quota|billing|credits/i.test(condensed)) {
+      return 'Pi 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
+    }
+    if (/network|timed out|timeout|ECONNRESET|ENOTFOUND|TLS|certificate|fetch failed/i.test(condensed)) {
+      return 'Pi 运行时网络请求失败。请检查当前网络、代理或证书环境后重试。';
+    }
+    return `Pi 任务失败${exitInfo}：${condensed}`;
+  }
+
   if (/ENOENT|not found|No such file/i.test(condensed)) {
-    return '找不到 Claude CLI。请检查当前环境是否能直接运行 `claude`。';
+    return `找不到 Claude CLI（当前配置路径：${CLAUDE_PATH}）。请确认本机可执行 \`claude\`，或在 .env 中设置正确的 CLAUDE_PATH（例如 ${path.join(process.env.HOME || '~', '.local', 'bin', 'claude')}）。`;
   }
   if (/authentication|unauthorized|forbidden|not logged in|\/login|login|api key|credential/i.test(condensed)) {
     return 'Claude 本地认证不可用。请检查本机 Claude CLI 当前是账号登录态还是本地自定义 API 配置，并确认对应凭据仍然有效。';
@@ -4484,27 +4914,40 @@ function formatRuntimeError(agent, raw, context = {}) {
 }
 
 function compactStartMessage(agent) {
-  return agent === 'codex'
-    ? '正在执行 Codex /compact 压缩上下文，请稍候…'
-    : '正在执行 Claude 原生 /compact 压缩上下文，请稍候…';
+  const label = agentDisplayName(agent);
+  if (agent === 'codex') return '正在执行 Codex /compact 压缩上下文，请稍候…';
+  if (agent === 'pi') return '正在执行 Pi 会话压缩，请稍候…';
+  return `正在执行 ${label} 原生 /compact 压缩上下文，请稍候…`;
 }
 
 function compactDoneMessage(agent) {
-  return agent === 'codex'
-    ? '上下文压缩完成。已执行 Codex /compact，下次继续在同一会话发送即可。'
-    : '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
+  if (agent === 'codex') {
+    return '上下文压缩完成。已执行 Codex /compact，下次继续在同一会话发送即可。';
+  }
+  if (agent === 'pi') {
+    return '上下文压缩完成。已向 Pi 会话发送 /compact（若 CLI 支持），下次继续在同一会话发送即可。';
+  }
+  return '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
 }
 
 function compactAutoStartMessage(agent) {
-  return agent === 'codex'
-    ? '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…'
-    : '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…';
+  if (agent === 'codex') {
+    return '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…';
+  }
+  if (agent === 'pi') {
+    return '检测到上下文达到上限，正在按 Pi /compact 自动压缩，然后继续当前任务…';
+  }
+  return '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…';
 }
 
 function compactAutoResumeMessage(agent) {
-  return agent === 'codex'
-    ? '检测到上一条请求因上下文过大失败，现已按 Codex 压缩计划继续执行。'
-    : '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。';
+  if (agent === 'codex') {
+    return '检测到上一条请求因上下文过大失败，现已按 Codex 压缩计划继续执行。';
+  }
+  if (agent === 'pi') {
+    return '检测到上一条请求因上下文过大失败，现已按 Pi 压缩计划继续执行。';
+  }
+  return '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。';
 }
 
 function isContextLimitError(agent, raw) {
@@ -4589,11 +5032,13 @@ function persistProcessCompletionSession(sessionId, entry, pendingSlash) {
   // Persist when we have final text, tool calls, OR thinking-only segments
   // (extended thinking intentionally stays out of fullText).
   if (session && (entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || hasPersistableSegments(entry))) {
+    const modelId = String(entry.resolvedModel || entry.effectiveModel || resolveEffectiveModelId(session) || '').trim() || null;
     session.messages.push({
       role: 'assistant',
       content: entry.fullText || '',
       toolCalls: entry.toolCalls || [],
       segments: entry.segments || [],
+      model: modelId,
       timestamp: new Date().toISOString(),
     });
     session.updated = new Date().toISOString();
@@ -4861,11 +5306,13 @@ function recoverProcesses() {
             } catch {}
           }
           if (session && (tempEntry.fullText || (tempEntry.toolCalls && tempEntry.toolCalls.length > 0))) {
+            const modelId = String(tempEntry.resolvedModel || tempEntry.effectiveModel || resolveEffectiveModelId(session) || '').trim() || null;
             session.messages.push({
               role: 'assistant',
               content: tempEntry.fullText,
               toolCalls: tempEntry.toolCalls || [],
               segments: tempEntry.segments || [],
+              model: modelId,
               timestamp: new Date().toISOString(),
             });
             session.updated = new Date().toISOString();
@@ -5218,6 +5665,12 @@ wss.on('connection', (ws, req) => {
       case 'get_codex_config':
         wsSend(ws, { type: 'codex_config', config: getCodexConfigMasked() });
         break;
+      case 'get_pi_config':
+        wsSend(ws, { type: 'pi_config', config: getPiConfigMasked() });
+        break;
+      case 'save_pi_config':
+        handleSavePiConfig(ws, msg.config);
+        break;
       case 'get_slash_commands': {
         const slashAgent = normalizeAgent(msg.agent || 'claude');
         const sendSlashList = () => {
@@ -5438,6 +5891,44 @@ function handleSaveModelConfig(ws, newConfig) {
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
+}
+
+function handleSavePiConfig(ws, newConfig) {
+  if (!newConfig || typeof newConfig !== 'object') {
+    return wsSend(ws, { type: 'error', message: '无效的 Pi 配置' });
+  }
+  const mode = normalizePiMode(newConfig.mode);
+  const sharedTemplate = String(newConfig.sharedTemplate || '').trim();
+  if (mode === 'unified') {
+    const modelConfig = loadModelConfig();
+    const templates = Array.isArray(modelConfig.templates) ? modelConfig.templates : [];
+    if (!templates.length) {
+      return wsSend(ws, { type: 'error', message: 'Pi 使用 AI 提供商时，请先创建至少一个提供商配置' });
+    }
+    if (sharedTemplate && !templates.find((t) => t.name === sharedTemplate)) {
+      return wsSend(ws, { type: 'error', message: `Pi 选中的提供商「${sharedTemplate}」不存在` });
+    }
+  }
+  savePiConfig({
+    mode,
+    sharedTemplate: mode === 'unified' ? sharedTemplate : '',
+  });
+  // Eagerly materialize runtime home so misconfig surfaces at save time.
+  const prepared = preparePiCustomRuntime(loadPiConfig());
+  if (prepared?.error) {
+    return wsSend(ws, { type: 'error', message: prepared.error });
+  }
+  plog('INFO', 'pi_config_saved', {
+    mode,
+    sharedTemplate: mode === 'unified' ? sharedTemplate : '',
+  });
+  wsSend(ws, { type: 'pi_config', config: getPiConfigMasked() });
+  wsSend(ws, {
+    type: 'system_message',
+    message: mode === 'unified'
+      ? 'Pi 配置已保存。当前将使用选中的 AI 提供商（写入隔离运行时，不影响 ~/.pi/agent）。'
+      : 'Pi 配置已保存。当前读取本机 ~/.pi/agent 配置。',
+  });
 }
 
 function handleSaveCodexConfig(ws, newConfig) {
@@ -5687,7 +6178,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
   const agent = session ? getSessionAgent(session) : normalizeAgent(fallbackAgent);
   const clientMessageId = normalizeClientMessageId(clientMessageIdRaw);
   const targetSessionId = session?.id || sessionId || null;
-  const label = agent === 'codex' ? 'Codex' : 'Claude';
+  const label = agentDisplayName(agent);
 
   function ackLocal() {
     // Idempotent replay of a completed local slash.
@@ -5747,6 +6238,49 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
           message: normalizedInput === 'default'
             ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
             : `Codex 模型已切换为: ${modelInput}`,
+        });
+      }
+      return;
+    }
+    if (agent === 'pi') {
+      if (!modelInput) {
+        wsSend(ws, {
+          type: 'model_list',
+          agent: 'pi',
+          entries: [
+            {
+              value: 'default',
+              label: '默认模型（Pi）',
+              desc: '使用 ~/.pi/agent 中配置的默认模型',
+            },
+            {
+              value: 'custom',
+              label: '自定义模型 ID',
+              desc: '例如 deepseek/deepseek-v4-pro、openai/gpt-4o、sonnet:high',
+            },
+          ],
+          current: session?.model || 'default',
+          currentFull: session?.model || '',
+          source: 'pi-cli',
+        });
+      } else {
+        const normalizedInput = modelInput.toLowerCase();
+        if (session) {
+          session.model = normalizedInput === 'default' ? null : modelInput;
+          session.updated = new Date().toISOString();
+          saveSession(session);
+        }
+        wsSend(ws, {
+          type: 'model_changed',
+          model: normalizedInput === 'default' ? '' : modelInput,
+          ...(session ? buildSessionRuntimeMeta(session) : {}),
+        });
+        wsSend(ws, {
+          type: 'system_message',
+          sessionId: targetSessionId,
+          message: normalizedInput === 'default'
+            ? 'Pi 模型已切换为: 默认模型（跟随 ~/.pi/agent 配置）'
+            : `Pi 模型已切换为: ${modelInput}`,
         });
       }
       return;
@@ -6204,6 +6738,8 @@ function handleDeleteSession(ws, sessionId) {
           error: error?.message || String(error),
         });
       });
+    } else if (sessionAgent === 'pi') {
+      deletePiLocalSession(sessionId);
     } else {
       for (const runtimeId of getAllRuntimeSessionIds(session, 'claude')) {
         deleteClaudeLocalSession(runtimeId);
@@ -6479,9 +7015,12 @@ function handleMessage(ws, msg, options = {}) {
   }
   sendSessionList(ws);
 
-  const spawnSpec = isClaudeSession(session)
-    ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
-    : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
+  const sessionAgent = getSessionAgent(session);
+  const spawnSpec = sessionAgent === 'codex'
+    ? buildCodexSpawnSpec(session, { attachments: resolvedAttachments })
+    : sessionAgent === 'pi'
+      ? buildPiSpawnSpec(session, { attachments: resolvedAttachments })
+      : buildClaudeSpawnSpec(session, { attachments: resolvedAttachments });
   if (spawnSpec?.error) {
     // New-chat session_info may have advertised isRunning=true; clear client state.
     wsSend(ws, { type: 'error', sessionId: currentSessionId, message: spawnSpec.error });
@@ -6631,34 +7170,37 @@ function handleMessage(ws, msg, options = {}) {
     setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
   });
 
+  const entryAgent = getSessionAgent(session);
+  const sharedRuntimeIdOpts = {
+    agent: entryAgent,
+    channelKey: spawnSpec.channelKey || null,
+    channelDescriptor: spawnSpec.channelDescriptor || null,
+  };
+  const existingRuntimeId = getRuntimeSessionId(session, sharedRuntimeIdOpts) || null;
   entry = {
     pid: proc.pid,
     ws,
-    agent: getSessionAgent(session),
+    agent: entryAgent,
     cwd: spawnSpec.cwd,
     // Snapshot mode for this turn — session.permissionMode may change mid-run for next turn.
     permissionMode: spawnSpec.mode || session.permissionMode || 'yolo',
+    // Concrete model used for this turn (for message avatar label).
+    effectiveModel: spawnSpec.effectiveModel || resolveEffectiveModelId(session) || null,
+    resolvedModel: null,
     abortRequested: false,
-    claudeRuntimeFingerprint: isClaudeSession(session) ? (spawnSpec.runtimeFingerprint || null) : null,
-    codexRuntimeFingerprint: getSessionAgent(session) === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
+    claudeRuntimeFingerprint: entryAgent === 'claude' ? (spawnSpec.runtimeFingerprint || null) : null,
+    codexRuntimeFingerprint: entryAgent === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
+    piRuntimeFingerprint: entryAgent === 'pi' ? (spawnSpec.runtimeFingerprint || null) : null,
     runtimeChannelKey: spawnSpec.channelKey || null,
     runtimeChannelDescriptor: spawnSpec.channelDescriptor || null,
-    claudeRuntimeSessionId: isClaudeSession(session)
-      ? (getRuntimeSessionId(session, {
-          agent: 'claude',
-          channelKey: spawnSpec.channelKey || null,
-          channelDescriptor: spawnSpec.channelDescriptor || null,
-        }) || null)
-      : null,
-    persistedClaudeSessionId: isClaudeSession(session)
-      ? (getRuntimeSessionId(session, {
-          agent: 'claude',
-          channelKey: spawnSpec.channelKey || null,
-          channelDescriptor: spawnSpec.channelDescriptor || null,
-        }) || null)
-      : null,
+    claudeRuntimeSessionId: entryAgent === 'claude' ? existingRuntimeId : null,
+    persistedClaudeSessionId: entryAgent === 'claude' ? existingRuntimeId : null,
+    piRuntimeSessionId: entryAgent === 'pi' ? existingRuntimeId : null,
+    persistedPiSessionId: entryAgent === 'pi' ? existingRuntimeId : null,
     claudePendingCostDelta: 0,
     claudeSessionTotalCost: session.totalCost || 0,
+    piPendingCostDelta: 0,
+    piSessionTotalCost: session.totalCost || 0,
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],
@@ -6717,11 +7259,14 @@ function sanitizeToolInput(toolName, input) {
 const {
   buildClaudeSpawnSpec,
   buildCodexSpawnSpec,
+  buildPiSpawnSpec,
   processRuntimeEvent,
 } = createAgentRuntime({
   processEnv: process.env,
   CLAUDE_PATH,
   CODEX_PATH,
+  PI_PATH,
+  SESSIONS_DIR,
   MODEL_MAP,
   loadModelConfig,
   applyCustomTemplateToSettings,
@@ -6729,6 +7274,9 @@ const {
   loadCodexConfig,
   prepareCodexCustomRuntime,
   getCodexRuntimeFingerprint,
+  loadPiConfig,
+  preparePiCustomRuntime,
+  getPiRuntimeFingerprint,
   wsSend,
   truncateObj,
   sanitizeToolInput,
@@ -7819,6 +8367,18 @@ plog('INFO', 'server_start', { port: PORT });
 
 server.listen(PORT, HOST, () => {
   console.log(`webcoding server listening on ${HOST}:${PORT}`);
+  console.log(`CLI paths: claude=${CLAUDE_PATH} | codex=${CODEX_PATH} | pi=${PI_PATH}`);
+  function warnStaleCliEnv(name, envVal, resolved) {
+    if (!envVal || envVal === resolved) return;
+    // Only warn when an explicit path was broken (not when a bare name was expanded to absolute).
+    const looksLikePath = path.isAbsolute(envVal) || envVal.includes('/') || envVal.includes('\\');
+    if (looksLikePath) {
+      console.warn(`[webcoding] ${name} env "${envVal}" is missing/unusable; using "${resolved}"`);
+    }
+  }
+  warnStaleCliEnv('CLAUDE_PATH', process.env.CLAUDE_PATH, CLAUDE_PATH);
+  warnStaleCliEnv('CODEX_PATH', process.env.CODEX_PATH, CODEX_PATH);
+  warnStaleCliEnv('PI_PATH', process.env.PI_PATH, PI_PATH);
   console.log(`  Local:   http://localhost:${PORT}`);
   const nets = os.networkInterfaces();
   for (const iface of Object.values(nets)) {

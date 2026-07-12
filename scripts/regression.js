@@ -14,6 +14,7 @@ const SERVER_PATH = path.join(REPO_DIR, 'server.js');
 const BRIDGE_PATH = path.join(REPO_DIR, 'lib', 'local-api-bridge.js');
 const MOCK_CLAUDE = path.join(REPO_DIR, 'scripts', 'mock-claude.js');
 const MOCK_CODEX = path.join(REPO_DIR, 'scripts', 'mock-codex.js');
+const MOCK_PI = path.join(REPO_DIR, 'scripts', 'mock-pi.js');
 const WS_AUTH_TIMEOUT_MS = 3000;
 const WS_CONNECT_TIMEOUT_MS = 10000;
 const THREAD_RESET_WARNING_RE = /重新建立新线程|无法原生续接旧线程|已新开线程并补充历史摘要/;
@@ -1482,6 +1483,92 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
   });
 }
 
+async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const session = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'hello from pi adapter', mode: 'yolo', agent: 'pi' }),
+      'session_info',
+      (msg) => msg.agent === 'pi' && /hello from pi adapter/.test(msg.title || ''),
+    );
+    assert(session.agent === 'pi', 'New session should be tagged as pi agent');
+
+    const delta = await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === session.sessionId && /Pi mock handled/.test(msg.text || ''),
+      8000,
+    );
+    assert(/Pi mock handled/.test(delta.text || ''), 'Pi mock should stream text_delta events');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
+    const firstText = getLastStoredAssistantText(sessionsDir, session.sessionId);
+    assert(/turn 1/.test(firstText || ''), 'First Pi turn should persist mock turn counter');
+
+    const processSpawnLine = findProcessLogLine(logsDir, session.sessionId, 'process_spawn');
+    assert(processSpawnLine && processSpawnLine.includes('"agent":"pi"'), 'Pi spawn should be logged with agent=pi');
+    assert(processSpawnLine.includes('--mode') && processSpawnLine.includes('json'), 'Pi spawn should use --mode json');
+
+    // Multi-turn resume via --session-id
+    client.send(buildAgentMessagePayload({
+      text: 'second turn on same pi session',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId: session.sessionId,
+    }));
+    await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === session.sessionId && /Pi mock handled/.test(msg.text || ''),
+      8000,
+    );
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
+    const secondText = getLastStoredAssistantText(sessionsDir, session.sessionId);
+    assert(/turn 2/.test(secondText || ''), 'Pi second turn should resume the same mock session state');
+
+    // Plan mode maps to read-only tools (assert full stored text — deltas are chunked)
+    const planSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'plan mode check', mode: 'plan', agent: 'pi' }),
+      'session_info',
+      (msg) => msg.agent === 'pi' && msg.title === 'plan mode check',
+    );
+    await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === planSession.sessionId && /Pi mock handled/.test(msg.text || ''),
+      8000,
+    );
+    await client.waitForType('done', (msg) => msg.sessionId === planSession.sessionId, 8000);
+    const planText = getLastStoredAssistantText(sessionsDir, planSession.sessionId);
+    assert(/tools=read,grep,find,ls/.test(planText || ''), 'Plan mode should map to read-only Pi tools');
+    const planSpawnLine = findProcessLogLine(logsDir, planSession.sessionId, 'process_spawn');
+    assert(planSpawnLine.includes('--tools') && planSpawnLine.includes('read,grep,find,ls'), 'Plan spawn should pass --tools read,grep,find,ls');
+
+    // Auth error mapping
+    const authSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger pi auth error', mode: 'yolo', agent: 'pi' }),
+      'session_info',
+      (msg) => msg.agent === 'pi' && msg.title === 'trigger pi auth error',
+    );
+    const authError = await client.waitForType('error', (msg) => /Pi 鉴权失败/.test(msg.message || ''), 8000);
+    assert(/Pi 鉴权失败/.test(authError.message || ''), 'Pi auth stderr should map to friendly auth error');
+    await client.waitForType('done', (msg) => msg.sessionId === authSession.sessionId, 8000);
+
+    // Structured JSON failure (exit 0 + stopReason=error) must surface as error, not silent success
+    const jsonErrSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger pi json error', mode: 'yolo', agent: 'pi' }),
+      'session_info',
+      (msg) => msg.agent === 'pi' && msg.title === 'trigger pi json error',
+    );
+    const jsonError = await client.waitForType(
+      'error',
+      (msg) => msg.sessionId === jsonErrSession.sessionId && /stopReason=error|Pi mock structured failure|Pi 请求失败/.test(msg.message || ''),
+      8000,
+    );
+    assert(jsonError, 'Pi JSON stopReason=error should emit error event even with exit code 0');
+    await client.waitForType('done', (msg) => msg.sessionId === jsonErrSession.sessionId, 8000);
+
+    // Session dir should exist under sessions/_pi-sessions
+    const piRoot = path.join(sessionsDir, '_pi-sessions');
+    assert(fs.existsSync(piRoot), 'Pi session storage root should be created under sessions/_pi-sessions');
+  });
+}
+
 async function runAttachmentBoundaryRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ token }) => {
     try {
@@ -2201,6 +2288,7 @@ async function runBridgeScriptRefreshRegressionCase({ tempRoot }) {
       HOME: homeDir,
       CLAUDE_PATH: MOCK_CLAUDE,
       CODEX_PATH: MOCK_CODEX,
+      PI_PATH: MOCK_PI,
     }, async () => {
       await waitForCondition(() => {
         try {
@@ -2275,6 +2363,7 @@ async function runClaudeLocalModelMapRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -2334,6 +2423,7 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async (serverHandle) => {
@@ -2488,6 +2578,7 @@ async function runClaudeConfigCarryoverRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -2678,6 +2769,7 @@ async function runClaudeStickyResumeRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -2783,6 +2875,7 @@ async function runCodexLocalConfigFingerprintRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -2869,6 +2962,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -3067,6 +3161,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   };
 
   await withServer(serverEnv, async () => {
@@ -3631,6 +3726,7 @@ async function main() {
       HOME: homeDir,
       CLAUDE_PATH: MOCK_CLAUDE,
       CODEX_PATH: MOCK_CODEX,
+      PI_PATH: MOCK_PI,
     };
 
     await withServer(serverEnv, async (serverHandle) => {
@@ -3669,6 +3765,7 @@ async function main() {
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));
+      await runner.run('pi agent adapter', () => runPiAgentRegressionCase(ctx));
       await runner.run('headless parity interactive and slash', () => runHeadlessParityRegressionCase(ctx));
       await runner.run('attachment boundary handling', () => runAttachmentBoundaryRegressionCase(ctx));
       await runner.run('expired attachment cleanup', () => runExpiredAttachmentCleanupRegressionCase(ctx));

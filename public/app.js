@@ -35,6 +35,7 @@
   const AGENT_LABELS = {
     claude: 'Claude',
     codex: 'Codex',
+    pi: 'Pi',
   };
 
   const DEFAULT_AGENT = 'claude';
@@ -111,6 +112,7 @@
   let currentAgent = selectedAgent;
   let modelConfigCache = null;
   let codexConfigCache = null;
+  let piConfigCache = null;
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
   let sidebarSwipe = null;
@@ -546,9 +548,12 @@
     const activeProject = getCurrentProjectContext();
     const runningCount = visibleSessions.filter((session) => session.isRunning).length;
     const currentMessageCount = getCurrentMessageCount();
-    const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
+    const usageText = costDisplay?.textContent
+      || (sessionState.currentAgent === 'codex' || sessionState.currentAgent === 'pi'
+        ? '暂无 token 统计'
+        : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
-    const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '默认模型' : 'Default');
+    const modelLabel = getConcreteModelLabel() || '—';
     const channelLabel = sessionState.currentActiveRuntime?.channelLabel || '当前渠道未建立';
     const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
@@ -1639,7 +1644,10 @@
       messages: cloneMessages(payload.messages || []),
       title: payload.title || '新会话',
       mode: payload.mode || 'yolo',
-      model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
+      // Prefer explicit session model; if empty, fall back to channel default from activeRuntime.
+      model: hasPayloadModel
+        ? (payload.model || normalizedRuntime?.displayModel || normalizedRuntime?.defaultModel || '')
+        : (normalizedRuntime?.displayModel || normalizedRuntime?.defaultModel || ''),
       activeRuntime: normalizedRuntime,
       activeChannelKey: payload.activeChannelKey || normalizedRuntime?.channelKey || null,
       runtimeCount: Number.isFinite(payload.runtimeCount)
@@ -2533,6 +2541,96 @@
     return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
   }
 
+  function isUsableModelId(value) {
+    const v = String(value || '').trim();
+    if (!v) return false;
+    if (/^default$/i.test(v)) return false;
+    if (/^默认/.test(v)) return false;
+    return true;
+  }
+
+  /** Concrete model id from channel config caches (client-side fallback). */
+  function getChannelConcreteModelFallback(agent) {
+    const normalized = normalizeAgent(agent || sessionState.currentAgent);
+    if (normalized === 'claude') {
+      const cfg = modelConfigCache;
+      if (cfg?.mode === 'custom' && cfg.activeTemplate) {
+        const tpl = (cfg.templates || []).find((t) => t.name === cfg.activeTemplate);
+        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
+        if (isUsableModelId(tpl?.sonnetModel)) return String(tpl.sonnetModel).trim();
+        if (isUsableModelId(tpl?.opusModel)) return String(tpl.opusModel).trim();
+      }
+      // Claude Code default when no override is configured.
+      return 'claude-sonnet-4-6';
+    }
+    if (normalized === 'codex') {
+      const cfg = codexConfigCache;
+      if (cfg?.mode === 'unified' && cfg.sharedTemplate) {
+        const tpl = (modelConfigCache?.templates || []).find((t) => t.name === cfg.sharedTemplate);
+        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
+      }
+      return '';
+    }
+    if (normalized === 'pi') {
+      const cfg = piConfigCache;
+      if (cfg?.mode === 'unified' && cfg.sharedTemplate) {
+        const tpl = (modelConfigCache?.templates || []).find((t) => t.name === cfg.sharedTemplate);
+        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
+      }
+      // Do not guess local Pi defaults (varies by machine); wait for runtime/session model.
+      return '';
+    }
+    return '';
+  }
+
+  /** Concrete model id for display — never "默认模型（…）". */
+  function getConcreteModelLabel(messageModel) {
+    const candidates = [
+      messageModel,
+      sessionState.currentModel,
+      sessionState.currentActiveRuntime?.explicitModel,
+      sessionState.currentActiveRuntime?.displayModel,
+      sessionState.currentActiveRuntime?.model,
+      sessionState.currentActiveRuntime?.defaultModel,
+      getChannelConcreteModelFallback(sessionState.currentAgent),
+    ];
+    for (const raw of candidates) {
+      if (!isUsableModelId(raw)) continue;
+      return String(raw).trim();
+    }
+    return '';
+  }
+
+  function formatModelAvatarLabel(modelId) {
+    const raw = String(modelId || '').trim();
+    if (!raw) return '';
+    // provider/model or provider/model:thinking → keep the model segment
+    let name = raw.includes('/') ? raw.split('/').pop() : raw;
+    name = name.replace(/:.*$/, ''); // strip :high thinking suffix
+    // Keep it short for the avatar column
+    if (name.length > 16) name = `${name.slice(0, 14)}…`;
+    return name;
+  }
+
+  function applyModelToAvatarCol(avatarCol, modelId) {
+    if (!avatarCol) return;
+    const id = getConcreteModelLabel(modelId);
+    let modelEl = avatarCol.querySelector('.msg-avatar-model');
+    if (!id) {
+      if (modelEl) modelEl.remove();
+      return;
+    }
+    if (!modelEl) {
+      modelEl = document.createElement('div');
+      modelEl.className = 'msg-avatar-model';
+      avatarCol.appendChild(modelEl);
+    }
+    modelEl.textContent = formatModelAvatarLabel(id);
+    modelEl.title = id;
+    const avatar = avatarCol.querySelector('.msg-avatar');
+    if (avatar) avatar.title = id;
+  }
+
   function updateCwdBadge() {
     const headerCwd = document.getElementById('chat-header-cwd');
     const headerMeta = document.getElementById('chat-session-meta');
@@ -2628,7 +2726,9 @@
     if (mas) mas.value = selectedAgent;
     if (mms) mms.value = sessionState.currentMode;
     if (importSessionBtn) {
-      importSessionBtn.textContent = selectedAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
+      if (selectedAgent === 'codex') importSessionBtn.textContent = '导入本地 Codex 会话';
+      else if (selectedAgent === 'pi') importSessionBtn.textContent = '导入本地 Pi 会话';
+      else importSessionBtn.textContent = '导入本地 Claude 会话';
     }
     if (chatAgentContext) {
       chatAgentContext.textContent = `当前对话：${currentAgentLabel} · 新建默认：${selectedAgentLabel}`;
@@ -2737,20 +2837,22 @@
     if (!sessionState.currentSessionId && snapshot.sessionId) {
       rebindNullQueueItemsToSession(snapshot.sessionId);
     }
-    // Preserve optimistic streaming when:
-    // 1) explicit option says so, or
-    // 2) first message of a new chat (currentSessionId was null) while still generating and server marks running.
+    // Preserve live streaming for this session until `done` finishes the turn.
+    // Do NOT require snapshot.isRunning — a late session_info with isRunning=false
+    // used to wipe pending text and leave a blank assistant bubble.
     const isNewSessionBind = !sessionState.currentSessionId && !!snapshot.sessionId && composeState.isGenerating;
+    const sameSession = !sessionState.currentSessionId
+      || snapshot.sessionId === sessionState.currentSessionId
+      || isNewSessionBind;
     const preserveStreaming = !!(
       composeState.isGenerating
-      && snapshot.isRunning
-      && (
-        options.preserveStreaming
-        || isNewSessionBind
-        || snapshot.sessionId === sessionState.currentSessionId
-      )
+      && sameSession
+      && options.preserveStreaming !== false
     );
     if (composeState.isGenerating && !preserveStreaming) {
+      // Flush any buffered tokens before tearing down the stream.
+      drainThinkingBuffer();
+      if (composeState.pendingText) flushRender();
       composeState.isGenerating = false;
       composeState.isAborting = false;
       sendBtn.hidden = false;
@@ -2760,6 +2862,8 @@
       abortBtn.title = '停止生成';
       composeState.pendingText = '';
       composeState.activeToolCalls.clear();
+      const streamEl = document.getElementById('streaming-msg');
+      if (streamEl) streamEl.removeAttribute('id');
     }
     sessionState.currentSessionId = snapshot.sessionId;
     sessionState.loadedHistorySessionId = snapshot.sessionId;
@@ -2897,7 +3001,7 @@
 
   function setStatsDisplay(msg) {
     if (!costDisplay) return;
-    if (sessionState.currentAgent === 'codex' && msg && msg.totalUsage) {
+    if ((sessionState.currentAgent === 'codex' || sessionState.currentAgent === 'pi') && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
         const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
@@ -3278,7 +3382,10 @@
       document.dispatchEvent(new CustomEvent('webcoding-auth-restored'));
       loginOverlay.hidden = true;
       app.hidden = false;
+      // Prefetch channel configs so avatar model labels can resolve concrete ids.
+      send({ type: 'get_model_config' });
       send({ type: 'get_codex_config' });
+      send({ type: 'get_pi_config' });
       send({ type: 'get_projects' });
       requestSlashCommands(selectedAgent);
       hideStatusBanner();
@@ -3374,8 +3481,9 @@
     applySessionSnapshot(snapshot, {
       immediate: isBlockingSessionLoad(msg.sessionId),
       suppressUnreadToast: false,
-      // Keep live streaming across session_info (incl. first message of a new chat).
-      preserveStreaming: !!(msg.isRunning && composeState.isGenerating && (
+      // Keep live streaming across session_info for this session until `done`.
+      // Do not gate on msg.isRunning — a late isRunning:false snapshot must not wipe the bubble.
+      preserveStreaming: !!(composeState.isGenerating && (
         !sessionState.currentSessionId || msg.sessionId === sessionState.currentSessionId
       )),
     });
@@ -3564,11 +3672,23 @@
   }
 
   function handleModelListMessage(msg) {
-    if ((msg.agent || sessionState.currentAgent) === 'codex') {
-      const options = Array.isArray(msg.entries) && msg.entries.length > 0 ? msg.entries : getCodexModelOptions();
+    const agent = msg.agent || sessionState.currentAgent;
+    if (agent === 'codex' || agent === 'pi') {
+      const options = Array.isArray(msg.entries) && msg.entries.length > 0
+        ? msg.entries
+        : (agent === 'codex' ? getCodexModelOptions() : [
+            { value: 'default', label: '默认模型（Pi）', desc: '使用 ~/.pi/agent 中配置的默认模型' },
+          ]);
       const activeValue = msg.currentFull || sessionState.currentModel || 'default';
-      showOptionPicker('选择 Codex 模型', options, activeValue, (value) => {
-        send({ type: 'message', text: `/model ${value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: 'codex' });
+      const title = agent === 'pi' ? '选择 Pi 模型' : '选择 Codex 模型';
+      showOptionPicker(title, options, activeValue, (value) => {
+        send({
+          type: 'message',
+          text: `/model ${value}`,
+          sessionId: sessionState.currentSessionId,
+          mode: sessionState.currentMode,
+          agent,
+        });
       });
       return;
     }
@@ -3684,7 +3804,9 @@
     if (!composeState.isGenerating && sessionState.currentSessionId) {
       setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
     }
-    if (composeState.isGenerating) finishGenerating(msg.sessionId);
+    if (composeState.isGenerating) {
+      finishGenerating(msg.sessionId, { skipResync: true });
+    }
   }
 
   function handleBackgroundDoneMessage(msg) {
@@ -3697,14 +3819,34 @@
     }
   }
 
+  function refreshAssistantAvatarModels() {
+    const modelId = getConcreteModelLabel();
+    if (!modelId || !messagesDiv) return;
+    messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
+      // Prefer per-message stored model when present.
+      const stored = msgEl.dataset.model || '';
+      const col = msgEl.querySelector('.msg-avatar-col');
+      applyModelToAvatarCol(col, stored || modelId);
+      if (!msgEl.dataset.model && modelId) msgEl.dataset.model = modelId;
+    });
+  }
+
   function handleModelConfigMessage(msg) {
     modelConfigCache = msg.config || null;
     emitWsEvent('model_config', msg.config);
+    refreshAssistantAvatarModels();
   }
 
   function handleCodexConfigMessage(msg) {
     codexConfigCache = msg.config || null;
     emitWsEvent('codex_config', msg.config);
+    refreshAssistantAvatarModels();
+  }
+
+  function handlePiConfigMessage(msg) {
+    piConfigCache = msg.config || null;
+    emitWsEvent('pi_config', msg.config);
+    refreshAssistantAvatarModels();
   }
 
   function handleProjectsConfigMessage(msg) {
@@ -3795,6 +3937,7 @@
     },
     model_config: handleModelConfigMessage,
     codex_config: handleCodexConfigMessage,
+    pi_config: handlePiConfigMessage,
     fetch_models_result: (msg) => {
       emitWsEvent('fetch_models_result', msg);
     },
@@ -3848,13 +3991,26 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
-    const msgEl = createMsgElement('assistant', '');
+    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
     msgEl.id = 'streaming-msg';
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';
     bubble.appendChild(createStreamingPlaceholder());
     messagesDiv.appendChild(msgEl);
     forceScrollToBottom();
+  }
+
+  function streamingBubbleHasVisibleAnswer() {
+    const bubble = getStreamingBubble();
+    if (!bubble) return false;
+    // Visible final text outside collapsed process groups
+    const candidates = bubble.querySelectorAll('.msg-segment-text');
+    for (const node of candidates) {
+      if (node.closest('.msg-process-group')) continue;
+      if (node.classList.contains('msg-segment-thinking') || node.dataset.phase === 'process') continue;
+      if (String(node.dataset.rawText || node.textContent || '').trim()) return true;
+    }
+    return false;
   }
 
   function finishGenerating(sessionId, options = {}) {
@@ -3889,14 +4045,35 @@
     // Collapse thinking/process/tools under a summary, leave the final answer expanded.
     collapseStreamingProcessForCompletedTurn();
 
-    const streamEl = document.getElementById('streaming-msg');
-    if (streamEl) streamEl.removeAttribute('id');
+    const sid = sessionId || sessionState.currentSessionId;
+    const needsResync = !options.interrupted && !options.skipResync && sid && !streamingBubbleHasVisibleAnswer();
 
-    if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
-      sessionState.currentSessionId = sessionId;
+    const streamEl = document.getElementById('streaming-msg');
+    if (streamEl) {
+      // Drop empty assistant shell left by failed/blank turns.
+      const bubble = streamEl.querySelector('.msg-bubble');
+      const hasContent = !!(bubble && (
+        bubble.querySelector('.msg-segment-text, .tool-call, .msg-process-group, .msg-text')
+        || String(bubble.textContent || '').trim()
+      ));
+      if (!hasContent) {
+        streamEl.remove();
+      } else {
+        streamEl.removeAttribute('id');
+      }
+    }
+
+    if (sid && (!sessionState.currentSessionId || sessionState.currentSessionId === sid)) {
+      sessionState.currentSessionId = sid;
     }
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
+
+    // If the stream ended with no visible answer (lost deltas / race), re-sync from server.
+    if (needsResync) {
+      openSession(sid, { forceSync: true, blocking: false, skipCloseSidebar: true });
+    }
+
     // Auto-send next queued message for this session after the turn completes.
     scheduleFlushSendQueue(80);
   }
@@ -4033,7 +4210,7 @@
     }
   }
 
-  function createMsgElement(role, content, attachments = []) {
+  function createMsgElement(role, content, attachments = [], model = '') {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
 
@@ -4045,14 +4222,26 @@
       return div;
     }
 
+    const avatarCol = document.createElement('div');
+    avatarCol.className = 'msg-avatar-col';
+
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
     if (role === 'user') {
       avatar.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
     } else if (sessionState.currentAgent === 'codex') {
       avatar.innerHTML = '<svg viewBox="0 0 256 260" width="18" height="18"><path fill="currentColor" d="M239.184 106.203a64.716 64.716 0 0 0-5.576-53.103C219.452 28.459 191 15.784 163.213 21.74A65.586 65.586 0 0 0 52.096 45.22a64.716 64.716 0 0 0-43.23 31.36c-14.31 24.602-11.061 55.634 8.033 76.74a64.665 64.665 0 0 0 5.525 53.102c14.174 24.65 42.644 37.324 70.446 31.36a64.72 64.72 0 0 0 48.754 21.744c28.481.025 53.714-18.361 62.414-45.481a64.767 64.767 0 0 0 43.229-31.36c14.137-24.558 10.875-55.423-8.083-76.483Zm-97.56 136.338a48.397 48.397 0 0 1-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 0 0 4.247-7.367v-72.85l21.845 12.636c.218.111.37.32.409.563v60.367c-.056 26.818-21.783 48.545-48.601 48.601Zm-104.466-44.61a48.345 48.345 0 0 1-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 0 0 8.441 0l63.181-36.425v25.221a.87.87 0 0 1-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803ZM23.549 85.38a48.499 48.499 0 0 1 25.58-21.333v61.39a8.288 8.288 0 0 0 4.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 0 1-.767 0L41.353 151.53c-23.211-13.454-31.171-43.144-17.804-66.405v.256Zm179.466 41.695-63.08-36.63L161.73 77.86a.819.819 0 0 1 .768 0l52.233 30.184a48.6 48.6 0 0 1-7.316 87.635v-61.391a8.544 8.544 0 0 0-4.4-7.213Zm21.742-32.69-1.535-.922-51.619-30.081a8.39 8.39 0 0 0-8.492 0L99.98 99.808V74.587a.716.716 0 0 1 .307-.665l52.233-30.133a48.652 48.652 0 0 1 72.236 50.391v.205ZM88.061 139.097l-21.845-12.585a.87.87 0 0 1-.41-.614V65.685a48.652 48.652 0 0 1 79.757-37.346l-1.535.87-51.67 29.825a8.595 8.595 0 0 0-4.246 7.367l-.051 72.697Zm11.868-25.58 28.138-16.217 28.188 16.218v32.434l-28.086 16.218-28.188-16.218-.052-32.434Z"/></svg>';
+    } else if (sessionState.currentAgent === 'pi') {
+      avatar.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 8v8"/><path d="M9 12h4a2.5 2.5 0 0 0 0-5H9"/><path d="M15 16.5c-.5.5-1.2.5-2 .5h-1"/></svg>';
     } else {
       avatar.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z" fill-rule="evenodd"/></svg>';
+    }
+    avatarCol.appendChild(avatar);
+
+    if (role === 'assistant') {
+      const modelId = getConcreteModelLabel(model);
+      applyModelToAvatarCol(avatarCol, modelId);
+      if (modelId) div.dataset.model = modelId;
     }
 
     const bubble = document.createElement('div');
@@ -4076,7 +4265,7 @@
       }
     }
 
-    div.appendChild(avatar);
+    div.appendChild(avatarCol);
     div.appendChild(bubble);
     return div;
   }
@@ -4652,7 +4841,7 @@
 
   function buildMsgElement(m) {
     if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || []);
-    const el = createMsgElement('assistant', '');
+    const el = createMsgElement('assistant', '', [], m.model || '');
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
@@ -5067,6 +5256,9 @@
     const normalized = normalizeAgent(agent);
     if (normalized === 'codex') {
       return '删除本会话将同步删去本地 Codex rollout 历史与线程记录，不可恢复。确认删除？';
+    }
+    if (normalized === 'pi') {
+      return '删除本会话将同步删去 webcoding 侧的 Pi 会话存储，不可恢复。确认删除？';
     }
     return '删除本会话将同步删去本地 Claude 中的会话历史，不可恢复。确认删除？';
   }
@@ -6372,12 +6564,14 @@
   }
 
   function showModelPicker() {
-    if (sessionState.currentAgent === 'codex') {
-      send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
-      return;
-    }
-    // Request real model list from server — server responds with model_list event
-    send({ type: 'message', text: '/model', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
+    // Request model list from server — Claude uses curated aliases; Codex/Pi use freeform IDs.
+    send({
+      type: 'message',
+      text: '/model',
+      sessionId: sessionState.currentSessionId,
+      mode: sessionState.currentMode,
+      agent: sessionState.currentAgent,
+    });
   }
 
   function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
@@ -6564,7 +6758,7 @@
       // Local tip from menu metadata when available; server remains source of truth.
       const baseCmd = text.split(/\s+/)[0];
       const meta = currentSlashCommands.find((c) => c.cmd === baseCmd || c.cmd === baseCmd.toLowerCase());
-      const label = sessionState.currentAgent === 'codex' ? 'Codex' : 'Claude';
+      const label = AGENT_LABELS[sessionState.currentAgent] || 'Agent';
       if (meta?.availability === 'platform' || baseCmd === '/web-help' || baseCmd === '/webhelp') {
         appendSystemMessage(`正在由 Webcoding 处理 ${baseCmd}…`);
       } else if (meta?.availability === 'tui-only') {
@@ -6719,6 +6913,8 @@
     if (action === 'import-session') {
       if (selectedAgent === 'codex') {
         showImportCodexSessionModal();
+      } else if (selectedAgent === 'pi') {
+        appendSystemMessage('Pi 会话导入尚未支持。请新建 Pi 会话，或在终端使用 `pi --resume` 继续本地会话。');
       } else {
         showImportSessionModal();
       }
@@ -6861,6 +7057,8 @@
     newChatDropdown.hidden = true;
     if (selectedAgent === 'codex') {
       showImportCodexSessionModal();
+    } else if (selectedAgent === 'pi') {
+      appendSystemMessage('Pi 会话导入尚未支持。请新建 Pi 会话，或在终端使用 `pi --resume` 继续本地会话。');
     } else {
       showImportSessionModal();
     }
@@ -7142,7 +7340,7 @@
         <button class="settings-nav-card" data-settings-page="agent">
           <div class="settings-nav-card-main">
             <div class="settings-nav-card-title">代理渠道</div>
-            <div class="settings-nav-card-meta">Claude / Codex 渠道与 AI 提供商</div>
+            <div class="settings-nav-card-meta">Claude / Codex / Pi 渠道与 AI 提供商</div>
           </div>
           <span class="settings-nav-card-arrow">›</span>
         </button>
@@ -7191,6 +7389,13 @@
         <div class="settings-field">
           <label>Codex 渠道</label>
           <select class="settings-select" id="unified-codex-mode"></select>
+        </div>
+        <div class="settings-field">
+          <label>Pi 渠道</label>
+          <select class="settings-select" id="unified-pi-mode"></select>
+          <div class="settings-inline-note" style="margin-top:6px">
+            本机 <code>~/.pi/agent</code>，或选用下方 AI 提供商（写入隔离运行时，不改本机 Pi 配置）。
+          </div>
         </div>
         <div class="settings-divider-light"></div>
         <div class="settings-section-title">AI 提供商</div>
@@ -7346,7 +7551,7 @@
       </div>
       <datalist id="unified-template-models"></datalist>
       <div class="settings-inline-note">
-        这套 AI 提供商配置会出现在 Claude 和 Codex 的渠道下拉框里。Codex 主要使用 API Key、API Base URL 和“默认模型”；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
+        这套 AI 提供商配置会出现在 Claude、Codex 和 Pi 的渠道下拉框里。Codex / Pi 主要使用 API Key、API Base URL 和“默认模型”；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
       </div>
       <div class="settings-actions">
         <button class="btn-save" id="unified-template-ok">确定</button>
@@ -7390,6 +7595,7 @@
     const closeBtn = panel.querySelector('.settings-close');
     const claudeModeSelect = panel.querySelector('#unified-claude-mode');
     const codexModeSelect = panel.querySelector('#unified-codex-mode');
+    const piModeSelect = panel.querySelector('#unified-pi-mode');
     const templateArea = panel.querySelector('#unified-template-area');
     const unifiedSaveBtn = panel.querySelector('#unified-save-btn');
     const unifiedStatusDiv = panel.querySelector('#unified-status');
@@ -7513,18 +7719,28 @@
 
     let currentNotifyConfig = null;
     let currentCodexConfig = null;
+    let currentPiConfig = null;
     let modelConfigLoaded = false;
     let codexConfigLoaded = false;
+    let piConfigLoaded = false;
     let modelEditingTemplates = [];
     let providerEditorSelection = '';
     let selectedClaudeChannel = 'local';
     let selectedCodexChannel = 'local';
+    let selectedPiChannel = 'local';
     let _onUpdateInfo = null;
 
+    function channelsReady() {
+      // Pi config is optional for opening the panel (older servers may not reply).
+      // Save still requires piConfigLoaded OR we treat missing as local.
+      return modelConfigLoaded && codexConfigLoaded;
+    }
+
     function syncUnifiedControlsState() {
-      const ready = modelConfigLoaded && codexConfigLoaded;
+      const ready = channelsReady();
       claudeModeSelect.disabled = !ready;
       codexModeSelect.disabled = !ready;
+      if (piModeSelect) piModeSelect.disabled = !ready;
       unifiedSaveBtn.disabled = !ready;
     }
 
@@ -7546,6 +7762,14 @@
       currentCodexConfig = config || { mode: 'local', legacyMode: '' };
       selectedCodexChannel = currentCodexConfig.mode === 'unified'
         ? (currentCodexConfig.sharedTemplate || modelEditingTemplates[0]?.name || 'local')
+        : 'local';
+    }
+
+    function applyPiConfigToPanel(config, markLoaded = true) {
+      if (markLoaded) piConfigLoaded = true;
+      currentPiConfig = config || { mode: 'local', sharedTemplate: '' };
+      selectedPiChannel = currentPiConfig.mode === 'unified'
+        ? (currentPiConfig.sharedTemplate || modelEditingTemplates[0]?.name || 'local')
         : 'local';
     }
 
@@ -7577,6 +7801,7 @@
         providerEditorSelection = '';
         selectedClaudeChannel = 'local';
         selectedCodexChannel = 'local';
+        selectedPiChannel = 'local';
         return;
       }
 
@@ -7589,6 +7814,9 @@
       }
       if (selectedCodexChannel !== 'local' && !names.has(selectedCodexChannel)) {
         selectedCodexChannel = modelEditingTemplates[0].name;
+      }
+      if (selectedPiChannel !== 'local' && !names.has(selectedPiChannel)) {
+        selectedPiChannel = modelEditingTemplates[0].name;
       }
     }
 
@@ -7605,18 +7833,34 @@
         <option value="local">读取本机 Codex 配置</option>
         ${providerOptions}
       `;
+      if (piModeSelect) {
+        piModeSelect.innerHTML = `
+          <option value="local">读取本机 Pi 配置 (~/.pi/agent)</option>
+          ${providerOptions}
+        `;
+        piModeSelect.value = selectedPiChannel;
+      }
       claudeModeSelect.value = selectedClaudeChannel;
       codexModeSelect.value = selectedCodexChannel;
     }
 
     function renderTemplateArea() {
-      if (!modelConfigLoaded || !codexConfigLoaded) {
+      if (!channelsReady()) {
         templateArea.innerHTML = `
           <div class="settings-inline-note">
             正在加载 AI 提供商配置...
           </div>
         `;
+        // Still paint channel selects so Claude/Codex/Pi rows are never blank shells.
+        if (modelConfigLoaded || codexConfigLoaded || piConfigLoaded) {
+          renderAgentChannelOptions();
+        }
         return;
+      }
+
+      // If Pi config never arrived (stale server), default to local so the panel stays usable.
+      if (!piConfigLoaded) {
+        applyPiConfigToPanel({ mode: 'local', sharedTemplate: '' }, true);
       }
 
       renderAgentChannelOptions();
@@ -7630,7 +7874,7 @@
       if (!modelEditingTemplates.length) {
         templateArea.innerHTML = `
           <div class="settings-inline-note">
-            AI 提供商列表为空。只要 Claude 或 Codex 有一个需要走远程接口，就先在这里新建至少一套提供商配置。
+            AI 提供商列表为空。只要 Claude、Codex 或 Pi 有一个需要走远程接口，就先在这里新建至少一套提供商配置。
           </div>
           ${legacyNote ? `<div class="settings-inline-note warning">${legacyNote}</div>` : ''}
           <div class="settings-actions" style="margin-top:0">
@@ -7791,6 +8035,7 @@
           if (providerEditorSelection === previousName) providerEditorSelection = name;
           if (selectedClaudeChannel === previousName) selectedClaudeChannel = name;
           if (selectedCodexChannel === previousName) selectedCodexChannel = name;
+          if (selectedPiChannel === previousName) selectedPiChannel = name;
         } else {
           modelEditingTemplates.push({
             name,
@@ -7820,6 +8065,12 @@
       selectedCodexChannel = codexModeSelect.value;
       renderTemplateArea();
     });
+    if (piModeSelect) {
+      piModeSelect.addEventListener('change', () => {
+        selectedPiChannel = piModeSelect.value;
+        renderTemplateArea();
+      });
+    }
     themeSelect.value = getStoredTheme();
     themeSelect.addEventListener('change', () => {
       const nextTheme = applyTheme(themeSelect.value);
@@ -7840,15 +8091,20 @@
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
 
     unifiedSaveBtn.addEventListener('click', async () => {
-      if (!modelConfigLoaded || !codexConfigLoaded) {
+      if (!channelsReady()) {
         showUnifiedStatus('正在同步当前配置，请稍后再保存', 'error');
         return;
+      }
+      if (!piConfigLoaded) {
+        // Stale server without get_pi_config — still allow Claude/Codex save.
+        applyPiConfigToPanel({ mode: 'local', sharedTemplate: '' }, true);
       }
 
       ensureChannelSelections();
       const claudeUsesProvider = selectedClaudeChannel !== 'local';
       const codexUsesProvider = selectedCodexChannel !== 'local';
-      const needsProvider = claudeUsesProvider || codexUsesProvider;
+      const piUsesProvider = selectedPiChannel !== 'local';
+      const needsProvider = claudeUsesProvider || codexUsesProvider || piUsesProvider;
       if (needsProvider && modelEditingTemplates.length === 0) {
         showUnifiedStatus('至少需要一个 AI 提供商配置', 'error');
         return;
@@ -7860,6 +8116,9 @@
       const codexTemplate = codexUsesProvider
         ? modelEditingTemplates.find((template) => template.name === selectedCodexChannel) || null
         : null;
+      const piTemplate = piUsesProvider
+        ? modelEditingTemplates.find((template) => template.name === selectedPiChannel) || null
+        : null;
 
       if (claudeUsesProvider && (!claudeTemplate || !claudeTemplate.apiKey || !claudeTemplate.apiBase)) {
         showUnifiedStatus('Claude 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
@@ -7869,10 +8128,19 @@
         showUnifiedStatus('Codex 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
         return;
       }
+      if (piUsesProvider && (!piTemplate || !piTemplate.apiKey || !piTemplate.apiBase)) {
+        showUnifiedStatus('Pi 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
+        return;
+      }
+      if (piUsesProvider && !String(piTemplate.defaultModel || '').trim()) {
+        showUnifiedStatus('Pi 选中的 AI 提供商需要填写「默认模型」', 'error');
+        return;
+      }
 
       showUnifiedStatus('正在保存...', '');
       const waitModelConfig = waitForWsEvent('model_config', { timeoutMs: 8000 });
       const waitCodexConfig = waitForWsEvent('codex_config', { timeoutMs: 8000 });
+      const waitPiConfig = waitForWsEvent('pi_config', { timeoutMs: 8000 });
       send({
         type: 'save_model_config',
         config: {
@@ -7890,9 +8158,31 @@
           enableSearch: false,
         },
       });
+      send({
+        type: 'save_pi_config',
+        config: {
+          mode: piUsesProvider ? 'unified' : 'local',
+          sharedTemplate: piUsesProvider ? selectedPiChannel : '',
+        },
+      });
       try {
-        await Promise.all([waitModelConfig, waitCodexConfig]);
-        showUnifiedStatus('已保存', 'success');
+        const results = await Promise.allSettled([waitModelConfig, waitCodexConfig, waitPiConfig]);
+        const modelOk = results[0].status === 'fulfilled';
+        const codexOk = results[1].status === 'fulfilled';
+        const piOk = results[2].status === 'fulfilled';
+        if (modelOk && codexOk && piOk) {
+          showUnifiedStatus('已保存（含 Pi 渠道）', 'success');
+        } else if (modelOk && codexOk) {
+          showUnifiedStatus(
+            piOk
+              ? '已保存'
+              : 'Claude/Codex 已保存；Pi 渠道未生效（请重启 webcoding 服务以加载最新后端）',
+            piOk ? 'success' : 'error',
+          );
+        } else {
+          const firstErr = results.find((r) => r.status === 'rejected');
+          showUnifiedStatus(firstErr?.reason?.message || '保存失败，请重试', 'error');
+        }
       } catch (error) {
         showUnifiedStatus(error?.message || '保存失败，请重试', 'error');
       }
@@ -7963,6 +8253,12 @@
       renderTemplateArea();
     });
 
+    registerSettingsPanelHandler('pi_config', (config) => {
+      applyPiConfigToPanel(config);
+      syncUnifiedControlsState();
+      renderTemplateArea();
+    });
+
     registerSettingsPanelHandler('tunnel_status', (msg) => {
       applyTunnelStatus(msg);
     });
@@ -7989,12 +8285,27 @@
 
     if (modelConfigCache) applyModelConfigToPanel(modelConfigCache, false);
     if (codexConfigCache) applyCodexConfigToPanel(codexConfigCache, false);
+    if (piConfigCache) applyPiConfigToPanel(piConfigCache, false);
     syncUnifiedControlsState();
     renderTemplateArea();
     send({ type: 'get_notify_config' });
     send({ type: 'get_model_config' });
     send({ type: 'get_codex_config' });
+    send({ type: 'get_pi_config' });
     send({ type: 'get_tunnel_status' });
+    // Paint default Pi options immediately so the row is never empty while waiting.
+    if (piModeSelect && !piModeSelect.options.length) {
+      piModeSelect.innerHTML = '<option value="local">读取本机 Pi 配置 (~/.pi/agent)</option>';
+      piModeSelect.value = 'local';
+    }
+    // If backend never answers get_pi_config (stale server), unstick the panel.
+    setTimeout(() => {
+      if (!piConfigLoaded && modelConfigLoaded && codexConfigLoaded) {
+        applyPiConfigToPanel({ mode: 'local', sharedTemplate: '' }, true);
+        syncUnifiedControlsState();
+        renderTemplateArea();
+      }
+    }, 1500);
   }
 
   function buildNotifyFieldsHtml(config, provider) {

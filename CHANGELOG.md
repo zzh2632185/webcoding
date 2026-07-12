@@ -1,5 +1,26 @@
 # 更新记录
 
+## v1.6.0
+
+### 新功能
+
+- **Pi Agent 适配** — 第三代理渠道：`pi -p --mode json` headless 接入
+  - 后端：`buildPiSpawnSpec` / `processPiEvent`（text/thinking 流、工具调用、费用与 token 统计、session 续接）
+  - 权限模式映射：YOLO=`--approve`，默认=`--no-approve`，Plan=`--tools read,grep,find,ls`
+  - 会话存储：`sessions/_pi-sessions/{sessionId}/`，多轮通过 `--session-id` 续接
+  - **代理渠道设置**：与 Claude/Codex 并列，可选「本机 ~/.pi/agent」或共用 AI 提供商；unified 模式写入隔离 `config/pi-runtime-home`（不改用户本机 Pi 配置）
+  - 前端：Agent 切换页签新增 Pi；模型选择支持 freeform ID（如 `provider/model`）
+  - 环境变量：`PI_PATH`（默认 `pi`）
+  - 回归：`scripts/mock-pi.js` + `pi agent adapter` 用例
+- **消息头像模型标签** — 助手消息头像下展示具体 model id（会话覆盖 / 渠道默认 / CLI 回报），不在顶栏堆「默认模型」文案
+
+### 修复
+
+- **Claude CLI 路径解析** — 环境变量指向失效绝对路径（如缺失的 `~/.volta/bin/claude`）时自动回退到 `~/.local/bin` 与 PATH 探测
+- **Claude 空白回复** — 生成中的 `session_info` 不再冲掉直播流；支持 `stream_event` 增量与 `result` 文本兜底；空气泡结束时自动重拉会话
+- **Pi 结构化错误** — `message_end.stopReason=error`（exit 0）也会向前端报错，避免静默成功
+- **顶栏 / 聊天头布局** — 会话标题与项目路径不再被固定高度裁切；三 Agent 页签下顶栏更耐挤压
+
 ## v1.5.0
 
 ### 修复
