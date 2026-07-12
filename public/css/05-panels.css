@@ -1182,17 +1182,17 @@ body.git-panel-resizing * {
 }
 
 .git-panel {
-  display: none;
+  display: none !important;
   width: var(--git-panel-width);
   min-width: var(--git-panel-width);
-  border-left: 1px solid var(--line);
-  background: var(--surface);
+  border-left: 1px solid var(--color-hairline);
+  background: var(--color-pure-white);
   flex-shrink: 0;
   overflow: hidden;
   flex-direction: column;
 }
 .git-panel.visible {
-  display: flex;
+  display: flex !important;
 }
 
 .git-topbar-btn {

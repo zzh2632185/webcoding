@@ -1443,46 +1443,15 @@
     const projectCount = Array.isArray(projects) ? projects.length : 0;
     return `
       <div class="welcome-msg">
-        <div class="welcome-header">
-          <h3>${label} 工作区</h3>
-          <p>开始对话，或从侧边栏选择已有会话。</p>
-        </div>
-        <div class="welcome-stats">
-          <div class="welcome-stat">
-            <strong>${sessionCount}</strong>
-            <span>会话数</span>
-          </div>
-          <div class="welcome-stat">
-            <strong>${projectCount}</strong>
-            <span>项目数</span>
-          </div>
-          <div class="welcome-stat">
-            <strong>${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode}</strong>
-            <span>模式</span>
-          </div>
-        </div>
+        <h3>${label}</h3>
+        <p>开始对话，或从侧边栏选择已有会话。</p>
+        <p class="welcome-meta">${sessionCount} 个会话 · ${projectCount} 个项目 · ${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode} 模式</p>
         <div class="welcome-actions">
           ${buildWorkspaceActionButtons([
             { action: 'new-session', label: '新建会话', primary: true },
             { action: 'import-session', label: '导入历史' },
             { action: 'switch-model', label: '切换模型' },
           ], { compact: true })}
-        </div>
-        <div class="welcome-panels">
-          <section class="welcome-panel">
-            <div class="welcome-panel-kicker">常用指令</div>
-            <ul class="welcome-list">
-              <li><code>/model</code> 查看或切换模型</li>
-              <li><code>/mode</code> 切换权限模式</li>
-              <li><code>/compact</code> 压缩上下文</li>
-            </ul>
-          </section>
-          <section class="welcome-panel">
-            <div class="welcome-panel-kicker">多模态协作</div>
-            <ul class="welcome-list">
-              <li>支持随消息附带图片，适合 UI、截图和报错定位。</li>
-            </ul>
-          </section>
         </div>
       </div>
     `;

@@ -213,16 +213,21 @@
     display: none !important;
   }
 
-  .git-panel {
+  .git-panel:not(.visible) {
+    display: none !important;
+  }
+
+  .git-panel.visible {
+    display: flex !important;
     position: fixed;
     right: 0;
-    top: 56px;
+    top: 0;
     bottom: 0;
     width: 100%;
     min-width: 0;
     z-index: 200;
     border-left: none;
-    border-top: 1px solid var(--line);
+    border-top: 1px solid var(--color-hairline);
   }
 
   .git-panel-scroll {

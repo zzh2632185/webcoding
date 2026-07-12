@@ -18,24 +18,47 @@
   background: transparent;
 }
 
+.new-chat-split {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
 .new-chat-btn {
-  width: 100%;
-  min-height: 38px;
-  padding: var(--spacing-8) var(--spacing-16);
+  flex: 1;
+  min-height: 36px;
+  padding: var(--spacing-6) var(--spacing-10);
   font-size: var(--text-caption);
   font-weight: var(--font-weight-medium);
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: var(--spacing-8);
   background: transparent;
   color: var(--color-graphite-ink);
-  border: 1px solid var(--color-hairline);
+  border: none;
   border-radius: var(--radius-nav);
   cursor: pointer;
 }
 
 .new-chat-btn:hover {
+  background: var(--color-hover-veil);
+}
+
+.new-chat-arrow {
+  flex-shrink: 0;
+  min-width: 32px;
+  min-height: 36px;
+  padding: var(--spacing-6) var(--spacing-8);
+  font-size: 12px;
+  color: var(--color-graphite-ink);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-nav);
+  cursor: pointer;
+}
+
+.new-chat-arrow:hover {
   background: var(--color-hover-veil);
 }
 

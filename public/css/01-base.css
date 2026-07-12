@@ -26,9 +26,7 @@ body {
 
 /* === Shared Button Base === */
 :where(
-  .login-box button,
-  .new-chat-btn,
-  .new-chat-arrow,
+  .login-submit-btn,
   .settings-actions button,
   .modal-btn-primary,
   .modal-btn-secondary,
@@ -63,9 +61,7 @@ body {
 }
 
 :where(
-  .login-box button,
-  .new-chat-btn,
-  .new-chat-arrow,
+  .login-submit-btn,
   .settings-actions .btn-test,
   .settings-actions .btn-save,
   .modal-btn-primary,
@@ -81,9 +77,7 @@ body {
 }
 
 :where(
-  .login-box button,
-  .new-chat-btn,
-  .new-chat-arrow,
+  .login-submit-btn,
   .settings-actions button,
   .modal-btn-primary,
   .modal-btn-secondary,

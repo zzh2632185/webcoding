@@ -955,20 +955,15 @@
   box-shadow: none;
 }
 
-/* Centered conversation column */
+/* Chat column fills workspace; reading width applied to messages/input only */
 .chat-stage-shell {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
   width: 100%;
-  max-width: var(--chat-max-width);
-  margin: 0 auto;
-}
-
-.messages {
-  padding-left: var(--spacing-16);
-  padding-right: var(--spacing-16);
+  max-width: none;
+  margin: 0;
 }
 
 .input-area {
