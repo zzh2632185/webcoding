@@ -8,6 +8,7 @@ const path = require('path');
 const { isDeepStrictEqual } = require('util');
 const { spawn, spawnSync } = require('child_process');
 const WebSocket = require('ws');
+const { createAgentRuntime } = require('../lib/agent-runtime');
 
 const REPO_DIR = path.resolve(__dirname, '..');
 const SERVER_PATH = path.join(REPO_DIR, 'server.js');
@@ -863,6 +864,198 @@ function createTestRunner() {
   };
 }
 
+function createRuntimeEnvFixture(processEnv, options = {}) {
+  const noop = () => {};
+  return createAgentRuntime({
+    processEnv,
+    CLAUDE_PATH: '/mock/claude',
+    CODEX_PATH: '/mock/codex',
+    PI_PATH: '/mock/pi',
+    SESSIONS_DIR: path.join(processEnv.HOME, 'sessions'),
+    MODEL_MAP: {},
+    loadModelConfig: () => options.modelConfig || { mode: 'local', activeTemplate: '', templates: [] },
+    applyCustomTemplateToSettings: noop,
+    getClaudeRuntimeFingerprint: () => 'claude-runtime-fixture',
+    loadCodexConfig: () => ({ mode: options.codexRuntimeConfig?.mode === 'custom' ? 'unified' : 'local' }),
+    prepareCodexCustomRuntime: () => options.codexRuntimeConfig || { mode: 'local' },
+    getCodexRuntimeFingerprint: () => 'codex-runtime-fixture',
+    loadPiConfig: () => ({ mode: 'local' }),
+    preparePiCustomRuntime: () => ({ mode: 'local' }),
+    getPiRuntimeFingerprint: () => 'pi-runtime-fixture',
+    wsSend: noop,
+    truncateObj: (value) => value,
+    sanitizeToolInput: (_name, value) => value,
+    loadSession: () => null,
+    saveSession: noop,
+    getRuntimeSessionState: () => null,
+    getFallbackRuntimeSessionState: () => null,
+    setRuntimeSessionState: noop,
+    setRuntimeSessionId: noop,
+    getRuntimeSessionId: () => null,
+    runtimeFingerprintsCompatible: (agent, left, right) => left === right,
+    onSlashCommandsDiscovered: noop,
+  });
+}
+
+async function runAgentRuntimeEnvironmentRegressionCase({ tempRoot }) {
+  const fixtureHome = path.join(tempRoot, 'runtime-env-home');
+  const processEnv = {
+    PATH: process.env.PATH || '/usr/bin',
+    HOME: fixtureHome,
+    LANG: 'en_US.UTF-8',
+    SSH_AUTH_SOCK: '/tmp/webcoding-regression-ssh.sock',
+    CC_WEB_PASSWORD: 'must-not-reach-agent',
+    CLAUDECODE: 'must-not-reach-agent',
+    CLAUDE_CONFIG_DIR: path.join(fixtureHome, 'custom-claude'),
+    ANTHROPIC_API_KEY: 'claude-local-key',
+    ANTHROPIC_BASE_URL: 'https://anthropic.example.test',
+    AWS_PROFILE: 'claude-bedrock-profile',
+    CODEX_HOME: path.join(fixtureHome, 'custom-codex'),
+    OPENAI_API_KEY: 'codex-local-key',
+    OPENAI_BASE_URL: 'https://openai.example.test',
+    CUSTOM_PROVIDER_TOKEN: 'explicit-provider-key',
+    UNRELATED_SECRET: 'must-not-reach-agent',
+    CC_WEB_CLI_ENV_PASSTHROUGH: 'CUSTOM_PROVIDER_TOKEN, CC_WEB_PASSWORD',
+  };
+  const session = { id: 'runtime-env-session', cwd: fixtureHome, permissionMode: 'yolo' };
+  const runtime = createRuntimeEnvFixture(processEnv);
+
+  const claudeEnv = runtime.buildClaudeSpawnSpec(session).env;
+  assert(claudeEnv.CLAUDE_CONFIG_DIR === processEnv.CLAUDE_CONFIG_DIR, 'Claude should inherit CLAUDE_CONFIG_DIR');
+  assert(claudeEnv.ANTHROPIC_API_KEY === 'claude-local-key', 'Claude should inherit local ANTHROPIC_API_KEY');
+  assert(claudeEnv.AWS_PROFILE === 'claude-bedrock-profile', 'Claude should inherit AWS provider configuration');
+  assert(claudeEnv.SSH_AUTH_SOCK === processEnv.SSH_AUTH_SOCK, 'Claude should inherit SSH agent access');
+  assert(claudeEnv.CUSTOM_PROVIDER_TOKEN === 'explicit-provider-key', 'Claude should inherit explicitly allowed provider env');
+  assert(!claudeEnv.OPENAI_API_KEY, 'Claude should not inherit Codex credentials by default');
+  assert(!claudeEnv.CC_WEB_PASSWORD && !claudeEnv.CLAUDECODE, 'Claude must not inherit Web server credentials or nesting markers');
+  assert(!claudeEnv.UNRELATED_SECRET, 'Claude should not inherit unrelated secrets');
+
+  const codexEnv = runtime.buildCodexSpawnSpec(session).env;
+  assert(codexEnv.CODEX_HOME === processEnv.CODEX_HOME, 'Codex should inherit CODEX_HOME');
+  assert(codexEnv.OPENAI_API_KEY === 'codex-local-key', 'Codex should inherit local OPENAI_API_KEY');
+  assert(codexEnv.OPENAI_BASE_URL === processEnv.OPENAI_BASE_URL, 'Codex should inherit local OPENAI_BASE_URL');
+  assert(codexEnv.SSH_AUTH_SOCK === processEnv.SSH_AUTH_SOCK, 'Codex should inherit SSH agent access');
+  assert(codexEnv.CUSTOM_PROVIDER_TOKEN === 'explicit-provider-key', 'Codex should inherit explicitly allowed provider env');
+  assert(!codexEnv.ANTHROPIC_API_KEY, 'Codex should not inherit Claude credentials by default');
+  assert(!codexEnv.CC_WEB_PASSWORD && !codexEnv.UNRELATED_SECRET, 'Codex must not inherit Web or unrelated secrets');
+
+  const piEnv = runtime.buildPiSpawnSpec(session).env;
+  assert(piEnv.ANTHROPIC_API_KEY === 'claude-local-key', 'Pi should keep supported provider credentials');
+  assert(piEnv.OPENAI_API_KEY === 'codex-local-key', 'Pi should keep supported OpenAI credentials');
+  assert(piEnv.CUSTOM_PROVIDER_TOKEN === 'explicit-provider-key', 'Pi should inherit explicitly allowed provider env');
+  assert(!piEnv.CC_WEB_PASSWORD && !piEnv.UNRELATED_SECRET, 'Pi must not inherit Web or unrelated secrets');
+
+  const managedRuntime = createRuntimeEnvFixture(processEnv, {
+    codexRuntimeConfig: {
+      mode: 'custom',
+      homeDir: path.join(fixtureHome, 'managed-codex'),
+      apiKey: 'managed-codex-key',
+      apiBase: 'http://127.0.0.1:9999/openai',
+      profileName: 'Managed fixture',
+      defaultModel: 'managed-model',
+    },
+  });
+  const managedCodexEnv = managedRuntime.buildCodexSpawnSpec(session).env;
+  assert(managedCodexEnv.CODEX_HOME.endsWith('managed-codex'), 'Managed Codex should use its isolated CODEX_HOME');
+  assert(managedCodexEnv.OPENAI_API_KEY === 'managed-codex-key', 'Managed Codex credentials should override local credentials');
+  assert(!managedCodexEnv.OPENAI_BASE_URL, 'Managed Codex should not inherit a conflicting OPENAI_BASE_URL');
+}
+
+async function runCustomCliDirectoriesRegressionCase({ tempRoot }) {
+  const caseRoot = path.join(tempRoot, 'custom-cli-directories');
+  const configDir = path.join(caseRoot, 'config');
+  const sessionsDir = path.join(caseRoot, 'sessions');
+  const logsDir = path.join(caseRoot, 'logs');
+  const homeDir = path.join(caseRoot, 'home');
+  const claudeConfigDir = path.join(caseRoot, 'claude-data');
+  const codexHome = path.join(caseRoot, 'codex-data');
+  mkdirp(configDir);
+  mkdirp(sessionsDir);
+  mkdirp(logsDir);
+  mkdirp(homeDir);
+  mkdirp(claudeConfigDir);
+  mkdirp(codexHome);
+
+  const claudeFixture = createFakeClaudeHistoryInConfigDir(claudeConfigDir);
+  fs.writeFileSync(path.join(claudeConfigDir, 'settings.json'), JSON.stringify({
+    env: {
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'custom-dir-opus',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'custom-dir-sonnet',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'custom-dir-haiku',
+    },
+  }, null, 2));
+  const codexThreadId = 'codex-custom-home-thread';
+  writeFakeCodexRolloutInHome(codexHome, codexThreadId);
+
+  const port = await getFreePort();
+  const password = 'Regression!234';
+  await withServer({
+    PORT: String(port),
+    HOST: '127.0.0.1',
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    CC_WEB_WS_MAX_PAYLOAD: String(64 * 1024),
+    HOME: homeDir,
+    CLAUDE_CONFIG_DIR: claudeConfigDir,
+    CODEX_HOME: codexHome,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
+  }, async (serverHandle) => {
+    assert(
+      serverHandle.stdout().includes(`webcoding server listening on 127.0.0.1:${port}`),
+      'Server should respect an explicit loopback HOST',
+    );
+
+    await withAuthedClient(port, password, async ({ client }) => {
+      const nativeSessions = await client.sendAndWaitType(
+        { type: 'list_native_sessions' },
+        'native_sessions',
+      );
+      const claudeItem = nativeSessions.groups
+        .flatMap((group) => group.sessions || [])
+        .find((item) => item.sessionId === claudeFixture.sessionId);
+      assert(claudeItem, 'Claude history should be discovered under CLAUDE_CONFIG_DIR');
+
+      const codexSessions = await client.sendAndWaitType(
+        { type: 'list_codex_sessions' },
+        'codex_sessions',
+      );
+      const codexItem = codexSessions.groups
+        .flatMap((group) => group.sessions || [])
+        .find((item) => item.threadId === codexThreadId);
+      assert(codexItem, 'Codex history should be discovered under CODEX_HOME');
+
+      const session = await client.sendAndWaitType(
+        { type: 'new_session', agent: 'claude', cwd: caseRoot, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === 'claude' && msg.cwd === caseRoot,
+      );
+      const modelList = await client.sendAndWaitType(
+        buildAgentMessagePayload({ text: '/model', sessionId: session.sessionId, mode: 'yolo', agent: 'claude' }),
+        'model_list',
+        (msg) => msg.agent === 'claude',
+      );
+      assert(modelList.models?.sonnet === 'custom-dir-sonnet', 'Claude settings should be read from CLAUDE_CONFIG_DIR');
+    });
+
+    const oversized = await openWs(port);
+    const closeResult = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Oversized WebSocket payload was not closed')), 3000);
+      oversized.ws.once('close', (code, reason) => {
+        clearTimeout(timer);
+        resolve({ code, reason: String(reason || '') });
+      });
+      oversized.ws.once('error', () => {});
+    });
+    oversized.ws.send(JSON.stringify({ type: 'oversized', data: 'x'.repeat(70 * 1024) }));
+    const closed = await closeResult;
+    assert(closed.code === 1009, `Oversized WebSocket payload should close with 1009, got ${closed.code}`);
+  });
+}
+
 async function connectAuthedClient(port, password, options = {}) {
   const { ws, messages, token } = await connectWs(port, password, WS_CONNECT_TIMEOUT_MS, options);
   const client = createScenarioClient(messages, ws);
@@ -1081,8 +1274,8 @@ function createExpiredAttachmentFixture(sessionsDir) {
   return { sessionId, attachmentId, dataPath, metaPath };
 }
 
-function createFakeClaudeHistory(homeDir) {
-  const projectDir = path.join(homeDir, '.claude', 'projects', 'tmp-project');
+function createFakeClaudeHistoryInConfigDir(claudeConfigDir) {
+  const projectDir = path.join(claudeConfigDir, 'projects', 'tmp-project');
   mkdirp(projectDir);
   const sessionId = 'claude-import-test';
   const filePath = path.join(projectDir, `${sessionId}.jsonl`);
@@ -1101,6 +1294,10 @@ function createFakeClaudeHistory(homeDir) {
   ];
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`);
   return { sessionId, projectDir: 'tmp-project', filePath };
+}
+
+function createFakeClaudeHistory(homeDir) {
+  return createFakeClaudeHistoryInConfigDir(path.join(homeDir, '.claude'));
 }
 
 function writeFakeCodexModelsCache(homeDir) {
@@ -1130,8 +1327,8 @@ function writeFakeCodexModelsCache(homeDir) {
   }, null, 2));
 }
 
-function writeFakeCodexRollout(homeDir, threadId) {
-  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '03', '12');
+function writeFakeCodexRolloutInHome(codexHome, threadId) {
+  const sessionsDir = path.join(codexHome, 'sessions', '2026', '03', '12');
   mkdirp(sessionsDir);
   const rolloutPath = path.join(sessionsDir, 'rollout-2026-03-12T00-00-00-codex-import-thread.jsonl');
   const rolloutLines = [
@@ -1174,6 +1371,10 @@ function writeFakeCodexRollout(homeDir, threadId) {
   ];
   fs.writeFileSync(rolloutPath, `${rolloutLines.join('\n')}\n`);
   return rolloutPath;
+}
+
+function writeFakeCodexRollout(homeDir, threadId) {
+  return writeFakeCodexRolloutInHome(path.join(homeDir, '.codex'), threadId);
 }
 
 function writeFakeCodexStateDb(homeDir, threadId, rolloutPath) {
@@ -1420,6 +1621,24 @@ async function runHeadlessParityRegressionCase({ port, password, sessionsDir, lo
     assert(slashList.capabilities && slashList.capabilities.headless === true, 'slash_commands_list should include headless capabilities');
     assert(slashList.capabilities.interactiveApproval === false, 'capabilities must not claim interactive approval in headless');
     assert(Array.isArray(slashList.capabilities.knownInteractiveEventTypes), 'capabilities should list known interactive event types');
+
+    // --- Codex /review maps to the native exec review subcommand ---
+    client.send(buildAgentMessagePayload({
+      text: '/review focus on authentication boundaries',
+      sessionId: codexSlashSession.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+    const reviewDelta = await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === codexSlashSession.sessionId && /focus on authentication boundaries/.test(msg.text || ''),
+      8000,
+    );
+    assert(!/\/review/.test(reviewDelta.text || ''), 'Codex review instructions should not include the Web slash command wrapper');
+    await client.waitForType('done', (msg) => msg.sessionId === codexSlashSession.sessionId, 8000);
+    const reviewSpawnLine = findProcessLogLine(logsDir, codexSlashSession.sessionId, 'process_spawn');
+    assert(reviewSpawnLine.includes('exec review'), 'Codex /review should invoke the native exec review subcommand');
+    assert(reviewSpawnLine.includes('--uncommitted'), 'Codex /review should review current uncommitted changes by default');
 
     // --- run-meta written on spawn ---
     const metaSession = await client.sendAndWaitType(
@@ -3745,6 +3964,8 @@ async function main() {
         serverHandle,
       };
       const runner = createTestRunner();
+      await runner.run('agent runtime environment passthrough', () => runAgentRuntimeEnvironmentRegressionCase(ctx));
+      await runner.run('custom CLI directories and server limits', () => runCustomCliDirectoriesRegressionCase(ctx));
       await runner.run('fetch_models apiBase version compatibility', () => runFetchModelsApiBaseCompatibilityRegressionCase(ctx));
       await runner.run('bridge ignores legacy reasoning effort config', () => runBridgeReasoningEffortRegressionCase(ctx));
       await runner.run('bridge responses fallback', () => runBridgeResponsesFallbackRegressionCase(ctx));

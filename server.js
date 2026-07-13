@@ -26,9 +26,12 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = parseInt(process.env.PORT) || 8001;
-// Ignore loopback-only HOST values (some cloud images set HOST=127.0.0.1 globally)
-const _HOST_ENV = process.env.HOST || '';
-const HOST = (_HOST_ENV && _HOST_ENV !== '127.0.0.1' && _HOST_ENV !== 'localhost') ? _HOST_ENV : '0.0.0.0';
+const HOST = String(process.env.HOST || '').trim() || '0.0.0.0';
+const DEFAULT_WS_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const requestedWsMaxPayload = Number.parseInt(process.env.CC_WEB_WS_MAX_PAYLOAD || '', 10);
+const WS_MAX_PAYLOAD_BYTES = Number.isFinite(requestedWsMaxPayload) && requestedWsMaxPayload > 0
+  ? Math.min(Math.max(requestedWsMaxPayload, 64 * 1024), 32 * 1024 * 1024)
+  : DEFAULT_WS_MAX_PAYLOAD_BYTES;
 
 /**
  * Resolve a CLI binary path robustly.
@@ -1938,8 +1941,9 @@ function resolveCodexActiveSource(config) {
 function getCodexRuntimeFingerprint(config) {
   const source = resolveCodexActiveSource(config || loadCodexConfig());
   if (!source || source.mode === 'local') {
-    const codexLocalConfigPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml');
-    const codexLocalAuthPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'auth.json');
+    const codexHome = getUserCodexHome();
+    const codexLocalConfigPath = path.join(codexHome, 'config.toml');
+    const codexLocalAuthPath = path.join(codexHome, 'auth.json');
     return JSON.stringify({
       runtimeVersion: 5,
       mode: 'local',
@@ -1962,8 +1966,18 @@ function getCodexRuntimeFingerprint(config) {
  * Custom/unified mode spawns with CODEX_HOME=CODEX_RUNTIME_HOME, so we overlay
  * skills + prompts from the user home into the managed runtime home.
  */
+function getUserHomeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function getClaudeConfigDir() {
+  const configured = String(process.env.CLAUDE_CONFIG_DIR || '').trim();
+  return path.resolve(configured || path.join(getUserHomeDir(), '.claude'));
+}
+
 function getUserCodexHome() {
-  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const configured = String(process.env.CODEX_HOME || '').trim();
+  return path.resolve(configured || path.join(getUserHomeDir(), '.codex'));
 }
 
 /** Last known Codex runtime overlay status (local = no overlay needed). */
@@ -2211,11 +2225,8 @@ function getCodexModelsCachePaths(config) {
   if (config?.mode && config.mode !== 'local') {
     paths.push(path.join(CODEX_RUNTIME_HOME, 'models_cache.json'));
   }
-  const home = process.env.HOME || process.env.USERPROFILE || '';
-  if (home) {
-    paths.push(path.join(home, '.codex', 'models_cache.json'));
-  }
-  return paths;
+  paths.push(path.join(getUserCodexHome(), 'models_cache.json'));
+  return [...new Set(paths.map((item) => path.resolve(item)))];
 }
 
 function buildVersionedEndpointUrl(apiBase, endpoint) {
@@ -2427,7 +2438,7 @@ function fileContentFingerprint(filePath) {
 }
 
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
-const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+const CLAUDE_SETTINGS_PATH = path.join(getClaudeConfigDir(), 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
@@ -3873,7 +3884,7 @@ function buildClaudeCarryoverConfigLines(session) {
   } else {
     const localCreds = readClaudeSettingsCredentials();
     lines.push('Claude 当前运行配置: local');
-    lines.push('Claude 本地配置文件: ~/.claude/settings.json');
+    lines.push(`Claude 本地配置文件: ${CLAUDE_SETTINGS_PATH}`);
     if (localCreds?.apiBase) lines.push(`Claude 本地 API Base: ${localCreds.apiBase}`);
     if (localCreds?.defaultModel) lines.push(`Claude 本地默认模型: ${localCreds.defaultModel}`);
   }
@@ -3887,9 +3898,10 @@ function buildCodexCarryoverConfigLines(session) {
   const lines = [];
   const config = loadCodexConfig();
   if (normalizeCodexMode(config.mode) === 'local') {
+    const codexHome = getUserCodexHome();
     lines.push('Codex 当前运行配置: local');
-    lines.push('Codex 本地配置文件: ~/.codex/config.toml');
-    lines.push('Codex 本地鉴权文件: ~/.codex/auth.json');
+    lines.push(`Codex 本地配置文件: ${path.join(codexHome, 'config.toml')}`);
+    lines.push(`Codex 本地鉴权文件: ${path.join(codexHome, 'auth.json')}`);
   } else {
     const source = resolveCodexActiveSource(config);
     if (source?.error) {
@@ -5530,6 +5542,7 @@ function isAllowedWsOrigin(origin, req) {
 
 const wss = new WebSocketServer({
   server,
+  maxPayload: WS_MAX_PAYLOAD_BYTES,
   verifyClient: (info) => isAllowedWsOrigin(info.origin || info.req?.headers?.origin || '', info.req),
 });
 
@@ -6638,7 +6651,7 @@ function sqlQuote(value) {
 function deleteClaudeLocalSession(claudeSessionId) {
   const safeId = sanitizeId(claudeSessionId);
   if (!safeId) return;
-  const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+  const projectsDir = CLAUDE_PROJECTS_DIR;
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
       const target = path.join(projectsDir, proj, `${safeId}.jsonl`);
@@ -6663,7 +6676,7 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   let removedFiles = 0;
   for (const filePath of rolloutPaths) {
     try {
-      if ((filePath.startsWith(CODEX_SESSIONS_DIR) || filePath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
+      if ((isPathInside(filePath, CODEX_SESSIONS_DIR) || isPathInside(filePath, CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
         removedFiles++;
       }
@@ -7016,8 +7029,14 @@ function handleMessage(ws, msg, options = {}) {
   sendSessionList(ws);
 
   const sessionAgent = getSessionAgent(session);
+  const codexReviewMatch = sessionAgent === 'codex'
+    ? normalizedText.match(/^\/review(?:\s+([\s\S]*))?$/i)
+    : null;
   const spawnSpec = sessionAgent === 'codex'
-    ? buildCodexSpawnSpec(session, { attachments: resolvedAttachments })
+    ? buildCodexSpawnSpec(session, {
+        attachments: resolvedAttachments,
+        review: codexReviewMatch ? { instructions: codexReviewMatch[1] || '' } : null,
+      })
     : sessionAgent === 'pi'
       ? buildPiSpawnSpec(session, { attachments: resolvedAttachments })
       : buildClaudeSpawnSpec(session, { attachments: resolvedAttachments });
@@ -7039,7 +7058,8 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.threadReset) {
     wsSend(ws, { type: 'system_message', sessionId: currentSessionId, message: buildThreadCarryoverNotice(threadCarryover) });
   }
-  const runtimeInputText = threadCarryover?.prompt || textValue;
+  const runtimeInputText = threadCarryover?.prompt
+    || (Object.prototype.hasOwnProperty.call(spawnSpec, 'inputText') ? spawnSpec.inputText : textValue);
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -7347,11 +7367,11 @@ function handleCheckUpdate(ws) {
 
 // === Native Session Import ===
 
-const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
-const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'sessions');
+const CLAUDE_PROJECTS_DIR = path.join(getClaudeConfigDir(), 'projects');
+const CODEX_SESSIONS_DIR = path.join(getUserCodexHome(), 'sessions');
 const CODEX_RUNTIME_SESSIONS_DIR = path.join(CODEX_RUNTIME_HOME, 'sessions');
-const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
-const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
+const CODEX_STATE_DB_PATH = path.join(getUserCodexHome(), 'state_5.sqlite');
+const CODEX_LOG_DB_PATH = path.join(getUserCodexHome(), 'logs_1.sqlite');
 
 function resolveClaudeSessionLocalMeta(claudeSessionId) {
   if (!claudeSessionId) return null;
@@ -7603,7 +7623,7 @@ function handleImportNativeSession(ws, msg) {
     return wsSend(ws, { type: 'error', message: '缺少 sessionId 或 projectDir' });
   }
   const filePath = path.join(CLAUDE_PROJECTS_DIR, String(projectDir), `${sanitizeId(sessionId)}.jsonl`);
-  if (!filePath.startsWith(CLAUDE_PROJECTS_DIR)) {
+  if (!isPathInside(filePath, CLAUDE_PROJECTS_DIR)) {
     return wsSend(ws, { type: 'error', message: '非法路径' });
   }
   let content;
@@ -7736,7 +7756,7 @@ function handleImportCodexSession(ws, msg) {
 
   let parsed = null;
   const requestedPath = msg?.rolloutPath ? path.resolve(String(msg.rolloutPath)) : '';
-  if (requestedPath && (requestedPath.startsWith(CODEX_SESSIONS_DIR) || requestedPath.startsWith(CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(requestedPath)) {
+  if (requestedPath && (isPathInside(requestedPath, CODEX_SESSIONS_DIR) || isPathInside(requestedPath, CODEX_RUNTIME_SESSIONS_DIR)) && fs.existsSync(requestedPath)) {
     parsed = parseCodexRolloutFile(requestedPath);
   }
   if (!parsed) {
@@ -8363,7 +8383,7 @@ try {
   }
 } catch {}
 
-plog('INFO', 'server_start', { port: PORT });
+plog('INFO', 'server_start', { port: PORT, host: HOST, wsMaxPayloadBytes: WS_MAX_PAYLOAD_BYTES });
 
 server.listen(PORT, HOST, () => {
   console.log(`webcoding server listening on ${HOST}:${PORT}`);
@@ -8379,12 +8399,16 @@ server.listen(PORT, HOST, () => {
   warnStaleCliEnv('CLAUDE_PATH', process.env.CLAUDE_PATH, CLAUDE_PATH);
   warnStaleCliEnv('CODEX_PATH', process.env.CODEX_PATH, CODEX_PATH);
   warnStaleCliEnv('PI_PATH', process.env.PI_PATH, PI_PATH);
-  console.log(`  Local:   http://localhost:${PORT}`);
-  const nets = os.networkInterfaces();
-  for (const iface of Object.values(nets)) {
-    for (const addr of iface) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        console.log(`  Network: http://${addr.address}:${PORT}`);
+  const wildcardHost = HOST === '0.0.0.0' || HOST === '::';
+  const localDisplayHost = wildcardHost ? 'localhost' : (HOST.includes(':') ? `[${HOST}]` : HOST);
+  console.log(`  Local:   http://${localDisplayHost}:${PORT}`);
+  if (wildcardHost) {
+    const nets = os.networkInterfaces();
+    for (const iface of Object.values(nets)) {
+      for (const addr of iface) {
+        if (addr.family === 'IPv4' && !addr.internal) {
+          console.log(`  Network: http://${addr.address}:${PORT}`);
+        }
       }
     }
   }

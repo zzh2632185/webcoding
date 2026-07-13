@@ -9157,7 +9157,7 @@
       bodyId: 'is-body',
       agent: 'claude',
       cardTitle: '从 Claude 原生历史导入',
-      cardCopy: '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。',
+      cardCopy: '读取 Claude 配置目录中 projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。',
       loadingText: '正在加载…',
       onClose: () => {
         _onNativeSessions = null;
@@ -9248,7 +9248,7 @@
       bodyId: 'ics-body',
       agent: 'codex',
       cardTitle: '从 Codex rollout 历史导入',
-      cardCopy: '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。',
+      cardCopy: '读取 CODEX_HOME 中 sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。',
       loadingText: '正在加载 Codex 本地历史…',
       onClose: () => {
         _onCodexSessions = null;

@@ -1,5 +1,16 @@
 # 更新记录
 
+## 未发布
+
+### 安全与兼容性
+
+- `ws` 升级至 `8.21.0`，并为 WebSocket 增加可配置的单消息大小限制
+- `HOST=127.0.0.1` / `localhost` 现在会按配置生效，不再被强制改为全网卡监听
+- Claude 与 Codex 本地模式会继承各自官方鉴权和配置环境，额外变量可通过 `CC_WEB_CLI_ENV_PASSTHROUGH` 显式允许
+- Claude 历史和设置尊重 `CLAUDE_CONFIG_DIR`，Codex 历史、状态和模型缓存尊重 `CODEX_HOME`
+- 本地历史导入和删除使用目录边界校验，避免相似路径前缀被误判为合法路径
+- Codex `/review` 映射为原生 `codex exec review --uncommitted`，命令后的文字作为审查要求传入
+
 ## v1.6.0
 
 ### 新功能

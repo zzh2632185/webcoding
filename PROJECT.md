@@ -2,13 +2,13 @@
 
 ## 项目概述
 
-Webcoding 是一个用 Node.js 实现的轻量级浏览器工作台，用来远程控制本机 `Claude Code` / `Codex` CLI。后端通过 detached 子进程加文件 I/O 维持任务运行，前端通过 WebSocket 实时收发消息、工具调用状态、运行态摘要和会话列表。
+Webcoding 是一个用 Node.js 实现的轻量级浏览器工作台，用来远程控制本机 `Claude Code` / `Codex` / `Pi` CLI。后端通过 detached 子进程加文件 I/O 维持任务运行，前端通过 WebSocket 实时收发消息、工具调用状态、运行态摘要和会话列表。
 
 **创建日期**：2026-03-19
-**最后更新**：2026-03-21
-**当前版本**：v1.3.2
-**当前状态**：进行中（双 Agent、统一 API bridge、线程续接补偿、运行态可视化、隔离回归已接通）
-**当前规模**：`server.js` 5878 行，`public/app.js` 5956 行，`public/style.css` 3941 行，`scripts/regression.js` 3540 行
+**最后更新**：2026-07-13
+**当前版本**：v1.6.0
+**当前状态**：进行中（三 Agent、统一 API bridge、线程续接补偿、运行态可视化、隔离回归已接通）
+**当前规模**：`server.js` 8415 行，`public/app.js` 9466 行，`public/style.css` 6877 行，`scripts/regression.js` 4010 行
 
 ---
 
@@ -56,7 +56,7 @@ webcoding/
 
 ## 关联资源
 
-- CLI 依赖：`@anthropic-ai/claude-code`、`@openai/codex`
+- CLI 依赖：`@anthropic-ai/claude-code`、`@openai/codex`、`@earendil-works/pi-coding-agent`
 - 运行依赖：`ws`
 - 启动入口：`npm start`
 - 回归入口：`npm run regression`

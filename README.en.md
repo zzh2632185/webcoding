@@ -1,6 +1,6 @@
 # Webcoding
 
-Webcoding is a lightweight browser workspace for Claude Code and Codex, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
+Webcoding is a lightweight browser workspace for Claude Code, Codex, and Pi, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -16,26 +16,28 @@ Webcoding is a lightweight browser workspace for Claude Code and Codex, designed
 ## Features
 
 - **Lightweight runtime**: low backend overhead, browser-based control panel.
-- **Dual-agent sessions**: create Claude or Codex sessions on the same backend core.
-- **Agent-isolated views**: switching Claude / Codex only shows that agent's sessions, recent state, settings, and import entry points.
+- **Multi-agent sessions**: create Claude, Codex, or Pi sessions on the same backend core.
+- **Agent-isolated views**: switching Claude / Codex / Pi only shows that agent's sessions, recent state, settings, and import entry points.
 - **Agent-specific settings**: Claude keeps template-based model config; Codex has its own path, default model, mode, and search settings.
 - **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
-- **Local history import**: import Claude history from `~/.claude/projects/` and Codex rollout history from `~/.codex/sessions/`.
+- **Local history import**: import Claude history from its configuration directory and Codex rollout history from `CODEX_HOME/sessions/`.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
 - **Background task support**: Claude processes continue after browser disconnect and notify you on completion.
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
 - **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
+- **Native Codex review**: `/review` invokes `codex exec review --uncommitted`; trailing text becomes review instructions.
 
 ## Requirements
 
-- **Node.js** >= 18
-- **Claude Code CLI** and/or **Codex CLI** installed and configured
+- **Node.js** >= 22
+- At least one configured **Claude Code CLI**, **Codex CLI**, or **Pi CLI**
 
 ```bash
 npm install -g @anthropic-ai/claude-code
 npm install -g @openai/codex
+npm install -g @earendil-works/pi-coding-agent
 ```
 
 ## Quick Start
@@ -90,12 +92,19 @@ After startup, open `http://localhost:8001` and sign in with your password.
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | No | Auto-generated | Web login password (migrated into `config/auth.json` on first start) |
 | `PORT` | No | `8001` | Service port |
-| `HOST` | No | `0.0.0.0` | Service bind address |
+| `HOST` | No | `0.0.0.0` | Service bind address; use `127.0.0.1` for local-only access |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
 | `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
+| `PI_PATH` | No | `pi` | Executable path to Pi CLI |
+| `CLAUDE_CONFIG_DIR` | No | `~/.claude` | Claude configuration, authentication, and history directory |
+| `CODEX_HOME` | No | `~/.codex` | Codex configuration, authentication, and history directory |
+| `CC_WEB_CLI_ENV_PASSTHROUGH` | No | - | Additional environment variable names passed to agents, separated by commas |
+| `CC_WEB_WS_MAX_PAYLOAD` | No | `4194304` | Maximum WebSocket message size in bytes (64 KB–32 MB) |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |
 
 Note: the `CC_WEB_*` variable prefix is kept for backward compatibility with older installs. The product name is now `Webcoding`.
+
+Claude automatically receives local `ANTHROPIC_*` and `AWS_*` provider settings, Codex receives `OPENAI_*`, and Pi receives its supported provider variables. Add non-standard keys to `CC_WEB_CLI_ENV_PASSTHROUGH`; `CC_WEB_PASSWORD` is always blocked from agent subprocesses.
 
 ### Notification Configuration
 
