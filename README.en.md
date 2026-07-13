@@ -19,7 +19,7 @@ Webcoding is a lightweight browser workspace for Claude Code, Codex, and Pi, des
 - **Multi-agent sessions**: create Claude, Codex, or Pi sessions on the same backend core.
 - **Agent-isolated views**: switching Claude / Codex / Pi only shows that agent's sessions, recent state, settings, and import entry points.
 - **Agent-specific settings**: Claude keeps template-based model config; Codex has its own path, default model, mode, and search settings.
-- **Bidirectional Pi RPC**: persistent Pi sessions with real extension dialogs, native abort, model discovery, and command discovery.
+- **Bidirectional Pi RPC**: persistent Pi sessions with real extension dialogs, native steer/follow-up queues during generation, native abort, model discovery, and command discovery.
 - **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
 - **Local history import**: import Claude history from its configuration directory and Codex rollout history from `CODEX_HOME/sessions/`.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
@@ -172,7 +172,8 @@ Browser ←WebSocket→ Node.js (server.js) ─┬─file I/O→ Claude / Codex 
 
 - Claude and Codex use detached per-turn subprocesses with file I/O in `sessions/{id}-run/` and restart recovery.
 - Pi uses one persistent `--mode rpc` process per active Web session, with correlated JSONL requests and events.
-- Pi RPC supports extension dialogs and native abort. By default, idle runtimes expire after 30 minutes with at most 8 concurrent runtimes; both limits are configurable.
+- While Pi is generating, new messages can use its native `steer` or `followUp` queue. Web history follows Pi's actual execution order, and duplicate client message IDs are coalesced.
+- Pi RPC restores pending queue state after reconnect. Aborting discards messages that have not started. By default, idle runtimes expire after 30 minutes with at most 8 concurrent runtimes; both limits are configurable.
 - A server restart interrupts an active Pi RPC turn, but the persisted Pi session resumes on the next message.
 - Set `CC_WEB_PI_TRANSPORT=headless` to restore the one-shot `pi -p --mode json` path.
 - PID is persisted to disk and recovered after service restart (`recoverProcesses()`).

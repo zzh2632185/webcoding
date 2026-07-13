@@ -52,6 +52,11 @@ async function runRpcMode(args) {
   let isStreaming = false;
   let pendingUi = null;
   let activeInput = '';
+  let steeringQueue = [];
+  let followUpQueue = [];
+  let queueDrainTimer = null;
+  let lastAssistantText = '';
+  let lastStopReason = 'stop';
 
   function persistState() {
     if (!statePath) return;
@@ -76,8 +81,31 @@ async function runRpcMode(args) {
     };
   }
 
-  function finishTurn(text, stopReason = 'stop', errorMessage = null) {
+  function emitUserMessage(text, images = []) {
+    const message = {
+      role: 'user',
+      content: [
+        { type: 'text', text },
+        ...(Array.isArray(images) ? images : []),
+      ],
+      timestamp: Date.now(),
+    };
+    emit({ type: 'message_start', message });
+    emit({ type: 'message_end', message });
+  }
+
+  function emitQueueUpdate() {
+    emit({
+      type: 'queue_update',
+      steering: steeringQueue.map((item) => item.text),
+      followUp: followUpQueue.map((item) => item.text),
+    });
+  }
+
+  function emitAssistantTurn(text, stopReason = 'stop', errorMessage = null) {
     const usage = usageFor(text);
+    lastAssistantText = text;
+    lastStopReason = stopReason;
     emit({
       type: 'message_start',
       message: {
@@ -110,17 +138,61 @@ async function runRpcMode(args) {
       message: { role: 'assistant', content: text ? [{ type: 'text', text }] : [], usage, stopReason, timestamp: Date.now() },
       toolResults: [],
     });
+  }
+
+  function finishAgent() {
     emit({
       type: 'agent_end',
       messages: [
         { role: 'user', content: [{ type: 'text', text: activeInput }] },
-        { role: 'assistant', content: text ? [{ type: 'text', text }] : [], usage, stopReason },
+        {
+          role: 'assistant',
+          content: lastAssistantText ? [{ type: 'text', text: lastAssistantText }] : [],
+          usage: usageFor(lastAssistantText),
+          stopReason: lastStopReason,
+        },
       ],
       willRetry: false,
     });
     isStreaming = false;
     activeInput = '';
     pendingUi = null;
+  }
+
+  function finishTurn(text, stopReason = 'stop', errorMessage = null) {
+    emitAssistantTurn(text, stopReason, errorMessage);
+    finishAgent();
+  }
+
+  function drainQueuedTurns() {
+    if (!isStreaming) return;
+    queueDrainTimer = null;
+    emitAssistantTurn('Pi RPC initial queued turn complete.');
+    while (steeringQueue.length > 0 || followUpQueue.length > 0) {
+      const item = steeringQueue.length > 0 ? steeringQueue.shift() : followUpQueue.shift();
+      emitQueueUpdate();
+      activeInput = item.text;
+      emit({ type: 'turn_start' });
+      emitUserMessage(item.text, item.images);
+      state.turns = (state.turns || 0) + 1;
+      state.lastInput = item.text;
+      persistState();
+      const queueLabel = item.streamingBehavior === 'steer' ? 'steer' : 'followUp';
+      emitAssistantTurn(`Pi RPC ${queueLabel} handled: ${item.text}`);
+    }
+    finishAgent();
+  }
+
+  function queueStreamingPrompt(command) {
+    const item = {
+      text: String(command.message || ''),
+      images: Array.isArray(command.images) ? command.images : [],
+      streamingBehavior: command.streamingBehavior === 'steer' ? 'steer' : 'followUp',
+    };
+    if (item.streamingBehavior === 'steer') steeringQueue.push(item);
+    else followUpQueue.push(item);
+    emitQueueUpdate();
+    response('prompt', true, undefined, null, command.id);
   }
 
   function startPrompt(command) {
@@ -137,6 +209,7 @@ async function runRpcMode(args) {
     persistState();
     emit({ type: 'agent_start' });
     emit({ type: 'turn_start' });
+    emitUserMessage(input, Array.isArray(command.images) ? command.images : []);
 
     if (input === 'trigger pi silent exit') {
       emit({
@@ -192,6 +265,17 @@ async function runRpcMode(args) {
       });
       return;
     }
+    if (input === 'trigger pi rpc queue' || input === 'trigger pi rpc queue reconnect') {
+      emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Pi RPC queue is waiting...' },
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Pi RPC queue is waiting...' }], model, timestamp: Date.now() },
+      });
+      if (input === 'trigger pi rpc queue') {
+        queueDrainTimer = setTimeout(drainQueuedTurns, 800);
+      }
+      return;
+    }
 
     const imageCount = Array.isArray(command.images) ? command.images.length : 0;
     let text = imageCount > 0
@@ -224,7 +308,7 @@ async function runRpcMode(args) {
           sessionId,
           autoCompactionEnabled: true,
           messageCount: state.turns * 2,
-          pendingMessageCount: 0,
+          pendingMessageCount: steeringQueue.length + followUpQueue.length,
         }, null, command.id);
         const delayMs = Number.parseInt(process.env.MOCK_PI_RPC_GET_STATE_DELAY_MS || '', 10);
         if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(sendState, delayMs);
@@ -245,7 +329,17 @@ async function runRpcMode(args) {
         }, null, command.id);
         break;
       case 'prompt':
-        startPrompt(command);
+        if (isStreaming) {
+          if (String(command.message || '').startsWith('/rpc-demo')) {
+            response('prompt', true, undefined, null, command.id);
+          } else if (command.streamingBehavior === 'steer' || command.streamingBehavior === 'followUp') {
+            queueStreamingPrompt(command);
+          } else {
+            response('prompt', false, undefined, 'Agent is already processing. Specify streamingBehavior.', command.id);
+          }
+        } else {
+          startPrompt(command);
+        }
         break;
       case 'compact':
         emit({ type: 'compaction_start', reason: 'manual' });
@@ -253,6 +347,13 @@ async function runRpcMode(args) {
         response('compact', true, { summary: 'mock compact', tokensBefore: 1000, estimatedTokensAfter: 100 }, null, command.id);
         break;
       case 'abort':
+        if (queueDrainTimer) {
+          clearTimeout(queueDrainTimer);
+          queueDrainTimer = null;
+        }
+        steeringQueue = [];
+        followUpQueue = [];
+        emitQueueUpdate();
         response('abort', true, undefined, null, command.id);
         if (isStreaming) finishTurn('', 'aborted');
         break;

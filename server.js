@@ -2145,9 +2145,11 @@ function getRuntimeCapabilities(agent) {
       interactiveApproval: false,
       askUser: true,
       planConfirmUi: false,
+      nativeStreamingQueue: true,
+      streamingBehaviors: ['steer', 'followUp'],
       respondableInteractiveKinds: ['select', 'confirm', 'input', 'editor'],
       notes: [
-        'Pi 使用持久 RPC 通道，支持扩展交互、模型发现、命令发现和原生中断。',
+        'Pi 使用持久 RPC 通道，支持扩展交互、运行中转向/接着做、模型发现、命令发现和原生中断。',
         'Pi 本身没有 Claude/Codex 式权限审批；Plan 模式仍映射为只读工具集。',
       ],
     });
@@ -5652,7 +5654,14 @@ wss.on('connection', (ws, req) => {
     switch (msg.type) {
       case 'message':
         if (msg.text && msg.text.trim().startsWith('/')) {
-          handleSlashCommand(ws, msg.text.trim(), msg.sessionId, msg.agent, msg.clientMessageId);
+          handleSlashCommand(
+            ws,
+            msg.text.trim(),
+            msg.sessionId,
+            msg.agent,
+            msg.clientMessageId,
+            msg.streamingBehavior,
+          );
         } else {
           handleMessage(ws, msg);
         }
@@ -6186,18 +6195,22 @@ function handleFetchModels(ws, msg) {
 }
 
 // === Client message idempotency (short-lived) ===
-const acceptedClientMessages = new Map(); // key -> ts
+const acceptedClientMessages = new Map(); // key -> { timestamp, ack }
 const ACCEPTED_CLIENT_MESSAGE_TTL_MS = 10 * 60 * 1000;
 
-function rememberAcceptedClientMessage(sessionId, clientMessageId) {
+function rememberAcceptedClientMessage(sessionId, clientMessageId, ack = null) {
   if (!sessionId || !clientMessageId) return;
   const key = `${sessionId}:${clientMessageId}`;
-  acceptedClientMessages.set(key, Date.now());
+  acceptedClientMessages.set(key, {
+    timestamp: Date.now(),
+    ack: ack && typeof ack === 'object' ? { ...ack } : null,
+  });
   // Opportunistic cleanup
   if (acceptedClientMessages.size > 2000) {
     const cutoff = Date.now() - ACCEPTED_CLIENT_MESSAGE_TTL_MS;
-    for (const [k, ts] of acceptedClientMessages) {
-      if (ts < cutoff) acceptedClientMessages.delete(k);
+    for (const [k, record] of acceptedClientMessages) {
+      const timestamp = typeof record === 'number' ? record : record?.timestamp;
+      if (!timestamp || timestamp < cutoff) acceptedClientMessages.delete(k);
     }
   }
 }
@@ -6205,13 +6218,22 @@ function rememberAcceptedClientMessage(sessionId, clientMessageId) {
 function wasClientMessageAccepted(sessionId, clientMessageId) {
   if (!sessionId || !clientMessageId) return false;
   const key = `${sessionId}:${clientMessageId}`;
-  const ts = acceptedClientMessages.get(key);
-  if (!ts) return false;
-  if (Date.now() - ts > ACCEPTED_CLIENT_MESSAGE_TTL_MS) {
+  const record = acceptedClientMessages.get(key);
+  const timestamp = typeof record === 'number' ? record : record?.timestamp;
+  if (!timestamp) return false;
+  if (Date.now() - timestamp > ACCEPTED_CLIENT_MESSAGE_TTL_MS) {
     acceptedClientMessages.delete(key);
     return false;
   }
   return true;
+}
+
+function getAcceptedClientMessageAck(sessionId, clientMessageId) {
+  if (!wasClientMessageAccepted(sessionId, clientMessageId)) return {};
+  const record = acceptedClientMessages.get(`${sessionId}:${clientMessageId}`);
+  return record && typeof record === 'object' && record.ack
+    ? { ...record.ack }
+    : {};
 }
 
 function normalizeClientMessageId(raw) {
@@ -6238,7 +6260,7 @@ function sendMessageAccepted(ws, sessionId, clientMessageId, extra = {}) {
 //
 // Local handlers ACK with execution:'local' so the client does NOT startGenerating.
 // They intentionally do NOT emit `done` (avoids racing a subsequent real CLI turn).
-function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null) {
+function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null, streamingBehavior = null) {
   const parts = String(text || '').trim().split(/\s+/);
   const cmd = (parts[0] || '').toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
@@ -6524,6 +6546,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
     mode: session?.permissionMode || 'yolo',
     agent,
     clientMessageId,
+    streamingBehavior,
   }, { hideInHistory: false });
   const resolvedSessionId = wsSessionMap.get(ws) || targetSessionId || null;
   wsSend(ws, {
@@ -6689,7 +6712,10 @@ function handleLoadSession(ws, sessionId) {
       segments: entry.segments || [],
       permissionMode: entry.permissionMode || session?.permissionMode || 'yolo',
     });
-    if (entry.transport === 'pi-rpc') resendPiRpcInteractiveRequests(entry);
+    if (entry.transport === 'pi-rpc') {
+      resendPiRpcInteractiveRequests(entry);
+      sendPiRpcQueueState(entry);
+    }
   }
 }
 
@@ -6901,7 +6927,24 @@ function handleAbort(ws) {
   if (entry.transport === 'pi-rpc') {
     const runtime = entry.rpcRuntime || piRpcRuntimes.get(sessionId);
     if (!runtime?.client?.isAlive) return;
+    const discardedQueueCount = (entry.rpcQueuedMessages || []).filter((record) => !record.started).length;
+    entry.rpcQueuedMessages = [];
+    runtime.queueState = { steering: [], followUp: [] };
+    runtime.dequeuedQueueItems = [];
+    sendPiRpcQueueState(entry);
+    if (discardedQueueCount > 0) {
+      wsSend(ws, {
+        type: 'system_message',
+        sessionId,
+        message: `已丢弃 ${discardedQueueCount} 条尚未执行的 Pi 排队消息。`,
+      });
+    }
     runtime.client.request({ type: 'abort' }, { timeoutMs: 10_000 }).then(async () => {
+      if (discardedQueueCount > 0) {
+        if (activeProcesses.get(sessionId) === entry) handleProcessComplete(sessionId, 0, null);
+        disposePiRpcRuntime(sessionId, 'abort_discard_queue');
+        return;
+      }
       if (activeProcesses.get(sessionId) !== entry) return;
       try {
         const state = await runtime.client.request({ type: 'get_state' }, { timeoutMs: 5000 });
@@ -6973,6 +7016,10 @@ function createRuntimeEntry(session, ws, spawnSpec, resolvedAttachments, pid, tr
     pendingExitCode: null,
     pendingSignal: null,
     tailer: null,
+    rpcInitialUserPending: transport === 'pi-rpc',
+    rpcQueuedMessages: [],
+    rpcQueuedRequests: new Map(),
+    rpcPersistedAssistantMessages: 0,
   };
 }
 
@@ -7131,6 +7178,171 @@ function resendPiRpcInteractiveRequests(entry) {
   }
 }
 
+function piRpcMessageText(message) {
+  if (!message) return '';
+  if (typeof message.content === 'string') return message.content;
+  if (!Array.isArray(message.content)) return '';
+  return message.content
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('');
+}
+
+function piRpcArrayDifference(left, right) {
+  const remaining = Array.isArray(right) ? right.slice() : [];
+  const difference = [];
+  for (const value of Array.isArray(left) ? left : []) {
+    const index = remaining.indexOf(value);
+    if (index >= 0) remaining.splice(index, 1);
+    else difference.push(value);
+  }
+  return difference;
+}
+
+function getPiRpcQueueItems(entry) {
+  return (entry?.rpcQueuedMessages || [])
+    .filter((record) => record.accepted && !record.started && !record.immediate)
+    .map((record) => ({
+      clientMessageId: record.clientMessageId || record.id,
+      text: record.text,
+      attachments: record.savedAttachments || [],
+      streamingBehavior: record.streamingBehavior,
+      status: 'queued',
+    }));
+}
+
+function sendPiRpcQueueState(entry) {
+  if (!entry?.ws || entry.ws.readyState !== 1 || entry.transport !== 'pi-rpc') return;
+  const runtime = entry.rpcRuntime;
+  const queueState = runtime?.queueState || { steering: [], followUp: [] };
+  wsSend(entry.ws, {
+    type: 'pi_queue_update',
+    sessionId: runtime?.sessionId || null,
+    steeringCount: Array.isArray(queueState.steering) ? queueState.steering.length : 0,
+    followUpCount: Array.isArray(queueState.followUp) ? queueState.followUp.length : 0,
+    items: getPiRpcQueueItems(entry),
+  });
+}
+
+function persistPiRpcAssistantBuffer(runtime, entry) {
+  if (!runtime || !entry) return false;
+  if (!(entry.fullText || (entry.toolCalls && entry.toolCalls.length > 0) || hasPersistableSegments(entry))) {
+    return false;
+  }
+  const session = loadSession(runtime.sessionId);
+  if (!session) return false;
+  const modelId = String(entry.resolvedModel || entry.effectiveModel || resolveEffectiveModelId(session) || '').trim() || null;
+  session.messages.push({
+    role: 'assistant',
+    content: entry.fullText || '',
+    toolCalls: entry.toolCalls || [],
+    segments: entry.segments || [],
+    model: modelId,
+    timestamp: new Date().toISOString(),
+  });
+  session.updated = new Date().toISOString();
+  if (!entry.ws) session.hasUnread = true;
+  saveSession(session);
+  entry.rpcPersistedAssistantMessages = (entry.rpcPersistedAssistantMessages || 0) + 1;
+  entry.fullText = '';
+  entry.toolCalls = [];
+  entry.segments = [];
+  return true;
+}
+
+function piRpcAssistantMessageNeedsTools(message) {
+  const stopReason = String(message?.stopReason || message?.stop_reason || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (stopReason === 'tooluse' || stopReason === 'toolcalls') return true;
+  return Array.isArray(message?.content) && message.content.some((part) => (
+    part?.type === 'toolCall' || part?.type === 'tool_call' || part?.type === 'tool_use'
+  ));
+}
+
+function handlePiRpcQueueUpdate(runtime, entry, event) {
+  const previous = runtime.queueState || { steering: [], followUp: [] };
+  const next = {
+    steering: Array.isArray(event.steering) ? event.steering.slice() : [],
+    followUp: Array.isArray(event.followUp) ? event.followUp.slice() : [],
+  };
+  for (const [queueKey, streamingBehavior] of [['steering', 'steer'], ['followUp', 'followUp']]) {
+    const added = piRpcArrayDifference(next[queueKey], previous[queueKey]);
+    for (const expandedText of added) {
+      const record = (entry.rpcQueuedMessages || []).find((item) => (
+        !item.observedQueued && !item.started && item.streamingBehavior === streamingBehavior
+      ));
+      if (!record) continue;
+      record.observedQueued = true;
+      record.expandedText = expandedText;
+      record.status = 'queued';
+    }
+    const removed = piRpcArrayDifference(previous[queueKey], next[queueKey]);
+    for (const expandedText of removed) {
+      runtime.dequeuedQueueItems.push({ streamingBehavior, expandedText });
+    }
+  }
+  runtime.queueState = next;
+  sendPiRpcQueueState(entry);
+}
+
+function takePiRpcQueuedRecord(runtime, entry, messageText) {
+  const dequeuedIndex = runtime.dequeuedQueueItems.findIndex((item) => item.expandedText === messageText);
+  const fallbackDequeuedIndex = dequeuedIndex >= 0 ? dequeuedIndex : (runtime.dequeuedQueueItems.length > 0 ? 0 : -1);
+  const dequeued = fallbackDequeuedIndex >= 0
+    ? runtime.dequeuedQueueItems.splice(fallbackDequeuedIndex, 1)[0]
+    : null;
+  const records = entry.rpcQueuedMessages || [];
+  let recordIndex = records.findIndex((item) => (
+    !item.started && (item.expandedText === messageText || item.text === messageText)
+  ));
+  if (recordIndex < 0 && dequeued) {
+    recordIndex = records.findIndex((item) => !item.started && item.streamingBehavior === dequeued.streamingBehavior);
+  }
+  if (recordIndex < 0) recordIndex = records.findIndex((item) => !item.started && item.accepted);
+  if (recordIndex < 0) return null;
+  const [record] = records.splice(recordIndex, 1);
+  record.started = true;
+  record.status = 'started';
+  return record;
+}
+
+function handlePiRpcUserMessageStart(runtime, entry, event) {
+  if (entry.rpcInitialUserPending) {
+    entry.rpcInitialUserPending = false;
+    return;
+  }
+  const messageText = piRpcMessageText(event.message);
+  const record = takePiRpcQueuedRecord(runtime, entry, messageText);
+  if (!record && !messageText) return;
+
+  // A steering message can arrive after a tool-use assistant message. Persist that
+  // completed portion before inserting the next user message so history stays ordered.
+  persistPiRpcAssistantBuffer(runtime, entry);
+
+  const session = loadSession(runtime.sessionId);
+  if (session) {
+    session.messages.push({
+      role: 'user',
+      content: record?.text ?? messageText,
+      attachments: record?.savedAttachments || [],
+      timestamp: new Date().toISOString(),
+    });
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+
+  if (entry.ws) {
+    wsSend(entry.ws, {
+      type: 'pi_queued_turn_start',
+      sessionId: runtime.sessionId,
+      clientMessageId: record?.clientMessageId || record?.id || null,
+      text: record?.text ?? messageText,
+      attachments: record?.savedAttachments || [],
+      streamingBehavior: record?.streamingBehavior || null,
+    });
+  }
+  sendPiRpcQueueState(entry);
+}
+
 function handlePiRpcEvent(runtime, event) {
   if (!runtime || !event) return;
   runtime.lastUsedAt = Date.now();
@@ -7140,9 +7352,24 @@ function handlePiRpcEvent(runtime, event) {
   }
   const entry = activeProcesses.get(runtime.sessionId);
   if (!entry || entry.transport !== 'pi-rpc' || entry.rpcRuntime !== runtime) return;
+  if (event.type === 'queue_update') {
+    handlePiRpcQueueUpdate(runtime, entry, event);
+    return;
+  }
+  if (event.type === 'message_start' && event.message?.role === 'user') {
+    handlePiRpcUserMessageStart(runtime, entry, event);
+  }
   if (event.type === 'agent_start') entry.rpcAgentStarted = true;
   processRuntimeEvent(entry, event, runtime.sessionId);
-  if (event.type === 'agent_end' && !entry.rpcCompleted) {
+  if (
+    event.type === 'message_end'
+    && event.message?.role === 'assistant'
+    && !piRpcAssistantMessageNeedsTools(event.message)
+  ) {
+    persistPiRpcAssistantBuffer(runtime, entry);
+  }
+  if (event.type === 'agent_end' && event.willRetry !== true && !entry.rpcCompleted) {
+    persistPiRpcAssistantBuffer(runtime, entry);
     entry.rpcCompleted = true;
     runtime.pendingUi.clear();
     handleProcessComplete(runtime.sessionId, 0, null);
@@ -7174,6 +7401,8 @@ async function ensurePiRpcRuntime(session, spawnSpec) {
     models: [],
     commands: [],
     pendingUi: new Map(),
+    queueState: { steering: [], followUp: [] },
+    dequeuedQueueItems: [],
     lastUsedAt: Date.now(),
     startPromise: null,
     disposeReason: null,
@@ -7361,6 +7590,113 @@ function handlePiRpcInteractiveResponse(ws, msg) {
   });
 }
 
+function sendPiRpcMessageRejected(ws, sessionId, clientMessageId, message, retryable = true) {
+  wsSend(ws, {
+    type: 'message_rejected',
+    sessionId,
+    clientMessageId: clientMessageId || null,
+    retryable,
+    error: message,
+  });
+}
+
+function handleActivePiRpcMessage(ws, msg, session, entry, resolvedAttachments, savedAttachments, textValue) {
+  const sessionId = session.id;
+  const runtime = entry.rpcRuntime || piRpcRuntimes.get(sessionId);
+  const clientMessageId = normalizeClientMessageId(msg.clientMessageId);
+  const streamingBehavior = msg.streamingBehavior === 'steer'
+    ? 'steer'
+    : msg.streamingBehavior === 'followUp'
+      ? 'followUp'
+      : null;
+  if (!streamingBehavior) {
+    sendPiRpcMessageRejected(
+      ws,
+      sessionId,
+      clientMessageId,
+      'Pi 正在生成，请选择“转向”或“接着做”后再发送。',
+      false,
+    );
+    return;
+  }
+  if (!runtime?.client?.isAlive || entry.rpcCompleted) {
+    sendPiRpcMessageRejected(ws, sessionId, clientMessageId, 'Pi RPC 连接正在切换，请稍后重试。');
+    return;
+  }
+
+  const requestKey = clientMessageId || `pi-${crypto.randomUUID()}`;
+  const inflight = entry.rpcQueuedRequests.get(requestKey);
+  if (inflight) {
+    inflight.waiters.add(ws);
+    return;
+  }
+
+  entry.ws = ws;
+  entry.wsDisconnectTime = null;
+  wsSessionMap.set(ws, sessionId);
+  const record = {
+    id: requestKey,
+    clientMessageId,
+    text: textValue,
+    savedAttachments,
+    streamingBehavior,
+    status: 'submitting',
+    observedQueued: false,
+    accepted: false,
+    started: false,
+    immediate: false,
+    waiters: new Set([ws]),
+  };
+  entry.rpcQueuedMessages.push(record);
+  entry.rpcQueuedRequests.set(requestKey, record);
+
+  const images = piRpcPromptImages(resolvedAttachments);
+  record.promise = runtime.client.request({
+    type: 'prompt',
+    message: String(textValue || ''),
+    streamingBehavior,
+    ...(images.length > 0 ? { images } : {}),
+  }, { timeoutMs: 60_000 }).then(() => {
+    if (entry.abortRequested) {
+      entry.rpcQueuedRequests.delete(requestKey);
+      entry.rpcQueuedMessages = entry.rpcQueuedMessages.filter((item) => item !== record);
+      for (const waiter of record.waiters) {
+        sendPiRpcMessageRejected(waiter, sessionId, clientMessageId, '当前任务已停止，这条排队消息未执行。', false);
+      }
+      return;
+    }
+    record.accepted = true;
+    // Pi extension commands execute immediately during streaming and therefore
+    // never enter either native queue. Other slash inputs (skills/templates) do.
+    record.immediate = String(record.text || '').trim().startsWith('/') && !record.observedQueued && !record.started;
+    record.status = record.immediate ? 'handled' : (record.started ? 'started' : 'queued');
+    const ack = record.immediate
+      ? { execution: 'local' }
+      : { execution: 'pi-queue', streamingBehavior };
+    if (clientMessageId) rememberAcceptedClientMessage(sessionId, clientMessageId, ack);
+    for (const waiter of record.waiters) {
+      sendMessageAccepted(waiter, sessionId, clientMessageId, ack);
+    }
+    if (record.immediate) {
+      entry.rpcQueuedMessages = entry.rpcQueuedMessages.filter((item) => item !== record);
+    }
+    entry.rpcQueuedRequests.delete(requestKey);
+    sendPiRpcQueueState(entry);
+  }).catch((error) => {
+    entry.rpcQueuedRequests.delete(requestKey);
+    entry.rpcQueuedMessages = entry.rpcQueuedMessages.filter((item) => item !== record);
+    for (const waiter of record.waiters) {
+      sendPiRpcMessageRejected(
+        waiter,
+        sessionId,
+        clientMessageId,
+        `Pi 未接收这条消息：${error.message || String(error)}`,
+      );
+    }
+    sendPiRpcQueueState(entry);
+  });
+}
+
 // === Runtime Message Handler ===
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
@@ -7370,6 +7706,17 @@ function handleMessage(ws, msg, options = {}) {
   const normalizedText = textValue.trim();
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
+    const activeEntry = sessionId ? activeProcesses.get(sessionId) : null;
+    if (activeEntry?.transport === 'pi-rpc') {
+      sendPiRpcMessageRejected(
+        ws,
+        sessionId,
+        normalizeClientMessageId(msg.clientMessageId),
+        '图片附件已过期或不可用，请重新上传后再发送。',
+        false,
+      );
+      return;
+    }
     return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
   }
   if (!normalizedText && resolvedAttachments.length === 0) return;
@@ -7385,9 +7732,37 @@ function handleMessage(ws, msg, options = {}) {
     storageState: attachment.storageState,
   }));
 
+  const clientMessageIdEarly = normalizeClientMessageId(msg.clientMessageId);
+  if (sessionId && clientMessageIdEarly && wasClientMessageAccepted(sessionId, clientMessageIdEarly)) {
+    sendMessageAccepted(
+      ws,
+      sessionId,
+      clientMessageIdEarly,
+      getAcceptedClientMessageAck(sessionId, clientMessageIdEarly),
+    );
+    return;
+  }
+
   if (sessionId && activeProcesses.has(sessionId)) {
     const runningSession = loadSession(sessionId);
     const runningEntry = activeProcesses.get(sessionId);
+    if (
+      runningSession
+      && runningEntry
+      && getSessionAgent(runningSession) === 'pi'
+      && runningEntry.transport === 'pi-rpc'
+    ) {
+      handleActivePiRpcMessage(
+        ws,
+        msg,
+        runningSession,
+        runningEntry,
+        resolvedAttachments,
+        savedAttachments,
+        textValue,
+      );
+      return;
+    }
     // Use the mode snapshotted at spawn — not session.permissionMode (may already be next-turn).
     const activeTurnMode = runningEntry?.permissionMode || runningSession?.permissionMode || 'yolo';
     if (
@@ -7400,11 +7775,6 @@ function handleMessage(ws, msg, options = {}) {
     ) {
       // Plan mode: best-effort forward user input via input.txt append.
       // Not a reliable bidirectional interactive channel — ACK only after write succeeds.
-      const clientMessageIdEarly = normalizeClientMessageId(msg.clientMessageId);
-      if (clientMessageIdEarly && wasClientMessageAccepted(sessionId, clientMessageIdEarly)) {
-        sendMessageAccepted(ws, sessionId, clientMessageIdEarly, { execution: 'local' });
-        return;
-      }
       const inputPath = path.join(runDir(sessionId), 'input.txt');
       try {
         fs.appendFileSync(inputPath, normalizedText + '\n');
@@ -7443,7 +7813,7 @@ function handleMessage(ws, msg, options = {}) {
 
   // Idempotent accept BEFORE mutating history / spawning.
   if (session && clientMessageId && wasClientMessageAccepted(session.id, clientMessageId)) {
-    sendMessageAccepted(ws, session.id, clientMessageId);
+    sendMessageAccepted(ws, session.id, clientMessageId, getAcceptedClientMessageAck(session.id, clientMessageId));
     return;
   }
 
@@ -7499,8 +7869,9 @@ function handleMessage(ws, msg, options = {}) {
 
   const currentSessionId = session.id;
   if (clientMessageId) {
-    rememberAcceptedClientMessage(currentSessionId, clientMessageId);
-    sendMessageAccepted(ws, currentSessionId, clientMessageId);
+    const ack = { execution: 'turn' };
+    rememberAcceptedClientMessage(currentSessionId, clientMessageId, ack);
+    sendMessageAccepted(ws, currentSessionId, clientMessageId, ack);
   }
 
   for (const [, entry] of activeProcesses) {

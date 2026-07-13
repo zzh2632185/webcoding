@@ -2372,6 +2372,52 @@ html[data-theme="localhost"] .localfile-pre {
 }
 .send-queue-label {
   color: var(--text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.send-queue-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.pi-queue-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--segmented-control-group-gap);
+  padding: var(--segmented-control-group-padding);
+  border: var(--segmented-control-group-border);
+  border-radius: var(--segmented-control-group-radius);
+  background: var(--segmented-control-group-background);
+}
+.pi-queue-mode[hidden] {
+  display: none !important;
+}
+.pi-queue-mode-btn {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--segmented-control-item-radius);
+  background: var(--segmented-control-item-background);
+  color: var(--segmented-control-item-color);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.pi-queue-mode-btn:hover {
+  background: var(--segmented-control-item-hover-background);
+  color: var(--segmented-control-item-hover-color);
+}
+.pi-queue-mode-btn.active {
+  background: var(--segmented-control-item-active-background);
+  color: var(--segmented-control-item-active-color);
+  box-shadow: var(--segmented-control-item-active-shadow);
+}
+.pi-queue-mode-btn[data-streaming-behavior="steer"].active {
+  background: var(--segmented-control-item-alt-active-background);
 }
 .send-queue-clear {
   border: 2px solid var(--line);
@@ -3170,6 +3216,23 @@ html[data-theme="localhost"] .localfile-pre {
 .msg.user.msg-queued:hover .msg-queue-status {
   opacity: 1;
   text-decoration: underline;
+}
+.msg.user.msg-pi-queued {
+  opacity: 0.88;
+  cursor: default;
+}
+.msg.user.msg-pi-queued .msg-bubble {
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-left-style: dashed;
+  box-shadow: none;
+}
+.msg.user.msg-pi-queued .msg-queue-status {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  opacity: 0.88;
 }
 .msg.user .msg-attachment-label {
   background: var(--message-user-attachment-bg);
@@ -4341,6 +4404,20 @@ html[data-theme="localhost"] .localfile-pre {
   }
   .chat-cwd {
     display: none;
+  }
+  .send-queue-bar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .send-queue-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .pi-queue-mode {
+    flex: 1;
+  }
+  .pi-queue-mode-btn {
+    flex: 1;
   }
 }
 

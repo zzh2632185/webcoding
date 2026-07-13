@@ -1821,6 +1821,12 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
     );
     assert(slashList.capabilities?.protocol === 'pi-rpc', 'Pi capabilities should advertise the RPC protocol');
     assert(slashList.capabilities?.askUser === true, 'Pi RPC capabilities should advertise respondable interaction');
+    assert(slashList.capabilities?.nativeStreamingQueue === true, 'Pi RPC capabilities should advertise its native streaming queue');
+    assert(
+      slashList.capabilities?.streamingBehaviors?.includes('steer')
+        && slashList.capabilities?.streamingBehaviors?.includes('followUp'),
+      'Pi RPC capabilities should advertise steer and followUp modes',
+    );
 
     // Multi-turn resume via --session-id
     client.send(buildAgentMessagePayload({
@@ -1837,6 +1843,85 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
     await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
     const secondText = getLastStoredAssistantText(sessionsDir, session.sessionId);
     assert(/turn 2/.test(secondText || ''), 'Pi second turn should resume the same mock session state');
+
+    // Native streaming queue: follow-up is accepted first, but steering runs first.
+    client.send(buildAgentMessagePayload({
+      text: 'trigger pi rpc queue',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId: session.sessionId,
+    }));
+    await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === session.sessionId && /queue is waiting/.test(msg.text || ''),
+      8000,
+    );
+    const followUpPayload = buildAgentMessagePayload({
+      text: 'native follow-up message',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId: session.sessionId,
+      clientMessageId: 'pi-native-follow-up',
+    });
+    followUpPayload.streamingBehavior = 'followUp';
+    client.send(followUpPayload);
+    const followUpAck = await client.waitForType(
+      'message_accepted',
+      (msg) => msg.clientMessageId === 'pi-native-follow-up',
+      8000,
+    );
+    assert(followUpAck.execution === 'pi-queue' && followUpAck.streamingBehavior === 'followUp', 'Pi follow-up should ACK only after native queue acceptance');
+
+    const steerPayload = buildAgentMessagePayload({
+      text: 'native steering message',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId: session.sessionId,
+      clientMessageId: 'pi-native-steer',
+    });
+    steerPayload.streamingBehavior = 'steer';
+    client.send(steerPayload);
+    client.send(steerPayload); // same in-flight id must merge into one Pi request
+    const steerAck = await client.waitForType(
+      'message_accepted',
+      (msg) => msg.clientMessageId === 'pi-native-steer',
+      8000,
+    );
+    assert(steerAck.execution === 'pi-queue' && steerAck.streamingBehavior === 'steer', 'Pi steering should preserve its native queue mode in the ACK');
+    const queuedState = await client.waitForType(
+      'pi_queue_update',
+      (msg) => msg.sessionId === session.sessionId && msg.items?.length === 2,
+      8000,
+    );
+    assert(queuedState.steeringCount === 1 && queuedState.followUpCount === 1, 'Pi queue state should expose one item in each native queue');
+
+    const steerStart = await client.waitForType(
+      'pi_queued_turn_start',
+      (msg) => msg.sessionId === session.sessionId && msg.clientMessageId === 'pi-native-steer',
+      8000,
+    );
+    assert(steerStart.streamingBehavior === 'steer', 'Pi should start the steering message before an earlier follow-up');
+    const followUpStart = await client.waitForType(
+      'pi_queued_turn_start',
+      (msg) => msg.sessionId === session.sessionId && msg.clientMessageId === 'pi-native-follow-up',
+      8000,
+    );
+    assert(followUpStart.streamingBehavior === 'followUp', 'Pi should start the follow-up after steering is drained');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
+
+    const queuedHistory = readStoredSessionFile(sessionsDir, session.sessionId).messages;
+    const queueRootIndex = queuedHistory.findIndex((message) => message.role === 'user' && message.content === 'trigger pi rpc queue');
+    const queueSlice = queuedHistory.slice(queueRootIndex).map((message) => `${message.role}:${message.content || ''}`);
+    assert(queueRootIndex >= 0, 'Pi queue root prompt should be persisted');
+    assert(queueSlice[1]?.startsWith('assistant:Pi RPC queue is waiting...Pi RPC initial queued turn complete.'), 'Pi should persist the current assistant portion before queued user input');
+    assert(queueSlice[2] === 'user:native steering message', 'Pi history should persist the steering user message when it actually starts');
+    assert(queueSlice[3] === 'assistant:Pi RPC steer handled: native steering message', 'Pi history should keep the steering response adjacent to its user message');
+    assert(queueSlice[4] === 'user:native follow-up message', 'Pi history should persist follow-up after steering');
+    assert(queueSlice[5] === 'assistant:Pi RPC followUp handled: native follow-up message', 'Pi history should keep the follow-up response in order');
+    assert(
+      queuedHistory.filter((message) => message.role === 'user' && message.content === 'native steering message').length === 1,
+      'Duplicate in-flight clientMessageId must enqueue and persist only one steering message',
+    );
 
     client.send(buildAgentMessagePayload({
       text: 'trigger pi rpc select',
@@ -1882,6 +1967,20 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
       (msg) => msg.sessionId === session.sessionId && /still running/.test(msg.text || ''),
       8000,
     );
+    const discardedPayload = buildAgentMessagePayload({
+      text: 'discard this native follow-up',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId: session.sessionId,
+      clientMessageId: 'pi-native-discard',
+    });
+    discardedPayload.streamingBehavior = 'followUp';
+    client.send(discardedPayload);
+    await client.waitForType(
+      'message_accepted',
+      (msg) => msg.clientMessageId === 'pi-native-discard' && msg.execution === 'pi-queue',
+      8000,
+    );
     client.send({ type: 'abort' });
     const aborted = await client.waitForType(
       'done',
@@ -1889,6 +1988,8 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
       8000,
     );
     assert(aborted.interrupted === true, 'Pi RPC abort should stop the turn without killing the persistent session');
+    const abortedHistory = readStoredSessionFile(sessionsDir, session.sessionId).messages;
+    assert(!abortedHistory.some((message) => message.role === 'user' && message.content === 'discard this native follow-up'), 'Pi abort should discard queued user messages before they enter history');
 
     // Plan mode maps to read-only tools (assert full stored text — deltas are chunked)
     const planSession = await client.sendAndWaitType(
@@ -1994,6 +2095,59 @@ async function runPiRpcReconnectRegressionCase({ port, password }) {
       8000,
     );
     await resumedConnection.client.waitForType('done', (msg) => msg.sessionId === sessionId, 8000);
+
+    resumedConnection.client.send(buildAgentMessagePayload({
+      text: 'trigger pi rpc queue reconnect',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId,
+    }));
+    await resumedConnection.client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === sessionId && /queue is waiting/.test(msg.text || ''),
+      8000,
+    );
+    const reconnectQueuePayload = buildAgentMessagePayload({
+      text: 'restore this native queue item',
+      mode: 'yolo',
+      agent: 'pi',
+      sessionId,
+      clientMessageId: 'pi-native-reconnect',
+    });
+    reconnectQueuePayload.streamingBehavior = 'followUp';
+    resumedConnection.client.send(reconnectQueuePayload);
+    await resumedConnection.client.waitForType(
+      'message_accepted',
+      (msg) => msg.clientMessageId === 'pi-native-reconnect' && msg.execution === 'pi-queue',
+      8000,
+    );
+    await resumedConnection.client.waitForType(
+      'pi_queue_update',
+      (msg) => msg.sessionId === sessionId && msg.items?.some((item) => item.clientMessageId === 'pi-native-reconnect'),
+      8000,
+    );
+
+    await closeWs(resumedConnection.ws);
+    resumedConnection = await connectAuthedClient(port, password);
+    resumedConnection.client.send({ type: 'load_session', sessionId });
+    await resumedConnection.client.waitForType(
+      'session_info',
+      (msg) => msg.sessionId === sessionId && msg.isRunning === true,
+      5000,
+    );
+    await resumedConnection.client.waitForType('resume_generating', (msg) => msg.sessionId === sessionId, 5000);
+    const restoredQueue = await resumedConnection.client.waitForType(
+      'pi_queue_update',
+      (msg) => msg.sessionId === sessionId && msg.items?.some((item) => item.clientMessageId === 'pi-native-reconnect'),
+      5000,
+    );
+    assert(restoredQueue.followUpCount === 1, 'Pi native queue should be replayed after WebSocket reconnect');
+    resumedConnection.client.send({ type: 'abort' });
+    await resumedConnection.client.waitForType(
+      'done',
+      (msg) => msg.sessionId === sessionId && msg.interrupted === true,
+      8000,
+    );
     completed = true;
   } finally {
     if (!completed && resumedConnection?.ws?.readyState === WebSocket.OPEN && sessionId) {

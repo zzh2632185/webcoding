@@ -18,6 +18,7 @@
   // Slash menu is populated from server discovery (platform + CLI + filesystem).
   // Empty until the server responds with slash_commands_list.
   let currentSlashCommands = [];
+  let currentRuntimeCapabilities = null;
 
   const MODE_LABELS = {
     default: '默认',
@@ -68,6 +69,7 @@
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const SEND_ON_ENTER_STORAGE_KEY = 'webcoding-send-on-enter';
+  const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';
   const DEFAULT_THEME = 'default';
   const THEME_LABELS = {
     default: '默认主题',
@@ -118,6 +120,9 @@
   let sidebarSwipe = null;
   let pendingSendQueue = [];
   let pendingMessageAcks = new Map(); // clientMessageId -> { item, timer }
+  let piNativeQueue = new Map(); // clientMessageId -> server-confirmed Pi queue item
+  let piNativeQueueCounts = { steering: 0, followUp: 0 };
+  let piStreamingBehavior = localStorage.getItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY) === 'steer' ? 'steer' : 'followUp';
   let sessionSearchQuery = '';
   let statusBannerAction = null;
   let flushQueueTimer = null;
@@ -259,6 +264,8 @@
   const sendQueueBar = $('#send-queue-bar');
   const sendQueueLabel = $('#send-queue-label');
   const sendQueueClear = $('#send-queue-clear');
+  const piQueueMode = $('#pi-queue-mode');
+  const piQueueModeButtons = Array.from(document.querySelectorAll('.pi-queue-mode-btn'));
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
@@ -2123,9 +2130,49 @@
     return queueItemMatchesSession(item, sessionState.currentSessionId);
   }
 
+  function supportsPiNativeStreamingQueue() {
+    return sessionState.currentAgent === 'pi'
+      && currentRuntimeCapabilities?.protocol === 'pi-rpc'
+      && currentRuntimeCapabilities?.nativeStreamingQueue === true;
+  }
+
+  function isPiNativeStreamingQueueActive() {
+    return composeState.isGenerating && supportsPiNativeStreamingQueue();
+  }
+
+  function isPiNativeItemForCurrentView(item) {
+    return queueItemMatchesSession(item, sessionState.currentSessionId);
+  }
+
+  function syncPiQueueModeButtons() {
+    piQueueModeButtons.forEach((button) => {
+      const active = button.dataset.streamingBehavior === piStreamingBehavior;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  }
+
+  function syncComposerRuntimeControls() {
+    const nativeQueueActive = isPiNativeStreamingQueueActive();
+    if (piQueueMode) piQueueMode.hidden = !nativeQueueActive;
+    if (composeState.isGenerating) {
+      sendBtn.hidden = !nativeQueueActive;
+      abortBtn.hidden = false;
+    } else {
+      sendBtn.hidden = false;
+      abortBtn.hidden = true;
+    }
+    syncPiQueueModeButtons();
+  }
+
   function getQueuedBubble(queueId) {
     if (!queueId) return null;
     return messagesDiv.querySelector(`.msg.user.msg-queued[data-queue-id="${queueId}"]`);
+  }
+
+  function getPiNativeQueuedBubble(queueId) {
+    if (!queueId) return null;
+    return messagesDiv.querySelector(`.msg.user.msg-pi-queued[data-pi-queue-id="${queueId}"]`);
   }
 
   function queueStatusLabel(reason) {
@@ -2189,6 +2236,66 @@
     return el;
   }
 
+  function markBubbleAsPiNativeQueued(item) {
+    if (!item || !isPiNativeItemForCurrentView(item) || String(item.text || '').startsWith('/')) return null;
+    let el = getPiNativeQueuedBubble(item.id) || getQueuedBubble(item.id);
+    if (!el) {
+      const welcome = messagesDiv.querySelector('.welcome-msg');
+      if (welcome) welcome.remove();
+      el = createMsgElement('user', item.text || '', item.attachments || []);
+      messagesDiv.appendChild(el);
+    }
+    el.classList.remove('msg-queued', 'is-offline', 'is-busy', 'is-sending');
+    el.classList.add('msg-pi-queued');
+    el.removeAttribute('data-queue-id');
+    el.removeAttribute('data-queue-reason');
+    el.removeAttribute('data-queue-session-id');
+    el.dataset.piQueueId = item.id;
+    el.dataset.piQueueBehavior = item.streamingBehavior || 'followUp';
+    el.title = item.streamingBehavior === 'steer'
+      ? 'Pi 已接收，将在当前步骤结束后转向'
+      : 'Pi 已接收，将在当前任务完成后继续';
+    let status = el.querySelector('.msg-queue-status');
+    if (!status) {
+      status = document.createElement('div');
+      status.className = 'msg-queue-status';
+      el.querySelector('.msg-bubble')?.appendChild(status);
+    }
+    status.textContent = item.streamingBehavior === 'steer' ? 'Pi 原生队列 · 转向' : 'Pi 原生队列 · 接着做';
+    const clone = el.cloneNode(true);
+    el.replaceWith(clone);
+    return clone;
+  }
+
+  function promotePiNativeQueuedBubble(item) {
+    if (!item) return false;
+    const el = getPiNativeQueuedBubble(item.id) || getQueuedBubble(item.id);
+    if (!el) return false;
+    el.classList.remove('msg-pi-queued', 'msg-queued', 'is-offline', 'is-busy', 'is-sending');
+    el.removeAttribute('data-pi-queue-id');
+    el.removeAttribute('data-pi-queue-behavior');
+    el.removeAttribute('data-queue-id');
+    el.removeAttribute('data-queue-reason');
+    el.removeAttribute('data-queue-session-id');
+    el.removeAttribute('title');
+    el.querySelector('.msg-queue-status')?.remove();
+    const clone = el.cloneNode(true);
+    el.replaceWith(clone);
+    return true;
+  }
+
+  function removePiNativeQueuedBubble(queueId) {
+    getPiNativeQueuedBubble(queueId)?.remove();
+  }
+
+  function movePiNativeQueuedBubblesToEnd() {
+    for (const item of piNativeQueue.values()) {
+      if (!isPiNativeItemForCurrentView(item)) continue;
+      const bubble = getPiNativeQueuedBubble(item.id);
+      if (bubble) messagesDiv.appendChild(bubble);
+    }
+  }
+
   function promoteQueuedBubble(queueId) {
     const el = getQueuedBubble(queueId);
     if (!el) return false;
@@ -2249,10 +2356,15 @@
   /** Re-draw pending bubbles after history re-render / session switch. */
   function restoreQueuedBubblesForCurrentView() {
     messagesDiv.querySelectorAll('.msg.user.msg-queued').forEach((el) => el.remove());
+    messagesDiv.querySelectorAll('.msg.user.msg-pi-queued').forEach((el) => el.remove());
     for (const item of pendingSendQueue) {
       if (String(item.text || '').startsWith('/')) continue;
       if (!isQueueItemForCurrentView(item)) continue;
       if (!getQueuedBubble(item.id)) createQueuedUserBubble(item);
+    }
+    for (const item of piNativeQueue.values()) {
+      if (!isPiNativeItemForCurrentView(item)) continue;
+      markBubbleAsPiNativeQueued(item);
     }
   }
 
@@ -2260,7 +2372,21 @@
     if (!sendQueueBar || !sendQueueLabel) return;
     const visible = pendingSendQueue.filter((item) => isQueueItemForCurrentView(item));
     const count = visible.length;
+    const nativeVisible = Array.from(piNativeQueue.values()).filter((item) => isPiNativeItemForCurrentView(item));
+    const nativeQueueActive = isPiNativeStreamingQueueActive();
+    syncComposerRuntimeControls();
+    if (sendQueueClear) sendQueueClear.hidden = count === 0;
     if (count <= 0) {
+      if (nativeQueueActive || nativeVisible.length > 0) {
+        const nativeParts = [];
+        if (piNativeQueueCounts.steering > 0) nativeParts.push(`转向 ${piNativeQueueCounts.steering}`);
+        if (piNativeQueueCounts.followUp > 0) nativeParts.push(`接着做 ${piNativeQueueCounts.followUp}`);
+        sendQueueBar.hidden = false;
+        sendQueueLabel.textContent = nativeParts.length > 0
+          ? `Pi 原生队列 · ${nativeParts.join(' · ')}`
+          : 'Pi 运行中 · 下一条消息';
+        return;
+      }
       // Still show global offline backlog if any other session is waiting.
       const globalWaiting = pendingSendQueue.filter((item) => item.reason === 'offline' || item.reason === 'failed').length;
       if (globalWaiting > 0) {
@@ -2279,6 +2405,7 @@
     if (sendingCount > 0) parts.push(`发送中 ${sendingCount}`);
     if (busyCount > 0) parts.push(`排队 ${busyCount}`);
     if (offlineCount > 0) parts.push(`待重连 ${offlineCount}`);
+    if (nativeVisible.length > 0) parts.push(`Pi 队列 ${nativeVisible.length}`);
     sendQueueLabel.textContent = `${parts.join(' · ')} 条消息 · 点气泡可取消`;
     sendQueueBar.hidden = false;
   }
@@ -2318,6 +2445,7 @@
       sessionId: normalizeQueueSessionId(item.sessionId ?? sessionState.currentSessionId),
       mode: item.mode || sessionState.currentMode,
       agent: item.agent || sessionState.currentAgent,
+      streamingBehavior: item.streamingBehavior === 'steer' ? 'steer' : item.streamingBehavior === 'followUp' ? 'followUp' : null,
       reason: item.reason || 'queued',
       createdAt: Date.now(),
     };
@@ -2354,7 +2482,10 @@
 
     const forCurrent = isQueueItemForCurrentView(item);
     const isCommand = String(item.text || '').startsWith('/');
-    const allowWhileGenerating = options.allowWhileGenerating === true || isCommand;
+    const isPiNativeQueueItem = item.agent === 'pi'
+      && (item.streamingBehavior === 'steer' || item.streamingBehavior === 'followUp')
+      && supportsPiNativeStreamingQueue();
+    const allowWhileGenerating = options.allowWhileGenerating === true || isCommand || isPiNativeQueueItem;
     const isPlanModeActive = isActivePlanTurn();
 
     if (forCurrent) {
@@ -2438,6 +2569,21 @@
       return;
     }
 
+    if (msg.execution === 'pi-queue') {
+      const nativeItem = {
+        ...item,
+        sessionId: msg.sessionId || item.sessionId,
+        streamingBehavior: msg.streamingBehavior === 'steer' ? 'steer' : 'followUp',
+        reason: 'pi-native',
+      };
+      piNativeQueue.set(nativeItem.id, nativeItem);
+      markBubbleAsPiNativeQueued(nativeItem);
+      updateSendQueueIndicator();
+      forceScrollToBottom();
+      scheduleFlushSendQueue(40);
+      return;
+    }
+
     const isCommand = String(item.text || '').startsWith('/');
     if (!isCommand) {
       if (forCurrent) {
@@ -2466,6 +2612,60 @@
     scheduleFlushSendQueue(40);
   }
 
+  function handleMessageRejectedMessage(msg) {
+    const clientMessageId = msg?.clientMessageId;
+    const pending = clientMessageId ? clearMessageAck(clientMessageId) : null;
+    const item = pending?.item || pendingSendQueue.find((entry) => entry.id === clientMessageId) || null;
+    if (item) {
+      if (msg.retryable === false) {
+        pendingSendQueue = pendingSendQueue.filter((entry) => entry.id !== item.id);
+        removeQueuedBubble(item.id);
+      } else {
+        item.reason = isWsOpen() ? 'failed' : 'offline';
+        if (!pendingSendQueue.some((entry) => entry.id === item.id)) pendingSendQueue.unshift(item);
+        updateQueuedBubbleStatus(item.id, item.reason);
+      }
+    }
+    updateSendQueueIndicator();
+    appendError(msg.error || '消息未被 Pi 接收，请重试。');
+  }
+
+  function handlePiQueueUpdateMessage(msg) {
+    if (!isEventForCurrentSession(msg)) return;
+    piNativeQueueCounts = {
+      steering: Number.isFinite(msg.steeringCount) ? msg.steeringCount : 0,
+      followUp: Number.isFinite(msg.followUpCount) ? msg.followUpCount : 0,
+    };
+    const incoming = new Map();
+    for (const rawItem of Array.isArray(msg.items) ? msg.items : []) {
+      const id = String(rawItem?.clientMessageId || '').trim();
+      if (!id) continue;
+      const item = {
+        id,
+        text: String(rawItem.text || ''),
+        attachments: Array.isArray(rawItem.attachments) ? rawItem.attachments.map((attachment) => ({ ...attachment })) : [],
+        sessionId: msg.sessionId || sessionState.currentSessionId,
+        agent: 'pi',
+        streamingBehavior: rawItem.streamingBehavior === 'steer' ? 'steer' : 'followUp',
+        reason: 'pi-native',
+      };
+      incoming.set(id, item);
+      clearMessageAck(id);
+      pendingSendQueue = pendingSendQueue.filter((entry) => entry.id !== id);
+    }
+
+    for (const [id, item] of Array.from(piNativeQueue.entries())) {
+      if (!isPiNativeItemForCurrentView(item) || incoming.has(id)) continue;
+      piNativeQueue.delete(id);
+      removePiNativeQueuedBubble(id);
+    }
+    for (const [id, item] of incoming) {
+      piNativeQueue.set(id, item);
+      markBubbleAsPiNativeQueued(item);
+    }
+    updateSendQueueIndicator();
+  }
+
   function dispatchSendItem(item, options = {}) {
     if (!item) return false;
     if (item.reason === 'sending') return false;
@@ -2478,6 +2678,9 @@
       agent: item.agent || sessionState.currentAgent,
       clientMessageId: item.id,
     };
+    if (item.streamingBehavior === 'steer' || item.streamingBehavior === 'followUp') {
+      payload.streamingBehavior = item.streamingBehavior;
+    }
     if (!isCommand && Array.isArray(item.attachments) && item.attachments.length > 0) {
       payload.attachments = item.attachments;
     }
@@ -2750,8 +2953,15 @@
   }
 
   function setCurrentAgent(agent) {
-    sessionState.currentAgent = normalizeAgent(agent);
+    const nextAgent = normalizeAgent(agent);
+    if (sessionState.currentAgent !== nextAgent) {
+      currentRuntimeCapabilities = null;
+      piNativeQueueCounts = { steering: 0, followUp: 0 };
+    }
+    sessionState.currentAgent = nextAgent;
     updateAgentScopedUI();
+    syncComposerRuntimeControls();
+    updateSendQueueIndicator();
   }
 
   function handleAgentSelectionChange(agent) {
@@ -2810,10 +3020,9 @@
     composeState.pendingAttachments = [];
     composeState.uploadingAttachments = [];
     composeState.activeToolCalls.clear();
+    piNativeQueueCounts = { steering: 0, followUp: 0 };
     _previewCodeMap.clear();
     _previewCodeId = 0;
-    sendBtn.hidden = false;
-    abortBtn.hidden = true;
     abortBtn.disabled = false;
     abortBtn.classList.remove('is-aborting');
     abortBtn.title = '停止生成';
@@ -2821,6 +3030,7 @@
     sessionState.currentMode = getSavedModeForAgent(baseAgent);
     modeSelect.value = sessionState.currentMode;
     updateAgentScopedUI();
+    syncComposerRuntimeControls();
     chatTitle.textContent = '新会话';
     updateCwdBadge();
     messagesDiv.innerHTML = buildWelcomeMarkup(baseAgent);
@@ -2833,6 +3043,17 @@
 
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
+    if (sessionState.currentSessionId && snapshot.sessionId !== sessionState.currentSessionId) {
+      piNativeQueueCounts = { steering: 0, followUp: 0 };
+    }
+    if (!snapshot.isRunning) {
+      for (const [id, item] of Array.from(piNativeQueue.entries())) {
+        if (queueItemMatchesSession(item, snapshot.sessionId)) piNativeQueue.delete(id);
+      }
+      if (snapshot.sessionId === sessionState.currentSessionId || !sessionState.currentSessionId) {
+        piNativeQueueCounts = { steering: 0, followUp: 0 };
+      }
+    }
     // New chat bind: attach null-session queued items to the created session id.
     if (!sessionState.currentSessionId && snapshot.sessionId) {
       rebindNullQueueItemsToSession(snapshot.sessionId);
@@ -2855,8 +3076,7 @@
       if (composeState.pendingText) flushRender();
       composeState.isGenerating = false;
       composeState.isAborting = false;
-      sendBtn.hidden = false;
-      abortBtn.hidden = true;
+      syncComposerRuntimeControls();
       abortBtn.disabled = false;
       abortBtn.classList.remove('is-aborting');
       abortBtn.title = '停止生成';
@@ -3707,8 +3927,7 @@
     if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
       startGenerating();
     } else {
-      sendBtn.hidden = true;
-      abortBtn.hidden = false;
+      syncComposerRuntimeControls();
       composeState.activeToolCalls.clear();
       const bubble = document.querySelector('#streaming-msg .msg-bubble');
       if (bubble) bubble.innerHTML = '';
@@ -3904,6 +4123,9 @@
     text_delta: handleTextDeltaMessage,
     thinking_delta: handleThinkingDeltaMessage,
     message_accepted: handleMessageAcceptedMessage,
+    message_rejected: handleMessageRejectedMessage,
+    pi_queue_update: handlePiQueueUpdateMessage,
+    pi_queued_turn_start: handlePiQueuedTurnStartMessage,
     tool_start: handleToolStartMessage,
     tool_end: handleToolEndMessage,
     cost: handleCostMessage,
@@ -3971,9 +4193,25 @@
     const msgAgent = msg.agent || 'claude';
     if (msgAgent !== sessionState.currentAgent) return;
     currentSlashCommands = msg.commands;
+    currentRuntimeCapabilities = msg.capabilities && typeof msg.capabilities === 'object'
+      ? { ...msg.capabilities }
+      : null;
+    syncComposerRuntimeControls();
+    updateSendQueueIndicator();
+    scheduleFlushSendQueue(0);
   }
 
   // --- Generating State ---
+  function appendStreamingAssistantBubble() {
+    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
+    msgEl.id = 'streaming-msg';
+    const bubble = msgEl.querySelector('.msg-bubble');
+    bubble.innerHTML = '';
+    bubble.appendChild(createStreamingPlaceholder());
+    messagesDiv.appendChild(msgEl);
+    return msgEl;
+  }
+
   function startGenerating() {
     composeState.isGenerating = true;
     composeState.isAborting = false;
@@ -3982,22 +4220,66 @@
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
-    sendBtn.hidden = true;
-    abortBtn.hidden = false;
     abortBtn.disabled = false;
     abortBtn.classList.remove('is-aborting');
     abortBtn.title = '停止生成';
-    // 不禁用输入框，允许用户继续输入（但无法发送）
+    syncComposerRuntimeControls();
+    updateSendQueueIndicator();
 
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
-    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
-    msgEl.id = 'streaming-msg';
-    const bubble = msgEl.querySelector('.msg-bubble');
-    bubble.innerHTML = '';
-    bubble.appendChild(createStreamingPlaceholder());
-    messagesDiv.appendChild(msgEl);
+    appendStreamingAssistantBubble();
+    forceScrollToBottom();
+  }
+
+  function finalizeStreamingAssistantForPiContinuation() {
+    drainThinkingBuffer();
+    if (composeState.pendingText) flushRender();
+    collapseStreamingProcessForCompletedTurn();
+    const streamEl = document.getElementById('streaming-msg');
+    if (streamEl) {
+      const bubble = streamEl.querySelector('.msg-bubble');
+      const hasContent = !!(bubble && (
+        bubble.querySelector('.msg-segment-text, .tool-call, .msg-process-group, .msg-text')
+        || String(bubble.textContent || '').trim()
+      ));
+      if (hasContent) streamEl.removeAttribute('id');
+      else streamEl.remove();
+    }
+    composeState.pendingText = '';
+    composeState.activeToolCalls.clear();
+  }
+
+  function handlePiQueuedTurnStartMessage(msg) {
+    if (!isEventForCurrentSession(msg)) return;
+    const id = String(msg.clientMessageId || '').trim() || nextLocalId('pi-turn');
+    const existing = piNativeQueue.get(id) || pendingSendQueue.find((item) => item.id === id) || null;
+    const item = existing || {
+      id,
+      text: String(msg.text || ''),
+      attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
+      sessionId: msg.sessionId || sessionState.currentSessionId,
+      agent: 'pi',
+      streamingBehavior: msg.streamingBehavior === 'steer' ? 'steer' : 'followUp',
+    };
+
+    clearMessageAck(id);
+    pendingSendQueue = pendingSendQueue.filter((entry) => entry.id !== id);
+    finalizeStreamingAssistantForPiContinuation();
+    piNativeQueue.delete(id);
+    if (!promotePiNativeQueuedBubble(item)) {
+      messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || []));
+    }
+    if (!composeState.isGenerating) {
+      composeState.isGenerating = true;
+      composeState.activeTurnMode = sessionState.currentMode;
+      setCurrentSessionRunningState(true);
+    }
+    appendStreamingAssistantBubble();
+    movePiNativeQueuedBubblesToEnd();
+    syncComposerRuntimeControls();
+    updateSendQueueIndicator();
     forceScrollToBottom();
   }
 
@@ -4025,11 +4307,10 @@
     composeState.isGenerating = false;
     composeState.isAborting = false;
     composeState.activeTurnMode = null;
-    sendBtn.hidden = false;
-    abortBtn.hidden = true;
     abortBtn.disabled = false;
     abortBtn.classList.remove('is-aborting');
     abortBtn.title = '停止生成';
+    syncComposerRuntimeControls();
     setCurrentSessionRunningState(false, options.interrupted ? { phase: 'interrupted' } : {});
     // Avoid popping the mobile keyboard after every turn.
     if (!isMobileInputMode()) {
@@ -4067,6 +4348,12 @@
     if (sid && (!sessionState.currentSessionId || sessionState.currentSessionId === sid)) {
       sessionState.currentSessionId = sid;
     }
+    for (const [id, item] of Array.from(piNativeQueue.entries())) {
+      if (!queueItemMatchesSession(item, sid)) continue;
+      piNativeQueue.delete(id);
+      removePiNativeQueuedBubble(id);
+    }
+    piNativeQueueCounts = { steering: 0, followUp: 0 };
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
 
@@ -4076,6 +4363,7 @@
     }
 
     // Auto-send next queued message for this session after the turn completes.
+    updateSendQueueIndicator();
     scheduleFlushSendQueue(80);
   }
 
@@ -6850,6 +7138,7 @@
     if ((!text && composeState.pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
     hideCmdMenu();
     hideOptionPicker();
+    const nativeStreamingBehavior = isPiNativeStreamingQueueActive() ? piStreamingBehavior : null;
 
     // Slash commands: platform local, TUI-blocked, or CLI passthrough (server decides).
     if (text.startsWith('/')) {
@@ -6863,6 +7152,7 @@
         sessionId: sessionState.currentSessionId,
         mode: sessionState.currentMode,
         agent: sessionState.currentAgent,
+        streamingBehavior: nativeStreamingBehavior,
         reason: isWsOpen() ? 'queued' : 'offline',
       };
       if (!enqueueSendItem(commandItem, { toast: !isWsOpen() })) return;
@@ -6891,11 +7181,12 @@
       sessionId: sessionState.currentSessionId,
       mode: sessionState.currentMode,
       agent: sessionState.currentAgent,
+      streamingBehavior: nativeStreamingBehavior,
     };
 
     // Busy generating (non-plan): queue for auto-send after current turn.
     // Use spawn-time turn mode — not the next-turn mode selection.
-    if (composeState.isGenerating && !isActivePlanTurn()) {
+    if (composeState.isGenerating && !isActivePlanTurn() && !nativeStreamingBehavior) {
       if (!enqueueSendItem({ ...item, reason: 'busy' })) return;
       msgInput.value = '';
       composeState.pendingAttachments = [];
@@ -7200,6 +7491,16 @@
   if (sendQueueClear) {
     sendQueueClear.addEventListener('click', () => clearSendQueue());
   }
+  piQueueModeButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const behavior = button.dataset.streamingBehavior;
+      if (behavior !== 'steer' && behavior !== 'followUp') return;
+      piStreamingBehavior = behavior;
+      localStorage.setItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY, behavior);
+      syncPiQueueModeButtons();
+      msgInput.focus({ preventScroll: true });
+    });
+  });
   if (appStatusBannerAction) {
     appStatusBannerAction.addEventListener('click', () => {
       const action = statusBannerAction;

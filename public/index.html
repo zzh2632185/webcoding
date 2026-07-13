@@ -152,7 +152,13 @@
             <div class="input-area">
               <div id="send-queue-bar" class="send-queue-bar" hidden>
                 <span id="send-queue-label" class="send-queue-label">队列中 0 条</span>
-                <button type="button" id="send-queue-clear" class="send-queue-clear" title="清空待发送队列">清空</button>
+                <div class="send-queue-actions">
+                  <div id="pi-queue-mode" class="pi-queue-mode" role="group" aria-label="Pi 运行中消息模式" hidden>
+                    <button type="button" class="pi-queue-mode-btn active" data-streaming-behavior="followUp" aria-pressed="true" title="当前任务完成后继续处理">接着做</button>
+                    <button type="button" class="pi-queue-mode-btn" data-streaming-behavior="steer" aria-pressed="false" title="当前步骤结束后立即调整方向">转向</button>
+                  </div>
+                  <button type="button" id="send-queue-clear" class="send-queue-clear" title="清空待发送队列">清空</button>
+                </div>
               </div>
               <div id="attachment-tray" class="attachment-tray" hidden></div>
               <div class="input-wrapper">
