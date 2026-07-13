@@ -6,17 +6,19 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <title>Webcoding</title>
-  <link rel="stylesheet" href="css/00-tokens.css?v=1.8.2">
-  <link rel="stylesheet" href="css/01-base.css?v=1.8.2">
-  <link rel="stylesheet" href="css/02-layout.css?v=1.8.2">
-  <link rel="stylesheet" href="css/03-chat.css?v=1.8.2">
-  <link rel="stylesheet" href="css/04-sessions.css?v=1.8.2">
-  <link rel="stylesheet" href="css/05-panels.css?v=1.8.2">
-  <link rel="stylesheet" href="css/06-components.css?v=1.8.2">
-  <link rel="stylesheet" href="css/07-themes.css?v=1.8.2">
-  <link rel="stylesheet" href="css/08-mobile.css?v=1.8.2">
-  <link rel="stylesheet" href="css/09-polish.css?v=1.8.2">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="css/00-tokens.css?v=1.8.11">
+  <link rel="stylesheet" href="css/01-base.css?v=1.8.11">
+  <link rel="stylesheet" href="css/02-layout.css?v=1.8.11">
+  <link rel="stylesheet" href="css/03-chat.css?v=1.8.11">
+  <link rel="stylesheet" href="css/04-sessions.css?v=1.8.11">
+  <link rel="stylesheet" href="css/05-panels.css?v=1.8.11">
+  <link rel="stylesheet" href="css/06-components.css?v=1.8.11">
+  <link rel="stylesheet" href="css/07-themes.css?v=1.8.11">
+  <link rel="stylesheet" href="css/09-polish.css?v=1.8.11">
+  <link rel="stylesheet" href="css/10-git-panel.css?v=1.8.11">
+  <link rel="stylesheet" href="css/11-color-scheme.css?v=1.8.11">
+  <link rel="stylesheet" href="css/08-mobile.css?v=1.8.11">
+  <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 </head>
 <body>
   <!-- Login -->
@@ -51,11 +53,16 @@
       <!-- Sidebar -->
       <aside id="sidebar" class="sidebar">
         <div class="sidebar-top-strip">
-          <div class="sidebar-top-brand">
-            <strong>Webcoding</strong>
+          <div class="sidebar-top-leading">
+            <div class="sidebar-top-brand">
+              <strong>Webcoding</strong>
+            </div>
           </div>
           <div class="sidebar-top-actions">
-            <span id="topbar-cost-display" class="cost-display sidebar-cost" hidden></span>
+            <button type="button" id="color-scheme-btn" class="color-scheme-btn topbar-icon-btn" title="切换深色模式" aria-label="切换深色模式" aria-pressed="false">
+              <svg class="color-scheme-icon color-scheme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+              <svg class="color-scheme-icon color-scheme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+            </button>
             <button id="git-panel-btn" class="git-topbar-btn topbar-icon-btn" title="Git 面板" aria-label="Git">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
               <span id="git-badge" class="git-badge" hidden></span>
@@ -104,10 +111,6 @@
               <button type="button" class="mode-tab" data-mode="plan" title="Plan：规划/只读向">Plan</button>
             </div>
           </div>
-          <div id="sidebar-cwd-block" class="sidebar-cwd-block" hidden>
-            <span class="sidebar-footer-label">工作目录</span>
-            <span id="topbar-chat-cwd" class="topbar-chat-cwd sidebar-cwd" title=""></span>
-          </div>
         </div>
       </aside>
 
@@ -119,6 +122,10 @@
         <main class="chat-main">
           <div class="chat-stage-shell">
             <header class="chat-header">
+              <button type="button" id="color-scheme-btn-mobile" class="color-scheme-btn-mobile" title="切换深色模式" aria-label="切换深色模式" aria-pressed="false">
+                <svg class="color-scheme-icon color-scheme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                <svg class="color-scheme-icon color-scheme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+              </button>
               <button id="menu-btn" class="menu-btn" title="菜单" aria-label="打开侧边栏">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
               </button>
@@ -183,7 +190,8 @@
                     <path d="M21.44 11.05l-8.49 8.49a6 6 0 1 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
                   </svg>
                 </button>
-                <textarea id="msg-input" rows="1" placeholder="输入消息… 输入 / 查看指令 · ⌘/Ctrl+Enter 发送" autocomplete="off"></textarea>
+                <textarea id="msg-input" rows="1" placeholder="输入消息…" autocomplete="off" aria-describedby="message-input-hint"></textarea>
+                <span id="message-input-hint" hidden>输入斜杠查看指令，使用设定的发送快捷键发送</span>
                 <button id="send-btn" class="send-btn" title="发送（⌘/Ctrl+Enter）" aria-label="发送">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -208,13 +216,17 @@
         <aside id="git-panel" class="git-panel" aria-label="Git 面板">
           <div class="git-panel-header">
             <span class="git-panel-title">Git</span>
+            <button class="git-panel-close" id="git-panel-close" title="关闭" aria-label="关闭">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+          <div class="git-panel-tabs-wrap">
             <div class="git-panel-tabs" id="git-panel-tabs">
-              <button class="git-panel-tab active" data-git-view="status">状态</button>
-              <button class="git-panel-tab" data-git-view="diff">Diff</button>
-              <button class="git-panel-tab" data-git-view="log">Log</button>
-              <button class="git-panel-tab" data-git-view="commit">提交</button>
+              <button type="button" class="git-panel-tab active" data-git-view="status">状态</button>
+              <button type="button" class="git-panel-tab" data-git-view="diff">Diff</button>
+              <button type="button" class="git-panel-tab" data-git-view="log">Log</button>
+              <button type="button" class="git-panel-tab" data-git-view="commit">提交</button>
             </div>
-            <button class="git-panel-close" id="git-panel-close" title="关闭" aria-label="关闭">✕</button>
           </div>
           <div class="git-panel-toolbar" id="git-panel-toolbar">
             <button class="git-toolbar-btn primary" data-workspace-action="refresh-git" title="刷新 Git 状态">刷新</button>
@@ -245,6 +257,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="/qrcode.min.js"></script>
-  <script src="app.js?v=1.8.2"></script>
+  <script src="app.js?v=1.8.11"></script>
 </body>
 </html>

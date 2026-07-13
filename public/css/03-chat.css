@@ -236,7 +236,7 @@
   background: var(--bg-tertiary, rgba(0, 0, 0, 0.06));
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
   line-height: 1.15;
   text-align: center;
@@ -324,19 +324,19 @@
 }
 .msg-segment-text {
   min-width: 0;
-  font-size: 13px;
+  font-size: var(--text-caption);
   line-height: 1.6;
   color: var(--text-primary);
   opacity: 1;
 }
 .msg-segment-text.msg-segment-process {
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.55;
   color: var(--text-secondary);
   opacity: 0.88;
 }
 .msg-segment-text.msg-segment-thinking {
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.55;
   color: var(--text-muted);
   opacity: 0.9;
@@ -345,7 +345,7 @@
   padding-left: 10px;
 }
 .msg-segment-text.msg-segment-final {
-  font-size: 13px;
+  font-size: var(--text-caption);
   line-height: 1.6;
   color: var(--text-primary);
   opacity: 1;
@@ -371,7 +371,7 @@
   list-style: none;
   user-select: none;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
@@ -395,9 +395,9 @@
   min-width: 0;
 }
 .msg-process-group-hint {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
-  color: var(--text-muted);
+  color: var(--color-mid-ash);
   opacity: 0.85;
 }
 .msg-process-group-summary:hover {
@@ -421,7 +421,7 @@
   margin: 0 0 6px;
   padding: 4px 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -662,7 +662,7 @@
 .tool-call summary {
   padding: 8px 12px;
   cursor: pointer;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-secondary);
   background: var(--bg-secondary);
   display: flex;
@@ -684,7 +684,7 @@
   width: 100%;
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 11px;
+  font-size: 13px;
   text-transform: none;
   color: var(--text-primary);
   line-height: 1.25;
@@ -699,16 +699,16 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-muted);
-  font-size: 11px;
+  color: var(--color-mid-ash);
+  font-size: 12px;
 }
 .tool-call-state {
   flex-shrink: 0;
   padding: 2px 8px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-nav);
+  border-radius: var(--radius-badges);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: none;
@@ -754,7 +754,7 @@
 }
 .tool-call-content {
   padding: 8px 12px;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-secondary);
   background: var(--bg-primary);
   border-top: 1px solid var(--line);
@@ -769,10 +769,10 @@
 .tool-call-content.reasoning {
   font-family: var(--font-ui);
   line-height: 1.7;
-  color: var(--text-muted);
+  color: var(--color-mid-ash);
   background: var(--bg-primary);
   font-style: italic;
-  font-size: 10px;
+  font-size: 12px;
   opacity: 0.9;
 }
 .tool-call-content.command,
@@ -791,11 +791,11 @@
 }
 .tool-call-section-label {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: normal;
   text-transform: none;
-  color: var(--text-muted);
+  color: var(--color-mid-ash);
 }
 .tool-call-code {
   margin: 0;
@@ -807,7 +807,7 @@
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.6;
 }
 .tool-call-empty {
@@ -826,8 +826,8 @@
   padding: 8px 12px;
   cursor: pointer;
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-muted);
+  font-size: 13px;
+  color: var(--color-mid-ash);
   background: var(--bg-secondary);
   list-style: none;
   user-select: none;
@@ -1144,7 +1144,7 @@
   background: transparent;
   border: none;
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--text-caption);
   font-family: var(--font-ui);
   font-weight: 500;
   line-height: 1.5;
@@ -1153,7 +1153,7 @@
   max-height: var(--input-max-height);
   min-height: 22px;
   overflow-y: auto;
-  letter-spacing: 0.01em;
+  letter-spacing: normal;
 }
 #msg-input::placeholder { color: var(--text-muted); }
 .send-btn, .abort-btn {
@@ -1390,7 +1390,8 @@
   --compact-text-control-size: 11px;
 
   display: none;
-  appearance: auto;
+  -webkit-appearance: none;
+  appearance: none;
   min-height: 36px;
   padding: 0 28px 0 10px;
   border: var(--mobile-topbar-select-border);

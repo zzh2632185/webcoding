@@ -1,16 +1,4 @@
 /* 08-mobile.css — responsive rules */
-@media (max-width: 1180px) {
-  .topbar-chat-cwd {
-    max-width: min(120px, 14vw);
-  }
-}
-
-@media (max-width: 980px) {
-  .topbar-chat-cwd {
-    display: none !important;
-  }
-}
-
 @media (pointer: coarse) {
   .messages-wrap:hover .custom-scrollbar {
     opacity: 0;
@@ -56,9 +44,16 @@
 }
 
 @media (max-width: 728px) {
+  .sidebar-resizer {
+    display: none;
+  }
+
   .sidebar {
     position: fixed;
     left: 0; top: 0; bottom: 0;
+    width: min(85vw, 280px);
+    min-width: min(85vw, 280px);
+    max-width: 280px;
     z-index: 100;
     transform: translateX(-100%);
   }
@@ -68,8 +63,20 @@
     background: var(--mobile-sidebar-overlay-background);
     z-index: 99;
   }
-  .menu-btn { display: block; }
-  .msg { max-width: 95%; }
+  .menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+  }
+  .color-scheme-btn-mobile {
+    width: 44px;
+    height: 44px;
+  }
+  .msg { max-width: 100%; }
+  .msg.assistant { width: 100%; }
   .input-area { padding: var(--space-lg) var(--space-md); padding-bottom: max(var(--space-lg), var(--safe-bottom)); }
   .messages { padding: var(--space-lg) var(--space-md); gap: var(--space-lg); }
   .session-item-actions { display: flex; }
@@ -99,14 +106,22 @@
   .mobile-topbar-select {
     display: block;
     width: auto;
+    min-height: 44px;
+    font-family: var(--font-ui);
+    font-size: 14px;
+  }
+  .session-search-input {
+    min-height: 44px;
   }
   .cmd-menu { left: var(--space-md); right: var(--space-md); transform: none; min-width: auto; bottom: 72px; }
   .option-picker { left: var(--space-md); right: var(--space-md); transform: none; min-width: auto; max-width: none; bottom: 72px; }
   .chat-title {
-    font-size: 11px;
+    font-size: 14px;
   }
   .chat-agent-context {
-    font-size: 9px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+    letter-spacing: normal;
   }
   .chat-agent-menu {
     right: var(--space-md);
@@ -118,28 +133,102 @@
 }
 
 @media (max-width: 480px) {
-  .msg-avatar { width: 24px;
-  height: 24px; }
+  .chat-header {
+    display: grid;
+    grid-template-columns: 44px 44px minmax(0, 1fr);
+    grid-template-areas:
+      "scheme menu title"
+      "controls controls controls";
+    align-items: center;
+    gap: 6px 8px;
+    min-height: 0;
+    padding: 8px 12px 10px;
+  }
+  .color-scheme-btn-mobile { grid-area: scheme; }
+  .menu-btn { grid-area: menu; }
+  .chat-header-copy {
+    grid-area: title;
+    width: 100%;
+  }
+  .chat-title {
+    padding: 0;
+    line-height: 1.43;
+  }
+  .chat-agent-context,
+  .chat-session-meta {
+    display: none;
+  }
+  .chat-toolbar {
+    grid-area: controls;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+  }
+  .mobile-topbar-select {
+    width: 100%;
+    min-width: 0;
+  }
+  .chat-runtime-state {
+    grid-column: 1 / -1;
+    min-height: 36px;
+    justify-content: center;
+  }
+  .msg-avatar-col {
+    width: 36px;
+  }
+  .msg.user .msg-avatar-col {
+    width: 28px;
+  }
+  .msg-avatar {
+    width: 28px;
+    height: 28px;
+  }
   .msg-avatar svg { width: 14px; height: 14px; }
-  .msg-bubble { padding: 9px 11px; font-size: 12px; }
-  .msg-segment-text.msg-segment-process { font-size: 11px; }
-  .msg-segment-text.msg-segment-final { font-size: 12px; }
-  .code-block-wrapper pre code { font-size: 10px; }
-  .input-wrapper { padding: var(--space-sm) var(--space-md); box-shadow: none; }
-  .attach-btn { width: 36px; height: 36px; }
-  .send-btn, .abort-btn { width: 34px;
-  height: 34px; }
+  .msg-avatar-model { display: none; }
+  .msg-bubble {
+    padding: 9px 10px;
+    font-size: 14px;
+  }
+  .msg.assistant .msg-bubble {
+    flex: 1;
+  }
+  .msg-segment-text,
+  .msg-segment-text.msg-segment-final { font-size: 14px; }
+  .msg-segment-text.msg-segment-process,
+  .msg-segment-text.msg-segment-thinking { font-size: 13px; }
+  .code-block-wrapper pre code { font-size: 12px; }
+  .input-wrapper {
+    gap: 6px;
+    padding: 6px 8px;
+    box-shadow: none;
+  }
+  #msg-input {
+    min-height: 44px;
+    padding: 11px 0;
+  }
+  .attach-btn,
+  .send-btn,
+  .abort-btn {
+    width: 44px;
+    height: 44px;
+  }
   .new-chat-btn,
-  .new-chat-arrow { min-height: 40px; }
+  .new-chat-arrow { min-height: 44px; }
   .new-chat-arrow { width: 44px; }
   /* Mobile tool content overflow fix */
+  .msg-process-group-summary,
+  .tool-call summary,
+  .tool-group-summary {
+    min-height: 44px;
+  }
   .tool-call-content {
     max-height: 180px;
-    font-size: 10px;
+    font-size: 12px;
     padding: var(--space-md) var(--space-sm);
   }
   .tool-call-code {
-    font-size: 10px;
+    font-size: 12px;
     padding: var(--space-md) 10px;
   }
   .code-block-wrapper {
@@ -157,7 +246,23 @@
 @media (max-width: 480px) {
   .settings-panel { width: 95%; padding: 20px 16px; }
   .settings-nav-card { padding: 13px 14px; }
-  .settings-back { width: 32px; height: 32px; }
+  .settings-back,
+  .settings-panel h3 .settings-close,
+  .settings-header .settings-close {
+    width: 44px;
+    height: 44px;
+  }
+  .settings-actions button { min-height: 44px; }
+  .modal-close-btn,
+  .modal-btn-primary,
+  .modal-btn-secondary,
+  .modal-btn-danger {
+    min-height: 44px;
+  }
+  .modal-close-btn {
+    width: 44px;
+    height: 44px;
+  }
 }
 
 @media (max-width: 728px) {
@@ -190,6 +295,16 @@
     max-width: none;
     width: 100%;
   }
+  .dir-browser-crumb,
+  .dir-browser-crumb-current,
+  .dir-browser-edit-btn,
+  .dir-browser-go-btn {
+    min-height: 44px;
+  }
+  .dir-browser-crumb,
+  .dir-browser-crumb-current {
+    min-width: 44px;
+  }
 }
 
 @media (max-width: 480px) {
@@ -201,7 +316,7 @@
   }
   .project-picker-item-name,
   .dir-browser-current-name {
-    font-size: 12px;
+    font-size: 14px;
   }
   .dir-browser-pathbar {
     padding: 8px;
@@ -217,14 +332,15 @@
     display: none !important;
   }
 
-  .git-panel.visible {
+  #git-panel.visible {
     display: flex !important;
     position: fixed;
     right: 0;
     top: 0;
     bottom: 0;
-    width: 100%;
-    min-width: 0;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
     z-index: 200;
     border-left: none;
     border-top: 1px solid var(--color-hairline);
@@ -302,21 +418,35 @@
 
   .git-tree-action-btn,
   .git-tree-stage-btn {
-    min-height: 28px;
+    min-height: 44px;
+  }
+
+  .git-panel-tab,
+  .git-toolbar-btn,
+  .git-panel-close {
+    min-height: 44px;
   }
 }
 @media (max-width: 728px) {
   .sidebar-top-strip {
-    display: none;
+    display: flex;
+    min-height: 60px;
+    padding: var(--spacing-8) var(--spacing-12);
+  }
+
+  .sidebar .color-scheme-btn {
+    display: none !important;
+  }
+
+  .sidebar .git-topbar-btn,
+  .sidebar .settings-btn {
+    width: 44px;
+    height: 44px;
+    padding: 0;
   }
 
   .sidebar-footer {
     display: none;
-  }
-
-  .sidebar {
-    width: min(85vw, 300px);
-    min-width: min(85vw, 300px);
   }
 
   .chat-header {
@@ -334,6 +464,10 @@
 
   .mobile-topbar-select {
     display: block;
+  }
+
+  .welcome-actions .workspace-action-btn {
+    min-height: 44px;
   }
 }
 

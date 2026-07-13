@@ -10,9 +10,9 @@
 .session-list-empty {
   margin: var(--spacing-8) 0 var(--spacing-10);
   padding: var(--spacing-10);
-  border: 1px dashed var(--color-hairline);
-  border-radius: var(--radius-nav);
-  color: var(--text-secondary);
+  border: none;
+  border-radius: 0;
+  color: var(--color-mid-ash);
   font-size: var(--text-caption);
   line-height: var(--leading-caption);
   background: transparent;
@@ -106,16 +106,19 @@
   border-radius: 50%;
   border: 1px solid var(--color-hairline);
   background: var(--color-pure-white);
+  opacity: 0;
 }
 
 .session-item.is-running .session-item-marker {
   background: var(--color-graphite-ink);
   border-color: var(--color-graphite-ink);
+  opacity: 1;
 }
 
 .session-item.has-unread .session-item-marker {
   background: var(--color-graphite-ink);
   border-color: var(--color-graphite-ink);
+  opacity: 1;
 }
 
 .session-item-content {
@@ -151,22 +154,22 @@
 }
 
 .session-item-agent {
-  font-size: 11px;
-  color: var(--text-muted);
-  background: transparent;
-  border: 1px solid var(--color-hairline);
-  border-radius: var(--radius-nav);
-  padding: 1px 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--color-sidebar-mist);
+  border: none;
+  border-radius: var(--radius-badges);
+  padding: 2px 5px;
   line-height: 1.2;
 }
 
 .session-item-status {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-primary);
   background: var(--color-hover-veil);
-  border: 1px solid var(--color-hairline);
-  border-radius: var(--radius-nav);
-  padding: 1px 5px;
+  border: none;
+  border-radius: var(--radius-badges);
+  padding: 2px 5px;
   line-height: 1.2;
   display: inline-flex;
   align-items: center;
@@ -468,7 +471,7 @@
   min-height: 38px;
   padding: 0;
   border-left: 1px solid var(--button-border);
-  border-radius: var(--radius-nav) var(--button-radius) var(--button-radius) 0;
+  border-radius: 0 var(--button-radius) var(--button-radius) 0;
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;

@@ -16,10 +16,10 @@
   box-shadow: none;
 }
 .login-kicker {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: normal;
   text-transform: none;
   color: var(--text-muted);
   margin-bottom: 16px;
@@ -35,15 +35,15 @@
   text-align: left;
 }
 .login-brand-copy strong {
-  font-family: var(--font-mono);
-  font-size: 13px;
+  font-family: var(--font-ui);
+  font-size: 14px;
   text-transform: none;
-  letter-spacing: 0.06em;
+  letter-spacing: normal;
   display: block;
 }
 .login-brand-copy span {
-  font-size: 11px;
-  color: var(--text-muted);
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 .login-logo {
   width: 44px;
@@ -82,19 +82,19 @@
 }
 .login-field span {
   display: block;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 500;
   color: var(--text-secondary);
   margin-bottom: 6px;
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   text-transform: none;
-  letter-spacing: 0.06em;
+  letter-spacing: normal;
 }
 .login-box input {
   width: 100%;
   padding: 10px 12px;
   margin-bottom: 14px;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.4;
 }
 .login-box button {
@@ -135,7 +135,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 14px;
   color: var(--text-secondary);
   margin-bottom: 12px;
   cursor: pointer;
@@ -150,7 +150,7 @@
 .login-error {
   color: var(--danger);
   margin-top: 12px;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -192,8 +192,13 @@
   --compact-btn-color: var(--text-muted);
 
   margin-left: auto;
-  font-size: 13px;
-  padding: 2px 8px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
 }
 .settings-panel h3 .settings-close:hover { /* keep explicit block for readability */ }
 /* Local file viewer */
@@ -269,17 +274,22 @@
   margin-bottom: 2px;
   color: var(--text-muted);
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
-  letter-spacing: 0.02em;
+  letter-spacing: normal;
 }
 .settings-header .settings-close {
   --compact-btn-bg: transparent;
   --compact-btn-color: var(--text-muted);
 
   margin-left: auto;
-  font-size: 13px;
-  padding: 2px 8px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
 }
 .settings-header .settings-close:hover { /* keep explicit block for readability */ }
 .settings-field {
@@ -297,7 +307,7 @@
   align-items: center;
   gap: 6px;
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
   color: var(--blue-strong);
@@ -311,16 +321,16 @@
   margin-bottom: 4px;
 }
 .agent-context-copy {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-secondary);
   line-height: 1.65;
 }
 .settings-field label {
   display: block;
   font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: normal;
   color: var(--text-secondary);
   margin-bottom: var(--space-md);
 }
@@ -331,7 +341,7 @@
 }
 .tpl-fetch-toolbar-title {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.01em;
   color: var(--text-secondary);
@@ -345,7 +355,7 @@
   background: var(--bg-secondary);
   color: var(--text-primary);
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
   box-shadow: none;
@@ -362,7 +372,7 @@
 .tpl-fetch-toolbar-status {
   display: block;
   margin-top: 4px;
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 .tpl-fetch-toolbar-status:empty {
@@ -373,7 +383,7 @@
   padding: 8px 11px;
   border: 1px solid var(--inline-note-border);
   border-radius: var(--chat-card-border-radius);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.55;
   color: var(--text-muted);
   background: var(--inline-note-background);
@@ -385,7 +395,7 @@
 }
 .settings-inline-note code {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 12px;
   padding: 1px 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius-nav);
@@ -424,12 +434,12 @@
 }
 .settings-nav-card-title {
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
 }
 .settings-nav-card-meta {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 .settings-nav-card-arrow {
@@ -468,13 +478,17 @@
   margin-bottom: 16px;
 }
 .settings-subpage-header h3 {
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
 }
 .settings-field input,
 .settings-select {
   width: 100%;
+  min-height: 40px;
   padding: 10px 12px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.43;
 }
 .settings-select {
   -webkit-appearance: none;
@@ -495,9 +509,9 @@
   --nb-btn-hover-shift: 1px;
 
   flex: 1;
-  min-height: 36px;
+  min-height: 40px;
   padding: 7px 14px;
-  font-size: var(--btn-md-font);
+  font-size: 14px;
   letter-spacing: var(--btn-letter-spacing);
 }
 .settings-actions .btn-test {
@@ -518,8 +532,8 @@
 }
 .settings-status {
   margin-top: 12px;
-  font-family: var(--font-mono);
-  font-size: 12px;
+  font-family: var(--font-ui);
+  font-size: 13px;
   text-align: center;
   min-height: 20px;
   text-transform: none;
@@ -600,7 +614,7 @@
 
 /* === Password Hint === */
 .password-hint {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
   margin: -4px 0 10px 2px;
   text-align: left;
@@ -623,7 +637,7 @@
 /* === Settings Section Title === */
 .settings-section-title {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--text-secondary);
@@ -664,9 +678,9 @@
   flex-shrink: 0;
 }
 .modal-title {
-  font-family: var(--font-mono);
-  font-weight: 700;
-  font-size: 13px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 14px;
   text-transform: none;
   color: var(--text-primary);
 }
@@ -674,8 +688,13 @@
   --compact-btn-bg: transparent;
   --compact-btn-color: var(--text-muted);
 
-  font-size: 14px;
-  padding: 4px 8px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
 }
 .modal-close-btn:hover { /* keep explicit block for readability */ }
 .modal-body {
@@ -693,11 +712,11 @@
 }
 .modal-field-label {
   display: block;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 500;
   text-transform: none;
-  letter-spacing: 0.06em;
+  letter-spacing: normal;
   color: var(--text-secondary);
   margin-bottom: 8px;
 }
@@ -719,35 +738,41 @@
   padding: 9px 10px;
 }
 .modal-btn-primary {
-  --nb-btn-bg: var(--blue);
+  --nb-btn-bg: var(--color-sidebar-mist);
+  --nb-btn-hover-bg: var(--color-hover-veil);
 
-  min-height: var(--btn-md-min-h);
+  min-height: 40px;
   padding: var(--btn-md-pad-y) var(--btn-lg-pad-x);
-  font-size: var(--btn-md-font);
-  letter-spacing: var(--btn-letter-spacing);
+  color: var(--color-graphite-ink);
+  font-size: 14px;
+  letter-spacing: normal;
   line-height: 1.2;
 }
 .modal-btn-primary:hover {
   /* keep explicit block for readability with shared button base */
 }
 .modal-btn-secondary {
-  --nb-btn-bg: var(--bg-secondary);
+  --nb-btn-bg: var(--color-pure-white);
+  --nb-btn-hover-bg: var(--color-hover-veil);
 
-  min-height: var(--btn-md-min-h);
+  min-height: 40px;
   padding: var(--btn-md-pad-y) var(--btn-lg-pad-x);
-  font-size: var(--btn-md-font);
-  letter-spacing: var(--btn-letter-spacing);
+  color: var(--color-graphite-ink);
+  font-size: 14px;
+  letter-spacing: normal;
   line-height: 1.2;
 }
 .modal-btn-secondary:hover {
   /* keep explicit block for readability with shared button base */
 }
 .modal-btn-danger {
-  --nb-btn-bg: var(--danger, #d44);
-  min-height: var(--btn-md-min-h);
+  --nb-btn-bg: var(--color-sidebar-mist);
+  --nb-btn-hover-bg: var(--color-hover-veil);
+  min-height: 40px;
   padding: var(--btn-md-pad-y) var(--btn-lg-pad-x);
-  font-size: var(--btn-md-font);
-  letter-spacing: var(--btn-letter-spacing);
+  color: var(--color-graphite-ink);
+  font-size: 14px;
+  letter-spacing: normal;
   line-height: 1.2;
 }
 .modal-btn-danger:hover {
@@ -765,7 +790,7 @@
   text-align: center;
   color: var(--text-muted);
   padding: 32px 0;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 /* === Directory Browser === */
@@ -780,18 +805,18 @@
   box-shadow: none;
 }
 .dir-browser-current-label {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: normal;
   text-transform: none;
   color: var(--text-muted);
 }
 .dir-browser-current-name {
   margin-top: 5px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
   line-height: 1.3;
   text-transform: none;
   color: var(--text-primary);
@@ -799,7 +824,7 @@
 }
 .dir-browser-current-path {
   margin-top: 3px;
-  font-size: 10px;
+  font-size: 13px;
   line-height: 1.55;
   color: var(--text-secondary);
   word-break: break-all;
@@ -829,11 +854,11 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 26px;
+  min-height: 32px;
   padding: 0 8px;
   border-radius: var(--radius-nav);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-family: var(--font-ui);
+  font-size: 12px;
   line-height: 1;
   white-space: nowrap;
 }
@@ -851,9 +876,9 @@
   }
 .dir-browser-crumb-current {
   border: 1px solid var(--line);
-  background: var(--blue);
-  color: var(--text-primary);
-  font-weight: 700;
+  background: var(--color-sidebar-mist);
+  color: var(--color-graphite-ink);
+  font-weight: 600;
 }
 .dir-browser-crumb-sep {
   color: var(--text-muted);
@@ -869,9 +894,9 @@
   border-radius: var(--radius-nav);
   background: var(--bg-secondary);
   color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
   cursor: pointer;
   box-shadow: none;
   transition: transform 150ms ease, box-shadow 150ms ease, background 150ms ease;
@@ -968,9 +993,9 @@
   background: var(--surface);
 }
 .dir-browser-item-name {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
   line-height: 1.35;
   color: var(--text-primary);
   overflow: hidden;
@@ -978,7 +1003,7 @@
   white-space: nowrap;
 }
 .dir-browser-item-note {
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.4;
   color: var(--text-secondary);
 }
@@ -1000,7 +1025,7 @@
   border-radius: var(--radius-nav);
   background: var(--bg-secondary);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.55;
   text-align: center;
 }
@@ -1011,9 +1036,9 @@
   border-radius: var(--radius-nav);
   background: var(--surface-strong);
   color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
   cursor: pointer;
   box-shadow: none;
   transition: transform 150ms ease, box-shadow 150ms ease, background 150ms ease;
@@ -1034,7 +1059,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 10px;
+  font-size: 13px;
   line-height: 1.4;
   color: var(--text-secondary);
   cursor: pointer;
@@ -1050,8 +1075,8 @@
   border: 1px solid var(--line);
   border-radius: var(--radius-nav);
   background: var(--surface-strong);
-  font-family: var(--font-mono);
-  font-size: 9px;
+  font-family: var(--font-ui);
+  font-size: 12px;
   line-height: 1.4;
   color: var(--text-muted);
 }
@@ -1062,7 +1087,7 @@
 .dir-browser-go-btn:focus-visible,
 .dir-browser-crumb:focus-visible,
 .dir-browser-error-back:focus-visible {
-  outline: 3px solid var(--blue-strong);
+  outline: 2px solid var(--color-mid-ash);
   outline-offset: 2px;
 }
 
