@@ -6,7 +6,7 @@ Control local Claude Code, Codex, and Pi CLI agents from a browser.
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![Agents](https://img.shields.io/badge/Agents-Claude%20%7C%20Codex%20%7C%20Pi-111111)
 
-[简体中文](./README.md) | [English](./README.en.md) | [v2.0.1 release notes](https://github.com/HsMirage/webcoding/releases/tag/v2.0.1) | [Changelog](./CHANGELOG.md)
+[简体中文](./README.md) | [English](./README.en.md) | [v2.0.2 release notes](https://github.com/HsMirage/webcoding/releases/tag/v2.0.2) | [Changelog](./CHANGELOG.md)
 
 <p align="center">
   <a href="https://ai.hsnb.fun/"><strong>Welcome to MirageAI</strong></a>
@@ -16,7 +16,7 @@ Control local Claude Code, Codex, and Pi CLI agents from a browser.
 
 Webcoding is a lightweight local browser workspace. It connects to CLI agents that are already installed and authenticated on your machine, then lets a desktop, phone, or tablet manage sessions, answer runtime interactions, inspect tool activity, and reconnect to tasks that continued after the browser closed.
 
-> `v2.0.1` uses three native bidirectional transports by default: Claude `stream-json`, Codex App Server, and Pi RPC, with a more compact mobile header and redesigned Agent / permission-mode menus. Legacy one-shot transports remain available through environment variables.
+> `v2.0.2` uses three native bidirectional transports by default: Claude `stream-json`, Codex App Server, and Pi RPC, with a compact mobile header, redesigned Agent / permission-mode menus, and a denser mobile Git workspace. Legacy one-shot transports remain available through environment variables.
 
 <p align="center">
   <img src="./webcoding-refactored-ui.png" alt="Webcoding v2 workspace" width="100%" />
@@ -89,7 +89,7 @@ On Windows, you can also run `start.bat` after installing dependencies.
 - **In-flight guidance**: Codex and Pi can steer an active turn; Pi can also queue native follow-up messages.
 - **Rich content**: image attachments, Markdown, syntax highlighting, sandboxed HTML previews, tool calls, and thinking views.
 - **Command discovery**: the slash menu merges Web commands with live CLI capabilities and excludes unsupported TUI-only commands.
-- **Git workspace**: inspect status, diff, and log, then run add, commit, branch, and checkout operations.
+- **Git workspace**: inspect status, diff, and log, then run add, commit, branch, and checkout operations; mobile uses grouped controls and a compact file list.
 - **Notifications and remote access**: five completion-notification providers, Cloudflare Quick Tunnel, and LAN access.
 
 ### Security and Reliability
@@ -307,6 +307,6 @@ webcoding/
 
 ## Releases and Documentation
 
-- [v2.0.1 release notes](https://github.com/HsMirage/webcoding/releases/tag/v2.0.1)
+- [v2.0.2 release notes](https://github.com/HsMirage/webcoding/releases/tag/v2.0.2)
 - [Full changelog](./CHANGELOG.md)
 - [简体中文 README](./README.md)

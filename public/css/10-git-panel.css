@@ -160,6 +160,14 @@ body.git-panel-resizing .git-panel-resizer::before {
   flex-shrink: 0;
 }
 
+.git-toolbar-group {
+  display: contents;
+}
+
+.git-toolbar-group-label {
+  display: none;
+}
+
 .git-toolbar-btn {
   width: 100%;
   min-width: auto;
@@ -293,6 +301,23 @@ body.git-panel-resizing .git-panel-resizer::before {
 /* === File tree === */
 .git-panel-tree-wrap {
   min-width: 0;
+}
+
+.git-panel-section-heading,
+.git-panel-view-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-8);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-mid-ash);
+}
+
+.git-panel-section-heading {
+  margin-bottom: var(--spacing-6);
+  padding: 0 var(--spacing-4);
 }
 
 .git-tree-list {
@@ -449,6 +474,21 @@ body.git-panel-resizing .git-panel-resizer::before {
 }
 
 /* === Diff / log / commit === */
+.git-panel-view-card {
+  min-width: 0;
+  padding: var(--card-padding);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-cards);
+  background: var(--color-pure-white);
+}
+
+.git-panel-view-heading {
+  margin-bottom: var(--spacing-10);
+  padding-bottom: var(--spacing-8);
+  border-bottom: 1px solid var(--color-hairline);
+  color: var(--color-graphite-ink);
+}
+
 .git-panel-code {
   padding: var(--card-padding);
   border: 1px solid var(--color-hairline);

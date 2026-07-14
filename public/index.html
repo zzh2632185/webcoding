@@ -264,12 +264,17 @@
             </div>
           </div>
           <div class="git-panel-toolbar" id="git-panel-toolbar">
-            <button class="git-toolbar-btn primary" data-workspace-action="refresh-git" title="刷新 Git 状态">刷新</button>
-            <button class="git-toolbar-btn" data-workspace-action="git-add-all" title="暂存全部改动">全部暂存</button>
-            <span class="git-toolbar-sep"></span>
-            <button class="git-toolbar-btn" data-workspace-action="git-commit" title="进入提交视图">去提交</button>
-            <button class="git-toolbar-btn" data-workspace-action="git-checkout" title="切换分支">切分支</button>
-            <button class="git-toolbar-btn" data-workspace-action="git-create-branch" title="新建分支">新建分支</button>
+            <div class="git-toolbar-group git-toolbar-worktree" role="group" aria-label="工作区操作">
+              <span class="git-toolbar-group-label">工作区</span>
+              <button class="git-toolbar-btn primary" data-workspace-action="refresh-git" title="刷新 Git 状态">刷新</button>
+              <button class="git-toolbar-btn" data-workspace-action="git-add-all" title="暂存全部改动">全部暂存</button>
+              <button class="git-toolbar-btn" data-workspace-action="git-commit" title="进入提交视图">去提交</button>
+            </div>
+            <div class="git-toolbar-group git-toolbar-branches" role="group" aria-label="分支操作">
+              <span class="git-toolbar-group-label">分支</span>
+              <button class="git-toolbar-btn" data-workspace-action="git-checkout" title="切换分支">切分支</button>
+              <button class="git-toolbar-btn" data-workspace-action="git-create-branch" title="新建分支">新建分支</button>
+            </div>
           </div>
           <div class="git-panel-scroll">
             <div id="git-panel-content" class="git-panel-body"></div>

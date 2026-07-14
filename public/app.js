@@ -926,6 +926,10 @@
       const file = node.file;
       const statusText = gitFileStatusText(file);
       const statusTone = gitFileStatusTone(file);
+      const fileName = file.path.split('/').pop() || file.path;
+      const parentPath = file.path.includes('/')
+        ? file.path.slice(0, Math.max(0, file.path.length - fileName.length)).replace(/\/$/, '')
+        : '';
       return `
         <div class="git-tree-node git-tree-file" style="--git-tree-depth:${depth}">
           <div class="git-tree-file-row">
@@ -934,10 +938,10 @@
             </div>
             <div class="git-tree-file-main">
               <div class="git-tree-file-head">
-                <div class="git-tree-file-name">${escapeHtml(file.path.split('/').pop() || file.path)}</div>
+                <div class="git-tree-file-name">${escapeHtml(fileName)}</div>
                 <span class="git-tree-badge git-tree-file-status${statusTone ? ` ${statusTone}` : ''}">${escapeHtml(statusText)}</span>
               </div>
-              <div class="git-tree-file-meta">${escapeHtml(file.path)}</div>
+              ${parentPath ? `<div class="git-tree-file-meta" title="${escapeHtml(file.path)}">${escapeHtml(parentPath)}</div>` : ''}
             </div>
             <div class="git-tree-file-trailing">
               <div class="git-tree-file-actions">
@@ -946,14 +950,16 @@
                   type="button"
                   data-git-action="show-diff"
                   data-git-file="${escapeHtml(file.path)}"
+                  aria-label="查看 ${escapeHtml(fileName)} 的 Diff"
                   ${file.staged && !file.modified ? 'data-git-staged="1"' : ''}
-                >diff</button>
+                >Diff</button>
                 ${!file.staged ? `
                   <button
                     class="workspace-action-btn git-tree-action-btn git-tree-stage-btn"
                     type="button"
                     data-git-action="add"
                     data-git-file="${escapeHtml(file.path)}"
+                    aria-label="暂存 ${escapeHtml(fileName)}"
                   >暂存</button>
                 ` : ''}
               </div>
@@ -1140,6 +1146,10 @@
           </div>
           ${gitState.lastError ? `<div class="insights-note">${escapeHtml(gitState.lastError)}</div>` : ''}
           <div class="git-panel-tree-wrap">
+            <div class="git-panel-section-heading">
+              <span>变更文件</span>
+              <span>${status.files?.length || 0} 项</span>
+            </div>
             ${buildGitFileTreeMarkup(status.files || [])}
           </div>
         </section>
@@ -1155,8 +1165,10 @@
       return '<div class=\"insights-note\">当前没有 diff 内容。</div>';
     }
     return `
-      ${title ? `<div style=\"font-size:12px;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.04em\">${escapeHtml(title)}</div>` : ''}
-      <pre class=\"git-panel-code\"><code class=\"language-diff\">${escapeHtml(content)}</code></pre>
+      <section class=\"git-panel-view-card git-panel-diff-card\">
+        ${title ? `<div class=\"git-panel-view-heading\">${escapeHtml(title)}</div>` : ''}
+        <pre class=\"git-panel-code\"><code class=\"language-diff\">${escapeHtml(content)}</code></pre>
+      </section>
     `;
   }
 
@@ -1171,13 +1183,19 @@
         <span class=\"git-panel-log-subject\">${escapeHtml(e.subject || '')}</span>
       </div>
     `).join('');
-    return `<div class=\"git-panel-log-list\">${items}</div>`;
+    return `
+      <section class=\"git-panel-view-card\">
+        <div class=\"git-panel-view-heading\">最近提交</div>
+        <div class=\"git-panel-log-list\">${items}</div>
+      </section>
+    `;
   }
 
   function buildGitPanelCommitMarkup() {
     const stagedCount = gitState.status?.summary?.staged || 0;
     return `
-      <div class=\"git-panel-commit-area\">
+      <div class=\"git-panel-commit-area git-panel-view-card\">
+        <div class=\"git-panel-view-heading\">创建提交</div>
         <label class=\"modal-field-label\" for=\"git-panel-commit-message\">提交说明</label>
         <textarea id=\"git-panel-commit-message\" class=\"themed-textarea\" rows=\"6\"
           placeholder=\"例如：feat: add git panel\"

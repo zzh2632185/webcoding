@@ -1825,6 +1825,11 @@ async function runHttpSecurityRegressionCase({ port, password, tempRoot }) {
         && !index.text.includes('id="color-scheme-btn-mobile"'),
       'Mobile header should use compact custom pickers and keep theme switching in the sidebar',
     );
+    assert(
+      index.text.includes('class="git-toolbar-group git-toolbar-worktree"')
+        && index.text.includes('class="git-toolbar-group git-toolbar-branches"'),
+      'Git toolbar should keep worktree and branch actions in separate groups',
+    );
 
     const mobileCss = await requestHttpJson({ port, path: '/css/08-mobile.css' });
     assert(mobileCss.statusCode === 200, 'Mobile stylesheet should be served successfully');
@@ -1833,6 +1838,12 @@ async function runHttpSecurityRegressionCase({ port, password, tempRoot }) {
         && mobileCss.text.includes('.mobile-picker-menu')
         && mobileCss.text.includes('.sidebar .color-scheme-btn'),
       'Mobile stylesheet should retain the compact header, custom picker menus, and sidebar theme entry',
+    );
+    assert(
+      mobileCss.text.includes('.git-toolbar-worktree')
+        && mobileCss.text.includes('grid-template-columns: 16px minmax(0, 1fr) auto')
+        && mobileCss.text.includes('.git-panel-section-heading'),
+      'Mobile Git panel should retain grouped actions and compact file rows',
     );
 
     const appAsset = await requestHttpJson({ port, path: '/app.js' });
