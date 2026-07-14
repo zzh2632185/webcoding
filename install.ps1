@@ -90,11 +90,11 @@ function Invoke-Uninstall {
 # ── 检查依赖 ──────────────────────────────────────────────────
 Write-Info '检查依赖环境...'
 if (-not (Get-Command git  -ErrorAction SilentlyContinue)) { Write-Err '未找到 git。请先安装 git: https://git-scm.com/' }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Err '未找到 Node.js。请先安装 Node.js >= 18: https://nodejs.org/' }
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Err '未找到 Node.js。请先安装 Node.js >= 22: https://nodejs.org/' }
 if (-not (Get-Command npm  -ErrorAction SilentlyContinue)) { Write-Err '未找到 npm，请确认 Node.js 安装完整。' }
 $nodeVer = (node -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>$null)
-if ([int]$nodeVer -lt 18) {
-    Write-Err "Node.js 版本过低 (当前: $(node -v))，需要 >= 18。请升级: https://nodejs.org/"
+if ([int]$nodeVer -lt 22) {
+    Write-Err "Node.js 版本过低 (当前: $(node -v))，需要 >= 22。请升级: https://nodejs.org/"
 }
 Write-Success "Node.js $(node -v)  npm $(npm -v)  git $(git --version) — 全部就绪"
 

@@ -25,6 +25,52 @@ function getArgValue(args, flag) {
   return null;
 }
 
+function resolveConfigValue(value) {
+  const raw = String(value || '');
+  const envMatch = raw.match(/^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/);
+  if (!envMatch) return raw;
+  return String(process.env[envMatch[1] || envMatch[2]] || '');
+}
+
+async function probeManagedProvider() {
+  const configDir = String(process.env.PI_CODING_AGENT_DIR || '').trim();
+  if (!configDir) throw new Error('PI_CODING_AGENT_DIR is missing');
+  const modelsConfig = JSON.parse(fs.readFileSync(path.join(configDir, 'models.json'), 'utf8'));
+  const settingsConfig = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
+  const provider = modelsConfig?.providers?.[settingsConfig.defaultProvider];
+  if (!provider) throw new Error('Managed Pi provider is missing');
+  if (provider.api !== 'openai-responses') {
+    throw new Error(`Unexpected managed Pi API: ${provider.api || 'missing'}`);
+  }
+  const apiKey = resolveConfigValue(provider.apiKey);
+  if (!apiKey) throw new Error('Managed Pi bridge token is missing');
+  const baseUrl = String(provider.baseUrl || '').replace(/\/+$/, '');
+  const modelId = provider.models?.[0]?.id || settingsConfig.defaultModel || 'mock-pi-model';
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      model: modelId,
+      input: [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'ping' }],
+      }],
+      stream: false,
+    }),
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(`Managed Pi provider probe failed with HTTP ${response.status}: ${responseText.slice(0, 300)}`);
+  }
+  const payload = responseText ? JSON.parse(responseText) : null;
+  return String(payload?.output_text || '').trim();
+}
+
 function mockModel(model) {
   return {
     id: model,
@@ -304,6 +350,12 @@ async function runRpcMode(args) {
     }
     if (input === 'trigger pi json error') {
       finishTurn('', 'error', 'Pi mock structured failure (stopReason=error)');
+      return;
+    }
+    if (input === 'verify pi unified bridge') {
+      probeManagedProvider()
+        .then((result) => finishTurn(`Pi mock provider probe: ${result}`))
+        .catch((error) => finishTurn('', 'error', error.message || String(error)));
       return;
     }
     if (input === 'trigger pi rpc select') {
@@ -651,6 +703,8 @@ async function runRpcMode(args) {
   let text = '';
   if (input === '/compact') {
     text = 'Pi mock compact finished.';
+  } else if (input === 'verify pi unified bridge') {
+    text = `Pi mock provider probe: ${await probeManagedProvider()}`;
   } else if (imageCount > 0) {
     text = `Pi mock handled ${imageCount} image attachment(s): ${input || '[no text]'}`;
   } else if (tools) {

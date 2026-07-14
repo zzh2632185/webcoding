@@ -1,6 +1,12 @@
 # 更新记录
 
-## 未发布
+## v2.0.0 - 2026-07-14
+
+### 重大更新
+
+- Claude 默认使用持久双向 `stream-json`，Codex 默认使用官方 App Server；审批、用户问题和 MCP elicitation 可在网页中直接回应
+- Pi 升级为第三个完整 Agent，并默认使用持久双向 RPC；三套 CLI 都保留兼容旧传输方式的环境变量
+- 运行环境基线提升到 Node.js 22，真实 CLI 契约检查纳入 `npm test`
 
 ### Pi 双向 RPC
 
@@ -21,12 +27,18 @@
 - Claude 与 Codex 本地模式会继承各自官方鉴权和配置环境，额外变量可通过 `CC_WEB_CLI_ENV_PASSTHROUGH` 显式允许
 - Claude 历史和设置尊重 `CLAUDE_CONFIG_DIR`，Codex 历史、状态和模型缓存尊重 `CODEX_HOME`
 - 本地历史导入和删除使用目录边界校验，避免相似路径前缀被误判为合法路径
-- Codex `/review` 映射为原生 `codex exec review --uncommitted`，命令后的文字作为审查要求传入
+- Codex `/review` 在 App Server 下使用原生 `review/start`，旧传输方式保留 `codex exec review --uncommitted` 回退
 - 回归结束会清理测试环境创建的本地 API bridge，避免反复测试后残留后台进程
 
-## v1.6.0
+### 界面与提供商
 
-### 新功能
+- 前端改为石墨灰纸面设计系统，并将样式拆分为按职责加载的模块化 CSS
+- 设置页和 AI 提供商页加入 MirageAI 入口，外部链接使用安全的新窗口打开方式
+- Claude `/model` 可合并当前 AI 提供商返回的模型；模型缓存按提供商凭据隔离，切换渠道后不会继续显示旧列表
+- 修复 AI 提供商页主按钮黑底黑字、文字不可见的问题
+- CLI 契约检查与服务端使用相同的可执行文件查找顺序，避免误检 PATH 中的旧版本
+
+### 其他新功能
 
 - **Pi Agent 适配** — 第三代理渠道：`pi -p --mode json` headless 接入
   - 后端：`buildPiSpawnSpec` / `processPiEvent`（text/thinking 流、工具调用、费用与 token 统计、session 续接）
@@ -44,6 +56,7 @@
 - **Claude 空白回复** — 生成中的 `session_info` 不再冲掉直播流；支持 `stream_event` 增量与 `result` 文本兜底；空气泡结束时自动重拉会话
 - **Pi 结构化错误** — `message_end.stopReason=error`（exit 0）也会向前端报错，避免静默成功
 - **顶栏 / 聊天头布局** — 会话标题与项目路径不再被固定高度裁切；三 Agent 页签下顶栏更耐挤压
+- **回归覆盖** — 46 项隔离回归覆盖三 Agent 生命周期、双向交互、桥接、附件、鉴权、重连与恢复
 
 ## v1.5.0
 

@@ -1463,7 +1463,7 @@ const CLAUDE_MODEL_MENU_ENTRIES = [
 const VALID_AGENTS = new Set(['claude', 'codex', 'pi']);
 
 // === Models API fetch ===
-let _modelCache = null; // { models: [{id, display_name}], fetchedAt: number, source: 'anthropic'|'openai' }
+let _modelCache = null; // { models, fetchedAt, source, credentialsKey }
 
 function resolveActiveApiCredentials() {
   // Check Claude-selected provider first
@@ -1548,13 +1548,24 @@ function fetchModelsFromApi(credentials) {
 
 async function getModelList() {
   const now = Date.now();
-  if (_modelCache && now - _modelCache.fetchedAt < 3600_000) return _modelCache;
   const creds = resolveActiveApiCredentials();
   if (!creds) return null; // no credentials — caller uses stable CLI aliases
+  const credentialsKey = crypto.createHash('sha256').update(JSON.stringify({
+    apiBase: String(creds.apiBase || ''),
+    apiKey: String(creds.apiKey || ''),
+    upstreamType: String(creds.upstreamType || ''),
+  })).digest('hex');
+  if (
+    _modelCache
+    && _modelCache.credentialsKey === credentialsKey
+    && now - _modelCache.fetchedAt < 3600_000
+  ) {
+    return _modelCache;
+  }
   try {
     const { models, source } = await fetchModelsFromApi(creds);
     if (models.length > 0) {
-      _modelCache = { models, fetchedAt: now, source };
+      _modelCache = { models, fetchedAt: now, source, credentialsKey };
       return _modelCache;
     }
   } catch (e) {
@@ -2040,11 +2051,16 @@ function preparePiCustomRuntime(config) {
   } catch (error) {
     return { error: `启动 Pi 本地 API 桥接失败: ${error.message || error}` };
   }
+  const isAnthropic = source.upstreamType === 'anthropic';
+  // Route through the same local bridge as Claude/Codex so proxies get format translation
+  // and /responses ↔ /chat/completions fallback instead of hitting upstream URLs directly.
+  const api = isAnthropic ? 'anthropic-messages' : 'openai-responses';
+  const bridgeBaseUrl = isAnthropic ? bridge.anthropicBaseUrl : bridge.openaiBaseUrl;
   const modelsJson = {
     providers: {
       [PI_MANAGED_PROVIDER_ID]: {
-        baseUrl: bridge.openaiBaseUrl,
-        api: 'openai-responses',
+        baseUrl: bridgeBaseUrl,
+        api,
         apiKey: '$WEBCODING_PI_API_KEY',
         models: [
           {
@@ -2075,7 +2091,7 @@ function preparePiCustomRuntime(config) {
     homeDir: PI_RUNTIME_HOME,
     provider: PI_MANAGED_PROVIDER_ID,
     apiKey: bridge.token,
-    apiBase: bridge.openaiBaseUrl,
+    apiBase: bridgeBaseUrl,
     defaultModel: modelId,
     profileName: source.name,
     upstreamType: source.upstreamType,
@@ -4056,6 +4072,61 @@ function getClaudeModelMenuEntries() {
     }
     return { ...entry, value };
   });
+}
+
+async function getClaudeModelMenuPayload(session) {
+  const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
+  const currentFull = session?.model || '';
+  const entries = [];
+  const seen = new Set();
+
+  function pushEntry(entry) {
+    const value = String(entry?.value || entry?.alias || '').trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    entries.push(entry);
+  }
+
+  for (const entry of getClaudeModelMenuEntries()) {
+    pushEntry({ ...entry });
+  }
+
+  let source = 'claude-cli';
+  const cache = await getModelList();
+  if (cache?.models?.length) {
+    source = cache.source || 'provider-api';
+    for (const model of cache.models) {
+      const id = String(model?.id || '').trim();
+      if (!id) continue;
+      pushEntry({
+        alias: id,
+        value: id,
+        label: model.display_name || id,
+        desc: id,
+        pricing: '',
+      });
+    }
+  }
+
+  if (currentFull && !seen.has(currentFull)) {
+    pushEntry({
+      alias: currentFull,
+      value: currentFull,
+      label: currentFull,
+      desc: '当前会话模型',
+      pricing: '',
+    });
+  }
+
+  return {
+    type: 'model_list',
+    agent: 'claude',
+    models: MODEL_MAP,
+    entries,
+    current: currentAlias,
+    currentFull,
+    source,
+  };
 }
 
 function resolveClaudeModelInput(modelInput) {
@@ -7597,16 +7668,21 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
       return;
     }
     if (!modelInput) {
-      const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
-      const currentFull = session?.model || '';
-      wsSend(ws, {
-        type: 'model_list',
-        agent: 'claude',
-        models: MODEL_MAP,
-        entries: getClaudeModelMenuEntries(),
-        current: currentAlias,
-        currentFull,
-        source: 'claude-cli',
+      getClaudeModelMenuPayload(session).then((payload) => {
+        wsSend(ws, payload);
+      }).catch((error) => {
+        plog('WARN', 'claude_model_menu_failed', { error: error.message });
+        const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
+        const currentFull = session?.model || '';
+        wsSend(ws, {
+          type: 'model_list',
+          agent: 'claude',
+          models: MODEL_MAP,
+          entries: getClaudeModelMenuEntries(),
+          current: currentAlias,
+          currentFull,
+          source: 'claude-cli',
+        });
       });
       return;
     }

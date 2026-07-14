@@ -96,11 +96,11 @@ do_uninstall() {
 # ── 检查依赖 ──────────────────────────────────────────────────
 info "检查依赖环境..."
 command -v git  >/dev/null 2>&1 || error "未找到 git。请先安装 git: https://git-scm.com/"
-command -v node >/dev/null 2>&1 || error "未找到 Node.js。请先安装 Node.js >= 18: https://nodejs.org/"
+command -v node >/dev/null 2>&1 || error "未找到 Node.js。请先安装 Node.js >= 22: https://nodejs.org/"
 command -v npm  >/dev/null 2>&1 || error "未找到 npm，请确认 Node.js 安装完整。"
 NODE_MAJOR=$(node -e "process.stdout.write(process.versions.node.split('.')[0])")
-if [ "$NODE_MAJOR" -lt 18 ]; then
-  error "Node.js 版本过低 (当前: $(node -v))，需要 >= 18。请升级: https://nodejs.org/"
+if [ "$NODE_MAJOR" -lt 22 ]; then
+  error "Node.js 版本过低 (当前: $(node -v))，需要 >= 22。请升级: https://nodejs.org/"
 fi
 success "Node.js $(node -v)  npm $(npm -v)  git $(git --version | awk '{print $3}') — 全部就绪"
 

@@ -8264,6 +8264,16 @@
           </div>
           <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
         </button>
+        <div class="settings-promo-links" aria-label="推荐服务">
+          <a class="settings-promo-link" href="https://ai.hsnb.fun/" target="_blank" rel="noopener noreferrer">
+            <span>幻境MirageAI欢迎你</span>
+            <span class="settings-promo-arrow" aria-hidden="true">↗</span>
+          </a>
+          <a class="settings-promo-link" href="https://pay.ldxp.cn/shop/mirage" target="_blank" rel="noopener noreferrer">
+            <span>购买AI订阅认准：幻境MirageAI</span>
+            <span class="settings-promo-arrow" aria-hidden="true">↗</span>
+          </a>
+        </div>
       </div>
 
       <div class="settings-subpage" id="settings-page-agent" hidden>
@@ -8296,6 +8306,12 @@
           <button class="btn-save" id="unified-save-btn">保存渠道配置</button>
         </div>
         <div class="settings-status" id="unified-status"></div>
+        <div class="settings-promo-links settings-promo-links-provider" aria-label="推荐服务">
+          <a class="settings-promo-link" href="https://ai.hsnb.fun/" target="_blank" rel="noopener noreferrer">
+            <span>幻境MirageAI欢迎你</span>
+            <span class="settings-promo-arrow" aria-hidden="true">↗</span>
+          </a>
+        </div>
       </div>
 
       <div class="settings-subpage" id="settings-page-notify" hidden>

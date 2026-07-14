@@ -465,7 +465,7 @@ async function startResponsesFallbackUpstream(port, options = {}) {
         counters.models += 1;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
-          data: [
+          data: Array.isArray(options.models) ? options.models : [
             {
               id: 'regression-api-model',
               display_name: 'regression-api-model',
@@ -1820,6 +1820,21 @@ async function runHttpSecurityRegressionCase({ port, password, tempRoot }) {
       'Index should receive automatic asset cache versions',
     );
 
+    const appAsset = await requestHttpJson({ port, path: '/app.js' });
+    assert(appAsset.statusCode === 200, 'Frontend application asset should be served successfully');
+    assert(
+      (appAsset.text.match(/https:\/\/ai\.hsnb\.fun\//g) || []).length === 2,
+      'MirageAI welcome link should appear in settings home and AI provider pages',
+    );
+    assert(
+      (appAsset.text.match(/https:\/\/pay\.ldxp\.cn\/shop\/mirage/g) || []).length === 1,
+      'MirageAI subscription link should appear once on the settings home page',
+    );
+    assert(
+      (appAsset.text.match(/rel="noopener noreferrer"/g) || []).length >= 3,
+      'External settings promotions should prevent opener access',
+    );
+
     const markdownPath = path.join(tempRoot, 'unsafe-preview.md');
     fs.writeFileSync(markdownPath, '# Preview\n\n<img src=x onerror="window.__xss=1">\n\n[bad](javascript:alert(1))\n');
     const preview = await requestHttpJson({
@@ -2652,6 +2667,110 @@ async function runPiManagedRuntimeRegressionCase({ port, password, configDir, ho
       assert(fs.realpathSync(mounted) === fs.realpathSync(path.join(piFixture.agentDir, dirName)), `Pi managed runtime should mount the user ${dirName} package store`);
     }
   });
+}
+
+async function runPiUnifiedBridgeRegressionCase({ port, password, configDir, sessionsDir }) {
+  const upstreamPort = await getFreePort();
+  const upstream = await startResponsesFallbackUpstream(upstreamPort);
+  try {
+    await withAuthedClient(port, password, async ({ client }) => {
+      await saveConfigAndWait(
+        client,
+        'save_model_config',
+        {
+          mode: 'custom',
+          activeTemplate: 'Pi Unified Bridge',
+          templates: [{
+            name: 'Pi Unified Bridge',
+            apiKey: 'sk-pi-unified-bridge',
+            // No /v1 suffix: this reproduces providers that reject Pi's direct endpoint with HTTP 405.
+            apiBase: `http://127.0.0.1:${upstreamPort}`,
+            upstreamType: 'openai',
+            defaultModel: 'regression-pi-model',
+            opusModel: 'regression-pi-model',
+            sonnetModel: 'regression-pi-model',
+            haikuModel: 'regression-pi-model',
+          }],
+        },
+        'model_config',
+      );
+
+      await saveConfigAndWait(
+        client,
+        'save_pi_config',
+        {
+          mode: 'unified',
+          sharedTemplate: 'Pi Unified Bridge',
+        },
+        'pi_config',
+      );
+
+      const modelsJson = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'models.json'), 'utf8'));
+      const provider = modelsJson?.providers?.webcoding;
+      assert(provider, 'Pi unified runtime should materialize the managed webcoding provider');
+      assert(provider.api === 'openai-responses', 'Pi openai upstream should use openai-responses via the local bridge');
+      assert(/http:\/\/127\.0\.0\.1:\d+\/openai$/.test(provider.baseUrl || ''), 'Pi unified runtime should route through the local bridge openai base URL');
+      assert(provider.apiKey === '$WEBCODING_PI_API_KEY', 'Pi unified runtime should resolve API key from WEBCODING_PI_API_KEY');
+      assert(provider.models?.some((model) => model.id === 'regression-pi-model'), 'Pi unified runtime should expose the selected template default model');
+
+      const settingsJson = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'settings.json'), 'utf8'));
+      assert(settingsJson.defaultProvider === 'webcoding', 'Pi unified runtime should default to the managed provider');
+      assert(settingsJson.defaultModel === 'regression-pi-model', 'Pi unified runtime should default to the selected template model');
+
+      const probeSession = await client.sendAndWaitType(
+        buildAgentMessagePayload({ text: 'verify pi unified bridge', mode: 'yolo', agent: 'pi' }),
+        'session_info',
+        (msg) => msg.agent === 'pi' && msg.title === 'verify pi unified bridge',
+      );
+      await client.waitForType(
+        'text_delta',
+        (msg) => msg.sessionId === probeSession.sessionId && /provider probe/.test(msg.text || ''),
+        8000,
+      );
+      await client.waitForType('done', (msg) => msg.sessionId === probeSession.sessionId, 8000);
+      const probeText = getLastStoredAssistantText(sessionsDir, probeSession.sessionId);
+      assert(/provider probe: pong/.test(probeText || ''), 'Pi managed runtime should reach the configured provider through the local bridge');
+      assert(upstream.counters.responses === 1, 'Pi bridge should first try the upstream Responses endpoint');
+      assert(upstream.counters.chatCompletions === 1, 'Pi bridge should fall back to the upstream Chat Completions endpoint');
+
+      await saveConfigAndWait(
+        client,
+        'save_model_config',
+        {
+          mode: 'custom',
+          activeTemplate: 'Pi Unified Anthropic',
+          templates: [{
+            name: 'Pi Unified Anthropic',
+            apiKey: 'sk-pi-unified-anthropic',
+            apiBase: 'https://pi-unified-anthropic.example.test',
+            upstreamType: 'anthropic',
+            defaultModel: 'claude-sonnet-4-6',
+            opusModel: 'claude-opus-4-6',
+            sonnetModel: 'claude-sonnet-4-6',
+            haikuModel: 'claude-haiku-4-5-20251001',
+          }],
+        },
+        'model_config',
+      );
+
+      await saveConfigAndWait(
+        client,
+        'save_pi_config',
+        {
+          mode: 'unified',
+          sharedTemplate: 'Pi Unified Anthropic',
+        },
+        'pi_config',
+      );
+
+      const anthropicModelsJson = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'models.json'), 'utf8'));
+      const anthropicProvider = anthropicModelsJson?.providers?.webcoding;
+      assert(anthropicProvider?.api === 'anthropic-messages', 'Pi anthropic upstream should use anthropic-messages via the local bridge');
+      assert(/http:\/\/127\.0\.0\.1:\d+\/anthropic$/.test(anthropicProvider?.baseUrl || ''), 'Pi anthropic unified runtime should route through the local bridge anthropic base URL');
+    });
+  } finally {
+    await upstream.close();
+  }
 }
 
 async function runPiNativeImportAndForkRegressionCase({ port, password, sessionsDir, piFixture }) {
@@ -3728,20 +3847,49 @@ async function runAuthLockRegressionCase({ port, password }) {
 
 async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password, tempRoot }) {
   const upstreamPort = await getFreePort();
-  const upstream = await startResponsesFallbackUpstream(upstreamPort);
+  const upstreamOptions = {};
+  const upstream = await startResponsesFallbackUpstream(upstreamPort, upstreamOptions);
   try {
     await withAuthedClient(port, password, async ({ client, messages }) => {
       const variants = [
-        { label: 'without-v1', apiBase: `http://127.0.0.1:${upstreamPort}` },
-        { label: 'with-v1', apiBase: `http://127.0.0.1:${upstreamPort}/v1` },
+        {
+          label: 'without-v1',
+          apiBase: `http://127.0.0.1:${upstreamPort}`,
+          apiKey: 'sk-regression-without-v1',
+          claudeModel: 'claude-regression-without-v1',
+        },
+        {
+          label: 'with-v1',
+          apiBase: `http://127.0.0.1:${upstreamPort}/v1`,
+          apiKey: 'sk-regression-with-v1',
+          claudeModel: 'claude-regression-with-v1',
+        },
       ];
 
       for (const variant of variants) {
+        upstreamOptions.models = [
+          {
+            id: 'regression-api-model',
+            display_name: 'regression-api-model',
+            description: 'Regression-only upstream model.',
+            visibility: 'list',
+            supported_in_api: true,
+            priority: 0,
+          },
+          {
+            id: variant.claudeModel,
+            display_name: variant.claudeModel,
+            description: 'Claude provider-cache regression model.',
+            visibility: 'list',
+            supported_in_api: true,
+            priority: 1,
+          },
+        ];
         const fetchResult = await client.sendAndWaitType(
           {
             type: 'fetch_models',
             apiBase: variant.apiBase,
-            apiKey: 'sk-regression',
+            apiKey: variant.apiKey,
             upstreamType: 'openai',
             templateName: `Regression ${variant.label}`,
           },
@@ -3749,6 +3897,7 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
         );
         assert(fetchResult.success === true, `fetch_models ${variant.label} should succeed: ${fetchResult.message || 'unknown error'}`);
         assert(Array.isArray(fetchResult.models) && fetchResult.models.includes('regression-api-model'), `fetch_models ${variant.label} should return regression-api-model`);
+        assert(fetchResult.models.includes(variant.claudeModel), `fetch_models ${variant.label} should return its Claude model`);
 
         await saveConfigAndWait(
           client,
@@ -3758,7 +3907,7 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
             activeTemplate: `Regression ${variant.label}`,
             templates: [{
               name: `Regression ${variant.label}`,
-              apiKey: 'sk-regression',
+              apiKey: variant.apiKey,
               apiBase: variant.apiBase,
               upstreamType: 'openai',
               defaultModel: 'regression-api-model',
@@ -3795,6 +3944,26 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
             && msg.entries.some((entry) => entry.value === 'regression-api-model'),
         );
         assert(modelList.entries.some((entry) => entry.value === 'regression-api-model'), `Codex /model ${variant.label} should use upstream model list`);
+
+        const claudeCwd = path.join(tempRoot, `claude-model-fetch-${variant.label}`);
+        mkdirp(claudeCwd);
+        const claudeSession = await client.sendAndWaitType(
+          { type: 'new_session', agent: 'claude', cwd: claudeCwd, mode: 'plan' },
+          'session_info',
+          (msg) => msg.agent === 'claude' && msg.cwd === claudeCwd,
+        );
+        const claudeModelList = await client.sendAndWaitType(
+          buildAgentMessagePayload({ text: '/model', sessionId: claudeSession.sessionId, mode: 'plan', agent: 'claude' }),
+          'model_list',
+          (msg) => msg.agent === 'claude'
+            && Array.isArray(msg.entries)
+            && msg.entries.some((entry) => entry.value === variant.claudeModel),
+        );
+        assert(claudeModelList.source === 'openai', `Claude /model ${variant.label} should identify the configured provider source`);
+        assert(
+          claudeModelList.entries.some((entry) => entry.value === variant.claudeModel),
+          `Claude /model ${variant.label} should refresh after the provider changes`,
+        );
       }
     });
 
@@ -5642,6 +5811,7 @@ async function main() {
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));
       await runner.run('pi agent adapter', () => runPiAgentRegressionCase(ctx));
       await runner.run('pi managed responses runtime', () => runPiManagedRuntimeRegressionCase(ctx));
+      await runner.run('pi unified bridge runtime', () => runPiUnifiedBridgeRegressionCase(ctx));
       await runner.run('pi native import and fork', () => runPiNativeImportAndForkRegressionCase(ctx));
       await runner.run('pi rpc interaction reconnect', () => runPiRpcReconnectRegressionCase(ctx));
       await runner.run('claude and codex interaction reconnect', () => runClaudeCodexInteractionReconnectRegressionCase(ctx));

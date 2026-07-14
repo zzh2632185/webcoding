@@ -34,15 +34,19 @@ function findExecutableCandidate(filePath) {
 
 function resolveCommand(envValue, defaultName) {
   const requested = String(envValue || '').trim();
-  if (requested && (path.isAbsolute(requested) || requested.includes('/') || requested.includes('\\'))) {
+  const requestedHasPath = requested
+    && (path.isAbsolute(requested) || requested.includes('/') || requested.includes('\\'));
+  if (requestedHasPath) {
     const resolved = path.isAbsolute(requested) ? requested : path.resolve(ROOT, requested);
-    return findExecutableCandidate(resolved) || requested;
-  }
-  const name = requested || defaultName;
-  for (const dir of String(process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
-    const candidate = findExecutableCandidate(path.join(dir, name));
+    const candidate = findExecutableCandidate(resolved);
     if (candidate) return candidate;
   }
+
+  // Match server.js resolution so the contract checks the same CLI binary used at runtime.
+  // IDE launchers can prepend a stale package binary ahead of the active Volta/local shim.
+  const name = requestedHasPath
+    ? (path.basename(requested.replace(/\\/g, '/')) || defaultName)
+    : (requested || defaultName);
   const home = process.env.HOME || process.env.USERPROFILE || '';
   for (const unresolved of [
     path.join(home, '.local', 'bin', name),
@@ -54,7 +58,11 @@ function resolveCommand(envValue, defaultName) {
     const candidate = findExecutableCandidate(unresolved);
     if (candidate) return candidate;
   }
-  return name;
+  for (const dir of String(process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    const candidate = findExecutableCandidate(path.join(dir, name));
+    if (candidate) return candidate;
+  }
+  return requestedHasPath ? requested : name;
 }
 
 const CLAUDE = resolveCommand(process.env.CLAUDE_PATH, 'claude');

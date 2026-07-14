@@ -191,7 +191,9 @@ webcoding/
 ├── public/
 │   ├── index.html          # 页面结构
 │   ├── app.js              # 前端逻辑（WebSocket 通信、UI 交互）
-│   ├── style.css           # 样式（和风暖色调主题）
+│   ├── css/                # 按基础、布局、聊天、面板等职责拆分的样式
+│   ├── markdown-viewer.js  # 隔离的 Markdown 文件预览器
+│   ├── style.css           # 旧入口兼容说明（主页面不再加载）
 │   └── sw.js               # Service Worker（移动端推送通知）
 ├── config/
 │   ├── codex.json          # Codex 独立配置（运行时生成）

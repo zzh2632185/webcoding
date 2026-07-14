@@ -470,6 +470,47 @@
   transform: translateX(2px);
 }
 
+.settings-promo-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.settings-promo-links-provider {
+  margin-top: 4px;
+}
+.settings-promo-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 32px;
+  padding: 5px 2px;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-decoration: none;
+}
+.settings-promo-link:hover {
+  color: var(--text-primary);
+}
+.settings-promo-link:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 2px;
+}
+.settings-promo-arrow {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.settings-promo-link:hover .settings-promo-arrow {
+  color: currentColor;
+}
+
 /* === Settings Subpage === */
 .settings-subpage {
   animation: fadeIn 0.2s ease;
@@ -521,7 +562,9 @@
   /* keep explicit block for readability with shared button base */
 }
 .settings-actions .btn-save {
-  --nb-btn-bg: var(--blue);
+  --nb-btn-bg: var(--btn-primary-bg);
+  --nb-btn-hover-bg: var(--btn-primary-hover);
+  color: var(--surface-inverse-text);
 }
 .settings-actions .btn-save:hover {
   /* keep explicit block for readability with shared button base */

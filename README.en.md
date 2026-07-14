@@ -155,7 +155,9 @@ webcoding/
 ├── public/
 │   ├── index.html          # UI structure
 │   ├── app.js              # Frontend logic (WebSocket, UI interactions)
-│   ├── style.css           # Styles
+│   ├── css/                # Modular styles grouped by responsibility
+│   ├── markdown-viewer.js  # Isolated Markdown file viewer
+│   ├── style.css           # Legacy compatibility notice (not loaded by the app)
 │   └── sw.js               # Service Worker (mobile notifications)
 ├── config/
 │   ├── notify.json         # Notification channel config (generated at runtime)

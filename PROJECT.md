@@ -2,13 +2,13 @@
 
 ## 项目概述
 
-Webcoding 是一个用 Node.js 实现的轻量级浏览器工作台，用来远程控制本机 `Claude Code` / `Codex` / `Pi` CLI。Claude/Codex 通过 detached 子进程和文件 I/O 运行，Pi 默认通过持久 JSONL RPC 运行；前端通过 WebSocket 收发消息、交互请求、工具状态和会话列表。
+Webcoding 是一个用 Node.js 实现的轻量级浏览器工作台，用来远程控制本机 `Claude Code` / `Codex` / `Pi` CLI。Claude 默认使用双向 `stream-json`，Codex 默认使用官方 App Server，Pi 默认使用 JSONL RPC；旧的 detached 文件 I/O 传输仍作为兼容路径保留。前端通过 WebSocket 收发消息、交互请求、工具状态和会话列表。
 
 **创建日期**：2026-03-19
-**最后更新**：2026-07-13
-**当前版本**：v1.6.0
+**最后更新**：2026-07-14
+**当前版本**：v2.0.0
 **当前状态**：进行中（三 Agent、Pi 双向 RPC 与原生 steer/follow-up 队列、统一 API bridge、线程续接补偿、隔离回归已接通）
-**当前规模**：`server.js` 9261 行，`public/app.js` 9878 行，`public/style.css` 7007 行，`scripts/regression.js` 4509 行
+**当前规模**：`server.js` 约 1.24 万行，`public/app.js` 约 1.05 万行，模块化 CSS 约 7900 行，`scripts/regression.js` 约 5800 行
 
 ---
 
@@ -30,13 +30,18 @@ webcoding/
 ├── server.js                      # 后端主入口（HTTP / WebSocket / 进程管理 / 配置 / 存储）
 ├── lib/
 │   ├── agent-runtime.js           # Claude / Codex 启动参数与事件解析适配层
+│   ├── claude-stream-client.js    # Claude 双向 stream-json 客户端
+│   ├── codex-app-server-client.js # Codex App Server JSON-RPC 客户端
 │   ├── pi-rpc-client.js           # Pi RPC JSONL 帧、请求关联与子进程生命周期
+│   ├── pi-sessions.js             # Pi 原生 JSONL 历史解析
 │   ├── codex-rollouts.js          # Codex rollout 历史导入解析
 │   └── local-api-bridge.js        # 本地统一 API bridge 服务
 ├── public/
 │   ├── index.html                 # 页面骨架
 │   ├── app.js                     # 前端单文件 SPA 逻辑
-│   ├── style.css                  # 前端样式
+│   ├── css/                       # 模块化前端样式
+│   ├── markdown-viewer.js         # 隔离的 Markdown 预览逻辑
+│   ├── style.css                  # 旧样式入口兼容说明
 │   ├── sw.js                      # Service Worker
 │   └── test-components.html       # 独立组件 / 可访问性测试页
 ├── scripts/
@@ -215,9 +220,9 @@ Browser
 - `showImportSessionModal()`：Claude 导入
 - `showImportCodexSessionModal()`：Codex 导入
 
-#### `public/style.css`
+#### `public/css/`
 
-- 维护全局设计变量与三套主题外观
+- 维护全局设计变量、亮暗配色与主题外观
 - 覆盖登录页、侧边栏、聊天区、设置面板、目录浏览器、运行态徽章和响应式布局
 
 #### `public/sw.js`
@@ -228,13 +233,13 @@ Browser
 
 - 独立样式测试页，不参与主流程
 - 主要用于验证会话项焦点态、tool call 可访问性和 workspace insights 视觉样式
-- 改动 `public/style.css` 或交互可访问性时，可以用它做快速人工回看
+- 改动 `public/css/` 或交互可访问性时，可以用它做快速人工回看
 
 ### 5. 测试与回归
 
 #### `scripts/regression.js`
 
-这是最重要的验证脚本，当前 4509 行，特点：
+这是最重要的验证脚本，当前约 5800 行，特点：
 
 - 启动真实 `server.js`
 - 使用临时目录隔离 `config/`、`sessions/`、`logs/`
@@ -306,11 +311,11 @@ Browser
 | 修复 Codex 历史导入 | `lib/codex-rollouts.js` |
 | 调整模型模板 / 自定义 API | `server.js`、`lib/local-api-bridge.js` |
 | 调整统一 API 渠道 / bridge | `server.js`、`lib/agent-runtime.js`、`lib/local-api-bridge.js` |
-| 调整设置面板 | `public/app.js`、`public/style.css` |
+| 调整设置面板 | `public/app.js`、`public/css/05-panels.css` |
 | 调整登录 / 记住密码 | `public/app.js`、`server.js` |
 | 调整项目分组 / 路径浏览器 | `server.js`、`public/app.js` |
-| 调整工作区洞察 / 运行态徽章 | `public/app.js`、`public/style.css` |
-| 调整测试页 | `public/test-components.html`、`public/style.css` |
+| 调整工作区洞察 / 运行态徽章 | `public/app.js`、`public/css/05-panels.css` |
+| 调整测试页 | `public/test-components.html`、`public/css/` |
 | 修复回归失败 | `scripts/regression.js` + 对应 mock CLI |
 
 ---
