@@ -221,6 +221,21 @@ async function stopServer(handle) {
     try { child.kill('SIGKILL'); } catch {}
     await waitChildExit(child, 800);
   }
+
+  const configDir = String(handle?.env?.CC_WEB_CONFIG_DIR || '').trim();
+  if (!configDir) return;
+  const bridgeStatePath = path.join(configDir, 'bridge-state.json');
+  let bridgePid = 0;
+  try {
+    bridgePid = Number.parseInt(JSON.parse(fs.readFileSync(bridgeStatePath, 'utf8'))?.pid, 10);
+  } catch {}
+  if (!isPidAlive(bridgePid)) return;
+  try { process.kill(bridgePid, 'SIGTERM'); } catch {}
+  const deadline = Date.now() + 1200;
+  while (isPidAlive(bridgePid) && Date.now() < deadline) await sleep(30);
+  if (isPidAlive(bridgePid)) {
+    try { process.kill(bridgePid, 'SIGKILL'); } catch {}
+  }
 }
 
 async function withServer(env, fn) {
@@ -456,6 +471,7 @@ async function startResponsesFallbackUpstream(port, options = {}) {
         method: req.method,
         path: requestUrl.pathname,
         search: requestUrl.search,
+        headers: { ...req.headers },
         bodyText: body,
         bodyJson: (() => {
           try { return body ? JSON.parse(body) : null; } catch { return null; }
@@ -463,8 +479,13 @@ async function startResponsesFallbackUpstream(port, options = {}) {
       });
       if (req.method === 'GET' && requestUrl.pathname === '/v1/models') {
         counters.models += 1;
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
+        const modelsStatus = Number(options.modelsStatus || 200);
+        res.writeHead(modelsStatus, { 'content-type': 'application/json' });
+        if (modelsStatus < 200 || modelsStatus >= 300) {
+          res.end(JSON.stringify(options.modelsError || { error: { message: 'models unavailable' } }));
+          return;
+        }
+        res.end(JSON.stringify(options.modelsResponse || {
           data: Array.isArray(options.models) ? options.models : [
             {
               id: 'regression-api-model',
@@ -1263,7 +1284,9 @@ async function runCustomCliDirectoriesRegressionCase({ tempRoot }) {
         'model_list',
         (msg) => msg.agent === 'claude',
       );
-      assert(modelList.models?.sonnet === 'custom-dir-sonnet', 'Claude settings should be read from CLAUDE_CONFIG_DIR');
+      assert(modelList.source === 'claude-settings', 'Claude settings should be read from CLAUDE_CONFIG_DIR');
+      assert(modelList.entries?.some((entry) => entry.value === 'custom-dir-sonnet'), 'Claude local model list should include CLAUDE_CONFIG_DIR Sonnet mapping');
+      assert(modelList.entries?.some((entry) => entry.value === 'custom-dir-opus'), 'Claude local model list should include CLAUDE_CONFIG_DIR Opus mapping');
     });
 
     const oversized = await openWs(port);
@@ -1525,7 +1548,17 @@ function createFakeClaudeHistoryInConfigDir(claudeConfigDir) {
 }
 
 function createFakeClaudeHistory(homeDir) {
-  return createFakeClaudeHistoryInConfigDir(path.join(homeDir, '.claude'));
+  const claudeDir = path.join(homeDir, '.claude');
+  const fixture = createFakeClaudeHistoryInConfigDir(claudeDir);
+  fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify({
+    env: {
+      ANTHROPIC_MODEL: 'claude-local-default',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-local-alt',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-local-default',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-local-fast',
+    },
+  }, null, 2));
+  return fixture;
 }
 
 function createFakePiHistory(homeDir) {
@@ -1553,6 +1586,19 @@ function createFakePiHistory(homeDir) {
     skills: ['./skills'],
     prompts: ['./prompts'],
     themes: ['./themes'],
+  }, null, 2));
+  fs.writeFileSync(path.join(agentDir, 'models.json'), JSON.stringify({
+    providers: {
+      'local-provider': {
+        api: 'openai-completions',
+        baseUrl: 'http://127.0.0.1:9',
+        apiKey: 'local-fixture-key',
+        models: [
+          { id: 'local-model', name: 'Local Pi Default' },
+          { id: 'pi-local-alt', name: 'Local Pi Alternate', reasoning: true },
+        ],
+      },
+    },
   }, null, 2));
 
   const lines = [
@@ -1607,8 +1653,17 @@ function createFakePiHistory(homeDir) {
 }
 
 function writeFakeCodexModelsCache(homeDir) {
-  const modelsCachePath = path.join(homeDir, '.codex', 'models_cache.json');
-  mkdirp(path.dirname(modelsCachePath));
+  const codexHome = path.join(homeDir, '.codex');
+  const modelsCachePath = path.join(codexHome, 'models_cache.json');
+  mkdirp(codexHome);
+  fs.writeFileSync(path.join(codexHome, 'config.toml'), [
+    'profile = "fixture"',
+    'model = "codex-local-default"',
+    '',
+    '[profiles.fixture]',
+    'model = "codex-profile-model"',
+    '',
+  ].join('\n'));
   fs.writeFileSync(modelsCachePath, JSON.stringify({
     fetched_at: '2026-03-12T00:00:00.000Z',
     client_version: '0.114.0',
@@ -1769,6 +1824,89 @@ function buildFakeCodexFixture(homeDir, threadId) {
 
 function createFakeCodexHistory(homeDir) {
   return buildFakeCodexFixture(homeDir, 'codex-import-thread');
+}
+
+async function runLocalAgentModelSourcesRegressionCase({ port, password, tempRoot, sessionsDir, logsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const sessions = {};
+    const expectedDefaults = {
+      claude: 'claude-local-default',
+      codex: 'codex-profile-model',
+      pi: 'local-provider/local-model',
+    };
+    for (const agent of ['claude', 'codex', 'pi']) {
+      const cwd = path.join(tempRoot, `${agent}-local-model-source`);
+      mkdirp(cwd);
+      sessions[agent] = await client.sendAndWaitType(
+        { type: 'new_session', agent, cwd, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === agent && msg.cwd === cwd,
+      );
+      assert(sessions[agent].activeRuntime?.defaultModel === expectedDefaults[agent], `${agent} new session should expose its real local default model`);
+    }
+
+    const claudeModels = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: '/model', sessionId: sessions.claude.sessionId, mode: 'yolo', agent: 'claude' }),
+      'model_list',
+      (msg) => msg.sessionId === sessions.claude.sessionId && msg.agent === 'claude',
+      8000,
+    );
+    const claudeIds = new Set((claudeModels.entries || []).map((entry) => entry.value));
+    assert(claudeModels.source === 'claude-settings', 'Claude local models should come from the real settings file');
+    assert(claudeIds.has('claude-local-default') && claudeIds.has('claude-local-alt') && claudeIds.has('claude-local-fast'), 'Claude local menu should match configured model IDs');
+    assert(!claudeIds.has('sonnet[1m]') && !claudeIds.has('opus[1m]'), 'Claude local menu should not inject fixed aliases');
+
+    const codexModels = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: '/model', sessionId: sessions.codex.sessionId, mode: 'yolo', agent: 'codex' }),
+      'model_list',
+      (msg) => msg.sessionId === sessions.codex.sessionId && msg.agent === 'codex',
+      8000,
+    );
+    const codexIds = new Set((codexModels.entries || []).map((entry) => entry.value));
+    assert(codexIds.has('codex-local-default'), 'Codex local menu should include the root config model');
+    assert(codexIds.has('codex-profile-model'), 'Codex local menu should include models from local profiles');
+    assert(codexIds.has('custom-regression-model'), 'Codex local menu should include the real local model cache');
+
+    const piModels = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: '/model', sessionId: sessions.pi.sessionId, mode: 'yolo', agent: 'pi' }),
+      'model_list',
+      (msg) => msg.sessionId === sessions.pi.sessionId && msg.agent === 'pi',
+      8000,
+    );
+    const piIds = new Set((piModels.entries || []).map((entry) => entry.value));
+    assert(piIds.has('local-provider/local-model') && piIds.has('local-provider/pi-local-alt'), 'Pi local menu should include models.json provider models');
+    assert(piIds.has('mock/mock-pi-fast'), 'Pi local menu should merge live RPC model discovery');
+
+    const selections = {
+      claude: 'claude-local-alt',
+      codex: 'codex-profile-model',
+      pi: 'local-provider/pi-local-alt',
+    };
+    for (const agent of ['claude', 'codex', 'pi']) {
+      await client.sendAndWaitType(
+        buildAgentMessagePayload({ text: `/model ${selections[agent]}`, sessionId: sessions[agent].sessionId, mode: 'yolo', agent }),
+        'model_changed',
+        (msg) => msg.sessionId === sessions[agent].sessionId && msg.model === selections[agent],
+      );
+      client.send(buildAgentMessagePayload({
+        text: `run ${agent} with local selected model`,
+        sessionId: sessions[agent].sessionId,
+        mode: 'yolo',
+        agent,
+      }));
+      await client.waitForType('done', (msg) => msg.sessionId === sessions[agent].sessionId, 8000);
+    }
+
+    const claudeSpawn = findProcessLogLines(logsDir, sessions.claude.sessionId, 'process_spawn').at(-1) || '';
+    const codexTurnLine = findProcessLogLines(logsDir, sessions.codex.sessionId, 'codex_app_turn_start').at(-1) || '';
+    const codexArgs = codexTurnLine ? (JSON.parse(codexTurnLine).args || '') : '';
+    const piSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
+    assert(claudeSpawn.includes('--model claude-local-alt'), 'Claude local CLI startup args should use the selected session model');
+    assert(codexArgs.includes('-c model="codex-profile-model"'), 'Codex local App Server startup args should use the selected session model');
+    assert(piSpawn.includes('--provider local-provider') && piSpawn.includes('--model pi-local-alt'), 'Pi local CLI startup args should split provider and model correctly');
+    const storedPi = readStoredSessionFile(sessionsDir, sessions.pi.sessionId);
+    assert(storedPi.model === 'pi-local-alt' && storedPi.piProvider === 'local-provider', 'Pi session selection should persist provider and model separately');
+  });
 }
 
 async function runAuthRegressionCase({ port, password }) {
@@ -2976,7 +3114,7 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
     const thinkingModelList = await client.sendAndWaitType(
       buildAgentMessagePayload({ text: '/model', sessionId: session.sessionId, mode: 'yolo', agent: 'pi' }),
       'model_list',
-      (msg) => msg.sessionId === undefined && msg.agent === 'pi' && msg.thinkingLevel === 'high',
+      (msg) => msg.sessionId === session.sessionId && msg.agent === 'pi' && msg.thinkingLevel === 'high',
       8000,
     );
     assert(thinkingModelList.thinkingLevel === 'high', 'Pi set_thinking_level should update the live RPC runtime without restarting it');
@@ -3484,7 +3622,7 @@ async function runPiHeadlessFallbackRegressionCase({ tempRoot, password }) {
         (msg) => msg.agent === 'pi',
         5000,
       );
-      assert(modelList.source === 'pi-headless', 'Pi headless model menu should identify the compatibility source');
+      assert(modelList.source === 'pi-local-config', 'Pi headless model menu should read its local settings/models configuration');
     });
   });
 }
@@ -3871,61 +4009,60 @@ async function runAuthLockRegressionCase({ port, password }) {
   }
 }
 
-async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password, tempRoot }) {
+async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, tempRoot, configDir, logsDir, sessionsDir }) {
+  const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  assert(!/unified-template-(?:opus|sonnet|haiku|fetch-models)/.test(appSource), 'Provider settings UI should only expose one default model field');
+  assert(!/type:\s*['"]fetch_models['"]/.test(appSource), 'Settings UI must not request model APIs directly');
+  assert(!/sonnet\[1m\]|opus\[1m\]/.test(appSource), 'Frontend model menus must not contain fixed Claude aliases');
+  const showModelPickerSource = appSource.slice(appSource.indexOf('function showModelPicker'), appSource.indexOf('function showModePicker'));
+  assert(/text:\s*['"]\/model['"]/.test(showModelPickerSource), 'The switch-model action should reuse the same /model backend path');
+
   const upstreamPort = await getFreePort();
   const upstreamOptions = {};
   const upstream = await startResponsesFallbackUpstream(upstreamPort, upstreamOptions);
   try {
-    await withAuthedClient(port, password, async ({ client, messages }) => {
+    await withAuthedClient(port, password, async ({ client }) => {
       const variants = [
         {
-          label: 'without-v1',
+          label: 'openai-without-v1',
           apiBase: `http://127.0.0.1:${upstreamPort}`,
           apiKey: 'sk-regression-without-v1',
-          claudeModel: 'claude-regression-without-v1',
+          upstreamType: 'openai',
+          selectedModel: 'provider-openai-selected',
+          responseField: 'data',
         },
         {
-          label: 'with-v1',
+          label: 'anthropic-with-v1',
           apiBase: `http://127.0.0.1:${upstreamPort}/v1`,
           apiKey: 'sk-regression-with-v1',
-          claudeModel: 'claude-regression-with-v1',
+          upstreamType: 'anthropic',
+          selectedModel: 'provider-anthropic-selected',
+          responseField: 'models',
         },
       ];
 
-      for (const variant of variants) {
-        upstreamOptions.models = [
+      for (const [variantIndex, variant] of variants.entries()) {
+        const providerModels = [
           {
             id: 'regression-api-model',
-            display_name: 'regression-api-model',
-            description: 'Regression-only upstream model.',
+            display_name: 'Provider Default',
+            description: 'Regression provider default.',
             visibility: 'list',
             supported_in_api: true,
-            priority: 0,
           },
           {
-            id: variant.claudeModel,
-            display_name: variant.claudeModel,
-            description: 'Claude provider-cache regression model.',
+            id: variant.selectedModel,
+            display_name: variant.selectedModel,
+            description: 'Regression session selection.',
             visibility: 'list',
             supported_in_api: true,
-            priority: 1,
           },
+          { id: variant.selectedModel, display_name: 'Duplicate should be removed' },
         ];
-        const fetchResult = await client.sendAndWaitType(
-          {
-            type: 'fetch_models',
-            apiBase: variant.apiBase,
-            apiKey: variant.apiKey,
-            upstreamType: 'openai',
-            templateName: `Regression ${variant.label}`,
-          },
-          'fetch_models_result',
-        );
-        assert(fetchResult.success === true, `fetch_models ${variant.label} should succeed: ${fetchResult.message || 'unknown error'}`);
-        assert(Array.isArray(fetchResult.models) && fetchResult.models.includes('regression-api-model'), `fetch_models ${variant.label} should return regression-api-model`);
-        assert(fetchResult.models.includes(variant.claudeModel), `fetch_models ${variant.label} should return its Claude model`);
+        upstreamOptions.modelsStatus = 200;
+        upstreamOptions.modelsResponse = { [variant.responseField]: providerModels };
 
-        await saveConfigAndWait(
+        const modelConfig = await saveConfigAndWait(
           client,
           'save_model_config',
           {
@@ -3935,8 +4072,9 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
               name: `Regression ${variant.label}`,
               apiKey: variant.apiKey,
               apiBase: variant.apiBase,
-              upstreamType: 'openai',
+              upstreamType: variant.upstreamType,
               defaultModel: 'regression-api-model',
+              // Legacy fields must remain harmless and must not be saved back.
               opusModel: 'claude-opus-4-6',
               sonnetModel: 'claude-sonnet-4-6',
               haikuModel: 'claude-haiku-4-5',
@@ -3944,58 +4082,168 @@ async function runFetchModelsApiBaseCompatibilityRegressionCase({ port, password
           },
           'model_config',
         );
+        const savedTemplate = modelConfig.config.templates?.[0] || {};
+        assert(savedTemplate.defaultModel === 'regression-api-model', 'Provider default model should be saved');
+        for (const legacyField of ['opusModel', 'sonnetModel', 'haikuModel']) {
+          assert(!Object.prototype.hasOwnProperty.call(savedTemplate, legacyField), `Provider config should ignore legacy ${legacyField}`);
+        }
 
         await saveConfigAndWait(
           client,
           'save_codex_config',
           {
             mode: 'unified',
+            sharedTemplate: `Regression ${variant.label}`,
             enableSearch: false,
           },
           'codex_config',
         );
+        await saveConfigAndWait(
+          client,
+          'save_pi_config',
+          { mode: 'unified', sharedTemplate: `Regression ${variant.label}` },
+          'pi_config',
+        );
 
-        const cwd = path.join(tempRoot, `codex-model-fetch-${variant.label}`);
-        mkdirp(cwd);
-        const session = await client.sendAndWaitType(
-          { type: 'new_session', agent: 'codex', cwd, mode: 'plan' },
-          'session_info',
-          (msg) => msg.agent === 'codex' && msg.cwd === cwd,
-        );
-        const modelList = await client.sendAndWaitType(
-          buildAgentMessagePayload({ text: '/model', sessionId: session.sessionId, mode: 'plan', agent: 'codex' }),
-          'model_list',
-          (msg) => msg.agent === 'codex'
-            && Array.isArray(msg.entries)
-            && msg.entries.some((entry) => entry.value === 'regression-api-model'),
-        );
-        assert(modelList.entries.some((entry) => entry.value === 'regression-api-model'), `Codex /model ${variant.label} should use upstream model list`);
+        const requestsBeforeSessions = upstream.counters.models;
+        const sessions = {};
+        for (const agent of ['claude', 'codex', 'pi']) {
+          const cwd = path.join(tempRoot, `${agent}-provider-model-${variant.label}`);
+          mkdirp(cwd);
+          sessions[agent] = await client.sendAndWaitType(
+            { type: 'new_session', agent, cwd, mode: 'yolo' },
+            'session_info',
+            (msg) => msg.agent === agent && msg.cwd === cwd,
+          );
+          assert(sessions[agent].model === null, `${agent} new session should keep provider default as a non-overridden session model`);
+          assert(sessions[agent].activeRuntime?.defaultModel === 'regression-api-model', `${agent} new session should resolve the configured provider default`);
+        }
+        assert(upstream.counters.models === requestsBeforeSessions, 'Saving settings and creating sessions must not request the model API');
 
-        const claudeCwd = path.join(tempRoot, `claude-model-fetch-${variant.label}`);
-        mkdirp(claudeCwd);
-        const claudeSession = await client.sendAndWaitType(
-          { type: 'new_session', agent: 'claude', cwd: claudeCwd, mode: 'plan' },
-          'session_info',
-          (msg) => msg.agent === 'claude' && msg.cwd === claudeCwd,
-        );
-        const claudeModelList = await client.sendAndWaitType(
-          buildAgentMessagePayload({ text: '/model', sessionId: claudeSession.sessionId, mode: 'plan', agent: 'claude' }),
-          'model_list',
-          (msg) => msg.agent === 'claude'
-            && Array.isArray(msg.entries)
-            && msg.entries.some((entry) => entry.value === variant.claudeModel),
-        );
-        assert(claudeModelList.source === 'openai', `Claude /model ${variant.label} should identify the configured provider source`);
-        assert(
-          claudeModelList.entries.some((entry) => entry.value === variant.claudeModel),
-          `Claude /model ${variant.label} should refresh after the provider changes`,
-        );
+        if (variantIndex === 0) {
+          for (const agent of ['claude', 'codex', 'pi']) {
+            client.send(buildAgentMessagePayload({
+              text: `use ${agent} provider default`,
+              sessionId: sessions[agent].sessionId,
+              mode: 'yolo',
+              agent,
+            }));
+            await client.waitForType('done', (msg) => msg.sessionId === sessions[agent].sessionId, 8000);
+          }
+          assert(upstream.counters.models === requestsBeforeSessions, 'Running a new session with its default model must not request the model list API');
+          const claudeDefaultSpawn = findProcessLogLines(logsDir, sessions.claude.sessionId, 'process_spawn').at(-1) || '';
+          const codexDefaultTurn = findProcessLogLines(logsDir, sessions.codex.sessionId, 'codex_app_turn_start').at(-1) || '';
+          const piDefaultSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
+          const codexDefaultArgs = codexDefaultTurn ? (JSON.parse(codexDefaultTurn).args || '') : '';
+          assert(claudeDefaultSpawn.includes('--model regression-api-model'), 'Claude new session should launch with the provider default model');
+          assert(codexDefaultArgs.includes('-c model="regression-api-model"'), 'Codex new session should launch with the provider default model');
+          assert(piDefaultSpawn.includes('--model regression-api-model'), 'Pi new session should launch with the provider default model');
+        }
+
+        for (const agent of ['claude', 'codex', 'pi']) {
+          const beforeRequest = upstream.counters.models;
+          const modelList = await client.sendAndWaitType(
+            buildAgentMessagePayload({ text: '/model', sessionId: sessions[agent].sessionId, mode: 'yolo', agent }),
+            'model_list',
+            (msg) => msg.sessionId === sessions[agent].sessionId && msg.agent === agent,
+            8000,
+          );
+          assert(modelList.success === true, `${agent} /model ${variant.label} should return a successful provider list`);
+          assert(modelList.source === `provider-api:${variant.upstreamType}`, `${agent} should report the current provider API source`);
+          assert(upstream.counters.models === beforeRequest + 1, `${agent} /model should make one fresh provider models request`);
+          const ids = (modelList.entries || []).map((entry) => entry.value);
+          assert(ids.includes(variant.selectedModel), `${agent} /model should include the provider model`);
+          assert(ids.filter((id) => id === variant.selectedModel).length === 1, `${agent} /model should deduplicate model IDs`);
+          const request = upstream.requests.filter((item) => item.path === '/v1/models').at(-1);
+          assert(request && !request.path.includes('/v1/v1/'), 'Provider model URL must not duplicate the version segment');
+          if (variant.upstreamType === 'anthropic') {
+            assert(request.headers['x-api-key'] === variant.apiKey, 'Anthropic model request should use x-api-key authentication');
+            assert(request.headers['anthropic-version'] === '2023-06-01', 'Anthropic model request should send anthropic-version');
+          } else {
+            assert(request.headers.authorization === `Bearer ${variant.apiKey}`, 'OpenAI-compatible model request should use Bearer authentication');
+          }
+        }
+
+        if (variantIndex === 0) {
+          for (const agent of ['claude', 'codex', 'pi']) {
+            const changed = await client.sendAndWaitType(
+              buildAgentMessagePayload({ text: `/model ${variant.selectedModel}`, sessionId: sessions[agent].sessionId, mode: 'yolo', agent }),
+              'model_changed',
+              (msg) => msg.sessionId === sessions[agent].sessionId && msg.model === variant.selectedModel,
+            );
+            assert(changed.model === variant.selectedModel, `${agent} should update only the current session model`);
+          }
+          const configAfterSelection = await client.sendAndWaitType({ type: 'get_model_config' }, 'model_config');
+          const templateAfterSelection = configAfterSelection.config.templates?.[0] || {};
+          assert(templateAfterSelection.defaultModel === 'regression-api-model', 'Session model selection must not overwrite the provider default');
+          assert(!Object.prototype.hasOwnProperty.call(templateAfterSelection, 'models'), 'Provider API results must not be persisted as fixed configuration');
+
+          for (const agent of ['claude', 'codex', 'pi']) {
+            client.send(buildAgentMessagePayload({
+              text: `use ${agent} selected provider model`,
+              sessionId: sessions[agent].sessionId,
+              mode: 'yolo',
+              agent,
+            }));
+            await client.waitForType('done', (msg) => msg.sessionId === sessions[agent].sessionId, 8000);
+          }
+          const claudeSelectedSpawn = findProcessLogLines(logsDir, sessions.claude.sessionId, 'process_spawn').at(-1) || '';
+          const codexSelectedTurn = findProcessLogLines(logsDir, sessions.codex.sessionId, 'codex_app_turn_start').at(-1) || '';
+          const piSelectedSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
+          const codexSelectedArgs = codexSelectedTurn ? (JSON.parse(codexSelectedTurn).args || '') : '';
+          assert(claudeSelectedSpawn.includes(`--model ${variant.selectedModel}`), 'Claude CLI startup args should use the selected session model');
+          assert(codexSelectedArgs.includes(`-c model="${variant.selectedModel}"`), 'Codex CLI startup args should use the selected session model');
+          assert(piSelectedSpawn.includes(`--model ${variant.selectedModel}`), 'Pi CLI startup args should use the selected session model');
+          const piManagedModels = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'models.json'), 'utf8'));
+          const managedPiIds = (piManagedModels.providers?.webcoding?.models || []).map((model) => model.id);
+          assert(managedPiIds.includes('regression-api-model') && managedPiIds.includes(variant.selectedModel), 'Pi managed runtime should register both provider default and current session model');
+          const piManagedSettings = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'settings.json'), 'utf8'));
+          assert(piManagedSettings.defaultModel === 'regression-api-model', 'Pi session selection must not rewrite the provider default model');
+
+          upstreamOptions.modelsStatus = 503;
+          upstreamOptions.modelsError = { error: { message: `models unavailable for ${variant.apiKey}` } };
+          const beforeFailure = upstream.counters.models;
+          const failedList = await client.sendAndWaitType(
+            buildAgentMessagePayload({ text: '/model', sessionId: sessions.claude.sessionId, mode: 'yolo', agent: 'claude' }),
+            'model_list',
+            (msg) => msg.sessionId === sessions.claude.sessionId && msg.agent === 'claude' && msg.success === false,
+            8000,
+          );
+          assert(upstream.counters.models === beforeFailure + 1, 'Retrying /model should make a fresh request after failure');
+          assert(/获取当前服务商模型失败/.test(failedList.error || ''), 'Provider API failure should return a clear error');
+          assert(!(failedList.error || '').includes(variant.apiKey), 'Provider API failure must not expose the API key to the browser');
+          assert(failedList.entries.some((entry) => entry.value === variant.selectedModel), 'Provider API failure should retain the current session model');
+          assert(failedList.entries.some((entry) => entry.value === 'default'), 'Provider API failure should retain the default option');
+          assert(readStoredSessionFile(sessionsDir, sessions.claude.sessionId).model === variant.selectedModel, 'Provider API failure must not damage the current session model');
+          upstreamOptions.modelsStatus = 200;
+          delete upstreamOptions.modelsError;
+        }
       }
+
+      const latestModelConfig = await client.sendAndWaitType({ type: 'get_model_config' }, 'model_config');
+      await saveConfigAndWait(
+        client,
+        'save_model_config',
+        { ...latestModelConfig.config, mode: 'local', activeTemplate: '' },
+        'model_config',
+      );
+      await saveConfigAndWait(
+        client,
+        'save_codex_config',
+        { mode: 'local', sharedTemplate: '', enableSearch: false },
+        'codex_config',
+      );
+      await saveConfigAndWait(
+        client,
+        'save_pi_config',
+        { mode: 'local', sharedTemplate: '' },
+        'pi_config',
+      );
     });
 
     const modelRequests = upstream.requests.filter((req) => req.path === '/v1/models');
-    assert(modelRequests.length >= 2, `Version compatibility regression should hit /v1/models for both explicit fetches, got ${modelRequests.length}`);
-    assert(!upstream.requests.some((req) => req.path.includes('/v1/v1/')), 'No fetch_models request should duplicate /v1 in upstream path');
+    assert(modelRequests.length >= 7, `Dynamic model discovery should query /v1/models for every explicit menu request, got ${modelRequests.length}`);
+    assert(!upstream.requests.some((req) => req.path.includes('/v1/v1/')), 'Dynamic model discovery must not duplicate /v1 in upstream paths');
   } finally {
     await upstream.close();
   }
@@ -4420,9 +4668,12 @@ async function runClaudeLocalModelMapRegressionCase({ tempRoot }) {
         'model_list',
         (msg) => msg.agent === 'claude',
       );
-      assert(modelList.models?.opus === 'local-opus-model', 'Claude local model map should read opus model from settings.json env');
-      assert(modelList.models?.sonnet === 'local-sonnet-model', 'Claude local model map should read sonnet model from settings.json env');
-      assert(modelList.models?.haiku === 'local-haiku-model', 'Claude local model map should read haiku model from settings.json env');
+      const modelIds = new Set((modelList.entries || []).map((entry) => entry.value));
+      assert(modelIds.has('local-opus-model'), 'Claude local model list should read opus mapping from settings.json env');
+      assert(modelIds.has('local-sonnet-model'), 'Claude local model list should read sonnet mapping from settings.json env');
+      assert(modelIds.has('local-haiku-model'), 'Claude local model list should read haiku mapping from settings.json env');
+      assert(modelList.defaultModel === 'local-opus-model', 'Claude local model list should use ANTHROPIC_MODEL as the real default');
+      assert(!modelIds.has('sonnet[1m]') && !modelIds.has('opus[1m]'), 'Claude local model list must not inject fixed aliases');
     });
   });
 }
@@ -4510,6 +4761,10 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
     assert(unifiedSettings.env?.ANTHROPIC_API_KEY, 'Claude isolated runtime settings should inject the managed API key');
     assert(!unifiedSettings.env?.ANTHROPIC_AUTH_TOKEN, 'Claude isolated runtime settings should replace the local auth token');
     assert(/http:\/\/127\.0\.0\.1:\d+\/anthropic/.test(unifiedSettings.env?.ANTHROPIC_BASE_URL || ''), 'Claude isolated runtime settings should point at the local bridge');
+    assert(unifiedSettings.env?.ANTHROPIC_MODEL === 'claude-sonnet-4-6', 'Claude isolated runtime settings should inject only the provider default model');
+    for (const key of ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL']) {
+      assert(!Object.prototype.hasOwnProperty.call(unifiedSettings.env || {}, key), `Claude isolated runtime settings should not inject ${key}`);
+    }
     assert(!fs.existsSync(backupPath), 'Fresh Claude unified mode should not need a user-settings backup');
     const storedCustomRuntimeSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeRuntimeSession.sessionId}.json`), 'utf8'));
     firstRuntimeSessionId = storedCustomRuntimeSession.claudeSessionId;
@@ -5547,6 +5802,9 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(modelConfigMsg.config.mode === 'custom', 'Unified API config mode save/load failed');
     assert(modelConfigMsg.config.activeTemplate === 'Regression Unified API', 'Unified API active template save/load failed');
     assert(Array.isArray(modelConfigMsg.config.templates) && modelConfigMsg.config.templates[0]?.apiKey.includes('****'), 'Unified API key should be masked');
+    for (const legacyField of ['opusModel', 'sonnetModel', 'haikuModel']) {
+      assert(!Object.prototype.hasOwnProperty.call(modelConfigMsg.config.templates[0], legacyField), `Legacy ${legacyField} should be ignored and omitted from effective config`);
+    }
 
     const codexConfigMsg = await saveConfigAndWait(
       client,
@@ -5568,6 +5826,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     );
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
     assert(codexSession.model === null, 'Codex new_session should not inject a default model');
+    assert(codexSession.activeRuntime?.defaultModel === 'custom-regression-model', 'Codex new_session should resolve the provider default model without querying the model API');
 
     const codexModelList = await client.sendAndWaitType(
       buildAgentMessagePayload({ text: '/model', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }),
@@ -5636,32 +5895,25 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     const autoCompactRetryText = await client.waitForType('text_delta', (msg) => /trigger codex context limit/.test(msg.text || ''), 8000);
     assert(/trigger codex context limit/.test(autoCompactRetryText.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
 
-    const claudeOneMCwd = path.join(tempRoot, 'claude-1m-space');
-    mkdirp(claudeOneMCwd);
+    const claudeModelCwd = path.join(tempRoot, 'claude-model-space');
+    mkdirp(claudeModelCwd);
     const claudeModelSession = await client.sendAndWaitType(
-      { type: 'new_session', agent: 'claude', cwd: claudeOneMCwd, mode: 'yolo' },
+      { type: 'new_session', agent: 'claude', cwd: claudeModelCwd, mode: 'yolo' },
       'session_info',
-      (msg) => msg.agent === 'claude' && msg.cwd === claudeOneMCwd,
+      (msg) => msg.agent === 'claude' && msg.cwd === claudeModelCwd,
     );
-    const claudeModelList = await client.sendAndWaitType(
-      buildAgentMessagePayload({ text: '/model', sessionId: claudeModelSession.sessionId, mode: 'yolo', agent: 'claude' }),
-      'model_list',
-      (msg) => msg.agent === 'claude' && msg.current === 'default',
-    );
-    assert(Array.isArray(claudeModelList.entries) && claudeModelList.entries.some((entry) => entry.alias === 'sonnet[1m]'), 'Claude /model should expose Sonnet 1M option');
-    assert(claudeModelList.entries.some((entry) => entry.alias === 'opus[1m]'), 'Claude /model should expose Opus 1M option');
     const claudeModelChanged = await client.sendAndWaitType(
-      buildAgentMessagePayload({ text: '/model sonnet[1m]', sessionId: claudeModelSession.sessionId, mode: 'yolo', agent: 'claude' }),
+      buildAgentMessagePayload({ text: '/model claude-session-override', sessionId: claudeModelSession.sessionId, mode: 'yolo', agent: 'claude' }),
       'model_changed',
-      (msg) => msg.model === 'sonnet[1m]',
+      (msg) => msg.model === 'claude-session-override',
     );
-    assert(claudeModelChanged.model === 'sonnet[1m]', 'Claude /model should accept Sonnet 1M alias');
-    client.send(buildAgentMessagePayload({ text: 'use sonnet 1m', sessionId: claudeModelSession.sessionId, mode: 'yolo', agent: 'claude' }));
+    assert(claudeModelChanged.model === 'claude-session-override', 'Claude /model should persist a literal session model override');
+    client.send(buildAgentMessagePayload({ text: 'use selected claude model', sessionId: claudeModelSession.sessionId, mode: 'yolo', agent: 'claude' }));
     await client.waitForType('done', (msg) => msg.sessionId === claudeModelSession.sessionId);
-    const claudeOneMSpawnLine = findProcessLogLine(logsDir, claudeModelSession.sessionId, 'process_spawn');
-    assert(claudeOneMSpawnLine && claudeOneMSpawnLine.includes('claude-sonnet-4-6[1m]'), 'Claude /model Sonnet 1M should honor the configured provider mapping');
-    const storedClaudeOneMSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeModelSession.sessionId}.json`), 'utf8'));
-    assert(storedClaudeOneMSession.model === 'claude-sonnet-4-6[1m]', 'Claude /model should persist the configured provider mapping');
+    const claudeModelSpawnLine = findProcessLogLine(logsDir, claudeModelSession.sessionId, 'process_spawn');
+    assert(claudeModelSpawnLine && claudeModelSpawnLine.includes('--model claude-session-override'), 'Claude CLI startup args should use the current session model override');
+    const storedClaudeModelSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeModelSession.sessionId}.json`), 'utf8'));
+    assert(storedClaudeModelSession.model === 'claude-session-override', 'Claude session model override should be stored without changing provider defaults');
 
     for (const inheritedName of ['constructor', '__proto__']) {
       const changed = await client.sendAndWaitType(
@@ -5814,7 +6066,8 @@ async function main() {
       await runner.run('codex app server client lifecycle', () => runCodexAppServerClientLifecycleRegressionCase(ctx));
       await runner.run('pi rpc client lifecycle cleanup', () => runPiRpcClientLifecycleRegressionCase(ctx));
       await runner.run('custom CLI directories and server limits', () => runCustomCliDirectoriesRegressionCase(ctx));
-      await runner.run('fetch_models apiBase version compatibility', () => runFetchModelsApiBaseCompatibilityRegressionCase(ctx));
+      await runner.run('local agent model sources and startup args', () => runLocalAgentModelSourcesRegressionCase(ctx));
+      await runner.run('dynamic provider model discovery', () => runDynamicProviderModelDiscoveryRegressionCase(ctx));
       await runner.run('bridge ignores legacy reasoning effort config', () => runBridgeReasoningEffortRegressionCase(ctx));
       await runner.run('bridge responses fallback', () => runBridgeResponsesFallbackRegressionCase(ctx));
       await runner.run('bridge responses 404 fallback', () => runBridgeResponses404FallbackRegressionCase(ctx));

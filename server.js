@@ -1423,161 +1423,12 @@ function execFileQuiet(command, args = []) {
   });
 }
 
-const DEFAULT_CLAUDE_MODEL_MAP = {
-  opus: 'opus',
-  sonnet: 'sonnet',
-  haiku: 'haiku',
-};
-
-// Default fallback MODEL_MAP (overridden by model config at runtime)
-let MODEL_MAP = { ...DEFAULT_CLAUDE_MODEL_MAP };
-
-const CLAUDE_MODEL_MENU_ENTRIES = [
-  {
-    alias: 'default',
-    label: '默认（推荐）',
-    desc: '使用当前 Claude Code 或提供商配置的默认模型',
-  },
-  {
-    alias: 'sonnet[1m]',
-    label: 'Sonnet（1M 上下文）',
-    desc: '使用当前 Sonnet 映射并启用 1M 上下文',
-  },
-  {
-    alias: 'opus',
-    label: 'Opus',
-    desc: '使用当前 Opus 模型映射',
-  },
-  {
-    alias: 'opus[1m]',
-    label: 'Opus（1M 上下文）',
-    desc: '使用当前 Opus 映射并启用 1M 上下文',
-  },
-  {
-    alias: 'haiku',
-    label: 'Haiku',
-    desc: '使用当前 Haiku 模型映射',
-  },
-];
-
 const VALID_AGENTS = new Set(['claude', 'codex', 'pi']);
-
-// === Models API fetch ===
-let _modelCache = null; // { models, fetchedAt, source, credentialsKey }
-
-function resolveActiveApiCredentials() {
-  // Check Claude-selected provider first
-  try {
-    const tpl = getClaudeSelectedTemplate(loadModelConfig());
-    if (tpl && tpl.apiKey) {
-      return {
-        apiKey: tpl.apiKey,
-        apiBase: tpl.apiBase || 'https://api.anthropic.com',
-        upstreamType: tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
-      };
-    }
-  } catch {}
-  // Check ~/.claude/settings.json env block
-  try {
-    const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
-    const env = settings.env || {};
-    const key = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN;
-    if (key) return { apiKey: key, apiBase: env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
-  } catch {}
-  // Fall back to process.env
-  const key = process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
-  if (key) return { apiKey: key, apiBase: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
-  return null;
-}
-
-function fetchModelsFromApi(credentials) {
-  return new Promise((resolve, reject) => {
-    const apiBase = credentials.apiBase || 'https://api.anthropic.com';
-    const isAnthropic = credentials.upstreamType === 'anthropic';
-    let spec;
-    let url;
-    try {
-      spec = buildModelsRequestSpec(apiBase, credentials.apiKey, credentials.upstreamType);
-      url = new URL(spec.fullUrl);
-    } catch (error) {
-      return reject(error);
-    }
-    url.searchParams.set('limit', '100');
-    const options = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname + (url.search || ''),
-      method: 'GET',
-      headers: {
-        ...spec.headers,
-        'content-type': 'application/json',
-      },
-    };
-    const proto = url.protocol === 'https:' ? https : http;
-    const req = proto.request(options, (res) => {
-      let body = '';
-      let bodyBytes = 0;
-      res.on('data', (d) => {
-        bodyBytes += d.length;
-        if (bodyBytes > HTTP_BODY_MAX_BYTES) {
-          req.destroy(new Error('response too large'));
-          return;
-        }
-        body += d;
-      });
-      res.on('end', () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
-        try {
-          const json = JSON.parse(body);
-          // Anthropic format: { data: [{id, display_name, ...}] }
-          // OpenAI-compat format: { data: [{id, object, ...}] }
-          const raw = json.data || json.models || [];
-          const models = raw
-            .filter(m => typeof m.id === 'string' && m.id.toLowerCase().includes('claude'))
-            .map(m => ({ id: m.id, display_name: m.display_name || m.id }));
-          const source = isAnthropic ? 'anthropic' : 'openai';
-          resolve({ models, source });
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(8000, () => { req.destroy(new Error('timeout')); });
-    req.end();
-  });
-}
-
-async function getModelList() {
-  const now = Date.now();
-  const creds = resolveActiveApiCredentials();
-  if (!creds) return null; // no credentials — caller uses stable CLI aliases
-  const credentialsKey = crypto.createHash('sha256').update(JSON.stringify({
-    apiBase: String(creds.apiBase || ''),
-    apiKey: String(creds.apiKey || ''),
-    upstreamType: String(creds.upstreamType || ''),
-  })).digest('hex');
-  if (
-    _modelCache
-    && _modelCache.credentialsKey === credentialsKey
-    && now - _modelCache.fetchedAt < 3600_000
-  ) {
-    return _modelCache;
-  }
-  try {
-    const { models, source } = await fetchModelsFromApi(creds);
-    if (models.length > 0) {
-      _modelCache = { models, fetchedAt: now, source, credentialsKey };
-      return _modelCache;
-    }
-  } catch (e) {
-    console.error('[model-api] fetch failed:', e.message);
-  }
-  return null; // caller uses stable CLI aliases
-}
 
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
-  templates: [],      // array of { name, apiKey, apiBase, upstreamType, defaultModel, opusModel, sonnetModel, haikuModel }
+  templates: [],      // array of { name, apiKey, apiBase, upstreamType, defaultModel }
   activeTemplate: '', // name of active template (for 'custom' mode)
 };
 
@@ -1599,13 +1450,8 @@ const DEFAULT_PI_CONFIG = {
 function normalizeModelTemplate(template) {
   const apiBase = String(template?.apiBase || '').trim();
   const name = String(template?.name || '').trim();
-  const modelHints = [
-    String(template?.defaultModel || '').trim(),
-    String(template?.opusModel || '').trim(),
-    String(template?.sonnetModel || '').trim(),
-    String(template?.haikuModel || '').trim(),
-  ].filter(Boolean);
-  const combinedHints = `${name}\n${apiBase}\n${modelHints.join('\n')}`.toLowerCase();
+  const defaultModel = String(template?.defaultModel || '').trim();
+  const combinedHints = `${name}\n${apiBase}\n${defaultModel}`.toLowerCase();
   const looksLikeAnthropicProtocol = /(^|\b)claude-|anthropic|messages\b/.test(combinedHints);
   const looksLikeOpenAiProtocol = /(^|\b)(gpt-|o1|o3|o4|openai|responses\b|chat\/completions|\/v1\b)/.test(combinedHints);
   const upstreamType = template?.upstreamType === 'anthropic'
@@ -1616,10 +1462,7 @@ function normalizeModelTemplate(template) {
     apiKey: String(template?.apiKey || ''),
     apiBase,
     upstreamType,
-    defaultModel: String(template?.defaultModel || '').trim(),
-    opusModel: String(template?.opusModel || '').trim(),
-    sonnetModel: String(template?.sonnetModel || '').trim(),
-    haikuModel: String(template?.haikuModel || '').trim(),
+    defaultModel,
   };
 }
 
@@ -1941,6 +1784,52 @@ function loadUserPiSettings() {
   }
 }
 
+function piModelEntries(models) {
+  const entries = [];
+  for (const model of Array.isArray(models) ? models : []) {
+    const provider = String(model?.provider || '').trim();
+    const id = String(model?.id || model?.model || '').trim();
+    if (!id) continue;
+    const value = provider ? `${provider}/${id}` : id;
+    const details = [];
+    if (Number.isFinite(model?.contextWindow)) details.push(`${Math.round(model.contextWindow / 1000)}K 上下文`);
+    if (model?.reasoning) details.push('支持 thinking');
+    if (Array.isArray(model?.input) && model.input.includes('image')) details.push('支持图片');
+    entries.push({
+      value,
+      label: String(model?.name || id),
+      desc: details.join(' · ') || `模型 ID：${value}`,
+    });
+  }
+  return mergeModelEntries(entries);
+}
+
+function loadPiLocalModelInfo() {
+  const settings = loadUserPiSettings();
+  const defaultProvider = String(settings?.defaultProvider || '').trim();
+  const defaultModel = String(settings?.defaultModel || '').trim();
+  const models = [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(getUserPiAgentDir(), 'models.json'), 'utf8'));
+    for (const [provider, providerConfig] of Object.entries(parsed?.providers || {})) {
+      for (const model of Array.isArray(providerConfig?.models) ? providerConfig.models : []) {
+        models.push({ ...model, provider, id: model?.id || model?.model });
+      }
+    }
+  } catch {}
+  const entries = piModelEntries(models);
+  if (defaultModel) {
+    const value = defaultProvider ? `${defaultProvider}/${defaultModel}` : defaultModel;
+    entries.unshift({ value, label: defaultModel, desc: 'Pi 本地配置默认模型' });
+  }
+  return {
+    defaultProvider,
+    defaultModel,
+    entries: mergeModelEntries(entries),
+    source: 'pi-local-config',
+  };
+}
+
 function resolveInheritedPiResourceEntry(entry, userPiDir) {
   if (typeof entry !== 'string') return null;
   const value = entry.trim();
@@ -2037,14 +1926,16 @@ function getPiRuntimeFingerprint(config) {
  * Build a managed PI_CODING_AGENT_DIR so Pi uses the selected AI provider
  * without mutating the user's ~/.pi/agent.
  */
-function preparePiCustomRuntime(config) {
+function preparePiCustomRuntime(config, sessionModel = '') {
   const source = resolvePiActiveSource(config || loadPiConfig());
   if (source?.error) return source;
   if (!source || source.mode === 'local') {
     return { mode: 'local' };
   }
 
-  const modelId = source.defaultModel || 'default';
+  const defaultModelId = source.defaultModel || 'default';
+  const selectedModelId = String(sessionModel || '').trim();
+  const runtimeModelIds = Array.from(new Set([defaultModelId, selectedModelId].filter(Boolean)));
   let bridge;
   try {
     bridge = ensureBridgeRuntimeForTemplate(source);
@@ -2062,16 +1953,11 @@ function preparePiCustomRuntime(config) {
         baseUrl: bridgeBaseUrl,
         api,
         apiKey: '$WEBCODING_PI_API_KEY',
-        models: [
-          {
-            id: modelId,
-            name: modelId,
-          },
-        ],
+        models: runtimeModelIds.map((modelId) => ({ id: modelId, name: modelId })),
       },
     },
   };
-  const settingsJson = buildManagedPiSettings(modelId);
+  const settingsJson = buildManagedPiSettings(defaultModelId);
 
   try {
     fs.mkdirSync(PI_RUNTIME_HOME, { recursive: true });
@@ -2092,7 +1978,7 @@ function preparePiCustomRuntime(config) {
     provider: PI_MANAGED_PROVIDER_ID,
     apiKey: bridge.token,
     apiBase: bridgeBaseUrl,
-    defaultModel: modelId,
+    defaultModel: defaultModelId,
     profileName: source.name,
     upstreamType: source.upstreamType,
   };
@@ -2120,9 +2006,6 @@ function getModelConfigMasked() {
       apiBase: t.apiBase || '',
       upstreamType: t.upstreamType || 'openai',
       defaultModel: t.defaultModel || '',
-      opusModel: t.opusModel || '',
-      sonnetModel: t.sonnetModel || '',
-      haikuModel: t.haikuModel || '',
     })),
   };
 }
@@ -2574,28 +2457,70 @@ function buildModelsRequestSpec(apiBase, apiKey, upstreamType = 'openai') {
   return { fullUrl, headers };
 }
 
-function isTlsHandshakeFailure(error) {
-  const text = String(error?.message || error || '').toLowerCase();
-  return /eproto|handshake failure|alert handshake failure|protocol version|ssl3_read_bytes|tlsv1 alert protocol version/.test(text);
-}
-
-function getClaudeFallbackModels() {
-  const models = [];
-  for (const alias of ['opus', 'sonnet', 'haiku']) {
-    const value = MODEL_MAP[alias] || DEFAULT_CLAUDE_MODEL_MAP[alias];
-    if (value) models.push(value);
-  }
-  return Array.from(new Set(models));
-}
-
-function fetchCodexModelsFromApi(profile) {
-  return new Promise((resolve, reject) => {
-    const base = String(profile?.apiBase || '').trim().replace(/\/$/, '');
-    const token = String(profile?.apiKey || '').trim();
-    const upstreamType = profile?.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
-    if (!base || !token) {
-      return resolve(null);
+function responseModelRecords(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  const records = [];
+  const candidates = [
+    payload.data,
+    payload.models,
+    payload.items,
+    payload.results,
+    payload.result,
+    payload.data?.models,
+    payload.data?.items,
+    payload.result?.data,
+    payload.result?.models,
+    payload.result?.items,
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      records.push(...candidate);
+      continue;
     }
+    if (!candidate || typeof candidate !== 'object') continue;
+    for (const [id, value] of Object.entries(candidate)) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        records.push({ ...value, id: value.id || id });
+      } else if (typeof value === 'string') {
+        records.push({ id: value });
+      }
+    }
+  }
+  return records;
+}
+
+function normalizeProviderModelEntries(payload) {
+  const entries = [];
+  const seen = new Set();
+  for (const raw of responseModelRecords(payload)) {
+    const value = String(raw?.id || raw?.model || raw?.slug || raw?.name || raw || '').trim();
+    if (!value || seen.has(value)) continue;
+    const visibility = String(raw?.visibility || '').trim().toLowerCase();
+    if (visibility === 'hide' || visibility === 'hidden' || raw?.supported_in_api === false) continue;
+    seen.add(value);
+    entries.push({
+      value,
+      label: String(raw?.display_name || raw?.displayName || raw?.title || raw?.name || value).trim() || value,
+      desc: String(raw?.description || raw?.summary || `模型 ID：${value}`).trim(),
+    });
+  }
+  return entries;
+}
+
+function redactProviderSecret(text, secret) {
+  const value = String(text || '');
+  const token = String(secret || '');
+  if (!token) return value;
+  return value.split(token).join('[REDACTED]');
+}
+
+function fetchProviderModelEntries(provider) {
+  return new Promise((resolve, reject) => {
+    const base = String(provider?.apiBase || '').trim().replace(/\/+$/, '');
+    const token = String(provider?.apiKey || '').trim();
+    const upstreamType = provider?.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
+    if (!base || !token) return reject(new Error('当前服务商缺少 API Base URL 或 API Key'));
     let url;
     let spec;
     try {
@@ -2603,6 +2528,9 @@ function fetchCodexModelsFromApi(profile) {
       url = new URL(spec.fullUrl);
     } catch (error) {
       return reject(error);
+    }
+    if (upstreamType === 'anthropic' && !url.searchParams.has('limit')) {
+      url.searchParams.set('limit', '100');
     }
     const options = {
       hostname: url.hostname,
@@ -2627,109 +2555,208 @@ function fetchCodexModelsFromApi(profile) {
         body += chunk;
       });
       res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          const safeBody = redactProviderSecret(body.slice(0, 200), token);
+          return reject(new Error(`HTTP ${res.statusCode}: ${safeBody}`));
         }
         try {
           const json = JSON.parse(body);
-          const entries = normalizeCodexModelEntries(json.data || json.models || []);
-          resolve(entries.length ? { entries, source: 'provider-api' } : null);
+          const entries = normalizeProviderModelEntries(json);
+          if (!entries.length) {
+            return reject(new Error('接口返回成功，但没有可识别的模型 ID'));
+          }
+          resolve({ entries, source: `provider-api:${upstreamType}` });
         } catch (error) {
-          reject(error);
+          reject(new Error(`无法解析模型列表响应：${error.message}`));
         }
       });
     });
     req.on('error', reject);
-    req.setTimeout(1500, () => req.destroy(new Error('timeout')));
+    req.setTimeout(15_000, () => req.destroy(new Error('请求超时（15 秒）')));
     req.end();
   });
 }
 
-async function getCodexModelMenuPayload(session) {
-  const currentFull = session?.model || '';
-  const current = currentFull || 'default';
-  const modelConfig = loadModelConfig();
-  const codexConfig = loadCodexConfig();
-  const activeTemplate = normalizeCodexMode(codexConfig.mode) === 'unified'
-    ? getCodexSelectedTemplate(codexConfig, modelConfig)
-    : null;
-  let dynamicEntries = [];
-  let source = null;
+function parseTomlStringValue(rawValue) {
+  const raw = String(rawValue || '').trim().replace(/\s+#.*$/, '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('"')) {
+    try { return String(JSON.parse(raw)); } catch {}
+  }
+  if (raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1);
+  return raw.split(/\s+/)[0] || '';
+}
 
+function loadCodexLocalConfigModels() {
+  const configPath = path.join(getUserCodexHome(), 'config.toml');
+  let text = '';
+  try { text = fs.readFileSync(configPath, 'utf8'); } catch {}
+  let section = '';
+  let activeProfile = '';
+  let rootModel = '';
+  const profileModels = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    const sectionMatch = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim();
+      continue;
+    }
+    const valueMatch = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
+    if (!valueMatch) continue;
+    const key = valueMatch[1];
+    const value = parseTomlStringValue(valueMatch[2]);
+    if (!value) continue;
+    if (!section && key === 'profile') activeProfile = value;
+    if (key !== 'model') continue;
+    const profileMatch = section.match(/^profiles\.(.+)$/);
+    if (profileMatch) {
+      const profileName = parseTomlStringValue(profileMatch[1]);
+      if (profileName) profileModels.set(profileName, value);
+    } else if (!section) {
+      rootModel = value;
+    }
+  }
+  const entries = [];
+  if (rootModel) entries.push({ value: rootModel, label: rootModel, desc: 'Codex 本地配置默认模型' });
+  for (const [profileName, model] of profileModels) {
+    entries.push({ value: model, label: model, desc: `Codex 本地 profile：${profileName}` });
+  }
+  return {
+    defaultModel: (activeProfile && profileModels.get(activeProfile)) || rootModel || '',
+    entries,
+    activeProfile,
+  };
+}
+
+function mergeModelEntries(...entryGroups) {
+  const merged = [];
+  const seen = new Set();
+  for (const entries of entryGroups) {
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const value = String(entry?.value || '').trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      merged.push({
+        value,
+        label: String(entry?.label || value),
+        desc: String(entry?.desc || `模型 ID：${value}`),
+      });
+    }
+  }
+  return merged;
+}
+
+function modelMenuCurrentValue(session, agent) {
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  const model = String(session?.model || '').trim();
+  if (normalizedAgent === 'pi' && model && session?.piProvider) {
+    return `${session.piProvider}/${model}`;
+  }
+  return model;
+}
+
+function buildAgentModelMenuPayload(session, agent, options = {}) {
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  const agentLabel = agentDisplayName(normalizedAgent);
+  const defaultModel = String(options.defaultModel || '').trim();
+  const currentFull = modelMenuCurrentValue(session, normalizedAgent);
+  const entries = [{
+    value: 'default',
+    label: defaultModel ? `默认模型（${defaultModel}）` : `默认模型（${agentLabel}）`,
+    desc: defaultModel ? `使用当前配置的默认模型 ${defaultModel}` : `使用当前 ${agentLabel} 配置决定的默认模型`,
+  }];
+  if (defaultModel) {
+    entries.push({ value: defaultModel, label: defaultModel, desc: '当前配置中的默认模型 ID' });
+  }
+  entries.push(...(Array.isArray(options.entries) ? options.entries : []));
+  if (currentFull) {
+    entries.push({ value: currentFull, label: currentFull, desc: '当前会话模型' });
+  }
+  return {
+    type: 'model_list',
+    sessionId: session?.id || null,
+    agent: normalizedAgent,
+    entries: mergeModelEntries(entries),
+    current: currentFull || 'default',
+    currentFull,
+    defaultModel,
+    source: options.source || null,
+    success: !options.error,
+    error: options.error ? String(options.error) : null,
+    retryable: !!options.error,
+  };
+}
+
+async function getCodexModelMenuPayload(session) {
+  const codexConfig = loadCodexConfig();
+  const activeSource = resolveCodexActiveSource(codexConfig);
+  if (activeSource?.mode && activeSource.mode !== 'local' && !activeSource.error) {
+    try {
+      const fetched = await fetchProviderModelEntries(activeSource);
+      return buildAgentModelMenuPayload(session, 'codex', {
+        entries: fetched.entries,
+        defaultModel: activeSource.defaultModel,
+        source: fetched.source,
+      });
+    } catch (error) {
+      plog('WARN', 'codex_model_fetch_failed', { error: error.message });
+      return buildAgentModelMenuPayload(session, 'codex', {
+        defaultModel: activeSource.defaultModel,
+        source: 'provider-api',
+        error: `获取当前服务商模型失败：${error.message}`,
+      });
+    }
+  }
+  if (activeSource?.error) {
+    return buildAgentModelMenuPayload(session, 'codex', { error: activeSource.error });
+  }
+
+  const localConfig = loadCodexLocalConfigModels();
+  let runtimeEntries = [];
+  let runtimeError = null;
   if (CODEX_TRANSPORT === 'app-server' && session) {
     try {
       const spawnSpec = buildCodexSpawnSpec(session, { transport: 'app-server' });
-      if (!spawnSpec?.error) {
-        const runtime = await ensureCodexAppRuntime(session, spawnSpec);
-        const result = await runtime.client.request('model/list', { limit: 100 }, { timeoutMs: 15_000 });
-        dynamicEntries = normalizeCodexModelEntries(result?.data || result?.models || []);
-        if (dynamicEntries.length) source = 'codex-app-server';
-      }
+      if (spawnSpec?.error) throw new Error(spawnSpec.error);
+      const runtime = await ensureCodexAppRuntime(session, spawnSpec);
+      const result = await runtime.client.request('model/list', { limit: 100 }, { timeoutMs: 15_000 });
+      runtimeEntries = normalizeCodexModelEntries(result?.data || result?.models || []);
     } catch (error) {
+      runtimeError = error;
       plog('WARN', 'codex_app_model_list_failed', { error: error.message });
     }
   }
-
-  if (!dynamicEntries.length && activeTemplate?.apiBase && activeTemplate?.apiKey) {
-    try {
-      const fetched = await fetchCodexModelsFromApi(activeTemplate);
-      if (fetched?.entries?.length) {
-        dynamicEntries = fetched.entries;
-        source = fetched.source;
-      }
-    } catch (error) {
-      plog('WARN', 'codex_model_fetch_failed', { error: error.message });
+  let cacheEntries = [];
+  for (const cachePath of getCodexModelsCachePaths({ mode: 'local' })) {
+    const cached = loadCodexModelsCacheEntries(cachePath);
+    if (cached?.entries?.length) {
+      cacheEntries = cached.entries;
+      break;
     }
   }
-
-  if (!dynamicEntries.length) {
-    for (const cachePath of getCodexModelsCachePaths(codexConfig)) {
-      const cached = loadCodexModelsCacheEntries(cachePath);
-      if (cached?.entries?.length) {
-        dynamicEntries = cached.entries;
-        source = cached.source;
-        break;
-      }
-    }
-  }
-
-  const entries = [{
-    value: 'default',
-    label: '默认模型（Codex）',
-    desc: activeTemplate?.defaultModel
-      ? `使用当前 Codex 默认模型（${activeTemplate.defaultModel}）`
-      : '使用当前 Codex 默认模型',
-  }];
-  const seen = new Set(entries.map((entry) => entry.value));
-  if (activeTemplate?.defaultModel && !seen.has(activeTemplate.defaultModel)) {
-    seen.add(activeTemplate.defaultModel);
-    entries.push({
-      value: activeTemplate.defaultModel,
-      label: activeTemplate.defaultModel,
-      desc: '当前 AI 提供商默认模型（Codex）',
-    });
-  }
-  for (const entry of dynamicEntries) {
-    if (seen.has(entry.value)) continue;
-    seen.add(entry.value);
-    entries.push(entry);
-  }
-  if (currentFull && !seen.has(currentFull)) {
-    entries.push({
-      value: currentFull,
-      label: currentFull,
-      desc: '当前会话模型',
-    });
-  }
-
-  return {
-    type: 'model_list',
-    agent: 'codex',
+  const entries = mergeModelEntries(localConfig.entries, runtimeEntries, cacheEntries);
+  return buildAgentModelMenuPayload(session, 'codex', {
     entries,
-    current,
-    currentFull,
-    source,
-  };
+    defaultModel: localConfig.defaultModel,
+    source: runtimeEntries.length ? 'codex-app-server' : (cacheEntries.length ? 'codex-local-cache' : 'codex-local-config'),
+    ...(!entries.length ? {
+      error: runtimeError
+        ? `读取 Codex 本地模型失败：${runtimeError.message}`
+        : '未在 Codex 本地配置、profile 或模型缓存中找到可用模型。',
+    } : {}),
+  });
+}
+
+async function getAgentModelMenuPayload(session, agent) {
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  if (!session) {
+    return buildAgentModelMenuPayload(null, normalizedAgent, {
+      error: '请先进入一个会话再查看模型列表。',
+    });
+  }
+  if (normalizedAgent === 'codex') return getCodexModelMenuPayload(session);
+  if (normalizedAgent === 'pi') return getPiModelMenuPayload(session);
+  return getClaudeModelMenuPayload(session);
 }
 
 const CLAUDE_EFFORT_ENTRIES = [
@@ -2843,31 +2870,65 @@ async function getEffortMenuPayload(session, agent) {
   };
 }
 
-function extractClaudeModelMapFromEnv(env) {
-  const map = {};
-  if (env?.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = String(env.ANTHROPIC_DEFAULT_OPUS_MODEL).trim();
-  if (env?.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = String(env.ANTHROPIC_DEFAULT_SONNET_MODEL).trim();
-  if (env?.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = String(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).trim();
-  if (!map.opus && env?.ANTHROPIC_MODEL) map.opus = String(env.ANTHROPIC_MODEL).trim();
-  return Object.keys(map).length > 0 ? map : null;
+const CLAUDE_LOCAL_MODEL_FIELDS = [
+  ['ANTHROPIC_MODEL', 'Claude 本地默认模型'],
+  ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'Claude 本地 Opus 映射'],
+  ['ANTHROPIC_DEFAULT_SONNET_MODEL', 'Claude 本地 Sonnet 映射'],
+  ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'Claude 本地 Haiku 映射'],
+  ['ANTHROPIC_REASONING_MODEL', 'Claude 本地推理模型'],
+];
+
+function claudeLocalModelEntriesFromEnv(env) {
+  const entries = [];
+  for (const [key, desc] of CLAUDE_LOCAL_MODEL_FIELDS) {
+    const value = String(env?.[key] || '').trim();
+    if (!value) continue;
+    entries.push({ value, label: value, desc });
+  }
+  return mergeModelEntries(entries);
 }
 
-function loadClaudeLocalModelMap() {
-  const settingsEnv = readClaudeSettingsEnv();
-  const settingsMap = extractClaudeModelMapFromEnv(settingsEnv);
-  if (settingsMap) return settingsMap;
+function resolveClaudeConfiguredModel(modelValue, env) {
+  const raw = String(modelValue || '').trim();
+  if (!raw) return '';
+  const oneMillion = raw.toLowerCase().endsWith('[1m]');
+  const alias = (oneMillion ? raw.slice(0, -4) : raw).toLowerCase();
+  const mapped = alias === 'opus'
+    ? env?.ANTHROPIC_DEFAULT_OPUS_MODEL
+    : alias === 'sonnet'
+      ? env?.ANTHROPIC_DEFAULT_SONNET_MODEL
+      : alias === 'haiku'
+        ? env?.ANTHROPIC_DEFAULT_HAIKU_MODEL
+        : '';
+  if (!mapped) return raw;
+  return `${String(mapped).trim()}${oneMillion ? '[1m]' : ''}`;
+}
 
+function loadClaudeLocalModelInfo() {
+  const settings = readClaudeSettings();
+  const sources = [{ source: 'claude-settings', env: settings?.env || {}, configuredModel: settings?.model }];
   try {
-    const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
-    if (fs.existsSync(p)) {
-      const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-      const claudeJsonMap = extractClaudeModelMapFromEnv(raw?.env || {});
-      if (claudeJsonMap) return claudeJsonMap;
-    }
+    const claudeJsonPath = path.join(getUserHomeDir(), '.claude.json');
+    const raw = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    sources.push({ source: 'claude-json', env: raw?.env || {}, configuredModel: raw?.model });
   } catch {}
+  sources.push({ source: 'process-env', env: process.env || {}, configuredModel: '' });
 
-  const processMap = extractClaudeModelMapFromEnv(process.env || {});
-  return processMap;
+  for (const source of sources) {
+    const configuredDefault = String(source.env?.ANTHROPIC_MODEL || '').trim()
+      || resolveClaudeConfiguredModel(source.configuredModel, source.env);
+    const entries = mergeModelEntries(
+      configuredDefault ? [{ value: configuredDefault, label: configuredDefault, desc: 'Claude 本地配置默认模型' }] : [],
+      claudeLocalModelEntriesFromEnv(source.env),
+    );
+    if (!entries.length) continue;
+    return {
+      source: source.source,
+      entries,
+      defaultModel: configuredDefault,
+    };
+  }
+  return { source: 'claude-local-config', entries: [], defaultModel: '' };
 }
 
 function fileContentFingerprint(filePath) {
@@ -2880,7 +2941,6 @@ function fileContentFingerprint(filePath) {
   }
 }
 
-// Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
 const CLAUDE_SETTINGS_PATH = path.join(getClaudeConfigDir(), 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
@@ -2940,9 +3000,6 @@ function extractManagedClaudeSettingsEnv(env) {
 function buildManagedClaudeSettingsEnv(tpl, bridge) {
   const managedEnv = {};
   const defaultModel = String(tpl?.defaultModel || '').trim();
-  const opusModel = String(tpl?.opusModel || defaultModel || '').trim();
-  const sonnetModel = String(tpl?.sonnetModel || defaultModel || '').trim();
-  const haikuModel = String(tpl?.haikuModel || defaultModel || '').trim();
 
   if (bridge?.token) {
     managedEnv.ANTHROPIC_API_KEY = String(bridge.token).trim();
@@ -2952,9 +3009,6 @@ function buildManagedClaudeSettingsEnv(tpl, bridge) {
   if (bridge?.anthropicBaseUrl) managedEnv.ANTHROPIC_BASE_URL = String(bridge.anthropicBaseUrl).trim();
   else if (tpl?.apiBase) managedEnv.ANTHROPIC_BASE_URL = String(tpl.apiBase).trim();
   if (defaultModel) managedEnv.ANTHROPIC_MODEL = defaultModel;
-  if (opusModel) managedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel;
-  if (sonnetModel) managedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetModel;
-  if (haikuModel) managedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel;
   return managedEnv;
 }
 
@@ -3145,27 +3199,6 @@ function restoreManagedClaudeSettings(previousTemplate = null, options = {}) {
   return true;
 }
 
-function applyModelConfig() {
-  const config = loadModelConfig();
-  const tpl = getClaudeSelectedTemplate(config);
-  if (tpl) {
-    const defaultModel = String(tpl.defaultModel || '').trim();
-    if (tpl.opusModel || defaultModel) MODEL_MAP.opus = tpl.opusModel || defaultModel;
-    if (tpl.sonnetModel || defaultModel) MODEL_MAP.sonnet = tpl.sonnetModel || defaultModel;
-    if (tpl.haikuModel || defaultModel) MODEL_MAP.haiku = tpl.haikuModel || defaultModel;
-    if (defaultModel || tpl.opusModel || tpl.sonnetModel || tpl.haikuModel) return;
-  }
-  // mode === 'local': read model names from local Claude settings / env overrides
-  const localMap = loadClaudeLocalModelMap();
-  if (localMap) {
-    if (localMap.opus) MODEL_MAP.opus = localMap.opus;
-    if (localMap.sonnet) MODEL_MAP.sonnet = localMap.sonnet;
-    if (localMap.haiku) MODEL_MAP.haiku = localMap.haiku;
-  }
-}
-
-// Apply on startup
-applyModelConfig();
 try {
   // Migrate installations from the older behavior that edited ~/.claude/settings.json.
   restoreManagedClaudeSettings(null, { onlyIfBackupExists: true });
@@ -3565,8 +3598,10 @@ function buildClaudeRuntimeChannelDescriptor(session, options = {}) {
       explicitModel,
     };
   }
+  const local = loadClaudeLocalModelInfo();
   return {
     mode: 'local',
+    defaultModel: String(local.defaultModel || ''),
     explicitModel,
   };
 }
@@ -3576,8 +3611,10 @@ function buildCodexRuntimeChannelDescriptor(session, options = {}) {
   const explicitModel = currentSessionModelOverride(session);
   const source = resolveCodexActiveSource(codexConfig);
   if (!source || source.mode === 'local') {
+    const local = loadCodexLocalConfigModels();
     return {
       mode: 'local',
+      defaultModel: String(local.defaultModel || ''),
       explicitModel,
     };
   }
@@ -3603,9 +3640,14 @@ function buildPiRuntimeChannelDescriptor(session, options = {}) {
   const explicitModel = currentSessionModelOverride(session);
   const source = resolvePiActiveSource(piConfig);
   if (!source || source.mode === 'local') {
+    const local = loadPiLocalModelInfo();
+    const defaultModel = local.defaultModel && local.defaultProvider
+      ? `${local.defaultProvider}/${local.defaultModel}`
+      : local.defaultModel;
     return {
       mode: 'local',
-      explicitModel,
+      defaultModel: String(defaultModel || ''),
+      explicitModel: sessionModelLabel(session) || explicitModel,
       provider: String(session?.piProvider || '').trim() || null,
     };
   }
@@ -3949,6 +3991,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeFingerprint')) session.codexRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'piSessionId')) session.piSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'piRuntimeFingerprint')) session.piRuntimeFingerprint = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'piProvider')) session.piProvider = null;
   if (session.agent === 'pi' && !session.piSessionId && session.claudeSessionId) {
     session.piSessionId = session.claudeSessionId;
     session.piRuntimeFingerprint = session.claudeRuntimeFingerprint || null;
@@ -4015,172 +4058,60 @@ function saveSession(session) {
   invalidateImportedSessionIdsCache();
 }
 
-function normalizeClaudeModelAliasInput(modelInput) {
-  const raw = String(modelInput || '').trim();
-  const lower = raw.toLowerCase();
-  if (lower === 'opus-1m' || lower === 'opus_1m') return 'opus[1m]';
-  if (lower === 'sonnet-1m' || lower === 'sonnet_1m') return 'sonnet[1m]';
-  return raw;
-}
-
-function getClaudeModelMapValue(alias) {
-  const key = String(alias || '');
-  if (!Object.prototype.hasOwnProperty.call(MODEL_MAP, key)) return null;
-  const value = MODEL_MAP[key];
-  return typeof value === 'string' && value ? value : null;
-}
-
-function modelShortName(fullModel) {
-  if (!fullModel) return null;
-  const normalized = normalizeClaudeModelAliasInput(fullModel);
-  const lower = normalized.toLowerCase();
-  if (lower === 'opus' || lower === 'sonnet' || lower === 'haiku' || lower === 'opus[1m]' || lower === 'sonnet[1m]') {
-    return lower;
-  }
-  const isOneM = lower.endsWith('[1m]');
-  const baseModel = isOneM ? normalized.slice(0, -4) : normalized;
-  const baseLower = baseModel.toLowerCase();
-  const entry = Object.entries(MODEL_MAP).find(([, value]) => String(value || '').toLowerCase() === baseLower);
-  return entry ? (isOneM ? `${entry[0]}[1m]` : entry[0]) : null;
-}
-
-function getClaudeModelMenuLabel(modelOrAlias) {
-  if (!modelOrAlias) return null;
-  const normalized = normalizeClaudeModelAliasInput(modelOrAlias);
-  const lower = normalized.toLowerCase();
-  if (lower === 'default') {
-    return CLAUDE_MODEL_MENU_ENTRIES.find((entry) => entry.alias === 'default')?.label || '默认';
-  }
-  const alias = modelShortName(normalized) || normalized;
-  const entry = CLAUDE_MODEL_MENU_ENTRIES.find((item) => item.alias.toLowerCase() === String(alias).toLowerCase());
-  return entry?.label || null;
-}
-
-function getClaudeModelMenuEntries() {
-  const config = loadModelConfig();
-  const useResolvedIds = config.mode === 'custom' && !!config.activeTemplate;
-  return CLAUDE_MODEL_MENU_ENTRIES.map((entry) => {
-    if (entry.alias === 'default') {
-      return { ...entry, value: 'default' };
-    }
-    const isOneM = entry.alias.endsWith('[1m]');
-    const baseAlias = isOneM ? entry.alias.slice(0, -4) : entry.alias;
-    let value = entry.alias;
-    const mappedModel = getClaudeModelMapValue(baseAlias);
-    if (useResolvedIds && mappedModel) {
-      value = isOneM ? `${mappedModel}[1m]` : mappedModel;
-    }
-    return { ...entry, value };
-  });
-}
-
 async function getClaudeModelMenuPayload(session) {
-  const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
-  const currentFull = session?.model || '';
-  const entries = [];
-  const seen = new Set();
-
-  function pushEntry(entry) {
-    const value = String(entry?.value || entry?.alias || '').trim();
-    if (!value || seen.has(value)) return;
-    seen.add(value);
-    entries.push(entry);
-  }
-
-  for (const entry of getClaudeModelMenuEntries()) {
-    pushEntry({ ...entry });
-  }
-
-  let source = 'claude-cli';
-  const cache = await getModelList();
-  if (cache?.models?.length) {
-    source = cache.source || 'provider-api';
-    for (const model of cache.models) {
-      const id = String(model?.id || '').trim();
-      if (!id) continue;
-      pushEntry({
-        alias: id,
-        value: id,
-        label: model.display_name || id,
-        desc: id,
-        pricing: '',
+  const config = loadModelConfig();
+  if (config.mode === 'custom') {
+    const provider = getClaudeSelectedTemplate(config);
+    if (!provider) {
+      return buildAgentModelMenuPayload(session, 'claude', {
+        error: 'Claude 当前没有可用的 AI 提供商配置。',
+      });
+    }
+    try {
+      const fetched = await fetchProviderModelEntries(provider);
+      return buildAgentModelMenuPayload(session, 'claude', {
+        entries: fetched.entries,
+        defaultModel: provider.defaultModel,
+        source: fetched.source,
+      });
+    } catch (error) {
+      plog('WARN', 'claude_model_fetch_failed', { error: error.message });
+      return buildAgentModelMenuPayload(session, 'claude', {
+        defaultModel: provider.defaultModel,
+        source: 'provider-api',
+        error: `获取当前服务商模型失败：${error.message}`,
       });
     }
   }
-
-  if (currentFull && !seen.has(currentFull)) {
-    pushEntry({
-      alias: currentFull,
-      value: currentFull,
-      label: currentFull,
-      desc: '当前会话模型',
-      pricing: '',
-    });
-  }
-
-  return {
-    type: 'model_list',
-    agent: 'claude',
-    models: MODEL_MAP,
-    entries,
-    current: currentAlias,
-    currentFull,
-    source,
-  };
-}
-
-function resolveClaudeModelInput(modelInput) {
-  const raw = String(modelInput || '').trim();
-  if (!raw) return null;
-  const normalized = normalizeClaudeModelAliasInput(raw);
-  const lower = normalized.toLowerCase();
-  if (lower === 'default') {
-    return { resolvedModel: null, resolvedAlias: 'default' };
-  }
-  if (lower.endsWith('[1m]')) {
-    const baseAlias = lower.slice(0, -4);
-    const mappedModel = getClaudeModelMapValue(baseAlias);
-    if (mappedModel) {
-      return {
-        resolvedModel: `${mappedModel}[1m]`,
-        resolvedAlias: `${baseAlias}[1m]`,
-      };
-    }
-  }
-  const mappedModel = getClaudeModelMapValue(lower);
-  if (mappedModel) {
-    return { resolvedModel: mappedModel, resolvedAlias: lower };
-  }
-  const exactEntry = Object.entries(MODEL_MAP).find(([, value]) => String(value || '').toLowerCase() === lower);
-  if (exactEntry) {
-    return { resolvedModel: exactEntry[1], resolvedAlias: exactEntry[0] };
-  }
-  const oneMEntry = Object.entries(MODEL_MAP).find(([, value]) => `${String(value || '').toLowerCase()}[1m]` === lower);
-  if (oneMEntry) {
-    return {
-      resolvedModel: `${oneMEntry[1]}[1m]`,
-      resolvedAlias: `${oneMEntry[0]}[1m]`,
-    };
-  }
-  return { resolvedModel: normalized, resolvedAlias: modelShortName(normalized) || normalized };
+  const local = loadClaudeLocalModelInfo();
+  return buildAgentModelMenuPayload(session, 'claude', {
+    entries: local.entries,
+    defaultModel: local.defaultModel,
+    source: local.source,
+    ...(!local.entries.length ? {
+      error: '未在 Claude 本地 settings、.claude.json 或环境变量中找到已配置的模型。',
+    } : {}),
+  });
 }
 
 /** Session-level model field for WS payloads — only explicit overrides, never invent defaults. */
 function sessionModelLabel(session) {
   if (!session?.model) return null;
-  return isClaudeSession(session) ? (modelShortName(session.model) || session.model) : session.model;
+  if (isPiSession(session) && session.piProvider) return `${session.piProvider}/${session.model}`;
+  return session.model;
 }
 
 /**
  * Resolve a concrete model id for spawn / message labels (never "default" placeholder).
- * Order: session override → channel/provider default → agent built-in fallback.
+ * Order: session override → channel/provider default → real local configuration.
  * Do NOT use this for session.model persistence on new_session.
  */
 function resolveEffectiveModelId(session) {
   const agent = getSessionAgent(session);
   const explicit = String(session?.model || '').trim();
   if (explicit && !/^default$/i.test(explicit)) {
-    return agent === 'claude' ? (modelShortName(explicit) || explicit) : explicit;
+    if (agent === 'pi' && session?.piProvider) return `${session.piProvider}/${explicit}`;
+    return explicit;
   }
 
   try {
@@ -4188,33 +4119,22 @@ function resolveEffectiveModelId(session) {
       const config = loadModelConfig();
       if (config.mode === 'custom') {
         const tpl = getClaudeSelectedTemplate(config);
-        const fromTpl = String(tpl?.defaultModel || tpl?.sonnetModel || tpl?.opusModel || '').trim();
+        const fromTpl = String(tpl?.defaultModel || '').trim();
         if (fromTpl) return fromTpl;
       }
-      const local = readClaudeSettingsCredentials();
-      if (local?.defaultModel) return String(local.defaultModel).trim();
-      // Runtime map sonnet is the Claude Code default.
-      return String(MODEL_MAP.sonnet || DEFAULT_CLAUDE_MODEL_MAP.sonnet || '').trim() || null;
+      return loadClaudeLocalModelInfo().defaultModel || null;
     }
     if (agent === 'codex') {
       const source = resolveCodexActiveSource(loadCodexConfig());
       if (source?.defaultModel) return String(source.defaultModel).trim();
-      return null;
+      return loadCodexLocalConfigModels().defaultModel || null;
     }
     if (agent === 'pi') {
       const source = resolvePiActiveSource(loadPiConfig());
       if (source?.defaultModel) return String(source.defaultModel).trim();
-      // Local Pi defaults from ~/.pi/agent/settings.json
-      try {
-        const piDir = process.env.PI_CODING_AGENT_DIR
-          || path.join(process.env.HOME || process.env.USERPROFILE || '', '.pi', 'agent');
-        const settings = JSON.parse(fs.readFileSync(path.join(piDir, 'settings.json'), 'utf8'));
-        const model = String(settings?.defaultModel || '').trim();
-        const provider = String(settings?.defaultProvider || '').trim();
-        if (model && provider) return `${provider}/${model}`;
-        if (model) return model;
-      } catch {}
-      return null;
+      const local = loadPiLocalModelInfo();
+      if (local.defaultModel && local.defaultProvider) return `${local.defaultProvider}/${local.defaultModel}`;
+      return local.defaultModel || null;
     }
   } catch {}
   return null;
@@ -6322,12 +6242,6 @@ wss.on('connection', (ws, req) => {
       case 'save_codex_config':
         handleSaveCodexConfig(ws, msg.config);
         break;
-      case 'fetch_models':
-        handleFetchModels(ws, msg);
-        break;
-      case 'get_model_list':
-        wsSend(ws, { type: 'model_list', models: MODEL_MAP });
-        break;
       case 'check_update':
         handleCheckUpdate(ws);
         break;
@@ -6506,9 +6420,6 @@ function handleSaveModelConfig(ws, newConfig) {
       apiBase: nt.apiBase || '',
       upstreamType: nt.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
       defaultModel: nt.defaultModel || '',
-      opusModel: nt.opusModel || '',
-      sonnetModel: nt.sonnetModel || '',
-      haikuModel: nt.haikuModel || '',
     });
   }
   if (merged.mode === 'custom' && !selectTemplateByName(merged.templates, merged.activeTemplate)) {
@@ -6520,9 +6431,6 @@ function handleSaveModelConfig(ws, newConfig) {
 
   saveModelConfig(merged);
 
-  // Re-apply at runtime
-  MODEL_MAP = { ...DEFAULT_CLAUDE_MODEL_MAP };
-  applyModelConfig();
   // Custom mode uses an isolated settings file passed with --settings.
   if (merged.mode === 'custom' && merged.activeTemplate) {
     restoreManagedClaudeSettings(previousTemplate, { onlyIfBackupExists: true });
@@ -6646,123 +6554,6 @@ function handleSaveCodexConfig(ws, newConfig) {
   });
 }
 
-// === Fetch Upstream Models ===
-function handleFetchModels(ws, msg) {
-  const { apiBase, apiKey } = msg;
-  if (!apiBase || !apiKey) {
-    return wsSend(ws, { type: 'fetch_models_result', success: false, message: '需要填写 API Base 和 API Key' });
-  }
-  const agent = msg.agent === 'codex' ? 'codex' : 'claude';
-  const upstreamType = msg.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
-  const base = String(apiBase || '').trim().replace(/\/+$/, '');
-  let fullUrl = '';
-  try {
-    const spec = buildModelsRequestSpec(base, apiKey, upstreamType);
-    fullUrl = spec.fullUrl;
-  } catch (error) {
-    return wsSend(ws, { type: 'fetch_models_result', success: false, message: error.message || '无效的 API Base URL' });
-  }
-
-  let parsed;
-  try { parsed = new URL(fullUrl); } catch {
-    return wsSend(ws, { type: 'fetch_models_result', success: false, message: '无效的 URL: ' + fullUrl });
-  }
-
-  // Resolve real apiKey (if masked, look up saved config by template name or apiBase)
-  let realKey = apiKey;
-  if (apiKey.includes('****')) {
-    if (msg.templateName) {
-      const config = loadModelConfig();
-      const saved = Array.isArray(config.templates) ? config.templates : [];
-      const template = saved.find((item) => item.name === msg.templateName)
-        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
-        || null;
-      if (template && template.apiKey && !template.apiKey.includes('****')) {
-        realKey = template.apiKey;
-      } else {
-        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
-      }
-    } else if (agent === 'codex') {
-      const config = loadCodexConfig();
-      const saved = Array.isArray(config.profiles) ? config.profiles : [];
-      const profile = (msg.profileName && saved.find((item) => item.name === msg.profileName))
-        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
-        || null;
-      if (profile && profile.apiKey && !profile.apiKey.includes('****')) {
-        realKey = profile.apiKey;
-      } else {
-        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
-      }
-    } else {
-      const config = loadModelConfig();
-      const saved = config.templates || [];
-      const tpl = (msg.templateName && saved.find((item) => item.name === msg.templateName))
-        || saved.find((item) => item.apiBase && item.apiBase.replace(/\/+$/, '') === base)
-        || null;
-      if (tpl && tpl.apiKey && !tpl.apiKey.includes('****')) {
-        realKey = tpl.apiKey;
-      } else {
-        return wsSend(ws, { type: 'fetch_models_result', success: false, message: 'API Key 已脱敏，请重新输入完整 Key' });
-      }
-    }
-  }
-
-  const mod = parsed.protocol === 'https:' ? require('https') : require('http');
-  const reqOptions = {
-    method: 'GET',
-    headers: buildModelsRequestSpec(base, realKey, upstreamType).headers,
-    timeout: 15000,
-  };
-
-  const req = mod.request(parsed, reqOptions, (res) => {
-    let body = '';
-    let bodyBytes = 0;
-    res.on('data', (chunk) => {
-      bodyBytes += chunk.length;
-      if (bodyBytes > HTTP_BODY_MAX_BYTES) {
-        req.destroy(new Error('response too large'));
-        return;
-      }
-      body += chunk;
-    });
-    res.on('end', () => {
-      if (res.statusCode !== 200) {
-        return wsSend(ws, { type: 'fetch_models_result', success: false, message: `HTTP ${res.statusCode}: ${body.slice(0, 200)}` });
-      }
-      try {
-        const json = JSON.parse(body);
-        const models = agent === 'codex'
-          ? normalizeCodexModelEntries(json.data || json.models || []).map((entry) => entry.value)
-          : (json.data || json.models || []).map((item) => typeof item === 'string' ? item : item.id || item.name || '').filter(Boolean).sort();
-        wsSend(ws, { type: 'fetch_models_result', success: true, models });
-      } catch (e) {
-        wsSend(ws, { type: 'fetch_models_result', success: false, message: '解析响应失败: ' + e.message });
-      }
-    });
-  });
-
-  req.on('error', (e) => {
-    if (agent === 'claude' && upstreamType === 'anthropic' && isTlsHandshakeFailure(e)) {
-      const fallbackModels = getClaudeFallbackModels();
-      if (fallbackModels.length) {
-        return wsSend(ws, {
-          type: 'fetch_models_result',
-          success: true,
-          models: fallbackModels,
-          fallback: true,
-          message: `上游拒绝了当前直连探测，已改用内置 Claude 模型列表（${fallbackModels.length} 个）。这类只面向官方 Claude Code CLI 的服务常会这样；你也可以直接手填模型 ID。`,
-        });
-      }
-    }
-    wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求失败: ' + e.message });
-  });
-  req.on('timeout', () => {
-    req.destroy();
-    wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求超时 (15s)' });
-  });
-  req.end();
-}
-
 // === Client message idempotency (short-lived) ===
 const acceptedClientMessages = new Map(); // key -> { timestamp, ack }
 const ACCEPTED_CLIENT_MESSAGE_TTL_MS = 10 * 60 * 1000;
@@ -6838,7 +6629,7 @@ async function performCodexFork(ws, session) {
   const result = await runtime.client.request('thread/fork', {
     threadId,
     cwd: spawnSpec.cwd,
-    model: session.model || null,
+    model: spawnSpec.effectiveModel || null,
     approvalPolicy: spawnSpec.approvalPolicy,
     sandbox: spawnSpec.threadSandbox,
   }, { timeoutMs: 30_000 });
@@ -7559,6 +7350,56 @@ async function applyEffortSelection(ws, session, agent, rawValue) {
   });
 }
 
+async function applySessionModelSelection(ws, session, agent, rawValue) {
+  if (!session) throw new Error('请先进入一个会话再切换模型。');
+  const normalizedAgent = normalizeAgent(agent || session.agent);
+  const value = String(rawValue || '').trim();
+  if (!value) throw new Error('模型名称不能为空。');
+  const resetToDefault = value.toLowerCase() === 'default';
+  const running = activeProcesses.has(session.id);
+
+  if (normalizedAgent === 'pi') {
+    session.piProvider = null;
+    if (resetToDefault) {
+      session.model = null;
+    } else if (normalizePiMode(loadPiConfig().mode) === 'local' && value.includes('/')) {
+      const [provider, ...modelParts] = value.split('/');
+      const model = modelParts.join('/').trim();
+      session.piProvider = provider.trim() || null;
+      session.model = model || value;
+    } else {
+      session.model = value;
+    }
+  } else {
+    session.model = resetToDefault ? null : value;
+  }
+  session.updated = new Date().toISOString();
+  saveSession(session);
+
+  if (!running) {
+    if (normalizedAgent === 'claude') disposeClaudeStreamRuntime(session.id, 'model_changed');
+    if (normalizedAgent === 'codex') disposeCodexAppRuntime(session.id, 'model_changed');
+    if (normalizedAgent === 'pi') disposePiRpcRuntime(session.id, 'model_changed');
+  }
+
+  const displayModel = sessionModelLabel(session) || '';
+  const effectiveDefault = resetToDefault ? resolveEffectiveModelId(session) : null;
+  wsSend(ws, {
+    type: 'model_changed',
+    sessionId: session.id,
+    agent: normalizedAgent,
+    model: displayModel,
+    ...buildSessionRuntimeMeta(session),
+  });
+  wsSend(ws, {
+    type: 'system_message',
+    sessionId: session.id,
+    message: resetToDefault
+      ? `${agentDisplayName(normalizedAgent)} 模型已恢复为当前配置默认值${effectiveDefault ? `：${effectiveDefault}` : ''}${running ? '（当前轮次不变，下一轮生效）' : ''}`
+      : `${agentDisplayName(normalizedAgent)} 当前会话模型已切换为：${displayModel}${running ? '（当前轮次不变，下一轮生效）' : ''}`,
+  });
+}
+
 function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdRaw = null, streamingBehavior = null) {
   const parts = String(text || '').trim().split(/\s+/);
   const cmd = (parts[0] || '').toLowerCase();
@@ -7589,135 +7430,24 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
     if (ackLocal()) return;
     markLocalAccepted();
     const modelInput = parts.slice(1).join(' ').trim();
-    if (agent === 'codex') {
-      if (!modelInput) {
-        getCodexModelMenuPayload(session).then((payload) => {
-          wsSend(ws, payload);
-        }).catch((error) => {
-          plog('WARN', 'codex_model_menu_failed', { error: error.message });
-          wsSend(ws, {
-            type: 'model_list',
-            agent: 'codex',
-            entries: [{
-              value: 'default',
-              label: '默认模型（Codex）',
-              desc: '使用当前 Codex 默认模型',
-            }],
-            current: session?.model || 'default',
-            currentFull: session?.model || '',
-            source: null,
-          });
-        });
-      } else {
-        const normalizedInput = modelInput.toLowerCase();
-        if (session) {
-          session.model = normalizedInput === 'default' ? null : modelInput;
-          session.updated = new Date().toISOString();
-          saveSession(session);
-        }
-        wsSend(ws, {
-          type: 'model_changed',
-          model: normalizedInput === 'default' ? '' : modelInput,
-          ...(session ? buildSessionRuntimeMeta(session) : {}),
-        });
-        wsSend(ws, {
-          type: 'system_message',
-          sessionId: targetSessionId,
-          message: normalizedInput === 'default'
-            ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
-            : `Codex 模型已切换为: ${modelInput}`,
-        });
-      }
-      return;
-    }
-    if (agent === 'pi') {
-      if (!modelInput) {
-        getPiModelMenuPayload(session).then((payload) => {
-          wsSend(ws, payload);
-        }).catch((error) => {
-          plog('WARN', 'pi_model_menu_failed', { error: error.message });
-          wsSend(ws, {
-            type: 'model_list',
-            agent: 'pi',
-            entries: piModelMenuEntries([]),
-            current: session?.model || 'default',
-            currentFull: session?.model || '',
-            source: PI_TRANSPORT === 'rpc' ? null : 'pi-headless',
-          });
-        });
-      } else {
-        const normalizedInput = modelInput.toLowerCase();
-        if (session) {
-          session.model = normalizedInput === 'default' ? null : modelInput;
-          session.updated = new Date().toISOString();
-          saveSession(session);
-        }
-        wsSend(ws, {
-          type: 'model_changed',
-          model: normalizedInput === 'default' ? '' : modelInput,
-          ...(session ? buildSessionRuntimeMeta(session) : {}),
-        });
-        wsSend(ws, {
-          type: 'system_message',
-          sessionId: targetSessionId,
-          message: normalizedInput === 'default'
-            ? 'Pi 模型已切换为: 默认模型（跟随 ~/.pi/agent 配置）'
-            : `Pi 模型已切换为: ${modelInput}`,
-        });
-      }
-      return;
-    }
     if (!modelInput) {
-      getClaudeModelMenuPayload(session).then((payload) => {
-        wsSend(ws, payload);
-      }).catch((error) => {
-        plog('WARN', 'claude_model_menu_failed', { error: error.message });
-        const currentAlias = session?.model ? modelShortName(session.model) || session.model : 'default';
-        const currentFull = session?.model || '';
-        wsSend(ws, {
-          type: 'model_list',
-          agent: 'claude',
-          models: MODEL_MAP,
-          entries: getClaudeModelMenuEntries(),
-          current: currentAlias,
-          currentFull,
-          source: 'claude-cli',
+      getAgentModelMenuPayload(session, agent)
+        .then((payload) => wsSend(ws, payload))
+        .catch((error) => {
+          plog('WARN', 'model_menu_failed', { agent, error: error.message });
+          wsSend(ws, buildAgentModelMenuPayload(session, agent, {
+            error: `获取模型列表失败：${error.message}`,
+          }));
         });
-      });
       return;
     }
-    const resolved = resolveClaudeModelInput(modelInput);
-    if (!resolved) {
-      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '模型名称不能为空' });
-      return;
-    }
-    const { resolvedModel, resolvedAlias } = resolved;
-    if (!resolvedModel) {
-      if (session) {
-        session.model = null;
-        session.updated = new Date().toISOString();
-        saveSession(session);
-      }
+    applySessionModelSelection(ws, session, agent, modelInput).catch((error) => {
       wsSend(ws, {
-        type: 'model_changed',
-        model: '',
-        ...(session ? buildSessionRuntimeMeta(session) : {}),
+        type: 'error',
+        sessionId: targetSessionId,
+        message: `/model 执行失败：${error.message}`,
       });
-      wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: '模型已切换为: 默认（使用 CLI 默认模型）' });
-      return;
-    }
-    if (session) {
-      session.model = resolvedModel;
-      session.updated = new Date().toISOString();
-      saveSession(session);
-    }
-    const displayName = getClaudeModelMenuLabel(resolvedModel) || getClaudeModelMenuLabel(resolvedAlias) || modelShortName(resolvedModel) || resolvedModel;
-    wsSend(ws, {
-      type: 'model_changed',
-      model: resolvedAlias,
-      ...(session ? buildSessionRuntimeMeta(session) : {}),
     });
-    wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: `模型已切换为: ${displayName} (${resolvedModel})` });
     return;
   }
 
@@ -9461,7 +9191,7 @@ async function startCodexAppTurn(ws, session, spawnSpec, resolvedAttachments, ru
     let threadResult;
     const threadParams = {
       cwd: spawnSpec.cwd,
-      model: session.model || null,
+      model: spawnSpec.effectiveModel || null,
       approvalPolicy: spawnSpec.approvalPolicy,
       sandbox: spawnSpec.threadSandbox,
     };
@@ -9564,7 +9294,7 @@ async function startCodexAppTurn(ws, session, spawnSpec, resolvedAttachments, ru
         threadId,
         input,
         cwd: spawnSpec.cwd,
-        model: session.model || null,
+        model: spawnSpec.effectiveModel || null,
         approvalPolicy: spawnSpec.approvalPolicy,
         sandboxPolicy: spawnSpec.sandboxPolicy,
         effort: spawnSpec.effort || null,
@@ -9635,30 +9365,6 @@ function persistPiRpcState(runtime, state) {
     channelDescriptor: runtime.spawnSpec.channelDescriptor || null,
   });
   saveSession(session);
-}
-
-function piModelMenuEntries(models) {
-  const entries = [{
-    value: 'default',
-    label: '默认模型（Pi）',
-    desc: '使用当前 Pi 配置中的默认模型',
-  }];
-  for (const model of Array.isArray(models) ? models : []) {
-    const provider = String(model?.provider || '').trim();
-    const id = String(model?.id || '').trim();
-    if (!id) continue;
-    const value = provider ? `${provider}/${id}` : id;
-    const details = [];
-    if (Number.isFinite(model?.contextWindow)) details.push(`${Math.round(model.contextWindow / 1000)}K 上下文`);
-    if (model?.reasoning) details.push('支持 thinking');
-    if (Array.isArray(model?.input) && model.input.includes('image')) details.push('支持图片');
-    entries.push({
-      value,
-      label: String(model?.name || id),
-      desc: details.join(' · ') || value,
-    });
-  }
-  return entries;
 }
 
 async function refreshPiRpcDiscovery(runtime) {
@@ -10146,25 +9852,62 @@ async function startPiRpcTurn(ws, session, spawnSpec, resolvedAttachments, input
 }
 
 async function getPiModelMenuPayload(session) {
-  if (PI_TRANSPORT !== 'rpc' || !session) {
-    throw new Error('Pi RPC model discovery is unavailable');
+  const piConfig = loadPiConfig();
+  const activeSource = resolvePiActiveSource(piConfig);
+  if (activeSource?.mode && activeSource.mode !== 'local' && !activeSource.error) {
+    try {
+      const fetched = await fetchProviderModelEntries(activeSource);
+      return buildAgentModelMenuPayload(session, 'pi', {
+        entries: fetched.entries,
+        defaultModel: activeSource.defaultModel,
+        source: fetched.source,
+      });
+    } catch (error) {
+      plog('WARN', 'pi_model_fetch_failed', { error: error.message });
+      return buildAgentModelMenuPayload(session, 'pi', {
+        defaultModel: activeSource.defaultModel,
+        source: 'provider-api',
+        error: `获取当前服务商模型失败：${error.message}`,
+      });
+    }
   }
-  const spawnSpec = buildPiSpawnSpec(session, { transport: 'rpc' });
-  if (spawnSpec?.error) throw new Error(spawnSpec.error);
-  const runtime = await ensurePiRpcRuntime(session, spawnSpec);
-  if (!runtime.models.length) await refreshPiRpcDiscovery(runtime);
-  const state = runtime.state || {};
-  const stateModel = state.model?.provider && state.model?.id
-    ? `${state.model.provider}/${state.model.id}`
-    : state.model?.id || '';
+  if (activeSource?.error) {
+    return buildAgentModelMenuPayload(session, 'pi', { error: activeSource.error });
+  }
+
+  const local = loadPiLocalModelInfo();
+  let runtimeEntries = [];
+  let state = null;
+  let runtimeError = null;
+  if (PI_TRANSPORT === 'rpc' && session) {
+    try {
+      const spawnSpec = buildPiSpawnSpec(session, { transport: 'rpc' });
+      if (spawnSpec?.error) throw new Error(spawnSpec.error);
+      const runtime = await ensurePiRpcRuntime(session, spawnSpec);
+      if (!runtime.models.length) await refreshPiRpcDiscovery(runtime);
+      runtimeEntries = piModelEntries(runtime.models);
+      state = runtime.state || null;
+    } catch (error) {
+      runtimeError = error;
+      plog('WARN', 'pi_model_discovery_failed', { error: error.message });
+    }
+  }
+  const defaultModel = local.defaultModel && local.defaultProvider
+    ? `${local.defaultProvider}/${local.defaultModel}`
+    : local.defaultModel;
+  const entries = mergeModelEntries(local.entries, runtimeEntries);
   return {
-    type: 'model_list',
-    agent: 'pi',
-    entries: piModelMenuEntries(runtime.models),
-    current: session.model || stateModel || 'default',
-    currentFull: session.model || stateModel || '',
-    source: 'pi-rpc',
-    thinkingLevel: state.thinkingLevel || null,
+    ...buildAgentModelMenuPayload(session, 'pi', {
+      entries,
+      defaultModel,
+      source: runtimeEntries.length ? 'pi-rpc' : local.source,
+      ...(!entries.length ? {
+        error: runtimeError
+          ? `读取 Pi 本地模型失败：${runtimeError.message}`
+          : '未在 Pi 本地 models.json、settings.json 或 RPC 模型列表中找到可用模型。',
+      } : {}),
+    }),
+    thinkingLevel: state?.thinkingLevel || null,
   };
 }
 
@@ -11058,7 +10801,6 @@ const {
   CODEX_PATH,
   PI_PATH,
   SESSIONS_DIR,
-  MODEL_MAP,
   loadModelConfig,
   applyCustomTemplateToSettings,
   getClaudeRuntimeFingerprint,

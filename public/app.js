@@ -6,14 +6,6 @@
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
 
-  // Stable Claude aliases; concrete model ids come from the server/runtime config.
-  const CLAUDE_MODEL_ENTRIES = [
-    { alias: 'default', value: 'default', label: '默认（推荐）', desc: '使用当前 Claude Code 或提供商配置的默认模型' },
-    { alias: 'sonnet[1m]', value: 'sonnet[1m]', label: 'Sonnet（1M 上下文）', desc: '使用当前 Sonnet 映射并启用 1M 上下文' },
-    { alias: 'opus', value: 'opus', label: 'Opus', desc: '使用当前 Opus 模型映射' },
-    { alias: 'opus[1m]', value: 'opus[1m]', label: 'Opus（1M 上下文）', desc: '使用当前 Opus 映射并启用 1M 上下文' },
-    { alias: 'haiku', value: 'haiku', label: 'Haiku', desc: '使用当前 Haiku 模型映射' },
-  ];
   const SHOW_SIDEBAR_COST = false;
 
   // Slash menu is populated from server discovery (platform + CLI + filesystem).
@@ -2758,40 +2750,6 @@
     return true;
   }
 
-  /** Concrete model id from channel config caches (client-side fallback). */
-  function getChannelConcreteModelFallback(agent) {
-    const normalized = normalizeAgent(agent || sessionState.currentAgent);
-    if (normalized === 'claude') {
-      const cfg = modelConfigCache;
-      if (cfg?.mode === 'custom' && cfg.activeTemplate) {
-        const tpl = (cfg.templates || []).find((t) => t.name === cfg.activeTemplate);
-        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
-        if (isUsableModelId(tpl?.sonnetModel)) return String(tpl.sonnetModel).trim();
-        if (isUsableModelId(tpl?.opusModel)) return String(tpl.opusModel).trim();
-      }
-      // Local Claude resolves aliases at runtime; wait for the CLI's actual model id.
-      return '';
-    }
-    if (normalized === 'codex') {
-      const cfg = codexConfigCache;
-      if (cfg?.mode === 'unified' && cfg.sharedTemplate) {
-        const tpl = (modelConfigCache?.templates || []).find((t) => t.name === cfg.sharedTemplate);
-        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
-      }
-      return '';
-    }
-    if (normalized === 'pi') {
-      const cfg = piConfigCache;
-      if (cfg?.mode === 'unified' && cfg.sharedTemplate) {
-        const tpl = (modelConfigCache?.templates || []).find((t) => t.name === cfg.sharedTemplate);
-        if (isUsableModelId(tpl?.defaultModel)) return String(tpl.defaultModel).trim();
-      }
-      // Do not guess local Pi defaults (varies by machine); wait for runtime/session model.
-      return '';
-    }
-    return '';
-  }
-
   /** Concrete model id for display — never "默认模型（…）". */
   function getConcreteModelLabel(messageModel) {
     const candidates = [
@@ -2801,7 +2759,6 @@
       sessionState.currentActiveRuntime?.displayModel,
       sessionState.currentActiveRuntime?.model,
       sessionState.currentActiveRuntime?.defaultModel,
-      getChannelConcreteModelFallback(sessionState.currentAgent),
     ];
     for (const raw of candidates) {
       if (!isUsableModelId(raw)) continue;
@@ -3365,26 +3322,6 @@
     }
     costDisplay.textContent = '';
     costDisplay.hidden = true;
-  }
-
-  function getCodexModelOptions() {
-    const seen = new Set();
-    const options = [];
-
-    function addOption(value, label, desc) {
-      const v = (value || '').trim();
-      if (!v || seen.has(v)) return;
-      seen.add(v);
-      options.push({ value: v, label: label || v, desc: desc || 'Codex 模型' });
-    }
-
-    addOption('default', '默认模型', '使用当前默认模型');
-    addOption(sessionState.currentModel, sessionState.currentModel, '当前会话模型');
-    sessionState.sessions
-      .filter((s) => normalizeAgent(s.agent) === 'codex')
-      .forEach((s) => addOption(s.model, s.model, s.id === sessionState.currentSessionId ? '当前会话已保存模型' : '其他 Codex 会话模型'));
-
-    return options;
   }
 
   // --- marked config ---
@@ -4029,6 +3966,7 @@
   }
 
   function handleModelChangedMessage(msg) {
+    if (msg.sessionId && msg.sessionId !== sessionState.currentSessionId) return;
     if (msg.model === undefined) return;
     const normalizedRuntime = normalizeActiveRuntime(msg.activeRuntime, sessionState.currentAgent, msg.model || '');
     sessionState.currentModel = msg.model || '';
@@ -4050,29 +3988,27 @@
   }
 
   function handleModelListMessage(msg) {
-    const agent = msg.agent || sessionState.currentAgent;
-    if (agent === 'codex' || agent === 'pi') {
-      const options = Array.isArray(msg.entries) && msg.entries.length > 0
-        ? msg.entries
-        : (agent === 'codex' ? getCodexModelOptions() : [
-            { value: 'default', label: '默认模型（Pi）', desc: '使用 ~/.pi/agent 中配置的默认模型' },
-          ]);
-      const activeValue = msg.currentFull || sessionState.currentModel || 'default';
-      const title = agent === 'pi' ? '选择 Pi 模型' : '选择 Codex 模型';
-      showOptionPicker(title, options, activeValue, (value) => {
-        send({
-          type: 'message',
-          text: `/model ${value}`,
-          sessionId: sessionState.currentSessionId,
-          mode: sessionState.currentMode,
-          agent,
-        });
-      });
+    if (msg.sessionId && msg.sessionId !== sessionState.currentSessionId) return;
+    const agent = normalizeAgent(msg.agent || sessionState.currentAgent);
+    const options = Array.isArray(msg.entries) ? msg.entries : [];
+    if (!options.length) {
+      appendError(msg.error || '当前配置没有返回可用模型。');
       return;
     }
-    if (msg.models) {
-      showClaudeModelPicker(msg.entries, msg.models, msg.current, msg.currentFull);
-    }
+    showOptionPicker(`选择 ${AGENT_LABELS[agent]} 模型`, options, msg.current || 'default', (value) => {
+      send({
+        type: 'message',
+        text: `/model ${value}`,
+        sessionId: sessionState.currentSessionId,
+        mode: sessionState.currentMode,
+        agent,
+      });
+    }, {
+      statusMessage: msg.error || '',
+      statusKind: msg.error ? 'error' : '',
+      retryLabel: msg.retryable ? '重试' : '',
+      onRetry: msg.retryable ? showModelPicker : null,
+    });
   }
 
   function handleEffortListMessage(msg) {
@@ -4566,9 +4502,6 @@
     model_config: handleModelConfigMessage,
     codex_config: handleCodexConfigMessage,
     pi_config: handlePiConfigMessage,
-    fetch_models_result: (msg) => {
-      emitWsEvent('fetch_models_result', msg);
-    },
     background_done: handleBackgroundDoneMessage,
     password_changed: handlePasswordChanged,
     force_logout: handleForcedLogout,
@@ -7476,15 +7409,23 @@
   }
 
   // --- Option Picker (generic) ---
-  function showOptionPicker(title, options, currentValue, onSelect) {
+  function showOptionPicker(title, options, currentValue, onSelect, uiOptions = {}) {
     hideOptionPicker();
 
     const picker = document.createElement('div');
     picker.className = 'option-picker';
     picker.id = 'option-picker';
+    const statusMessage = String(uiOptions.statusMessage || '').trim();
+    const retryLabel = String(uiOptions.retryLabel || '').trim();
 
     picker.innerHTML = `
       <div class="option-picker-title">${escapeHtml(title)}</div>
+      ${statusMessage ? `
+        <div class="option-picker-status${uiOptions.statusKind === 'error' ? ' error' : ''}">
+          <span>${escapeHtml(statusMessage)}</span>
+          ${retryLabel ? `<button type="button" class="option-picker-retry">${escapeHtml(retryLabel)}</button>` : ''}
+        </div>
+      ` : ''}
       <div class="option-picker-list">
         ${options.map(opt => `
           <div class="option-picker-item${opt.value === currentValue ? ' active' : ''}" data-value="${escapeHtml(opt.value)}">
@@ -7512,6 +7453,13 @@
         hideOptionPicker();
       });
     });
+    const retryBtn = picker.querySelector('.option-picker-retry');
+    if (retryBtn && typeof uiOptions.onRetry === 'function') {
+      retryBtn.addEventListener('click', () => {
+        hideOptionPicker();
+        uiOptions.onRetry();
+      });
+    }
 
     // Close on outside click (delayed to avoid immediate close)
     setTimeout(() => {
@@ -7544,7 +7492,10 @@
   }
 
   function showModelPicker() {
-    // Request model list from server — Claude uses curated aliases; Codex/Pi use freeform IDs.
+    if (!sessionState.currentSessionId) {
+      appendError('请先进入一个会话再切换模型。');
+      return;
+    }
     send({
       type: 'message',
       text: '/model',
@@ -7552,157 +7503,6 @@
       mode: sessionState.currentMode,
       agent: sessionState.currentAgent,
     });
-  }
-
-  function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
-    hideOptionPicker();
-
-    const picker = document.createElement('div');
-    picker.className = 'option-picker model-picker-claude';
-    picker.id = 'option-picker';
-
-    // Determine which entry is currently active
-    let activeAlias = 'default';
-    if (currentFull) {
-      const fullToAlias = {};
-      if (models.opus) fullToAlias[models.opus] = 'opus';
-      if (models.sonnet) fullToAlias[models.sonnet] = 'sonnet';
-      if (models.haiku) fullToAlias[models.haiku] = 'haiku';
-      activeAlias = fullToAlias[currentFull] || currentAlias || currentFull;
-    } else if (currentAlias && currentAlias !== 'default' && currentAlias !== '') {
-      activeAlias = currentAlias;
-    }
-
-    const entries = (Array.isArray(menuEntries) && menuEntries.length > 0)
-      ? menuEntries.map((entry) => Object.assign({}, entry, { value: entry.value || entry.alias }))
-      : [];
-
-    if (!entries.length) {
-      showToast('无法获取模型列表', null);
-      return;
-    }
-
-    // If current model isn't in the list, add it
-    const isStandard = entries.some((e) => e.alias === activeAlias || (currentFull && (e.value || e.alias) === currentFull));
-    if (!isStandard && currentFull) {
-      entries.push({
-        alias: currentAlias || currentFull,
-        value: currentFull,
-        label: currentAlias || currentFull,
-        desc: currentFull,
-        pricing: '',
-      });
-    }
-
-    let focusIdx = entries.findIndex((e) => e.alias === activeAlias || (currentFull && (e.value || e.alias) === currentFull));
-    if (focusIdx < 0) focusIdx = 0;
-
-    // Build items HTML
-    const itemsHtml = entries.map((e, i) => {
-      const itemValue = e.value || e.alias;
-      const isCurrent = e.alias === activeAlias || (currentFull && itemValue === currentFull);
-      const isFocused = i === focusIdx;
-      const descText = e.desc + (e.pricing ? ' \u00b7 ' + e.pricing : '');
-      return `
-        <div class="option-picker-item${isCurrent ? ' active' : ''}${isFocused ? ' focused' : ''}" data-value="${escapeHtml(itemValue)}" data-index="${i}">
-          <span class="mp-cursor">${isFocused ? '\u276f' : '\u2003'}</span>
-          <span class="mp-num">${i + 1}.</span>
-          <div class="option-picker-item-info">
-            <div class="option-picker-item-label">${escapeHtml(e.label)}${isCurrent ? ' <span class="mp-check">\u2714</span>' : ''}</div>
-            <div class="option-picker-item-desc">${escapeHtml(descText)}</div>
-          </div>
-        </div>
-      `;
-    }).join('');
-
-    picker.innerHTML = `
-      <div class="mp-header">
-        <div class="option-picker-title">选择模型</div>
-        <div class="mp-subtitle">切换当前会话使用的 Claude 模型。<br>如果要指定其他或旧版模型名，请使用 <code>--model</code>。</div>
-      </div>
-      <div class="mp-items">${itemsHtml}</div>
-      <div class="mp-custom">
-        <input type="text" id="model-custom-input" class="mp-custom-input" placeholder="输入模型别名或提供商返回的模型 ID">
-      </div>
-      <div class="mp-hint">回车确认 \u00b7 Esc 关闭</div>
-    `;
-
-    const chatMain = document.querySelector('.chat-main');
-    chatMain.appendChild(picker);
-    const itemsContainer = picker.querySelector('.mp-items');
-
-    function scrollFocusedItemIntoView() {
-      const activeEl = picker.querySelector(`.option-picker-item[data-index="${focusIdx}"]`);
-      if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
-    }
-
-    // Update focus indicators without full re-render
-    function updateFocus(newIdx) {
-      focusIdx = newIdx;
-      picker.querySelectorAll('.option-picker-item').forEach((el, i) => {
-        el.classList.toggle('focused', i === focusIdx);
-        const cur = el.querySelector('.mp-cursor');
-        if (cur) cur.textContent = i === focusIdx ? '\u276f' : '\u2003';
-      });
-      if (itemsContainer) scrollFocusedItemIntoView();
-    }
-
-    // Click & hover on items
-    picker.querySelectorAll('.option-picker-item').forEach(el => {
-      el.addEventListener('click', () => {
-        send({ type: 'message', text: `/model ${el.dataset.value}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
-        hideOptionPicker();
-      });
-      el.addEventListener('mouseenter', () => updateFocus(parseInt(el.dataset.index)));
-    });
-
-    // Keyboard navigation
-    function handleKeyDown(e) {
-      const customInput = picker.querySelector('#model-custom-input');
-      if (document.activeElement === customInput) {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          const val = customInput.value.trim();
-          if (val) {
-            send({ type: 'message', text: `/model ${val}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
-            hideOptionPicker();
-          }
-        } else if (e.key === 'Escape') {
-          hideOptionPicker();
-        }
-        return;
-      }
-      if (e.key === 'ArrowDown' || e.key === 'j') {
-        e.preventDefault();
-        updateFocus((focusIdx + 1) % entries.length);
-      } else if (e.key === 'ArrowUp' || e.key === 'k') {
-        e.preventDefault();
-        updateFocus((focusIdx - 1 + entries.length) % entries.length);
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        send({ type: 'message', text: `/model ${entries[focusIdx].value || entries[focusIdx].alias}`, sessionId: sessionState.currentSessionId, mode: sessionState.currentMode, agent: sessionState.currentAgent });
-        hideOptionPicker();
-      } else if (e.key === 'Escape') {
-        hideOptionPicker();
-      } else if (e.key >= '1' && e.key <= '9') {
-        const idx = parseInt(e.key) - 1;
-        if (idx < entries.length) {
-          e.preventDefault();
-          updateFocus(idx);
-        }
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown);
-    picker._keyHandler = handleKeyDown;
-
-    requestAnimationFrame(() => {
-      if (itemsContainer) scrollFocusedItemIntoView();
-    });
-
-    setTimeout(() => {
-      document.addEventListener('click', _pickerOutsideClick);
-    }, 0);
   }
 
   function showModePicker() {
@@ -8307,17 +8107,6 @@
   let _onCodexSessions = null;
   let _onPiSessions = null;
 
-  function renderFetchModelsResult(fetchStatus, datalist, result) {
-    if (result.success) {
-      datalist.innerHTML = (result.models || []).map((model) => `<option value="${escapeHtml(model)}">`).join('');
-      fetchStatus.textContent = result.message || `获取到 ${result.models.length} 个模型`;
-      fetchStatus.style.color = 'var(--text-success, #5dbe5d)';
-      return;
-    }
-    fetchStatus.textContent = result.message || '获取失败';
-    fetchStatus.style.color = 'var(--text-error, #e85d5d)';
-  }
-
   const settingsBtn = $('#settings-btn');
 
   const PROVIDER_OPTIONS = [
@@ -8532,34 +8321,11 @@
       <div class="settings-divider" style="margin:12px 0"></div>
 
       <div class="settings-field">
-        <div class="tpl-fetch-toolbar">
-          <div class="tpl-fetch-toolbar-title">获取上游模型列表</div>
-          <button class="btn-test tpl-fetch-toolbar-btn" id="unified-template-fetch-models">获取模型</button>
-          <span id="unified-template-fetch-status" class="tpl-fetch-toolbar-status"></span>
-        </div>
-      </div>
-
-      <div class="settings-divider" style="margin:12px 0"></div>
-
-      <div class="settings-field">
         <label>默认模型</label>
-        <input type="text" id="unified-template-default" list="unified-template-models" placeholder="输入提供商返回的默认模型 ID" value="${escapeHtml(draft.defaultModel || '')}" autocomplete="off">
+        <input type="text" id="unified-template-default" placeholder="输入新会话默认使用的模型 ID" value="${escapeHtml(draft.defaultModel || '')}" autocomplete="off">
       </div>
-      <div class="settings-field">
-        <label>Opus 模型名</label>
-        <input type="text" id="unified-template-opus" list="unified-template-models" placeholder="可选：Opus 对应模型 ID" value="${escapeHtml(draft.opusModel || '')}" autocomplete="off">
-      </div>
-      <div class="settings-field">
-        <label>Sonnet 模型名</label>
-        <input type="text" id="unified-template-sonnet" list="unified-template-models" placeholder="可选：Sonnet 对应模型 ID" value="${escapeHtml(draft.sonnetModel || '')}" autocomplete="off">
-      </div>
-      <div class="settings-field">
-        <label>Haiku 模型名</label>
-        <input type="text" id="unified-template-haiku" list="unified-template-models" placeholder="可选：Haiku 对应模型 ID" value="${escapeHtml(draft.haikuModel || '')}" autocomplete="off">
-      </div>
-      <datalist id="unified-template-models"></datalist>
       <div class="settings-inline-note">
-        这套 AI 提供商配置会出现在 Claude、Codex 和 Pi 的渠道下拉框里。Codex / Pi 主要使用 API Key、API Base URL 和“默认模型”；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
+        这套 AI 提供商配置会出现在 Claude、Codex 和 Pi 的渠道下拉框里。模型列表只会在会话中使用 <code>/model</code> 或点击“切换模型”时由后端实时获取。
       </div>
       <div class="settings-actions">
         <button class="btn-save" id="unified-template-ok">确定</button>
@@ -8944,9 +8710,6 @@
         apiBase: '',
         upstreamType: 'openai',
         defaultModel: '',
-        opusModel: '',
-        sonnetModel: '',
-        haikuModel: '',
       };
 
       const { overlay: modalOverlay, panel: modal, close: closeModal } = createOverlayPanel({
@@ -8955,45 +8718,7 @@
         panelHtml: buildUnifiedTemplateModalHtml(current, draft),
       });
 
-      const fetchBtn = modal.querySelector('#unified-template-fetch-models');
-      const fetchStatus = modal.querySelector('#unified-template-fetch-status');
-      const datalist = modal.querySelector('#unified-template-models');
-      let disposeFetchModelsResult = null;
-
-      fetchBtn.addEventListener('click', () => {
-        const apiBase = modal.querySelector('#unified-template-apibase').value.trim();
-        const apiKey = modal.querySelector('#unified-template-apikey').value.trim();
-        const upstreamType = modal.querySelector('#unified-template-upstream-type').value;
-        if (!apiBase || !apiKey) {
-          fetchStatus.textContent = '请先填写 API Base 和 API Key';
-          fetchStatus.style.color = 'var(--text-error, #e85d5d)';
-          return;
-        }
-        fetchBtn.disabled = true;
-        fetchStatus.textContent = '正在获取...';
-        fetchStatus.style.color = 'var(--text-secondary)';
-
-        if (disposeFetchModelsResult) disposeFetchModelsResult();
-        disposeFetchModelsResult = onWsEvent('fetch_models_result', (result) => {
-          disposeFetchModelsResult = null;
-          fetchBtn.disabled = false;
-          renderFetchModelsResult(fetchStatus, datalist, result);
-        }, { once: true });
-
-        send({
-          type: 'fetch_models',
-          apiBase,
-          apiKey,
-          upstreamType,
-          templateName: current?.name || modal.querySelector('#unified-template-name').value.trim(),
-        });
-      });
-
       const closeTemplateModal = () => {
-        if (disposeFetchModelsResult) {
-          disposeFetchModelsResult();
-          disposeFetchModelsResult = null;
-        }
         closeModal();
       };
 
@@ -9006,9 +8731,6 @@
         const apiBase = modal.querySelector('#unified-template-apibase').value.trim();
         const upstreamType = modal.querySelector('#unified-template-upstream-type').value;
         const defaultModel = modal.querySelector('#unified-template-default').value.trim();
-        const opusModel = modal.querySelector('#unified-template-opus').value.trim();
-        const sonnetModel = modal.querySelector('#unified-template-sonnet').value.trim();
-        const haikuModel = modal.querySelector('#unified-template-haiku').value.trim();
 
         if (!name) {
           alert('请填写提供商名称');
@@ -9037,9 +8759,6 @@
           current.apiBase = apiBase;
           current.upstreamType = upstreamType;
           current.defaultModel = defaultModel;
-          current.opusModel = opusModel;
-          current.sonnetModel = sonnetModel;
-          current.haikuModel = haikuModel;
           if (providerEditorSelection === previousName) providerEditorSelection = name;
           if (selectedClaudeChannel === previousName) selectedClaudeChannel = name;
           if (selectedCodexChannel === previousName) selectedCodexChannel = name;
@@ -9052,9 +8771,6 @@
             apiBase,
             upstreamType,
             defaultModel,
-            opusModel,
-            sonnetModel,
-            haikuModel,
           });
           if (!providerEditorSelection) providerEditorSelection = name;
         }
@@ -9134,9 +8850,15 @@
         showUnifiedStatus('Pi 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
         return;
       }
-      if (piUsesProvider && !String(piTemplate.defaultModel || '').trim()) {
-        showUnifiedStatus('Pi 选中的 AI 提供商需要填写「默认模型」', 'error');
-        return;
+      for (const [label, usesProvider, template] of [
+        ['Claude', claudeUsesProvider, claudeTemplate],
+        ['Codex', codexUsesProvider, codexTemplate],
+        ['Pi', piUsesProvider, piTemplate],
+      ]) {
+        if (usesProvider && !String(template?.defaultModel || '').trim()) {
+          showUnifiedStatus(`${label} 选中的 AI 提供商需要填写「默认模型」`, 'error');
+          return;
+        }
       }
 
       showUnifiedStatus('正在保存...', '');

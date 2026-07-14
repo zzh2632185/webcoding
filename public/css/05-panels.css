@@ -334,50 +334,6 @@
   color: var(--text-secondary);
   margin-bottom: var(--space-md);
 }
-.tpl-fetch-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.tpl-fetch-toolbar-title {
-  font-family: var(--font-ui);
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-.tpl-fetch-toolbar-btn {
-  flex: 0 0 auto;
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--button-radius);
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  font-family: var(--font-ui);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  box-shadow: none;
-  transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
-  white-space: nowrap;
-}
-.tpl-fetch-toolbar-btn:hover {
-  background: var(--yellow);
-  box-shadow: none;
-}
-.tpl-fetch-toolbar-btn:active {
-  box-shadow: none;
-}
-.tpl-fetch-toolbar-status {
-  display: block;
-  margin-top: 4px;
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.tpl-fetch-toolbar-status:empty {
-  display: none;
-}
 .settings-inline-note {
   margin: -4px 0 14px;
   padding: 8px 11px;

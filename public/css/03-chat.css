@@ -1237,6 +1237,34 @@
   margin-bottom: 0;
   padding: 0 2px;
 }
+.option-picker-status {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-nav);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.option-picker-status.error {
+  color: var(--text-error, #b42318);
+}
+.option-picker-retry {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-nav);
+  background: var(--surface);
+  color: inherit;
+  padding: 3px 8px;
+  font: inherit;
+  cursor: pointer;
+}
+.option-picker-retry:hover {
+  background: var(--accent-light);
+}
 .option-picker-list {
   display: flex;
   flex-direction: column;
@@ -1290,108 +1318,18 @@
 }
 .option-picker-item.active .option-picker-item-label,
 .option-picker-item.active .option-picker-item-desc,
-.option-picker-item.active .option-picker-item-check,
-.option-picker-item.active .mp-cursor,
-.option-picker-item.active .mp-num,
-.option-picker-item.active .mp-check {
+.option-picker-item.active .option-picker-item-check {
   color: var(--button-primary-text);
 }
-
-/* === Model Picker (Claude Code style) === */
-.model-picker-claude {
-  width: min(420px, calc(100vw - 32px));
-  max-width: calc(100vw - 32px);
-  max-height: min(76vh, 600px);
-}
-.mp-header {
-  margin-bottom: 8px;
-  padding: 0 2px;
-}
-.mp-subtitle {
-  font-size: 10px;
-  color: var(--text-secondary);
-  margin-top: 3px;
-  line-height: 1.4;
-}
-.mp-cursor {
-  font-size: 12px;
-  color: var(--accent, var(--accent-fallback));
-  width: 14px;
-  flex-shrink: 0;
-  text-align: center;
-}
-.mp-num {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-secondary);
-  min-width: 18px;
-  text-align: right;
-  flex-shrink: 0;
-}
-.mp-check {
-  color: var(--success-strong);
-  font-weight: 700;
-  margin-left: 4px;
-}
-.option-picker-item.focused:not(.active) {
-  background: var(--accent-light);
-}
-.mp-items {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 2px;
-  max-height: min(38vh, 280px);
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 2px;
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior: contain;
-  touch-action: pan-y;
-}
-.mp-custom {
-  padding: 6px 2px 0;
-  margin-top: 2px;
-  border-top: 1px solid var(--border-color);
-}
-.mp-custom-input {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 6px 8px;
-  border: 1px solid var(--input-border);
-  border-radius: 4px;
-  font-size: 11px;
-  line-height: 1.4;
-  font-family: var(--font-mono);
-  background: var(--input-background);
-  color: var(--text-primary);
-  outline: none;
-}
-.mp-custom-input:focus {
-  border-color: var(--blue);
-  box-shadow: none;
-}
-.option-picker-list::-webkit-scrollbar,
-.mp-items::-webkit-scrollbar {
+.option-picker-list::-webkit-scrollbar {
   width: 8px;
 }
-.option-picker-list::-webkit-scrollbar-thumb,
-.mp-items::-webkit-scrollbar-thumb {
+.option-picker-list::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
   border-radius: 999px;
 }
-.option-picker-list::-webkit-scrollbar-track,
-.mp-items::-webkit-scrollbar-track {
+.option-picker-list::-webkit-scrollbar-track {
   background: transparent;
-}
-
-.mp-hint {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-secondary);
-  text-align: center;
-  padding: 4px 0 0;
-  opacity: 0.7;
 }
 
 /* Mobile topbar bar — hidden on desktop */
