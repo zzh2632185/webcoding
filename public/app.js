@@ -263,6 +263,10 @@
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
   const modeSelect = $('#mode-select');
+  const mobileAgentSelect = $('#mobile-agent-select');
+  const mobileModeSelect = $('#mobile-mode-select');
+  const mobileAgentPicker = $('#mobile-agent-picker');
+  const mobileModePicker = $('#mobile-mode-picker');
 
   function getRememberedPassword() {
     return String(sessionStorage.getItem(REMEMBERED_PASSWORD_STORAGE_KEY) || '');
@@ -300,7 +304,7 @@
 
   function updateColorSchemeButtons(scheme) {
     const isDark = scheme === 'dark';
-    document.querySelectorAll('.color-scheme-btn, .color-scheme-btn-mobile').forEach((btn) => {
+    document.querySelectorAll('.color-scheme-btn').forEach((btn) => {
       const moon = btn.querySelector('.color-scheme-icon-moon');
       const sun = btn.querySelector('.color-scheme-icon-sun');
       if (moon) moon.hidden = isDark;
@@ -2891,7 +2895,6 @@
       const tip = getModeTooltip(btn.dataset.mode);
       if (tip) btn.title = tip;
     });
-    const mobileModeSelect = document.getElementById('mobile-mode-select');
     if (mobileModeSelect) {
       Array.from(mobileModeSelect.options || []).forEach((opt) => {
         const tip = getModeTooltip(opt.value);
@@ -2899,10 +2902,10 @@
       });
     }
     // Sync mobile selects
-    const mas = document.getElementById('mobile-agent-select');
-    const mms = document.getElementById('mobile-mode-select');
-    if (mas) mas.value = selectedAgent;
-    if (mms) mms.value = sessionState.currentMode;
+    if (mobileAgentSelect) mobileAgentSelect.value = selectedAgent;
+    if (mobileModeSelect) mobileModeSelect.value = sessionState.currentMode;
+    syncMobilePickerState(mobileAgentPicker, selectedAgent, AGENT_LABELS, '切换 Agent');
+    syncMobilePickerState(mobileModePicker, sessionState.currentMode, MODE_LABELS, '切换权限模式');
     if (importSessionBtn) {
       if (selectedAgent === 'codex') importSessionBtn.textContent = '导入本地 Codex 会话';
       else if (selectedAgent === 'pi') importSessionBtn.textContent = '导入本地 Pi 会话';
@@ -2946,6 +2949,104 @@
 
   function getSavedModeForAgent(agent) {
     return localStorage.getItem(getAgentModeStorageKey(agent)) || 'yolo';
+  }
+
+  function setMobilePickerOpen(picker, open, options = {}) {
+    if (!picker) return;
+    const trigger = picker.querySelector('.mobile-picker-trigger');
+    const menu = picker.querySelector('.mobile-picker-menu');
+    if (!trigger || !menu) return;
+    picker.classList.toggle('is-open', open);
+    trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menu.hidden = !open;
+    if (open && options.focusSelected) {
+      const selected = menu.querySelector('.mobile-picker-option[aria-selected="true"]')
+        || menu.querySelector('.mobile-picker-option');
+      selected?.focus({ preventScroll: true });
+    }
+    if (!open && options.restoreFocus) trigger.focus({ preventScroll: true });
+  }
+
+  function closeMobilePickers(except = null) {
+    [mobileAgentPicker, mobileModePicker].forEach((picker) => {
+      if (picker && picker !== except) setMobilePickerOpen(picker, false);
+    });
+  }
+
+  function syncMobilePickerState(picker, value, labels, ariaLabel) {
+    if (!picker) return;
+    const label = labels[value] || value;
+    const trigger = picker.querySelector('.mobile-picker-trigger');
+    const triggerValue = picker.querySelector('.mobile-picker-trigger-value');
+    if (triggerValue) triggerValue.textContent = label;
+    if (trigger) {
+      trigger.title = `${ariaLabel}：${label}`;
+      trigger.setAttribute('aria-label', `${ariaLabel}，当前${label}`);
+    }
+    picker.querySelectorAll('.mobile-picker-option').forEach((option) => {
+      const selected = option.dataset.value === value;
+      option.setAttribute('aria-selected', selected ? 'true' : 'false');
+      if (picker === mobileModePicker) option.title = getModeTooltip(option.dataset.value);
+    });
+  }
+
+  function bindMobilePicker(picker, onSelect) {
+    if (!picker) return;
+    const trigger = picker.querySelector('.mobile-picker-trigger');
+    const menu = picker.querySelector('.mobile-picker-menu');
+    if (!trigger || !menu) return;
+
+    const getOptions = () => Array.from(menu.querySelectorAll('.mobile-picker-option'));
+    const openPicker = (focusSelected = false) => {
+      closeMobilePickers(picker);
+      setMobilePickerOpen(picker, true, { focusSelected });
+    };
+
+    trigger.addEventListener('click', () => {
+      const open = trigger.getAttribute('aria-expanded') === 'true';
+      if (open) setMobilePickerOpen(picker, false);
+      else openPicker(false);
+    });
+    trigger.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      event.preventDefault();
+      openPicker(true);
+    });
+    menu.addEventListener('click', (event) => {
+      const option = event.target.closest?.('.mobile-picker-option');
+      if (!option || !menu.contains(option)) return;
+      onSelect(option.dataset.value);
+      setMobilePickerOpen(picker, false, { restoreFocus: true });
+    });
+    menu.addEventListener('keydown', (event) => {
+      const options = getOptions();
+      const currentIndex = options.indexOf(document.activeElement);
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setMobilePickerOpen(picker, false, { restoreFocus: true });
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+      if (event.key === 'ArrowDown') nextIndex = (nextIndex + 1) % options.length;
+      if (event.key === 'ArrowUp') nextIndex = (nextIndex - 1 + options.length) % options.length;
+      if (event.key === 'Home') nextIndex = 0;
+      if (event.key === 'End') nextIndex = options.length - 1;
+      options[nextIndex]?.focus({ preventScroll: true });
+    });
+  }
+
+  function handleModeSelectionChange(mode) {
+    if (!['yolo', 'default', 'plan'].includes(mode)) return;
+    sessionState.currentMode = mode;
+    modeSelect.value = mode;
+    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
+    }
+    renderWorkspaceInsights();
   }
 
   function setSelectedAgent(agent, options = {}) {
@@ -7721,7 +7822,7 @@
     sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
   });
 
-  document.querySelectorAll('#color-scheme-btn, #color-scheme-btn-mobile').forEach((btn) => {
+  document.querySelectorAll('#color-scheme-btn').forEach((btn) => {
     if (!btn) return;
     btn.addEventListener('click', () => toggleColorScheme());
   });
@@ -7756,8 +7857,6 @@
   });
 
   // Mobile agent select
-  const mobileAgentSelect = document.getElementById('mobile-agent-select');
-  const mobileModeSelect = document.getElementById('mobile-mode-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -7766,15 +7865,20 @@
   }
   if (mobileModeSelect) {
     mobileModeSelect.addEventListener('change', () => {
-      const mode = mobileModeSelect.value;
-      sessionState.currentMode = mode;
-      modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
-      updateAgentScopedUI();
-      if (sessionState.currentSessionId) send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
-      renderWorkspaceInsights();
+      handleModeSelectionChange(mobileModeSelect.value);
     });
   }
+  bindMobilePicker(mobileAgentPicker, (value) => handleAgentSelectionChange(normalizeAgent(value)));
+  bindMobilePicker(mobileModePicker, handleModeSelectionChange);
+  document.addEventListener('pointerdown', (event) => {
+    if (!event.target.closest?.('.mobile-picker')) closeMobilePickers();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeMobilePickers();
+  });
+  window.addEventListener('resize', () => {
+    if (window.innerWidth > 728) closeMobilePickers();
+  });
 
   function handleWorkspaceActionClick(actionBtn, event) {
     if (!actionBtn) return;
@@ -8043,25 +8147,11 @@
   // Mode tabs click
   document.querySelectorAll('.mode-tab').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const mode = btn.dataset.mode;
-      sessionState.currentMode = mode;
-      modeSelect.value = mode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
-      updateAgentScopedUI();
-      if (sessionState.currentSessionId) {
-        send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
-      }
-      renderWorkspaceInsights();
+      handleModeSelectionChange(btn.dataset.mode);
     });
   });
   modeSelect.addEventListener('change', () => {
-    sessionState.currentMode = modeSelect.value;
-    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
-    updateAgentScopedUI();
-    if (sessionState.currentSessionId) {
-      send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
-    }
-    renderWorkspaceInsights();
+    handleModeSelectionChange(modeSelect.value);
   });
 
   msgInput.addEventListener('input', () => {

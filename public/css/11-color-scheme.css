@@ -54,28 +54,3 @@ html[data-color-scheme="dark"] {
 .color-scheme-btn .color-scheme-icon[hidden] {
   display: none !important;
 }
-
-.color-scheme-btn-mobile {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: none;
-  border-radius: var(--radius-nav);
-  background: transparent;
-  color: var(--color-graphite-ink);
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.color-scheme-btn-mobile:hover {
-  background: var(--color-hover-veil);
-}
-
-@media (max-width: 728px) {
-  .color-scheme-btn-mobile {
-    display: flex;
-  }
-}

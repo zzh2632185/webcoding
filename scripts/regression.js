@@ -1819,6 +1819,21 @@ async function runHttpSecurityRegressionCase({ port, password, tempRoot }) {
         && /app\.js\?v=[a-z0-9]+/.test(index.text),
       'Index should receive automatic asset cache versions',
     );
+    assert(
+      index.text.includes('id="mobile-agent-trigger"')
+        && index.text.includes('id="mobile-mode-trigger"')
+        && !index.text.includes('id="color-scheme-btn-mobile"'),
+      'Mobile header should use compact custom pickers and keep theme switching in the sidebar',
+    );
+
+    const mobileCss = await requestHttpJson({ port, path: '/css/08-mobile.css' });
+    assert(mobileCss.statusCode === 200, 'Mobile stylesheet should be served successfully');
+    assert(
+      mobileCss.text.includes('grid-template-areas: "menu title controls"')
+        && mobileCss.text.includes('.mobile-picker-menu')
+        && mobileCss.text.includes('.sidebar .color-scheme-btn'),
+      'Mobile stylesheet should retain the compact header, custom picker menus, and sidebar theme entry',
+    );
 
     const appAsset = await requestHttpJson({ port, path: '/app.js' });
     assert(appAsset.statusCode === 200, 'Frontend application asset should be served successfully');

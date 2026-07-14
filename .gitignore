@@ -51,3 +51,4 @@ vendor/
 coverage/
 .cache/
 tmp/
+.codegraph/

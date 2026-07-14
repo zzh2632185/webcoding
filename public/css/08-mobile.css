@@ -67,13 +67,9 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 44px;
-    height: 44px;
+    width: 40px;
+    height: 40px;
     padding: 0;
-  }
-  .color-scheme-btn-mobile {
-    width: 44px;
-    height: 44px;
   }
   .msg { max-width: 100%; }
   .msg.assistant { width: 100%; }
@@ -104,11 +100,7 @@
     display: none;
   }
   .mobile-topbar-select {
-    display: block;
-    width: auto;
-    min-height: 44px;
-    font-family: var(--font-ui);
-    font-size: 14px;
+    display: none !important;
   }
   .session-search-input {
     min-height: 44px;
@@ -135,16 +127,14 @@
 @media (max-width: 480px) {
   .chat-header {
     display: grid;
-    grid-template-columns: 44px 44px minmax(0, 1fr);
-    grid-template-areas:
-      "scheme menu title"
-      "controls controls controls";
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    grid-template-areas: "menu title controls";
     align-items: center;
-    gap: 6px 8px;
-    min-height: 0;
-    padding: 8px 12px 10px;
+    gap: 8px;
+    min-height: 52px;
+    height: 52px;
+    padding: 6px 10px;
   }
-  .color-scheme-btn-mobile { grid-area: scheme; }
   .menu-btn { grid-area: menu; }
   .chat-header-copy {
     grid-area: title;
@@ -160,19 +150,18 @@
   }
   .chat-toolbar {
     grid-area: controls;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-    width: 100%;
-  }
-  .mobile-topbar-select {
-    width: 100%;
+    display: flex;
+    gap: 6px;
+    width: auto;
     min-width: 0;
   }
   .chat-runtime-state {
-    grid-column: 1 / -1;
-    min-height: 36px;
-    justify-content: center;
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 10px;
+    min-height: 28px;
+    padding: 4px 8px;
+    z-index: 20;
   }
   .msg-avatar-col {
     width: 36px;
@@ -435,7 +424,10 @@
   }
 
   .sidebar .color-scheme-btn {
-    display: none !important;
+    display: flex !important;
+    width: 44px;
+    height: 44px;
+    color: var(--color-graphite-ink) !important;
   }
 
   .sidebar .git-topbar-btn,
@@ -443,6 +435,7 @@
     width: 44px;
     height: 44px;
     padding: 0;
+    color: var(--color-graphite-ink) !important;
   }
 
   .sidebar-footer {
@@ -450,7 +443,10 @@
   }
 
   .chat-header {
-    padding: var(--spacing-8) var(--spacing-12);
+    min-height: 52px;
+    padding: 6px var(--spacing-12);
+    gap: 8px;
+    z-index: 30;
   }
 
   .messages {
@@ -463,6 +459,10 @@
   }
 
   .mobile-topbar-select {
+    display: none !important;
+  }
+
+  .mobile-picker {
     display: block;
   }
 
@@ -478,5 +478,157 @@
 
   .mobile-topbar-select {
     display: none !important;
+  }
+}
+
+/* Compact mobile pickers replace the native select popups. */
+.mobile-picker {
+  display: none;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.mobile-picker-trigger {
+  appearance: none;
+  min-width: 72px;
+  height: 40px;
+  padding: 0 26px 0 10px;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-nav);
+  background-color: var(--color-pure-white);
+  background-image: var(--select-caret-icon);
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  color: var(--color-graphite-ink);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: var(--font-weight-semibold);
+  line-height: 1;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#mobile-mode-trigger {
+  min-width: 66px;
+}
+
+.mobile-picker-trigger:hover,
+.mobile-picker-trigger:active,
+.mobile-picker.is-open .mobile-picker-trigger {
+  background-color: var(--color-hover-veil);
+}
+
+.mobile-picker-trigger:focus-visible,
+.mobile-picker-option:focus-visible {
+  outline: 2px solid var(--color-graphite-ink);
+  outline-offset: 2px;
+}
+
+.mobile-picker-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 120;
+  width: 218px;
+  max-width: calc(100vw - 24px);
+  padding: 6px;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-nav);
+  background: var(--color-pure-white);
+  box-shadow: 0 14px 36px rgb(0 0 0 / 12%);
+}
+
+.mobile-mode-menu {
+  width: 238px;
+}
+
+.mobile-picker-option {
+  appearance: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 48px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-graphite-ink);
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-picker-option + .mobile-picker-option {
+  margin-top: 2px;
+}
+
+.mobile-picker-option:hover,
+.mobile-picker-option:focus-visible,
+.mobile-picker-option[aria-selected="true"] {
+  background: var(--color-hover-veil);
+}
+
+.mobile-picker-option > span:first-child {
+  min-width: 0;
+}
+
+.mobile-picker-option strong,
+.mobile-picker-option small {
+  display: block;
+  letter-spacing: 0;
+}
+
+.mobile-picker-option strong {
+  font-size: 13px;
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.25;
+}
+
+.mobile-picker-option small {
+  margin-top: 2px;
+  color: var(--color-mid-ash);
+  font-size: 11px;
+  font-weight: var(--font-weight-regular);
+  line-height: 1.25;
+}
+
+.mobile-picker-option::after {
+  content: "";
+  justify-self: center;
+  color: var(--color-graphite-ink);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.mobile-picker-option[aria-selected="true"]::after {
+  content: "✓";
+}
+
+.mobile-picker-native {
+  display: none !important;
+}
+
+@media (max-width: 728px) {
+  .mobile-picker {
+    display: block;
+  }
+}
+
+@media (max-width: 360px) {
+  .chat-header {
+    padding-inline: 8px;
+    gap: 6px;
+  }
+
+  .mobile-picker-trigger {
+    min-width: 68px;
+    padding-left: 8px;
+  }
+
+  #mobile-mode-trigger {
+    min-width: 60px;
   }
 }
