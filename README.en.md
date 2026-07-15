@@ -49,7 +49,7 @@ Windows PowerShell:
 $s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression $s
 ```
 
-The installer first asks for the install/runtime directory, then offers install, start/restart, update, dependency reinstall, stop, status, and uninstall actions. Startup automatically configures a persistent background service: user-level `systemd` on Linux, a LaunchAgent on macOS, and a per-user Scheduled Task on Windows. Closing the terminal no longer stops Webcoding; native service-manager setups also start again after the next login.
+The installer first asks for the install/runtime directory, then offers install, start/restart, update, dependency reinstall, stop, status, and uninstall actions. On Windows, if the selected parent directory already contains files (for example, `D:\AI\Tools`), the installer automatically uses its `webcoding` subdirectory so existing files are not overwritten and Git clone does not fail. Startup automatically configures a persistent background service: user-level `systemd` on Linux, a LaunchAgent on macOS, and a per-user Scheduled Task on Windows. Closing the terminal no longer stops Webcoding; native service-manager setups also start again after the next login.
 
 The installed service uses the same lifecycle commands on every platform:
 

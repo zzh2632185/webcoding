@@ -49,7 +49,7 @@ Windows PowerShell：
 $s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression $s
 ```
 
-安装器会先让你确认安装/运行目录，再显示安装、启动/重启、更新、重装依赖、停止、状态和卸载等选项。启动时会自动配置持久化后台服务：Linux 优先使用用户级 `systemd`，macOS 使用 `LaunchAgent`，Windows 使用当前用户的计划任务。关闭终端不会停止 Webcoding；使用原生服务管理器时，下次登录也会自动启动。
+安装器会先让你确认安装/运行目录，再显示安装、启动/重启、更新、重装依赖、停止、状态和卸载等选项。Windows 下如果选择的是已有且非空的父目录（例如 `D:\AI\Tools`），安装器会自动使用其下的 `webcoding` 子目录，避免覆盖已有文件或触发 Git 克隆失败。启动时会自动配置持久化后台服务：Linux 优先使用用户级 `systemd`，macOS 使用 `LaunchAgent`，Windows 使用当前用户的计划任务。关闭终端不会停止 Webcoding；使用原生服务管理器时，下次登录也会自动启动。
 
 安装后可使用统一管理命令：
 
