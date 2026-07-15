@@ -4264,6 +4264,9 @@ async function runDeploymentScriptsRegressionCase() {
   assert(/webcoding \{start\|restart\|stop\|status\|logs\|foreground\}/.test(installSh), 'Unix launcher should expose service lifecycle commands');
 
   assert(/安装\/运行目录/.test(installPs1) && /WEBCODING_DIR/.test(installPs1), 'Windows installer should let the user choose an install/runtime directory');
+  assert(/& node --version/.test(installPs1) && !/node -e/.test(installPs1), 'Windows installer should detect Node.js without PowerShell 5.1-sensitive inline JavaScript quoting');
+  assert(/Test-DirectoryHasEntries/.test(installPs1) && /Join-Path \$resolved 'webcoding'/.test(installPs1), 'Windows installer should redirect a non-empty parent directory to a webcoding subdirectory');
+  assert(/安装目录不是空目录，已停止以避免覆盖现有文件/.test(installPs1), 'Windows installer should recheck the clone target before writing files');
   assert(/Register-ScheduledTask/.test(windowsService), 'Windows service helper should register a scheduled task');
   assert(/New-ScheduledTaskTrigger -AtLogOn/.test(windowsService), 'Windows scheduled task should start automatically at user logon');
   assert(/ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/.test(windowsService), 'Windows scheduled task should not receive a finite execution timeout');

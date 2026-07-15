@@ -25,6 +25,28 @@ function Pause-IfNeeded {
     }
 }
 
+function Test-DirectoryHasEntries {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    try {
+        return $null -ne (Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Select-Object -First 1)
+    }
+    catch { Write-Err "无法读取安装目录: $Path。$($_.Exception.Message)" }
+}
+
+function Test-WebcodingDirectory {
+    param([string]$Path)
+    $packagePath = Join-Path $Path 'package.json'
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git')) -or -not (Test-Path -LiteralPath $packagePath)) {
+        return $false
+    }
+    try {
+        $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+        return $package.name -eq 'webcoding'
+    }
+    catch { return $false }
+}
+
 function Resolve-InstallDirectory {
     $defaultDir = Join-Path $HOME 'webcoding'
     if ($env:WEBCODING_DIR) {
@@ -45,6 +67,24 @@ function Resolve-InstallDirectory {
         $resolved = [IO.Path]::GetFullPath($expanded)
         if ($resolved.TrimEnd('\') -ieq ([IO.Path]::GetPathRoot($resolved)).TrimEnd('\')) {
             Write-Err '安装目录不能是磁盘根目录。'
+        }
+        if (Test-Path -LiteralPath $resolved) {
+            if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+                Write-Err "安装路径已被文件占用: $resolved"
+            }
+            if (-not (Test-WebcodingDirectory $resolved) -and (Test-DirectoryHasEntries $resolved)) {
+                $nestedDir = Join-Path $resolved 'webcoding'
+                if (Test-Path -LiteralPath $nestedDir) {
+                    if (-not (Test-Path -LiteralPath $nestedDir -PathType Container)) {
+                        Write-Err "建议安装路径已被文件占用: $nestedDir"
+                    }
+                    if (-not (Test-WebcodingDirectory $nestedDir) -and (Test-DirectoryHasEntries $nestedDir)) {
+                        Write-Err "所选目录与其 webcoding 子目录均不是空目录。请重新运行并选择其他目录: $nestedDir"
+                    }
+                }
+                Write-Warn "所选目录不是空目录，将使用子目录: $nestedDir"
+                $resolved = $nestedDir
+            }
         }
         return $resolved
     }
@@ -74,11 +114,19 @@ function Assert-Dependencies {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Err '未找到 git。请先安装 git: https://git-scm.com/' }
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Err '未找到 Node.js。请先安装 Node.js >= 22: https://nodejs.org/' }
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Err '未找到 npm，请确认 Node.js 安装完整。' }
-    $nodeMajor = node -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>$null
-    if ([int]$nodeMajor -lt 22) {
-        Write-Err "Node.js 版本过低 (当前: $(node -v))，需要 >= 22。请升级: https://nodejs.org/"
+    $nodeVersionOutput = @(& node --version 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $nodeVersionOutput.Count -eq 0) {
+        Write-Err '无法读取 Node.js 版本，请检查 Node.js 安装是否完整。'
     }
-    Write-Success "Node.js $(node -v)  npm $(npm -v)  git $(git --version) — 全部就绪"
+    $nodeVersion = ([string]$nodeVersionOutput[0]).Trim()
+    if ($nodeVersion -notmatch '^v?([0-9]+)(?:\.[0-9]+){1,3}$') {
+        Write-Err "无法识别 Node.js 版本: $nodeVersion"
+    }
+    $nodeMajor = [int]$Matches[1]
+    if ($nodeMajor -lt 22) {
+        Write-Err "Node.js 版本过低 (当前: $nodeVersion)，需要 >= 22。请升级: https://nodejs.org/"
+    }
+    Write-Success "Node.js $nodeVersion  npm $(npm -v)  git $(git --version) — 全部就绪"
 
     $agents = @()
     if (Get-Command claude -ErrorAction SilentlyContinue) { $agents += 'Claude' }
@@ -255,11 +303,14 @@ if ($action -eq 'start') {
 switch ($action) {
     'install' {
         if ($isInstalled) { Write-Err '已安装。如需覆盖，请选择更新或先卸载。' }
+        if ((Test-Path -LiteralPath $INSTALL_DIR) -and (Test-DirectoryHasEntries $INSTALL_DIR)) {
+            Write-Err "安装目录不是空目录，已停止以避免覆盖现有文件: $INSTALL_DIR"
+        }
         Write-Info "克隆仓库到 $INSTALL_DIR ..."
         $parentDir = Split-Path -Parent $INSTALL_DIR
         if (-not (Test-Path $parentDir)) { New-Item -ItemType Directory -Path $parentDir -Force | Out-Null }
         git clone --depth 1 $REPO $INSTALL_DIR
-        if ($LASTEXITCODE -ne 0) { Write-Err 'Git 克隆失败。' }
+        if ($LASTEXITCODE -ne 0) { Write-Err "Git 克隆失败。请检查网络与目录权限: $INSTALL_DIR" }
     }
     'update' {
         if (-not (Test-Path (Join-Path $INSTALL_DIR '.git'))) { Write-Err '未找到安装目录，请先安装。' }
