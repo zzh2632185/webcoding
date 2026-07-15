@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('start', 'restart', 'stop', 'status', 'logs', 'run', 'uninstall')]
     [string]$Command = 'start',
@@ -113,7 +113,9 @@ function Register-WebcodingTask {
 
     $node = Resolve-NodePath $NodePath
     $engine = (Get-Process -Id $PID).Path
-    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" -Command run -InstallDir `"$InstallDir`" -NodePath `"$node`""
+    # Interactive scheduled tasks otherwise expose the PowerShell console. Closing that
+    # window also closes the Node.js child process, defeating persistent operation.
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -Command run -InstallDir `"$InstallDir`" -NodePath `"$node`""
     $action = New-ScheduledTaskAction -Execute $engine -Argument $arguments -WorkingDirectory $InstallDir
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity

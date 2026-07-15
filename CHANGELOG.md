@@ -1,5 +1,23 @@
 # 更新记录
 
+## v2.0.6 - 2026-07-15
+
+### Windows 持久化运行
+
+- 修复计划任务启动后保留可见 PowerShell 窗口，关闭窗口会连带终止 Webcoding 的问题
+- 计划任务宿主改为隐藏窗口运行，关闭 `start.bat`、CMD 或 PowerShell 不再影响后台服务
+- 为 `install.ps1` 和 `deploy/windows/service.ps1` 增加 UTF-8 BOM，避免 Windows PowerShell 5.1 将中文脚本误读为本地编码并触发连锁语法错误
+
+### 项目整理
+
+- 删除无引用的推广原图、与正式资源完全重复的根目录截图，以及旧 CSS 备份
+- 忽略本地浏览器测试目录和界面验收截图，避免临时产物进入版本库
+
+### 验证
+
+- 49 项隔离回归全部通过
+- 新增 Windows PowerShell 5.1 脚本编码和后台隐藏窗口的回归覆盖
+
 ## v2.0.5 - 2026-07-15
 
 ### Windows 一键安装

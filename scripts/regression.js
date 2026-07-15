@@ -4333,9 +4333,13 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
 
 async function runDeploymentScriptsRegressionCase() {
   const installSh = fs.readFileSync(path.join(REPO_DIR, 'install.sh'), 'utf8');
-  const installPs1 = fs.readFileSync(path.join(REPO_DIR, 'install.ps1'), 'utf8');
+  const installPs1Path = path.join(REPO_DIR, 'install.ps1');
+  const installPs1Bytes = fs.readFileSync(installPs1Path);
+  const installPs1 = installPs1Bytes.toString('utf8');
   const startBat = fs.readFileSync(path.join(REPO_DIR, 'start.bat'), 'utf8');
-  const windowsService = fs.readFileSync(path.join(REPO_DIR, 'deploy', 'windows', 'service.ps1'), 'utf8');
+  const windowsServicePath = path.join(REPO_DIR, 'deploy', 'windows', 'service.ps1');
+  const windowsServiceBytes = fs.readFileSync(windowsServicePath);
+  const windowsService = windowsServiceBytes.toString('utf8');
   const macPlist = fs.readFileSync(path.join(REPO_DIR, 'deploy', 'macos', 'com.webcoding.server.plist'), 'utf8');
   const linuxService = fs.readFileSync(path.join(REPO_DIR, 'deploy', 'linux', 'webcoding.service'), 'utf8');
   const gitignore = fs.readFileSync(path.join(REPO_DIR, '.gitignore'), 'utf8');
@@ -4346,12 +4350,15 @@ async function runDeploymentScriptsRegressionCase() {
   assert(/webcoding \{start\|restart\|stop\|status\|logs\|foreground\}/.test(installSh), 'Unix launcher should expose service lifecycle commands');
 
   assert(/安装\/运行目录/.test(installPs1) && /WEBCODING_DIR/.test(installPs1), 'Windows installer should let the user choose an install/runtime directory');
+  assert(installPs1Bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])), 'Windows installer should include a UTF-8 BOM for Windows PowerShell 5.1');
   assert(/& node --version/.test(installPs1) && !/node -e/.test(installPs1), 'Windows installer should detect Node.js without PowerShell 5.1-sensitive inline JavaScript quoting');
   assert(/Test-DirectoryHasEntries/.test(installPs1) && /Join-Path \$resolved 'webcoding'/.test(installPs1), 'Windows installer should redirect a non-empty parent directory to a webcoding subdirectory');
   assert(/安装目录不是空目录，已停止以避免覆盖现有文件/.test(installPs1), 'Windows installer should recheck the clone target before writing files');
   assert(/Register-ScheduledTask/.test(windowsService), 'Windows service helper should register a scheduled task');
+  assert(windowsServiceBytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])), 'Windows service helper should include a UTF-8 BOM for Windows PowerShell 5.1');
   assert(/New-ScheduledTaskTrigger -AtLogOn/.test(windowsService), 'Windows scheduled task should start automatically at user logon');
   assert(/ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/.test(windowsService), 'Windows scheduled task should not receive a finite execution timeout');
+  assert(/-WindowStyle Hidden/.test(windowsService), 'Windows scheduled task should hide its PowerShell host so closing a console cannot stop the server');
   assert(/deploy\\windows\\service\.ps1/.test(startBat), 'start.bat should delegate to the persistent Windows service helper');
   assert(!/^\s*node\s+server\.js\s*$/mi.test(startBat), 'start.bat must not keep Webcoding attached to the terminal');
 

@@ -7,6 +7,10 @@ server.log
 webcoding.cmd
 test-results/
 attachments/
+.playwright-mcp/
+/*-current-ui.png
+/*-fixed*.png
+/remote-*.png
 .DS_Store
 .env
 config/notify.json

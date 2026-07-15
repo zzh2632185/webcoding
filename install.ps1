@@ -1,4 +1,4 @@
-# Webcoding 一键安装与服务管理脚本 (Windows PowerShell)
+﻿# Webcoding 一键安装与服务管理脚本 (Windows PowerShell)
 #
 # 交互安装：
 #   $s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression $s
