@@ -27,7 +27,7 @@ if not exist "deploy\windows\service.ps1" (
 )
 
 echo [Webcoding] 正在启动持久化后台服务...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy\windows\service.ps1" -Command start -InstallDir "%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy\windows\service.ps1" -Command start -InstallDir "%~dp0."
 if %errorlevel% neq 0 (
     echo [Webcoding] ERROR: 启动失败，请查看 logs\server.err.log。
     pause

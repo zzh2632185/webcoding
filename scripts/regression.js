@@ -4364,6 +4364,9 @@ async function runDeploymentScriptsRegressionCase() {
   assert(/New-ScheduledTaskTrigger -AtLogOn/.test(windowsService), 'Windows scheduled task should start automatically at user logon');
   assert(/ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/.test(windowsService), 'Windows scheduled task should not receive a finite execution timeout');
   assert(/-WindowStyle Hidden/.test(windowsService), 'Windows scheduled task should hide its PowerShell host so closing a console cannot stop the server');
+  assert(installPs1.includes('-InstallDir "%~dp0."') && startBat.includes('-InstallDir "%~dp0."'), 'Windows launchers should keep a trailing backslash away from the closing InstallDir quote');
+  assert(!installPs1.includes('-InstallDir "%~dp0"') && !startBat.includes('-InstallDir "%~dp0"'), 'Windows launchers must not pass a quoted InstallDir ending in a backslash');
+  assert([installPs1, windowsService].every((text) => text.includes("$expanded = $expanded.Trim('\"')") && text.includes('$resolved = $resolved.TrimEnd($separators)')), 'Windows PowerShell scripts should normalize stray quotes and trailing separators before re-launching services');
   assert(/deploy\\windows\\service\.ps1/.test(startBat), 'start.bat should delegate to the persistent Windows service helper');
   assert(!/^\s*node\s+server\.js\s*$/mi.test(startBat), 'start.bat must not keep Webcoding attached to the terminal');
 

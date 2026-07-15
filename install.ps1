@@ -63,11 +63,15 @@ function Resolve-InstallDirectory {
     elseif ($expanded.StartsWith('~\') -or $expanded.StartsWith('~/')) {
         $expanded = Join-Path $HOME $expanded.Substring(2)
     }
+    $expanded = ([string]$expanded).Trim()
+    $expanded = $expanded.Trim('"')
     try {
         $resolved = [IO.Path]::GetFullPath($expanded)
         if ($resolved.TrimEnd('\') -ieq ([IO.Path]::GetPathRoot($resolved)).TrimEnd('\')) {
             Write-Err '安装目录不能是磁盘根目录。'
         }
+        $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $resolved = $resolved.TrimEnd($separators)
         if (Test-Path -LiteralPath $resolved) {
             if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
                 Write-Err "安装路径已被文件占用: $resolved"
@@ -173,7 +177,7 @@ function Install-CommandLauncher {
 chcp 65001 >nul 2>&1
 set "ACTION=%~1"
 if "%ACTION%"=="" set "ACTION=start"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy\windows\service.ps1" -Command "%ACTION%" -InstallDir "%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy\windows\service.ps1" -Command "%ACTION%" -InstallDir "%~dp0."
 '@ | Set-Content -Encoding ASCII $launcherPath
 
     $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')

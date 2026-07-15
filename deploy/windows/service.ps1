@@ -19,7 +19,19 @@ function Resolve-InstallDirectory {
     elseif ($expanded.StartsWith('~\') -or $expanded.StartsWith('~/')) {
         $expanded = Join-Path $HOME $expanded.Substring(2)
     }
-    return [IO.Path]::GetFullPath($expanded)
+    $expanded = ([string]$expanded).Trim()
+    $expanded = $expanded.Trim('"')
+    try {
+        $resolved = [IO.Path]::GetFullPath($expanded)
+    } catch {
+        throw "安装目录参数无效: $Value。$($_.Exception.Message)"
+    }
+    $root = [IO.Path]::GetPathRoot($resolved)
+    if ($resolved.Length -gt $root.Length) {
+        $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $resolved = $resolved.TrimEnd($separators)
+    }
+    return $resolved
 }
 
 $InstallDir = Resolve-InstallDirectory $InstallDir
