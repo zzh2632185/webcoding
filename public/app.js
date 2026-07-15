@@ -72,6 +72,7 @@
   let sessionCache = new Map();
   let isGenerating = false;
   let isAborting = false;
+  let pendingTurnErrorSessionId = null;
   /** Permission mode snapshotted when the current CLI turn started (not next-turn selection). */
   let activeTurnMode = null;
   let reconnectAttempts = 0;
@@ -4344,6 +4345,7 @@
     // Do not wait for ack timeout when the server already rejected the turn.
     failInflightAcksForSession(msg.sessionId || sessionState.currentSessionId, 'failed');
     const errorMsg = msg.message || '发生未知错误';
+    pendingTurnErrorSessionId = msg.sessionId || sessionState.currentSessionId || null;
     markPiForkPickerError(msg.sessionId, errorMsg);
     appendError(errorMsg);
     // Surface important failures in the persistent top banner.
@@ -4471,7 +4473,13 @@
     usage: handleUsageMessage,
     done: (msg) => {
       if (!isEventForCurrentSession(msg)) return;
-      finishGenerating(msg.sessionId, { interrupted: !!msg.interrupted });
+      const doneSessionId = msg.sessionId || sessionState.currentSessionId || null;
+      const preserveError = !!doneSessionId && pendingTurnErrorSessionId === doneSessionId;
+      finishGenerating(msg.sessionId, {
+        interrupted: !!msg.interrupted,
+        skipResync: preserveError,
+      });
+      if (preserveError) pendingTurnErrorSessionId = null;
     },
     system_message: (msg) => {
       if (!isEventForCurrentSession(msg)) return;
@@ -4560,6 +4568,7 @@
   function startGenerating() {
     composeState.isGenerating = true;
     composeState.isAborting = false;
+    pendingTurnErrorSessionId = null;
     // Snapshot turn mode at start so next-turn /mode changes don't open Plan mid-send.
     composeState.activeTurnMode = sessionState.currentMode;
     setCurrentSessionRunningState(true);
@@ -8317,9 +8326,11 @@
       <div class="settings-field">
         <label>上游协议</label>
         <select class="settings-select" id="unified-template-upstream-type">
-          <option value="openai" ${draft.upstreamType === 'anthropic' ? '' : 'selected'}>OpenAI / Responses</option>
+          <option value="openai" ${draft.upstreamType !== 'anthropic' && draft.upstreamType !== 'openai-responses' ? 'selected' : ''}>OpenAI / Chat Completions</option>
+          <option value="openai-responses" ${draft.upstreamType === 'openai-responses' ? 'selected' : ''}>OpenAI / Responses</option>
           <option value="anthropic" ${draft.upstreamType === 'anthropic' ? 'selected' : ''}>Anthropic / Messages</option>
         </select>
+        <div class="settings-field-help">新建提供商默认使用兼容范围更广的 Chat Completions；只有服务商明确支持 Responses API 时再选择 Responses。</div>
       </div>
 
       <div class="settings-divider" style="margin:12px 0"></div>

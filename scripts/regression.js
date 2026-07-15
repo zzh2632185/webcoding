@@ -11,6 +11,7 @@ const { createAgentRuntime } = require('../lib/agent-runtime');
 const { PiRpcClient } = require('../lib/pi-rpc-client');
 const { CodexAppServerClient } = require('../lib/codex-app-server-client');
 const { ClaudeStreamClient } = require('../lib/claude-stream-client');
+const { buildVersionedEndpointUrl, detectConfiguredEndpoint } = require('../lib/api-endpoint');
 
 const REPO_DIR = path.resolve(__dirname, '..');
 const SERVER_PATH = path.join(REPO_DIR, 'server.js');
@@ -297,7 +298,8 @@ async function startBridgeProcess(tempDir, upstreamPort, options = {}) {
       name: 'Fallback OpenAI',
       apiKey: 'upstream-test-key',
       apiBase: upstreamApiBase,
-      kind: 'openai',
+      kind: options.upstreamKind === 'anthropic' ? 'anthropic' : 'openai',
+      ...(options.upstreamProtocol ? { protocol: options.upstreamProtocol } : {}),
       defaultModel,
       modelReasoningEffort,
     },
@@ -459,6 +461,7 @@ async function startResponsesFallbackUpstream(port, options = {}) {
   const counters = {
     responses: 0,
     chatCompletions: 0,
+    messages: 0,
     models: 0,
   };
   const requests = [];
@@ -510,23 +513,49 @@ async function startResponsesFallbackUpstream(port, options = {}) {
       if (req.method === 'POST' && requestUrl.pathname === '/v1/responses') {
         counters.responses += 1;
         const responsesStatus = Number(options.responsesStatus || 500);
-        const responsesError = options.responsesError || {
+        res.writeHead(responsesStatus, { 'content-type': 'application/json' });
+        if (responsesStatus >= 200 && responsesStatus < 300) {
+          const parsed = body ? JSON.parse(body) : {};
+          res.end(JSON.stringify(options.responsesResponse || {
+            id: 'resp_regression',
+            object: 'response',
+            model: parsed.model || 'fallback-model',
+            output: [{
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'responses pong' }],
+            }],
+            output_text: 'responses pong',
+            usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+          }));
+          return;
+        }
+        res.end(JSON.stringify(options.responsesError || {
           error: {
             message: 'not implemented',
             type: 'new_api_error',
             code: 'convert_request_failed',
           },
-        };
-        res.writeHead(responsesStatus, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(responsesError));
+        }));
         return;
       }
       if (req.method === 'POST' && requestUrl.pathname === '/v1/chat/completions') {
         counters.chatCompletions += 1;
         const parsed = body ? JSON.parse(body) : {};
+        const chatCompletionsStatus = Number(options.chatCompletionsStatus || 200);
+        res.writeHead(chatCompletionsStatus, { 'content-type': 'application/json' });
+        if (chatCompletionsStatus < 200 || chatCompletionsStatus >= 300) {
+          res.end(JSON.stringify(options.chatCompletionsError || {
+            error: {
+              message: 'chat completions unavailable',
+              type: 'invalid_request_error',
+              code: 'unsupported_endpoint',
+            },
+          }));
+          return;
+        }
         const model = parsed.model || 'fallback-model';
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
+        res.end(JSON.stringify(options.chatCompletionsResponse || {
           id: 'chatcmpl_regression',
           object: 'chat.completion',
           model,
@@ -543,6 +572,21 @@ async function startResponsesFallbackUpstream(port, options = {}) {
             completion_tokens: 1,
             total_tokens: 6,
           },
+        }));
+        return;
+      }
+      if (req.method === 'POST' && requestUrl.pathname === '/v1/messages') {
+        counters.messages += 1;
+        const parsed = body ? JSON.parse(body) : {};
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'msg_regression',
+          type: 'message',
+          role: 'assistant',
+          model: parsed.model || 'fallback-model',
+          content: [{ type: 'text', text: 'anthropic pong' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 5, output_tokens: 2 },
         }));
         return;
       }
@@ -614,6 +658,141 @@ async function startStreamingResponsesUpstream(port) {
 
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'not found' } }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  return {
+    server,
+    counters,
+    requests,
+    async close() {
+      await new Promise((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function startStreamingChatCompletionsUpstream(port, options = {}) {
+  const counters = {
+    chatCompletions: 0,
+    responses: 0,
+  };
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const bodyJson = (() => {
+        try { return body ? JSON.parse(body) : null; } catch { return null; }
+      })();
+      requests.push({
+        method: req.method,
+        path: requestUrl.pathname,
+        bodyText: body,
+        bodyJson,
+      });
+
+      if (req.method === 'POST' && requestUrl.pathname === '/v1/responses') {
+        counters.responses += 1;
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'responses endpoint unavailable' } }));
+        return;
+      }
+
+      if (req.method !== 'POST' || requestUrl.pathname !== '/v1/chat/completions') {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'not found' } }));
+        return;
+      }
+
+      counters.chatCompletions += 1;
+      if (bodyJson?.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'expected stream=true' } }));
+        return;
+      }
+
+      const model = bodyJson.model || 'fallback-model';
+      const id = `chatcmpl_stream_${counters.chatCompletions}`;
+      const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+      send({
+        id,
+        object: 'chat.completion.chunk',
+        model,
+        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+      });
+      send({
+        id,
+        object: 'chat.completion.chunk',
+        model,
+        choices: [{ index: 0, delta: { reasoning_content: 'stream reasoning' }, finish_reason: null }],
+      });
+      send({
+        id,
+        object: 'chat.completion.chunk',
+        model,
+        choices: [{ index: 0, delta: { content: options.text || 'stream pong' }, finish_reason: null }],
+      });
+      if (options.includeTool !== false) {
+        send({
+          id,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: 'call_stream_regression',
+                type: 'function',
+                function: { name: 'read_file', arguments: '{"path":' },
+              }],
+            },
+            finish_reason: null,
+          }],
+        });
+        send({
+          id,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                function: { arguments: '"demo.txt"}' },
+              }],
+            },
+            finish_reason: null,
+          }],
+        });
+      }
+      send({
+        id,
+        object: 'chat.completion.chunk',
+        model,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: options.includeTool === false ? 'stop' : 'tool_calls',
+        }],
+      });
+      send({
+        id,
+        object: 'chat.completion.chunk',
+        model,
+        choices: [],
+        usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+      });
+      res.end('data: [DONE]\n\n');
     });
   });
   await new Promise((resolve, reject) => {
@@ -2874,7 +3053,7 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
 
 async function runPiManagedRuntimeRegressionCase({ port, password, configDir, homeDir, piFixture }) {
   await withAuthedClient(port, password, async ({ client }) => {
-    await saveConfigAndWait(
+    const modelConfig = await saveConfigAndWait(
       client,
       'save_model_config',
       {
@@ -2884,12 +3063,17 @@ async function runPiManagedRuntimeRegressionCase({ port, password, configDir, ho
           name: 'Pi Responses Regression',
           apiKey: 'sk-pi-regression',
           apiBase: 'https://example.com/v1',
-          upstreamType: 'openai',
+          upstreamType: 'openai-responses',
           defaultModel: 'pi-responses-model',
         }],
       },
       'model_config',
     );
+    assert(modelConfig.config.templates?.[0]?.upstreamType === 'openai-responses', 'Provider config should preserve the explicit OpenAI Responses protocol');
+    const responsesBridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
+    const responsesBridgeEntry = Object.values(responsesBridgeRuntime.runtimes || {})
+      .find((entry) => entry?.upstream?.name === 'Pi Responses Regression');
+    assert(responsesBridgeEntry?.upstream?.protocol === 'responses', 'Explicit OpenAI Responses providers should persist the Responses wire protocol');
     const piConfig = await saveConfigAndWait(
       client,
       'save_pi_config',
@@ -2976,6 +3160,10 @@ async function runPiUnifiedBridgeRegressionCase({ port, password, configDir, ses
       const settingsJson = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'settings.json'), 'utf8'));
       assert(settingsJson.defaultProvider === 'webcoding', 'Pi unified runtime should default to the managed provider');
       assert(settingsJson.defaultModel === 'regression-pi-model', 'Pi unified runtime should default to the selected template model');
+      const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
+      const bridgeEntry = Object.values(bridgeRuntime.runtimes || {})
+        .find((entry) => entry?.upstream?.name === 'Pi Unified Bridge');
+      assert(bridgeEntry?.upstream?.protocol === 'chat-completions', 'Default OpenAI providers should persist the Chat Completions wire protocol');
 
       const probeSession = await client.sendAndWaitType(
         buildAgentMessagePayload({ text: 'verify pi unified bridge', mode: 'yolo', agent: 'pi' }),
@@ -2990,8 +3178,8 @@ async function runPiUnifiedBridgeRegressionCase({ port, password, configDir, ses
       await client.waitForType('done', (msg) => msg.sessionId === probeSession.sessionId, 8000);
       const probeText = getLastStoredAssistantText(sessionsDir, probeSession.sessionId);
       assert(/provider probe: pong/.test(probeText || ''), 'Pi managed runtime should reach the configured provider through the local bridge');
-      assert(upstream.counters.responses === 1, 'Pi bridge should first try the upstream Responses endpoint');
-      assert(upstream.counters.chatCompletions === 1, 'Pi bridge should fall back to the upstream Chat Completions endpoint');
+      assert(upstream.counters.responses === 0, 'Default OpenAI providers should not probe Responses before Chat Completions');
+      assert(upstream.counters.chatCompletions === 1, 'Default OpenAI providers should use Chat Completions directly');
 
       await saveConfigAndWait(
         client,
@@ -3463,6 +3651,35 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
     );
     assert(jsonError, 'Pi JSON stopReason=error should emit error event even with exit code 0');
     await client.waitForType('done', (msg) => msg.sessionId === jsonErrSession.sessionId, 8000);
+
+    // An externally terminated RPC process must report its real signal instead
+    // of inventing exit code 1, which otherwise makes an intentional SIGTERM
+    // look like a protocol or model failure.
+    const terminatedSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger pi rpc slow', mode: 'yolo', agent: 'pi' }),
+      'session_info',
+      (msg) => msg.agent === 'pi' && msg.title === 'trigger pi rpc slow',
+    );
+    await client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === terminatedSession.sessionId && /still running/.test(msg.text || ''),
+      8000,
+    );
+    await waitForCondition(
+      () => !!findProcessLogLine(logsDir, terminatedSession.sessionId, 'process_spawn'),
+      { timeoutMs: 2000, intervalMs: 40, label: 'Pi RPC external termination spawn log' },
+    );
+    const terminatedSpawn = JSON.parse(findProcessLogLine(logsDir, terminatedSession.sessionId, 'process_spawn'));
+    process.kill(terminatedSpawn.pid, 'SIGTERM');
+    const terminatedError = await client.waitForType(
+      'error',
+      (msg) => msg.sessionId === terminatedSession.sessionId && /Pi 任务被外部终止（信号 SIGTERM）/.test(msg.message || ''),
+      8000,
+    );
+    assert(!/退出码 1/.test(terminatedError.message || ''), 'Pi SIGTERM must not be mislabeled as exit code 1');
+    await client.waitForType('done', (msg) => msg.sessionId === terminatedSession.sessionId, 8000);
+    const terminatedComplete = JSON.parse(findProcessLogLine(logsDir, terminatedSession.sessionId, 'process_complete'));
+    assert(terminatedComplete.exitCode === null && terminatedComplete.signal === 'SIGTERM', 'Pi SIGTERM should preserve the real process outcome in logs');
 
     // Session dir should exist under sessions/_pi-sessions
     const piRoot = path.join(sessionsDir, '_pi-sessions');
@@ -4111,6 +4328,9 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
   assert(/id="unified-template-fetch-models"/.test(appSource), 'Provider default model field should expose a fetch-model-list button');
   assert(/id="unified-template-context-window"/.test(appSource), 'Provider settings should expose a context-window field');
   assert(/type:\s*['"]fetch_provider_models['"]/.test(appSource), 'Provider settings should request model discovery through the backend');
+  assert(/option value="openai"[^>]*>OpenAI \/ Chat Completions<\/option>/.test(appSource), 'New provider settings should default to OpenAI Chat Completions');
+  assert(/option value="openai-responses"[^>]*>OpenAI \/ Responses<\/option>/.test(appSource), 'Provider settings should retain an explicit OpenAI Responses option');
+  assert(/option value="anthropic"[^>]*>Anthropic \/ Messages<\/option>/.test(appSource), 'Provider settings should expose Anthropic Messages');
   assert(!/sonnet\[1m\]|opus\[1m\]/.test(appSource), 'Frontend model menus must not contain fixed Claude aliases');
   const showModelPickerSource = appSource.slice(appSource.indexOf('function showModelPicker'), appSource.indexOf('function showModePicker'));
   assert(/text:\s*['"]\/model['"]/.test(showModelPickerSource), 'The switch-model action should reuse the same /model backend path');
@@ -4130,7 +4350,7 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           responseField: 'data',
         },
         {
-          label: 'anthropic-with-v1',
+          label: 'neutral-with-v1',
           apiBase: `http://127.0.0.1:${upstreamPort}/v1`,
           apiKey: 'sk-regression-with-v1',
           upstreamType: 'anthropic',
@@ -4209,6 +4429,7 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
         const savedTemplate = modelConfig.config.templates?.[0] || {};
         assert(savedTemplate.defaultModel === 'regression-api-model', 'Provider default model should be saved');
         assert(savedTemplate.contextWindow === 200000, 'Provider context window should be saved');
+        assert(savedTemplate.upstreamType === variant.upstreamType, 'Saving a provider should preserve its explicit wire protocol');
         const claudeRuntimeSettings = JSON.parse(fs.readFileSync(path.join(configDir, 'claude-runtime-settings.json'), 'utf8'));
         assert(claudeRuntimeSettings.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS === '200000', 'Claude managed runtime should receive the provider context window');
         assert(claudeRuntimeSettings.env?.ANTHROPIC_MODEL === 'regression-api-model[1m]', 'Claude managed runtime should enable 1M context on the custom default model');
@@ -4484,6 +4705,35 @@ async function runDeploymentScriptsRegressionCase() {
   assert(/\.webcoding-service\.sh/.test(gitignore) && /webcoding\.cmd/.test(gitignore), 'Generated service launchers should not dirty installed Git checkouts');
 }
 
+function runApiEndpointNormalizationRegressionCase() {
+  const cases = [
+    { base: 'https://provider.example.test', endpoint: 'responses', path: '/v1/responses' },
+    { base: 'https://provider.example.test/v1', endpoint: 'chat/completions', path: '/v1/chat/completions' },
+    { base: 'https://provider.example.test/v1/responses', endpoint: 'chat/completions', path: '/v1/chat/completions' },
+    { base: 'https://provider.example.test/v1/chat/completions', endpoint: 'models', path: '/v1/models' },
+    { base: 'https://provider.example.test/proxy/v1/chat/completions', endpoint: 'responses', path: '/proxy/v1/responses' },
+    { base: 'https://provider.example.test/proxy/chat/completions', endpoint: 'responses', path: '/proxy/responses' },
+    { base: 'https://provider.example.test/responses?api-version=2026-01-01', endpoint: 'chat/completions', path: '/chat/completions', search: '?api-version=2026-01-01' },
+  ];
+  for (const item of cases) {
+    const resolved = new URL(buildVersionedEndpointUrl(item.base, item.endpoint));
+    assert(resolved.pathname === item.path, `API endpoint normalization should map ${item.base} to ${item.path}, got ${resolved.pathname}`);
+    assert(resolved.search === (item.search || ''), `API endpoint normalization should preserve query parameters for ${item.base}`);
+  }
+  assert(detectConfiguredEndpoint('https://provider.example.test/v1/responses') === 'responses', 'Endpoint detection should recognize explicit Responses URLs');
+  assert(detectConfiguredEndpoint('https://provider.example.test/v1/chat/completions') === 'chat/completions', 'Endpoint detection should recognize explicit Chat Completions URLs');
+  assert(detectConfiguredEndpoint('https://provider.example.test/v1/messages') === 'messages', 'Endpoint detection should recognize explicit Anthropic Messages URLs');
+  assert(detectConfiguredEndpoint('https://provider.example.test/v1') === '', 'Endpoint detection should leave version-only API bases in automatic mode');
+}
+
+function runFrontendErrorRetentionRegressionCase() {
+  const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  assert(/let pendingTurnErrorSessionId = null;/.test(appSource), 'Frontend should track the session whose current turn failed');
+  assert(/pendingTurnErrorSessionId = msg\.sessionId \|\| sessionState\.currentSessionId \|\| null;/.test(appSource), 'Frontend error handling should remember the failed turn before done arrives');
+  assert(/skipResync:\s*preserveError/.test(appSource), 'Frontend done handling should not resync away a visible runtime error');
+  assert(/if \(preserveError\) pendingTurnErrorSessionId = null;/.test(appSource), 'Frontend should clear retained error state after the matching done event');
+}
+
 async function runBridgeResponsesFallbackRegressionCase({ tempRoot }) {
   const bridgeTempDir = path.join(tempRoot, 'bridge-fallback');
   mkdirp(bridgeTempDir);
@@ -4538,6 +4788,200 @@ async function runBridgeResponsesFallbackRegressionCase({ tempRoot }) {
 
     assert(upstream.counters.responses === 2, `Bridge should probe /responses twice, got ${upstream.counters.responses}`);
     assert(upstream.counters.chatCompletions === 2, `Bridge should fall back to /chat/completions twice, got ${upstream.counters.chatCompletions}`);
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeEmptyMessagesFallbackRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-empty-messages-fallback');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startResponsesFallbackUpstream(upstreamPort, {
+    responsesStatus: 400,
+    responsesError: {
+      error: {
+        message: 'Empty input messages',
+        type: 'invalid_request_error',
+        code: 'invalid_request_error',
+      },
+    },
+  });
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort, {
+      upstreamApiBase: `http://127.0.0.1:${upstreamPort}/v1/responses`,
+    });
+    const response = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [
+          {
+            role: 'developer',
+            content: 'Pi-style system prompt without an explicit message type',
+          },
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: 'ping from responses' }],
+          },
+        ],
+        stream: false,
+      }),
+    });
+    assert(response.statusCode === 200, `Bridge empty-messages fallback should return 200, got ${response.statusCode}`);
+    assert(response.json?.output_text === 'pong', 'Bridge should translate the Chat Completions fallback response');
+    assert(upstream.counters.responses === 1, 'Bridge should try the explicit Responses endpoint once');
+    assert(upstream.counters.chatCompletions === 1, 'Bridge should retry with Chat Completions after Empty input messages');
+    const chatRequest = upstream.requests.find((request) => request.path === '/v1/chat/completions');
+    assert(chatRequest?.bodyJson?.messages?.some((message) => message.role === 'system' && /Pi-style system prompt/.test(String(message.content || ''))), 'Bridge should preserve type-less Pi system messages');
+    assert(chatRequest?.bodyJson?.messages?.some((message) => /ping from responses/.test(String(message.content || ''))), 'Bridge should convert Responses input into non-empty Chat Completions messages');
+
+    const stringInputResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: 'ping from string input',
+        stream: false,
+      }),
+    });
+    assert(stringInputResponse.statusCode === 200, `Bridge string-input fallback should return 200, got ${stringInputResponse.statusCode}`);
+    const stringChatRequest = upstream.requests.find((request) => request.path === '/v1/chat/completions'
+      && request.bodyJson?.messages?.some((message) => /ping from string input/.test(String(message.content || ''))));
+    assert(stringChatRequest, 'Responses string input should become a Chat Completions user message');
+    assert(upstream.counters.responses === 2, 'Bridge should try Responses once per fallback request');
+    assert(upstream.counters.chatCompletions === 2, 'Bridge should retry Chat Completions once per fallback request');
+    assert(!upstream.requests.some((request) => request.path.includes('/responses/v1/')), 'Explicit Responses API bases must be replaced instead of appended to');
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeTypelessResponsesToAnthropicRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-typeless-responses-anthropic');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startResponsesFallbackUpstream(upstreamPort);
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort, {
+      upstreamKind: 'anthropic',
+    });
+    const response = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [
+          { role: 'developer', content: 'Pi-style Anthropic system prompt' },
+          { role: 'user', content: [{ type: 'input_text', text: 'ping anthropic' }] },
+        ],
+        stream: true,
+      }),
+    });
+    assert(response.statusCode === 200, `Bridge type-less Anthropic conversion should return 200, got ${response.statusCode}`);
+    assert(/anthropic pong/.test(response.text), 'Bridge should convert the Anthropic response back into OpenAI Responses SSE');
+    assert(upstream.counters.messages === 1, 'Bridge should send one Anthropic Messages request');
+    const anthropicRequest = upstream.requests.find((request) => request.path === '/v1/messages');
+    assert(anthropicRequest?.bodyJson?.system?.some((block) => /Pi-style Anthropic system prompt/.test(String(block.text || ''))), 'Bridge should preserve type-less system content for Anthropic');
+    assert(anthropicRequest?.bodyJson?.messages?.some((message) => message.role === 'user' && message.content?.some((block) => /ping anthropic/.test(String(block.text || '')))), 'Bridge should preserve type-less user content for Anthropic');
+
+    const stringInputResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: 'ping anthropic string input',
+        stream: true,
+      }),
+    });
+    assert(stringInputResponse.statusCode === 200, `Bridge Anthropic string-input conversion should return 200, got ${stringInputResponse.statusCode}`);
+    const stringAnthropicRequest = upstream.requests.find((request) => request.path === '/v1/messages'
+      && request.bodyJson?.messages?.some((message) => message.content?.some((block) => /ping anthropic string input/.test(String(block.text || '')))));
+    assert(stringAnthropicRequest, 'Responses string input should become an Anthropic user message');
+    assert(upstream.counters.messages === 2, 'Bridge should send one Anthropic request per string/array input case');
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeChatEndpointReverseFallbackRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-chat-endpoint-reverse-fallback');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startResponsesFallbackUpstream(upstreamPort, {
+    responsesStatus: 200,
+    chatCompletionsStatus: 400,
+    chatCompletionsError: {
+      error: {
+        message: 'input is required; messages are unsupported',
+        type: 'invalid_request_error',
+        code: 'invalid_request_error',
+      },
+    },
+  });
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort, {
+      upstreamApiBase: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+    });
+    const response = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'ping from chat endpoint' }],
+        }],
+        stream: false,
+      }),
+    });
+    assert(response.statusCode === 200, `Bridge reverse fallback should return 200, got ${response.statusCode}`);
+    assert(response.json?.output_text === 'responses pong', 'Bridge should preserve the successful Responses result after reverse fallback');
+    assert(upstream.counters.chatCompletions === 1, 'Explicit Chat Completions API bases should receive messages first');
+    assert(upstream.counters.responses === 1, 'Bridge should reverse-fallback to Responses when the chat endpoint requests input');
+    const chatRequest = upstream.requests.find((request) => request.path === '/v1/chat/completions');
+    const responsesRequest = upstream.requests.find((request) => request.path === '/v1/responses');
+    assert(Array.isArray(chatRequest?.bodyJson?.messages) && chatRequest.bodyJson.messages.length > 0, 'Explicit Chat Completions requests should use messages');
+    assert(Array.isArray(responsesRequest?.bodyJson?.input) && responsesRequest.bodyJson.input.length > 0, 'Reverse fallback should retain non-empty Responses input');
+    assert(!upstream.requests.some((request) => request.path.includes('/chat/completions/v1/')), 'Explicit Chat Completions API bases must be replaced instead of appended to');
   } finally {
     await stopBridgeProcess(bridgeHandle);
     await upstream.close();
@@ -4627,6 +5071,157 @@ async function runBridgeStreamingPassthroughRegressionCase({ tempRoot }) {
 
     const responseRequest = upstream.requests.find((req) => req.path === '/v1/responses');
     assert(responseRequest?.bodyJson?.stream === true, 'Bridge should preserve stream=true when proxying OpenAI responses');
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeChatStreamingConversionRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-chat-streaming-conversion');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startStreamingChatCompletionsUpstream(upstreamPort);
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort, {
+      upstreamApiBase: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+      upstreamProtocol: 'chat-completions',
+    });
+
+    const openAiResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [
+          { role: 'developer', content: 'Pi-style streaming system prompt' },
+          { role: 'user', content: [{ type: 'input_text', text: 'stream from Pi or Codex' }] },
+        ],
+        tools: [{
+          type: 'function',
+          name: 'read_file',
+          description: 'Read one file',
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        }],
+        stream: true,
+      }),
+    });
+    assert(openAiResponse.statusCode === 200, `Chat-to-Responses streaming should return 200, got ${openAiResponse.statusCode}`);
+    assert(/response\.reasoning_summary_text\.delta/.test(openAiResponse.text), 'Chat reasoning_content should become Responses reasoning deltas');
+    assert(/response\.output_text\.delta/.test(openAiResponse.text), 'Chat text should become Responses text deltas');
+    assert(/response\.function_call_arguments\.delta/.test(openAiResponse.text), 'Chat tool arguments should become Responses tool deltas');
+    assert(/"status":"completed"/.test(openAiResponse.text), 'Converted Responses stream should include a completed terminal response');
+    assert(/stream pong/.test(openAiResponse.text), 'Converted Responses stream should preserve text content');
+    assert(/demo\.txt/.test(openAiResponse.text), 'Converted Responses stream should preserve tool arguments');
+
+    const anthropicResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/anthropic/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': 'bridge-regression-token',
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        system: 'Claude string-form system prompt',
+        messages: [{ role: 'user', content: 'stream from Claude Code' }],
+        tools: [{
+          name: 'read_file',
+          description: 'Read one file',
+          input_schema: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        }],
+        max_tokens: 128,
+        stream: true,
+      }),
+    });
+    assert(anthropicResponse.statusCode === 200, `Chat-to-Anthropic streaming should return 200, got ${anthropicResponse.statusCode}`);
+    assert(/event: message_start/.test(anthropicResponse.text), 'Converted Anthropic stream should emit message_start');
+    assert(/thinking_delta/.test(anthropicResponse.text), 'Chat reasoning_content should become Anthropic thinking deltas');
+    assert(/text_delta/.test(anthropicResponse.text), 'Chat text should become Anthropic text deltas');
+    assert(/input_json_delta/.test(anthropicResponse.text), 'Chat tool arguments should become Anthropic input_json_delta events');
+    assert(/event: message_stop/.test(anthropicResponse.text), 'Converted Anthropic stream should end with message_stop');
+
+    const reasoningRoundTripResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [
+          {
+            id: 'rs_previous',
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'previous reasoning content' }],
+          },
+          {
+            id: 'fc_previous_1',
+            type: 'function_call',
+            call_id: 'call_previous_1',
+            name: 'read_file',
+            arguments: '{"path":"one.txt"}',
+          },
+          {
+            id: 'fc_previous_2',
+            type: 'function_call',
+            call_id: 'call_previous_2',
+            name: 'read_file',
+            arguments: '{"path":"two.txt"}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_previous_1',
+            output: 'one',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_previous_2',
+            output: 'two',
+          },
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: 'continue after reasoning tools' }],
+          },
+        ],
+        stream: true,
+      }),
+    });
+    assert(reasoningRoundTripResponse.statusCode === 200, `Reasoning round-trip should return 200, got ${reasoningRoundTripResponse.statusCode}`);
+
+    assert(upstream.counters.chatCompletions === 3, `Streaming conversion should call Chat Completions three times, got ${upstream.counters.chatCompletions}`);
+    assert(upstream.counters.responses === 0, 'Explicit Chat Completions suppliers should not probe Responses during successful streams');
+    const openAiRequest = upstream.requests.find((request) => request.bodyJson?.messages?.some((message) => /Pi-style streaming system prompt/.test(String(message.content || ''))))?.bodyJson;
+    const anthropicRequest = upstream.requests.find((request) => request.bodyJson?.messages?.some((message) => /Claude string-form system prompt/.test(String(message.content || ''))))?.bodyJson;
+    const reasoningRequest = upstream.requests.find((request) => request.bodyJson?.messages?.some((message) => /continue after reasoning tools/.test(String(message.content || ''))))?.bodyJson;
+    assert(openAiRequest?.stream === true, 'Pi/Codex bridge requests should keep stream=true for Chat Completions');
+    assert(anthropicRequest?.stream === true, 'Claude bridge requests should keep stream=true for Chat Completions');
+    assert(openAiRequest?.messages?.some((message) => message.role === 'system' && /Pi-style streaming system prompt/.test(String(message.content || ''))), 'Pi/Codex system content should survive Chat streaming conversion');
+    assert(anthropicRequest?.messages?.some((message) => message.role === 'system' && /Claude string-form system prompt/.test(String(message.content || ''))), 'String-form Anthropic system prompts should survive Chat streaming conversion');
+    const reasoningAssistant = reasoningRequest?.messages?.find((message) => message.role === 'assistant' && /previous reasoning content/.test(String(message.reasoning_content || '')));
+    assert(reasoningAssistant, 'Responses reasoning items should become Chat reasoning_content');
+    assert(reasoningAssistant.tool_calls?.length === 2, 'Consecutive Responses function calls should stay grouped with their reasoning assistant message');
   } finally {
     await stopBridgeProcess(bridgeHandle);
     await upstream.close();
@@ -4994,7 +5589,7 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
     assert(unifiedSettings.env?.PRESERVE_ME === 'still-here', 'Claude isolated runtime settings should preserve unrelated env keys');
     assert(unifiedSettings.permissions?.allow?.[0] === 'Read(/tmp)', 'Claude isolated runtime settings should preserve unrelated top-level settings');
     assert(unifiedSettings.env?.ANTHROPIC_API_KEY, 'Claude isolated runtime settings should inject the managed API key');
-    assert(!unifiedSettings.env?.ANTHROPIC_AUTH_TOKEN, 'Claude isolated runtime settings should replace the local auth token');
+    assert(unifiedSettings.env?.ANTHROPIC_AUTH_TOKEN === unifiedSettings.env?.ANTHROPIC_API_KEY, 'Claude isolated runtime settings should pin the auth token to the local bridge');
     assert(/http:\/\/127\.0\.0\.1:\d+\/anthropic/.test(unifiedSettings.env?.ANTHROPIC_BASE_URL || ''), 'Claude isolated runtime settings should point at the local bridge');
     assert(unifiedSettings.env?.ANTHROPIC_MODEL === 'claude-sonnet-4-6[1m]', 'Claude isolated runtime settings should enable 1M context on the provider default model');
     for (const key of ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL']) {
@@ -6024,7 +6619,9 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
         templates: [{
           name: 'Regression Unified API',
           apiKey: 'sk-regression',
-          apiBase: 'https://example.com/v1',
+          // Keep /model fallback deterministic; an external example domain can
+          // take longer than the WebSocket assertion timeout on slow networks.
+          apiBase: 'http://127.0.0.1:1/v1',
           upstreamType: 'openai',
           defaultModel: 'custom-regression-model',
           opusModel: 'claude-opus-4-6',
@@ -6179,7 +6776,7 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     const claudeSettingsPath = path.join(configDir, 'claude-runtime-settings.json');
     const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
     assert(claudeSettings.env?.ANTHROPIC_API_KEY, 'Claude unified runtime should inject ANTHROPIC_API_KEY into isolated settings');
-    assert(!claudeSettings.env?.ANTHROPIC_AUTH_TOKEN, 'Claude isolated runtime settings should not contain ANTHROPIC_AUTH_TOKEN');
+    assert(claudeSettings.env?.ANTHROPIC_AUTH_TOKEN === claudeSettings.env?.ANTHROPIC_API_KEY, 'Claude unified runtime should prevent host OAuth credentials from bypassing the local bridge');
 
     const nativeSessions = await client.sendAndWaitType(
       { type: 'list_native_sessions' },
@@ -6303,12 +6900,18 @@ async function main() {
       await runner.run('custom CLI directories and server limits', () => runCustomCliDirectoriesRegressionCase(ctx));
       await runner.run('directory browser open and create folder', () => runDirectoryBrowserRegressionCase(ctx));
       await runner.run('cross-platform persistent deployment scripts', () => runDeploymentScriptsRegressionCase(ctx));
+      await runner.run('provider API endpoint normalization', () => runApiEndpointNormalizationRegressionCase(ctx));
+      await runner.run('frontend runtime error retention', () => runFrontendErrorRetentionRegressionCase(ctx));
       await runner.run('local agent model sources and startup args', () => runLocalAgentModelSourcesRegressionCase(ctx));
       await runner.run('dynamic provider model discovery', () => runDynamicProviderModelDiscoveryRegressionCase(ctx));
       await runner.run('bridge ignores legacy reasoning effort config', () => runBridgeReasoningEffortRegressionCase(ctx));
       await runner.run('bridge responses fallback', () => runBridgeResponsesFallbackRegressionCase(ctx));
+      await runner.run('bridge empty messages schema fallback', () => runBridgeEmptyMessagesFallbackRegressionCase(ctx));
+      await runner.run('bridge type-less Responses messages to Anthropic', () => runBridgeTypelessResponsesToAnthropicRegressionCase(ctx));
+      await runner.run('bridge explicit chat endpoint reverse fallback', () => runBridgeChatEndpointReverseFallbackRegressionCase(ctx));
       await runner.run('bridge responses 404 fallback', () => runBridgeResponses404FallbackRegressionCase(ctx));
       await runner.run('bridge streaming passthrough', () => runBridgeStreamingPassthroughRegressionCase(ctx));
+      await runner.run('bridge Chat Completions streaming conversion', () => runBridgeChatStreamingConversionRegressionCase(ctx));
       await runner.run('bridge upstream apiBase version compatibility', () => runBridgeUpstreamApiBaseCompatibilityRegressionCase(ctx));
       await runner.run('bridge stale process refresh', () => runBridgeScriptRefreshRegressionCase(ctx));
       await runner.run('claude local model map from settings', () => runClaudeLocalModelMapRegressionCase(ctx));

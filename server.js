@@ -17,6 +17,7 @@ const { PiRpcClient } = require('./lib/pi-rpc-client');
 const { getPiSessionFiles, parsePiSessionFile, summarizePiSessionFile } = require('./lib/pi-sessions');
 const { CodexAppServerClient } = require('./lib/codex-app-server-client');
 const { ClaudeStreamClient } = require('./lib/claude-stream-client');
+const { buildVersionedEndpointUrl, detectConfiguredEndpoint } = require('./lib/api-endpoint');
 const PACKAGE_VERSION = require('./package.json').version || 'unknown';
 
 // Load .env
@@ -1466,16 +1467,44 @@ function normalizeContextWindow(value) {
   return Number.isSafeInteger(normalized) ? normalized : null;
 }
 
+function normalizeProviderUpstreamType(value, apiBase = '', combinedHints = '') {
+  const requested = String(value || '').trim().toLowerCase();
+  const explicitEndpoint = detectConfiguredEndpoint(apiBase);
+  if (explicitEndpoint === 'messages') return 'anthropic';
+  if (explicitEndpoint === 'responses') return 'openai-responses';
+  if (explicitEndpoint === 'chat/completions') return 'openai';
+  const hints = String(combinedHints || '').toLowerCase();
+  const looksLikeAnthropicProtocol = /(^|\b)claude-|anthropic|messages\b/.test(hints);
+  const looksLikeOpenAiProtocol = /(^|\b)(gpt-|o1|o3|o4|openai|responses\b|chat\/completions)/.test(hints);
+  if (requested === 'anthropic') {
+    return looksLikeOpenAiProtocol && !looksLikeAnthropicProtocol
+      ? (/responses\b/.test(hints) ? 'openai-responses' : 'openai')
+      : 'anthropic';
+  }
+  if (requested === 'openai-responses' || requested === 'openai') return requested;
+
+  // Only infer a protocol for legacy/missing values. A version-only `/v1`
+  // base is shared by both ecosystems and therefore is not a protocol hint.
+  if (looksLikeAnthropicProtocol) return 'anthropic';
+  if (/responses\b/.test(hints)) return 'openai-responses';
+  return 'openai';
+}
+
+function providerUpstreamKind(upstreamType) {
+  return upstreamType === 'anthropic' ? 'anthropic' : 'openai';
+}
+
+function providerWireProtocol(upstreamType) {
+  if (upstreamType === 'anthropic') return 'messages';
+  return upstreamType === 'openai-responses' ? 'responses' : 'chat-completions';
+}
+
 function normalizeModelTemplate(template) {
   const apiBase = String(template?.apiBase || '').trim();
   const name = String(template?.name || '').trim();
   const defaultModel = withoutClaudeOneMillionContext(template?.defaultModel);
   const combinedHints = `${name}\n${apiBase}\n${defaultModel}`.toLowerCase();
-  const looksLikeAnthropicProtocol = /(^|\b)claude-|anthropic|messages\b/.test(combinedHints);
-  const looksLikeOpenAiProtocol = /(^|\b)(gpt-|o1|o3|o4|openai|responses\b|chat\/completions|\/v1\b)/.test(combinedHints);
-  const upstreamType = template?.upstreamType === 'anthropic'
-    ? (looksLikeOpenAiProtocol && !looksLikeAnthropicProtocol ? 'openai' : 'anthropic')
-    : 'openai';
+  const upstreamType = normalizeProviderUpstreamType(template?.upstreamType, apiBase, combinedHints);
   return {
     name,
     apiKey: String(template?.apiKey || ''),
@@ -1763,7 +1792,7 @@ function resolvePiActiveSource(config) {
     name: template.name,
     apiKey: template.apiKey,
     apiBase: String(template.apiBase || '').trim().replace(/\/+$/, ''),
-    upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+    upstreamType: template.upstreamType || 'openai',
     defaultModel: String(template.defaultModel || '').trim(),
     contextWindow: normalizeContextWindow(template.contextWindow),
   };
@@ -2084,7 +2113,7 @@ function resolveCodexUnifiedSource(config) {
       name: template.name,
       apiKey: template.apiKey,
       apiBase: template.apiBase,
-      upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+      upstreamType: template.upstreamType || 'openai',
       defaultModel: template.defaultModel || '',
       contextWindow: normalizeContextWindow(template.contextWindow),
     };
@@ -2462,15 +2491,6 @@ function getCodexModelsCachePaths(config) {
   }
   paths.push(path.join(getUserCodexHome(), 'models_cache.json'));
   return [...new Set(paths.map((item) => path.resolve(item)))];
-}
-
-function buildVersionedEndpointUrl(apiBase, endpoint) {
-  const base = String(apiBase || '').trim().replace(/\/+$/, '');
-  const normalizedEndpoint = String(endpoint || '').trim().replace(/^\/+/, '');
-  if (!base) throw new Error('缺少 API Base URL');
-  if (!normalizedEndpoint) throw new Error('缺少 API endpoint');
-  if (base.toLowerCase().endsWith(`/${normalizedEndpoint.toLowerCase()}`)) return base;
-  return /\/v\d+(?:\.\d+)?$/i.test(base) ? `${base}/${normalizedEndpoint}` : `${base}/v1/${normalizedEndpoint}`;
 }
 
 function buildFetchModelsUrl(apiBase) {
@@ -3060,7 +3080,11 @@ function buildManagedClaudeSettingsEnv(tpl, bridge) {
   const contextWindow = normalizeContextWindow(tpl?.contextWindow);
 
   if (bridge?.token) {
-    managedEnv.ANTHROPIC_API_KEY = String(bridge.token).trim();
+    const bridgeToken = String(bridge.token).trim();
+    managedEnv.ANTHROPIC_API_KEY = bridgeToken;
+    // Claude Code may otherwise prefer the host account OAuth credential over
+    // the custom API key. Pin both supported auth channels to the local bridge.
+    managedEnv.ANTHROPIC_AUTH_TOKEN = bridgeToken;
   } else if (tpl?.apiKey) {
     managedEnv.ANTHROPIC_API_KEY = String(tpl.apiKey).trim();
   }
@@ -3166,7 +3190,7 @@ function getClaudeRuntimeFingerprint(config = null) {
       mode: 'custom',
       templateName: String(tpl.name || '').trim(),
       apiBase: String(tpl.apiBase || '').trim().replace(/\/+$/, ''),
-      upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
+      upstreamType: String(tpl.upstreamType || 'openai'),
       ...(contextWindow ? { contextWindow } : {}),
     });
   }
@@ -3540,7 +3564,9 @@ function normalizeRuntimeApiBase(value) {
 }
 
 function normalizeRuntimeUpstreamType(value) {
-  return String(value === 'anthropic' ? 'anthropic' : (value || 'openai')).toLowerCase();
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'anthropic' || normalized === 'openai-responses') return normalized;
+  return 'openai';
 }
 
 function buildRuntimeChannelIdentityDescriptor(agent, descriptor = null) {
@@ -3657,7 +3683,7 @@ function buildClaudeRuntimeChannelDescriptor(session, options = {}) {
       mode: 'custom',
       templateName: String(tpl.name || ''),
       apiBase: String(tpl.apiBase || ''),
-      upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
+      upstreamType: String(tpl.upstreamType || 'openai'),
       defaultModel: String(tpl.defaultModel || ''),
       contextWindow: normalizeContextWindow(tpl.contextWindow),
       explicitModel,
@@ -5051,6 +5077,11 @@ function normalizeBridgeRuntimeUpstream(upstream) {
     apiKey,
     apiBase,
     kind: upstream.kind === 'anthropic' ? 'anthropic' : 'openai',
+    protocol: upstream.kind === 'anthropic'
+      ? 'messages'
+      : (upstream.protocol === 'responses' || upstream.protocol === 'chat-completions'
+          ? upstream.protocol
+          : 'auto'),
     defaultModel: String(upstream.defaultModel || '').trim(),
   };
 }
@@ -5200,7 +5231,8 @@ function ensureLocalBridgeRunning() {
 
 function ensureBridgeRuntimeForTemplate(tpl) {
   const defaultModel = String(tpl.defaultModel || '').trim();
-  const upstreamType = tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
+  const upstreamType = normalizeProviderUpstreamType(tpl.upstreamType, tpl.apiBase, `${tpl.name || ''}\n${tpl.defaultModel || ''}`);
+  const upstreamKind = providerUpstreamKind(upstreamType);
   const store = loadBridgeRuntimeStore();
   const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === String(tpl.name || '').trim()) || null;
   const token = existing?.token || crypto.randomBytes(24).toString('hex');
@@ -5211,7 +5243,8 @@ function ensureBridgeRuntimeForTemplate(tpl) {
       name: String(tpl.name || '').trim() || 'AI Provider',
       apiKey: String(tpl.apiKey || ''),
       apiBase: String(tpl.apiBase || '').trim(),
-      kind: upstreamType,
+      kind: upstreamKind,
+      protocol: providerWireProtocol(upstreamType),
       defaultModel,
     },
     updatedAt,
@@ -5397,7 +5430,14 @@ function condenseRuntimeError(raw) {
 
 function formatRuntimeError(agent, raw, context = {}) {
   const condensed = condenseRuntimeError(raw);
-  const exitInfo = typeof context.exitCode === 'number' ? `（退出码 ${context.exitCode}）` : '';
+  const signalName = typeof context.signal === 'string' && /^SIG[A-Z0-9]+$/.test(context.signal)
+    ? context.signal
+    : '';
+  const exitInfo = typeof context.exitCode === 'number'
+    ? `（退出码 ${context.exitCode}）`
+    : signalName
+      ? `（信号 ${signalName}）`
+      : '';
   const label = agentDisplayName(agent);
   if (!condensed) {
     return `${label} 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`;
@@ -5446,6 +5486,12 @@ function formatRuntimeError(agent, raw, context = {}) {
     }
     if (/network|timed out|timeout|ECONNRESET|ENOTFOUND|TLS|certificate|fetch failed/i.test(condensed)) {
       return 'Pi 运行时网络请求失败。请检查当前网络、代理或证书环境后重试。';
+    }
+    if (/Pi RPC process exited/i.test(condensed) && signalName) {
+      if (signalName === 'SIGTERM') {
+        return 'Pi 任务被外部终止（信号 SIGTERM）。如果不是你主动停止，可能是服务重启、系统回收或其他进程结束了 Pi。';
+      }
+      return `Pi RPC 进程意外退出（信号 ${signalName}）。请重试；如果持续发生，再检查服务运行日志。`;
     }
     return `Pi 任务失败${exitInfo}：${condensed}`;
   }
@@ -5544,7 +5590,7 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
       : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
-  plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
+  plog(completionError ? 'WARN' : (exitCode === 0 || exitCode === null ? 'INFO' : 'WARN'), 'process_complete', {
     sessionId: sessionId.slice(0, 8),
     pid: entry.pid,
     agent: entry.agent || 'claude',
@@ -6483,7 +6529,11 @@ function handleFetchProviderModels(ws, msg) {
     name: String(input.name || storedTemplate?.name || '').trim(),
     apiKey: mergeSecretField(input.apiKey, storedTemplate?.apiKey),
     apiBase: String(input.apiBase || '').trim(),
-    upstreamType: input.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+    upstreamType: normalizeProviderUpstreamType(
+      input.upstreamType,
+      input.apiBase,
+      `${input.name || ''}\n${input.apiBase || ''}`,
+    ),
   };
 
   fetchProviderModelEntries(provider)
@@ -6538,7 +6588,11 @@ function handleSaveModelConfig(ws, newConfig) {
       name: nt.name.trim(),
       apiKey: mergeSecretField(nt.apiKey, old?.apiKey),
       apiBase: nt.apiBase || '',
-      upstreamType: nt.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+      upstreamType: normalizeProviderUpstreamType(
+        nt.upstreamType,
+        nt.apiBase,
+        `${nt.name || ''}\n${nt.apiBase || ''}\n${nt.defaultModel || ''}`,
+      ),
       defaultModel: nt.defaultModel || '',
       contextWindow: normalizeContextWindow(nt.contextWindow),
     });
@@ -9523,7 +9577,7 @@ function handlePiRpcExit(runtime, info) {
   const entry = activeProcesses.get(runtime.sessionId);
   if (!entry || entry.transport !== 'pi-rpc' || entry.rpcRuntime !== runtime) return;
   if (!info.expected) entry.lastError = info.error?.message || 'Pi RPC 进程意外退出';
-  handleProcessComplete(runtime.sessionId, info.expected ? 0 : (info.code ?? 1), info.signal || null);
+  handleProcessComplete(runtime.sessionId, info.expected ? 0 : info.code, info.signal || null);
 }
 
 function sendPiRpcInteractiveRequest(runtime, event) {
