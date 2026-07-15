@@ -1064,6 +1064,19 @@ async function runAgentRuntimeEnvironmentRegressionCase({ tempRoot }) {
   assert(claudeSpec.args.includes('--include-partial-messages') && claudeSpec.args.includes('--include-hook-events'), 'Claude stream transport should request partial messages and hook events');
   const claudeEffortSpec = runtime.buildClaudeSpawnSpec({ ...session, effort: 'high' });
   assert(claudeEffortSpec.args.includes('--effort') && claudeEffortSpec.args.includes('high'), 'Claude effort should use the native --effort flag');
+  const localClaudeModelSpec = runtime.buildClaudeSpawnSpec({ ...session, model: 'claude-local-explicit' });
+  assert(localClaudeModelSpec.args[localClaudeModelSpec.args.indexOf('--model') + 1] === 'claude-local-explicit', 'Claude local models must not receive a synthetic [1m] suffix');
+  const customClaudeRuntime = createRuntimeEnvFixture(processEnv, {
+    modelConfig: {
+      mode: 'custom',
+      activeTemplate: 'Custom Claude',
+      templates: [{ name: 'Custom Claude', defaultModel: 'claude-custom-model' }],
+    },
+  });
+  const customClaudeSpec = customClaudeRuntime.buildClaudeSpawnSpec(session);
+  assert(customClaudeSpec.args[customClaudeSpec.args.indexOf('--model') + 1] === 'claude-custom-model[1m]', 'Claude custom default models should enable the native 1M context suffix');
+  const existingLongContextSpec = customClaudeRuntime.buildClaudeSpawnSpec({ ...session, model: 'claude-custom-alt[1M]' });
+  assert(existingLongContextSpec.args[existingLongContextSpec.args.indexOf('--model') + 1] === 'claude-custom-alt[1m]', 'Claude custom model suffix should be normalized without duplication');
 
   const codexEnv = runtime.buildCodexSpawnSpec(session).env;
   assert(codexEnv.CODEX_HOME === processEnv.CODEX_HOME, 'Codex should inherit CODEX_HOME');
@@ -1984,6 +1997,7 @@ async function runLocalAgentModelSourcesRegressionCase({ port, password, tempRoo
     const codexArgs = codexTurnLine ? (JSON.parse(codexTurnLine).args || '') : '';
     const piSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
     assert(claudeSpawn.includes('--model claude-local-alt'), 'Claude local CLI startup args should use the selected session model');
+    assert(!claudeSpawn.includes('claude-local-alt[1m]'), 'Claude local model selection must preserve the real local model id');
     assert(codexArgs.includes('-c model="codex-profile-model"'), 'Codex local App Server startup args should use the selected session model');
     assert(piSpawn.includes('--provider local-provider') && piSpawn.includes('--model pi-local-alt'), 'Pi local CLI startup args should split provider and model correctly');
     const storedPi = readStoredSessionFile(sessionsDir, sessions.pi.sessionId);
@@ -4093,8 +4107,10 @@ async function runAuthLockRegressionCase({ port, password }) {
 
 async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, tempRoot, configDir, logsDir, sessionsDir }) {
   const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
-  assert(!/unified-template-(?:opus|sonnet|haiku|fetch-models)/.test(appSource), 'Provider settings UI should only expose one default model field');
-  assert(!/type:\s*['"]fetch_models['"]/.test(appSource), 'Settings UI must not request model APIs directly');
+  assert(!/unified-template-(?:opus|sonnet|haiku)/.test(appSource), 'Provider settings UI should only expose one default model field');
+  assert(/id="unified-template-fetch-models"/.test(appSource), 'Provider default model field should expose a fetch-model-list button');
+  assert(/id="unified-template-context-window"/.test(appSource), 'Provider settings should expose a context-window field');
+  assert(/type:\s*['"]fetch_provider_models['"]/.test(appSource), 'Provider settings should request model discovery through the backend');
   assert(!/sonnet\[1m\]|opus\[1m\]/.test(appSource), 'Frontend model menus must not contain fixed Claude aliases');
   const showModelPickerSource = appSource.slice(appSource.indexOf('function showModelPicker'), appSource.indexOf('function showModePicker'));
   assert(/text:\s*['"]\/model['"]/.test(showModelPickerSource), 'The switch-model action should reuse the same /model backend path');
@@ -4122,6 +4138,7 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           responseField: 'models',
         },
       ];
+      let transitionSessions = null;
 
       for (const [variantIndex, variant] of variants.entries()) {
         const providerModels = [
@@ -4138,11 +4155,35 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
             description: 'Regression session selection.',
             visibility: 'list',
             supported_in_api: true,
+            context_window: 262144,
           },
           { id: variant.selectedModel, display_name: 'Duplicate should be removed' },
         ];
         upstreamOptions.modelsStatus = 200;
         upstreamOptions.modelsResponse = { [variant.responseField]: providerModels };
+
+        const draftRequestId = `provider-settings-draft-${variantIndex}`;
+        const beforeDraftFetch = upstream.counters.models;
+        const draftModels = await client.sendAndWaitType(
+          {
+            type: 'fetch_provider_models',
+            requestId: draftRequestId,
+            provider: {
+              name: `Regression ${variant.label}`,
+              originalName: '',
+              apiKey: variant.apiKey,
+              apiBase: variant.apiBase,
+              upstreamType: variant.upstreamType,
+            },
+          },
+          'provider_model_list',
+          (msg) => msg.requestId === draftRequestId,
+          8000,
+        );
+        assert(draftModels.success === true, 'Unsaved provider settings should fetch a model list');
+        assert(upstream.counters.models === beforeDraftFetch + 1, 'Settings model fetch should make one fresh provider request');
+        assert(draftModels.entries?.some((entry) => entry.value === variant.selectedModel), 'Settings model fetch should return provider model IDs');
+        assert(draftModels.entries?.find((entry) => entry.value === variant.selectedModel)?.contextWindow === 262144, 'Settings model fetch should preserve provider context metadata');
 
         const modelConfig = await saveConfigAndWait(
           client,
@@ -4155,7 +4196,8 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
               apiKey: variant.apiKey,
               apiBase: variant.apiBase,
               upstreamType: variant.upstreamType,
-              defaultModel: 'regression-api-model',
+              defaultModel: 'regression-api-model[1M]',
+              contextWindow: 200000,
               // Legacy fields must remain harmless and must not be saved back.
               opusModel: 'claude-opus-4-6',
               sonnetModel: 'claude-sonnet-4-6',
@@ -4166,9 +4208,37 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
         );
         const savedTemplate = modelConfig.config.templates?.[0] || {};
         assert(savedTemplate.defaultModel === 'regression-api-model', 'Provider default model should be saved');
+        assert(savedTemplate.contextWindow === 200000, 'Provider context window should be saved');
+        const claudeRuntimeSettings = JSON.parse(fs.readFileSync(path.join(configDir, 'claude-runtime-settings.json'), 'utf8'));
+        assert(claudeRuntimeSettings.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS === '200000', 'Claude managed runtime should receive the provider context window');
+        assert(claudeRuntimeSettings.env?.ANTHROPIC_MODEL === 'regression-api-model[1m]', 'Claude managed runtime should enable 1M context on the custom default model');
+        assert(String(savedTemplate.apiKey || '').includes('****'), 'Saved provider API key should remain masked in the browser');
         for (const legacyField of ['opusModel', 'sonnetModel', 'haikuModel']) {
           assert(!Object.prototype.hasOwnProperty.call(savedTemplate, legacyField), `Provider config should ignore legacy ${legacyField}`);
         }
+
+        const savedRequestId = `provider-settings-saved-${variantIndex}`;
+        const beforeSavedFetch = upstream.counters.models;
+        const savedModels = await client.sendAndWaitType(
+          {
+            type: 'fetch_provider_models',
+            requestId: savedRequestId,
+            provider: {
+              name: savedTemplate.name,
+              originalName: savedTemplate.name,
+              apiKey: savedTemplate.apiKey,
+              apiBase: savedTemplate.apiBase,
+              upstreamType: savedTemplate.upstreamType,
+            },
+          },
+          'provider_model_list',
+          (msg) => msg.requestId === savedRequestId,
+          8000,
+        );
+        assert(savedModels.success === true, 'Saved provider settings should fetch models with the stored API key');
+        assert(upstream.counters.models === beforeSavedFetch + 1, 'Masked-key settings fetch should make one fresh provider request');
+        assert(savedModels.entries?.some((entry) => entry.value === variant.selectedModel), 'Masked-key settings fetch should return provider models');
+        assert(savedModels.entries?.find((entry) => entry.value === variant.selectedModel)?.contextWindow === 262144, 'Masked-key settings fetch should preserve context metadata');
 
         await saveConfigAndWait(
           client,
@@ -4180,12 +4250,16 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           },
           'codex_config',
         );
+        const codexRuntimeConfig = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
+        assert(codexRuntimeConfig.includes('model_context_window = 200000'), 'Codex managed runtime should receive the provider context window');
         await saveConfigAndWait(
           client,
           'save_pi_config',
           { mode: 'unified', sharedTemplate: `Regression ${variant.label}` },
           'pi_config',
         );
+        const piProviderConfig = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'models.json'), 'utf8'));
+        assert(piProviderConfig.providers?.webcoding?.models?.every((model) => model.contextWindow === 200000), 'Pi managed runtime should receive the provider context window');
 
         const requestsBeforeSessions = upstream.counters.models;
         const sessions = {};
@@ -4200,6 +4274,7 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           assert(sessions[agent].model === null, `${agent} new session should keep provider default as a non-overridden session model`);
           assert(sessions[agent].activeRuntime?.defaultModel === 'regression-api-model', `${agent} new session should resolve the configured provider default`);
         }
+        if (variantIndex === 0) transitionSessions = sessions;
         assert(upstream.counters.models === requestsBeforeSessions, 'Saving settings and creating sessions must not request the model API');
 
         if (variantIndex === 0) {
@@ -4217,9 +4292,10 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           const codexDefaultTurn = findProcessLogLines(logsDir, sessions.codex.sessionId, 'codex_app_turn_start').at(-1) || '';
           const piDefaultSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
           const codexDefaultArgs = codexDefaultTurn ? (JSON.parse(codexDefaultTurn).args || '') : '';
-          assert(claudeDefaultSpawn.includes('--model regression-api-model'), 'Claude new session should launch with the provider default model');
+          assert(claudeDefaultSpawn.includes('--model regression-api-model[1m]'), 'Claude new session should launch the provider default model with 1M context enabled');
           assert(codexDefaultArgs.includes('-c model="regression-api-model"'), 'Codex new session should launch with the provider default model');
           assert(piDefaultSpawn.includes('--model regression-api-model'), 'Pi new session should launch with the provider default model');
+          assert(!codexDefaultArgs.includes('[1m]') && !piDefaultSpawn.includes('[1m]'), 'Claude 1M suffix must not leak into Codex or Pi');
         }
 
         for (const agent of ['claude', 'codex', 'pi']) {
@@ -4232,6 +4308,8 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           );
           assert(modelList.success === true, `${agent} /model ${variant.label} should return a successful provider list`);
           assert(modelList.source === `provider-api:${variant.upstreamType}`, `${agent} should report the current provider API source`);
+          assert(modelList.sourceKind === 'provider', `${agent} custom /model should identify the provider source kind`);
+          assert(modelList.sourceLabel === `AI 提供商「Regression ${variant.label}」`, `${agent} custom /model should identify the selected provider`);
           assert(upstream.counters.models === beforeRequest + 1, `${agent} /model should make one fresh provider models request`);
           const ids = (modelList.entries || []).map((entry) => entry.value);
           assert(ids.includes(variant.selectedModel), `${agent} /model should include the provider model`);
@@ -4273,9 +4351,10 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
           const codexSelectedTurn = findProcessLogLines(logsDir, sessions.codex.sessionId, 'codex_app_turn_start').at(-1) || '';
           const piSelectedSpawn = findProcessLogLines(logsDir, sessions.pi.sessionId, 'process_spawn').at(-1) || '';
           const codexSelectedArgs = codexSelectedTurn ? (JSON.parse(codexSelectedTurn).args || '') : '';
-          assert(claudeSelectedSpawn.includes(`--model ${variant.selectedModel}`), 'Claude CLI startup args should use the selected session model');
+          assert(claudeSelectedSpawn.includes(`--model ${variant.selectedModel}[1m]`), 'Claude CLI startup args should enable 1M context on the selected custom model');
           assert(codexSelectedArgs.includes(`-c model="${variant.selectedModel}"`), 'Codex CLI startup args should use the selected session model');
           assert(piSelectedSpawn.includes(`--model ${variant.selectedModel}`), 'Pi CLI startup args should use the selected session model');
+          assert(!codexSelectedArgs.includes('[1m]') && !piSelectedSpawn.includes('[1m]'), 'Claude selected-model suffix must remain Claude-only');
           const piManagedModels = JSON.parse(fs.readFileSync(path.join(configDir, 'pi-runtime-home', 'models.json'), 'utf8'));
           const managedPiIds = (piManagedModels.providers?.webcoding?.models || []).map((model) => model.id);
           assert(managedPiIds.includes('regression-api-model') && managedPiIds.includes(variant.selectedModel), 'Pi managed runtime should register both provider default and current session model');
@@ -4321,10 +4400,34 @@ async function runDynamicProviderModelDiscoveryRegressionCase({ port, password, 
         { mode: 'local', sharedTemplate: '' },
         'pi_config',
       );
+      assert(transitionSessions, 'Provider/local transition sessions should be available');
+      const expectedLocalModels = {
+        claude: 'claude-local-default',
+        codex: 'codex-profile-model',
+        pi: 'local-provider/local-model',
+      };
+      const requestsBeforeLocalMenus = upstream.counters.models;
+      for (const agent of ['claude', 'codex', 'pi']) {
+        const localList = await client.sendAndWaitType(
+          buildAgentMessagePayload({
+            text: '/model',
+            sessionId: transitionSessions[agent].sessionId,
+            mode: 'yolo',
+            agent,
+          }),
+          'model_list',
+          (msg) => msg.sessionId === transitionSessions[agent].sessionId && msg.agent === agent,
+          8000,
+        );
+        assert(localList.sourceKind === 'local', `${agent} local /model should identify the local source kind after switching configurations`);
+        assert(localList.sourceLabel === `${agent === 'claude' ? 'Claude' : agent === 'codex' ? 'Codex' : 'Pi'} 本地配置`, `${agent} local /model should identify the local configuration`);
+        assert(localList.entries?.some((entry) => entry.value === expectedLocalModels[agent]), `${agent} local /model should return real local models after switching from a provider`);
+      }
+      assert(upstream.counters.models === requestsBeforeLocalMenus, 'Local /model menus must not call the custom provider model API');
     });
 
     const modelRequests = upstream.requests.filter((req) => req.path === '/v1/models');
-    assert(modelRequests.length >= 7, `Dynamic model discovery should query /v1/models for every explicit menu request, got ${modelRequests.length}`);
+    assert(modelRequests.length >= 11, `Dynamic model discovery should query /v1/models for every explicit settings or menu request, got ${modelRequests.length}`);
     assert(!upstream.requests.some((req) => req.path.includes('/v1/v1/')), 'Dynamic model discovery must not duplicate /v1 in upstream paths');
   } finally {
     await upstream.close();
@@ -4889,7 +4992,7 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
     assert(unifiedSettings.env?.ANTHROPIC_API_KEY, 'Claude isolated runtime settings should inject the managed API key');
     assert(!unifiedSettings.env?.ANTHROPIC_AUTH_TOKEN, 'Claude isolated runtime settings should replace the local auth token');
     assert(/http:\/\/127\.0\.0\.1:\d+\/anthropic/.test(unifiedSettings.env?.ANTHROPIC_BASE_URL || ''), 'Claude isolated runtime settings should point at the local bridge');
-    assert(unifiedSettings.env?.ANTHROPIC_MODEL === 'claude-sonnet-4-6', 'Claude isolated runtime settings should inject only the provider default model');
+    assert(unifiedSettings.env?.ANTHROPIC_MODEL === 'claude-sonnet-4-6[1m]', 'Claude isolated runtime settings should enable 1M context on the provider default model');
     for (const key of ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL']) {
       assert(!Object.prototype.hasOwnProperty.call(unifiedSettings.env || {}, key), `Claude isolated runtime settings should not inject ${key}`);
     }

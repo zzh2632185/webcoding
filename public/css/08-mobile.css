@@ -235,6 +235,8 @@
 @media (max-width: 480px) {
   .settings-panel { width: 95%; padding: 20px 16px; }
   .settings-nav-card { padding: 13px 14px; }
+  .settings-input-row { flex-direction: column; }
+  .settings-field-action { width: 100%; min-height: 44px; }
   .settings-back,
   .settings-panel h3 .settings-close,
   .settings-header .settings-close {

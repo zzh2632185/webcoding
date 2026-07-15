@@ -4004,7 +4004,7 @@
         agent,
       });
     }, {
-      statusMessage: msg.error || '',
+      statusMessage: msg.error || (msg.sourceLabel ? `模型来源：${msg.sourceLabel}` : ''),
       statusKind: msg.error ? 'error' : '',
       retryLabel: msg.retryable ? '重试' : '',
       onRetry: msg.retryable ? showModelPicker : null,
@@ -4498,6 +4498,9 @@
     },
     tunnel_install_progress: (msg) => {
       emitWsEvent('tunnel_install_progress', msg);
+    },
+    provider_model_list: (msg) => {
+      emitWsEvent('provider_model_list', msg);
     },
     model_config: handleModelConfigMessage,
     codex_config: handleCodexConfigMessage,
@@ -8322,11 +8325,21 @@
       <div class="settings-divider" style="margin:12px 0"></div>
 
       <div class="settings-field">
-        <label>默认模型</label>
-        <input type="text" id="unified-template-default" placeholder="输入新会话默认使用的模型 ID" value="${escapeHtml(draft.defaultModel || '')}" autocomplete="off">
+        <label for="unified-template-default">默认模型</label>
+        <div class="settings-input-row">
+          <input type="text" id="unified-template-default" placeholder="输入新会话默认使用的模型 ID" value="${escapeHtml(draft.defaultModel || '')}" autocomplete="off">
+          <button type="button" class="settings-field-action" id="unified-template-fetch-models" aria-controls="unified-template-model-options" aria-expanded="false">获取模型列表</button>
+        </div>
+        <div class="settings-field-status" id="unified-template-model-status" role="status" aria-live="polite" hidden></div>
+        <div class="settings-model-options" id="unified-template-model-options" hidden></div>
+      </div>
+      <div class="settings-field">
+        <label for="unified-template-context-window">上下文长度（可选）</label>
+        <input type="number" id="unified-template-context-window" min="1" step="1" inputmode="numeric" placeholder="例如 200000" value="${escapeHtml(draft.contextWindow || '')}" autocomplete="off">
+        <div class="settings-field-help">Claude 自定义模型会自动以 <code>[1M]</code> 模式运行；这里填写的 Token 数会按 Claude、Codex、Pi 各自格式写入运行时，最终上限仍不超过模型服务允许值。</div>
       </div>
       <div class="settings-inline-note">
-        这套 AI 提供商配置会出现在 Claude、Codex 和 Pi 的渠道下拉框里。模型列表只会在会话中使用 <code>/model</code> 或点击“切换模型”时由后端实时获取。
+        这套 AI 提供商配置会出现在 Claude、Codex 和 Pi 的渠道下拉框里。获取到的模型列表不会写入配置，只会保存你选中的默认模型 ID。
       </div>
       <div class="settings-actions">
         <button class="btn-save" id="unified-template-ok">确定</button>
@@ -8711,6 +8724,7 @@
         apiBase: '',
         upstreamType: 'openai',
         defaultModel: '',
+        contextWindow: '',
       };
 
       const { overlay: modalOverlay, panel: modal, close: closeModal } = createOverlayPanel({
@@ -8719,6 +8733,77 @@
         panelHtml: buildUnifiedTemplateModalHtml(current, draft),
       });
 
+      const nameInput = modal.querySelector('#unified-template-name');
+      const apiKeyInput = modal.querySelector('#unified-template-apikey');
+      const apiBaseInput = modal.querySelector('#unified-template-apibase');
+      const upstreamTypeSelect = modal.querySelector('#unified-template-upstream-type');
+      const defaultModelInput = modal.querySelector('#unified-template-default');
+      const contextWindowInput = modal.querySelector('#unified-template-context-window');
+      const fetchModelsBtn = modal.querySelector('#unified-template-fetch-models');
+      const modelStatus = modal.querySelector('#unified-template-model-status');
+      const modelOptions = modal.querySelector('#unified-template-model-options');
+      let autoFilledContextWindow = '';
+
+      contextWindowInput.addEventListener('input', () => {
+        autoFilledContextWindow = '';
+      });
+
+      const setModelStatus = (message = '', kind = '') => {
+        modelStatus.textContent = message;
+        modelStatus.className = `settings-field-status${kind ? ` ${kind}` : ''}`;
+        modelStatus.hidden = !message;
+      };
+
+      const renderModelOptions = (entries) => {
+        const options = Array.isArray(entries) ? entries : [];
+        const currentValue = defaultModelInput.value.trim();
+        modelOptions.innerHTML = options.map((entry) => {
+          const value = String(entry?.value || '').trim();
+          const label = String(entry?.label || value).trim() || value;
+          const contextWindow = Number(entry?.contextWindow);
+          const contextDesc = Number.isSafeInteger(contextWindow) && contextWindow > 0
+            ? `${contextWindow.toLocaleString()} Token 上下文`
+            : '';
+          const desc = [
+            String(entry?.desc || (label !== value ? `模型 ID：${value}` : '')).trim(),
+            contextDesc,
+          ].filter(Boolean).join(' · ');
+          const active = value === currentValue;
+          return `
+            <button type="button" class="settings-model-option${active ? ' active' : ''}" data-value="${escapeHtml(value)}" aria-pressed="${active ? 'true' : 'false'}">
+              <span class="settings-model-option-copy">
+                <span class="settings-model-option-label">${escapeHtml(label)}</span>
+                ${desc ? `<span class="settings-model-option-desc">${escapeHtml(desc)}</span>` : ''}
+              </span>
+              <span class="settings-model-option-check" aria-hidden="true">${active ? '✓' : ''}</span>
+            </button>
+          `;
+        }).join('');
+        modelOptions.hidden = options.length === 0;
+        fetchModelsBtn.setAttribute('aria-expanded', options.length ? 'true' : 'false');
+        modelOptions.querySelectorAll('.settings-model-option').forEach((button) => {
+          button.addEventListener('click', () => {
+            defaultModelInput.value = button.dataset.value || '';
+            const selectedEntry = options.find((entry) => String(entry?.value || '').trim() === defaultModelInput.value);
+            const selectedContextWindow = Number(selectedEntry?.contextWindow);
+            if (Number.isSafeInteger(selectedContextWindow) && selectedContextWindow > 0) {
+              contextWindowInput.value = String(selectedContextWindow);
+              autoFilledContextWindow = contextWindowInput.value;
+            } else if (autoFilledContextWindow && contextWindowInput.value === autoFilledContextWindow) {
+              contextWindowInput.value = '';
+              autoFilledContextWindow = '';
+            }
+            renderModelOptions(options);
+            setModelStatus(
+              Number.isSafeInteger(selectedContextWindow) && selectedContextWindow > 0
+                ? `已选择默认模型：${defaultModelInput.value}，并填入上下文长度。`
+                : `已选择默认模型：${defaultModelInput.value}`,
+              'success'
+            );
+          });
+        });
+      };
+
       const closeTemplateModal = () => {
         closeModal();
       };
@@ -8726,12 +8811,72 @@
       modal.querySelector('#unified-template-modal-close').addEventListener('click', closeTemplateModal);
       modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeTemplateModal(); });
 
+      fetchModelsBtn.addEventListener('click', async () => {
+        const apiKey = apiKeyInput.value.trim();
+        const apiBase = apiBaseInput.value.trim();
+        if (!apiKey) {
+          setModelStatus('请先填写 API Key。', 'error');
+          apiKeyInput.focus();
+          return;
+        }
+        if (!apiBase) {
+          setModelStatus('请先填写 API Base URL。', 'error');
+          apiBaseInput.focus();
+          return;
+        }
+
+        const requestId = nextLocalId('provider-models');
+        const responsePromise = waitForWsEvent('provider_model_list', {
+          timeoutMs: 18_000,
+          predicate: (payload) => payload?.requestId === requestId,
+        });
+        fetchModelsBtn.disabled = true;
+        fetchModelsBtn.textContent = '正在获取…';
+        fetchModelsBtn.setAttribute('aria-expanded', 'false');
+        modelOptions.hidden = true;
+        modelOptions.innerHTML = '';
+        setModelStatus('正在连接服务商并读取模型列表…');
+        send({
+          type: 'fetch_provider_models',
+          requestId,
+          provider: {
+            name: nameInput.value.trim(),
+            originalName: current?.originalName || '',
+            apiKey,
+            apiBase,
+            upstreamType: upstreamTypeSelect.value,
+          },
+        });
+
+        try {
+          const result = await responsePromise;
+          if (!modalOverlay.isConnected) return;
+          const entries = (Array.isArray(result?.entries) ? result.entries : [])
+            .filter((entry) => String(entry?.value || '').trim());
+          if (!result?.success || entries.length === 0) {
+            setModelStatus(result?.error || '当前服务商没有返回可用模型。', 'error');
+            return;
+          }
+          renderModelOptions(entries);
+          setModelStatus(`已获取 ${entries.length} 个模型，请选择一个。`, 'success');
+        } catch {
+          if (modalOverlay.isConnected) setModelStatus('获取模型列表超时，请重试。', 'error');
+        } finally {
+          if (modalOverlay.isConnected) {
+            fetchModelsBtn.disabled = false;
+            fetchModelsBtn.textContent = '获取模型列表';
+          }
+        }
+      });
+
       modal.querySelector('#unified-template-ok').addEventListener('click', () => {
-        const name = modal.querySelector('#unified-template-name').value.trim();
-        const apiKey = modal.querySelector('#unified-template-apikey').value.trim();
-        const apiBase = modal.querySelector('#unified-template-apibase').value.trim();
-        const upstreamType = modal.querySelector('#unified-template-upstream-type').value;
-        const defaultModel = modal.querySelector('#unified-template-default').value.trim();
+        const name = nameInput.value.trim();
+        const apiKey = apiKeyInput.value.trim();
+        const apiBase = apiBaseInput.value.trim();
+        const upstreamType = upstreamTypeSelect.value;
+        const defaultModel = defaultModelInput.value.trim();
+        const contextWindowRaw = contextWindowInput.value.trim();
+        const contextWindow = contextWindowRaw ? Number(contextWindowRaw) : null;
 
         if (!name) {
           alert('请填写提供商名称');
@@ -8743,6 +8888,11 @@
         }
         if (!apiBase) {
           alert('请填写 API Base URL');
+          return;
+        }
+        if (contextWindowRaw && (!Number.isSafeInteger(contextWindow) || contextWindow <= 0)) {
+          alert('上下文长度需要填写大于 0 的整数');
+          contextWindowInput.focus();
           return;
         }
 
@@ -8760,6 +8910,7 @@
           current.apiBase = apiBase;
           current.upstreamType = upstreamType;
           current.defaultModel = defaultModel;
+          current.contextWindow = contextWindow;
           if (providerEditorSelection === previousName) providerEditorSelection = name;
           if (selectedClaudeChannel === previousName) selectedClaudeChannel = name;
           if (selectedCodexChannel === previousName) selectedCodexChannel = name;
@@ -8772,6 +8923,7 @@
             apiBase,
             upstreamType,
             defaultModel,
+            contextWindow,
           });
           if (!providerEditorSelection) providerEditorSelection = name;
         }

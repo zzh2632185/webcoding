@@ -6,7 +6,11 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
-const { createAgentRuntime } = require('./lib/agent-runtime');
+const {
+  createAgentRuntime,
+  withClaudeOneMillionContext,
+  withoutClaudeOneMillionContext,
+} = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 const { getStaticHeadlessCapabilities } = require('./lib/runtime-capabilities');
 const { PiRpcClient } = require('./lib/pi-rpc-client');
@@ -1435,7 +1439,7 @@ const VALID_AGENTS = new Set(['claude', 'codex', 'pi']);
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
-  templates: [],      // array of { name, apiKey, apiBase, upstreamType, defaultModel }
+  templates: [],      // array of { name, apiKey, apiBase, upstreamType, defaultModel, contextWindow }
   activeTemplate: '', // name of active template (for 'custom' mode)
 };
 
@@ -1454,10 +1458,18 @@ const DEFAULT_PI_CONFIG = {
   sharedTemplate: '',
 };
 
+function normalizeContextWindow(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  const normalized = Math.trunc(parsed);
+  return Number.isSafeInteger(normalized) ? normalized : null;
+}
+
 function normalizeModelTemplate(template) {
   const apiBase = String(template?.apiBase || '').trim();
   const name = String(template?.name || '').trim();
-  const defaultModel = String(template?.defaultModel || '').trim();
+  const defaultModel = withoutClaudeOneMillionContext(template?.defaultModel);
   const combinedHints = `${name}\n${apiBase}\n${defaultModel}`.toLowerCase();
   const looksLikeAnthropicProtocol = /(^|\b)claude-|anthropic|messages\b/.test(combinedHints);
   const looksLikeOpenAiProtocol = /(^|\b)(gpt-|o1|o3|o4|openai|responses\b|chat\/completions|\/v1\b)/.test(combinedHints);
@@ -1470,6 +1482,7 @@ function normalizeModelTemplate(template) {
     apiBase,
     upstreamType,
     defaultModel,
+    contextWindow: normalizeContextWindow(template?.contextWindow),
   };
 }
 
@@ -1752,6 +1765,7 @@ function resolvePiActiveSource(config) {
     apiBase: String(template.apiBase || '').trim().replace(/\/+$/, ''),
     upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
     defaultModel: String(template.defaultModel || '').trim(),
+    contextWindow: normalizeContextWindow(template.contextWindow),
   };
 }
 
@@ -1918,6 +1932,7 @@ function getPiRuntimeFingerprint(config) {
     });
   }
   if (source.error) return `error:${source.error}`;
+  const contextWindow = normalizeContextWindow(source.contextWindow);
   return JSON.stringify({
     runtimeVersion: 2,
     mode: 'remote',
@@ -1925,6 +1940,7 @@ function getPiRuntimeFingerprint(config) {
     apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
     upstreamType: String(source.upstreamType || 'openai').toLowerCase(),
     defaultModel: String(source.defaultModel || '').trim(),
+    ...(contextWindow ? { contextWindow } : {}),
     userSettingsFingerprint: fileContentFingerprint(path.join(getUserPiAgentDir(), 'settings.json')),
   });
 }
@@ -1960,7 +1976,11 @@ function preparePiCustomRuntime(config, sessionModel = '') {
         baseUrl: bridgeBaseUrl,
         api,
         apiKey: '$WEBCODING_PI_API_KEY',
-        models: runtimeModelIds.map((modelId) => ({ id: modelId, name: modelId })),
+        models: runtimeModelIds.map((modelId) => ({
+          id: modelId,
+          name: modelId,
+          ...(source.contextWindow ? { contextWindow: source.contextWindow } : {}),
+        })),
       },
     },
   };
@@ -1988,6 +2008,7 @@ function preparePiCustomRuntime(config, sessionModel = '') {
     defaultModel: defaultModelId,
     profileName: source.name,
     upstreamType: source.upstreamType,
+    contextWindow: source.contextWindow || null,
   };
 }
 
@@ -2013,6 +2034,7 @@ function getModelConfigMasked() {
       apiBase: t.apiBase || '',
       upstreamType: t.upstreamType || 'openai',
       defaultModel: t.defaultModel || '',
+      contextWindow: normalizeContextWindow(t.contextWindow),
     })),
   };
 }
@@ -2064,6 +2086,7 @@ function resolveCodexUnifiedSource(config) {
       apiBase: template.apiBase,
       upstreamType: template.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
       defaultModel: template.defaultModel || '',
+      contextWindow: normalizeContextWindow(template.contextWindow),
     };
   }
 
@@ -2107,12 +2130,14 @@ function getCodexRuntimeFingerprint(config) {
     });
   }
   if (source.error) return `error:${source.error}`;
+  const contextWindow = normalizeContextWindow(source.contextWindow);
   return JSON.stringify({
     runtimeVersion: 5,
     mode: 'remote',
     sourceName: String(source.name || '').trim(),
     apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
     upstreamType: String(source.upstreamType || 'openai').toLowerCase(),
+    ...(contextWindow ? { contextWindow } : {}),
   });
 }
 
@@ -2358,6 +2383,7 @@ function prepareCodexCustomRuntime(config) {
     `# bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}`,
     `# bridge_api_key = ${tomlString(bridge.token)}`,
     bridge.defaultModel ? `model = ${tomlString(bridge.defaultModel)}` : null,
+    source.contextWindow ? `model_context_window = ${source.contextWindow}` : null,
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
     '',
@@ -2377,6 +2403,7 @@ function prepareCodexCustomRuntime(config) {
     apiBase: bridge.openaiBaseUrl,
     profileName: source.name,
     defaultModel: bridge.defaultModel || '',
+    contextWindow: source.contextWindow || null,
   };
 }
 
@@ -2505,11 +2532,20 @@ function normalizeProviderModelEntries(payload) {
     if (!value || seen.has(value)) continue;
     const visibility = String(raw?.visibility || '').trim().toLowerCase();
     if (visibility === 'hide' || visibility === 'hidden' || raw?.supported_in_api === false) continue;
+    const contextWindow = normalizeContextWindow(
+      raw?.contextWindow
+      ?? raw?.context_window
+      ?? raw?.contextLength
+      ?? raw?.context_length
+      ?? raw?.maxContextLength
+      ?? raw?.max_context_length,
+    );
     seen.add(value);
     entries.push({
       value,
       label: String(raw?.display_name || raw?.displayName || raw?.title || raw?.name || value).trim() || value,
       desc: String(raw?.description || raw?.summary || `模型 ID：${value}`).trim(),
+      ...(contextWindow ? { contextWindow } : {}),
     });
   }
   return entries;
@@ -2642,11 +2678,13 @@ function mergeModelEntries(...entryGroups) {
     for (const entry of Array.isArray(entries) ? entries : []) {
       const value = String(entry?.value || '').trim();
       if (!value || seen.has(value)) continue;
+      const contextWindow = normalizeContextWindow(entry?.contextWindow);
       seen.add(value);
       merged.push({
         value,
         label: String(entry?.label || value),
         desc: String(entry?.desc || `模型 ID：${value}`),
+        ...(contextWindow ? { contextWindow } : {}),
       });
     }
   }
@@ -2688,6 +2726,8 @@ function buildAgentModelMenuPayload(session, agent, options = {}) {
     currentFull,
     defaultModel,
     source: options.source || null,
+    sourceKind: options.sourceKind || null,
+    sourceLabel: options.sourceLabel || null,
     success: !options.error,
     error: options.error ? String(options.error) : null,
     retryable: !!options.error,
@@ -2704,18 +2744,26 @@ async function getCodexModelMenuPayload(session) {
         entries: fetched.entries,
         defaultModel: activeSource.defaultModel,
         source: fetched.source,
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${activeSource.name}」`,
       });
     } catch (error) {
       plog('WARN', 'codex_model_fetch_failed', { error: error.message });
       return buildAgentModelMenuPayload(session, 'codex', {
         defaultModel: activeSource.defaultModel,
         source: 'provider-api',
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${activeSource.name}」`,
         error: `获取当前服务商模型失败：${error.message}`,
       });
     }
   }
   if (activeSource?.error) {
-    return buildAgentModelMenuPayload(session, 'codex', { error: activeSource.error });
+    return buildAgentModelMenuPayload(session, 'codex', {
+      sourceKind: 'provider',
+      sourceLabel: 'AI 提供商',
+      error: activeSource.error,
+    });
   }
 
   const localConfig = loadCodexLocalConfigModels();
@@ -2746,6 +2794,8 @@ async function getCodexModelMenuPayload(session) {
     entries,
     defaultModel: localConfig.defaultModel,
     source: runtimeEntries.length ? 'codex-app-server' : (cacheEntries.length ? 'codex-local-cache' : 'codex-local-config'),
+    sourceKind: 'local',
+    sourceLabel: 'Codex 本地配置',
     ...(!entries.length ? {
       error: runtimeError
         ? `读取 Codex 本地模型失败：${runtimeError.message}`
@@ -2951,7 +3001,7 @@ function fileContentFingerprint(filePath) {
 const CLAUDE_SETTINGS_PATH = path.join(getClaudeConfigDir(), 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_REASONING_MODEL'];
+  'ANTHROPIC_REASONING_MODEL','CLAUDE_CODE_MAX_CONTEXT_TOKENS'];
 const LOCAL_CLAUDE_BRIDGE_BASE_RE = /^http:\/\/127\.0\.0\.1:\d+\/anthropic\/?$/i;
 
 function readClaudeSettings() {
@@ -3006,7 +3056,8 @@ function extractManagedClaudeSettingsEnv(env) {
 
 function buildManagedClaudeSettingsEnv(tpl, bridge) {
   const managedEnv = {};
-  const defaultModel = String(tpl?.defaultModel || '').trim();
+  const defaultModel = withClaudeOneMillionContext(tpl?.defaultModel);
+  const contextWindow = normalizeContextWindow(tpl?.contextWindow);
 
   if (bridge?.token) {
     managedEnv.ANTHROPIC_API_KEY = String(bridge.token).trim();
@@ -3016,6 +3067,7 @@ function buildManagedClaudeSettingsEnv(tpl, bridge) {
   if (bridge?.anthropicBaseUrl) managedEnv.ANTHROPIC_BASE_URL = String(bridge.anthropicBaseUrl).trim();
   else if (tpl?.apiBase) managedEnv.ANTHROPIC_BASE_URL = String(tpl.apiBase).trim();
   if (defaultModel) managedEnv.ANTHROPIC_MODEL = defaultModel;
+  if (contextWindow) managedEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(contextWindow);
   return managedEnv;
 }
 
@@ -3108,12 +3160,14 @@ function getClaudeRuntimeFingerprint(config = null) {
   const modelConfig = config || loadModelConfig();
   const tpl = getClaudeSelectedTemplate(modelConfig);
   if (tpl) {
+    const contextWindow = normalizeContextWindow(tpl.contextWindow);
     return JSON.stringify({
       runtimeVersion: 3,
       mode: 'custom',
       templateName: String(tpl.name || '').trim(),
       apiBase: String(tpl.apiBase || '').trim().replace(/\/+$/, ''),
       upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
+      ...(contextWindow ? { contextWindow } : {}),
     });
   }
 
@@ -3492,6 +3546,7 @@ function normalizeRuntimeUpstreamType(value) {
 function buildRuntimeChannelIdentityDescriptor(agent, descriptor = null) {
   const normalizedAgent = normalizeAgent(agent);
   const mode = String(descriptor?.mode || 'local').toLowerCase();
+  const contextWindow = normalizeContextWindow(descriptor?.contextWindow);
   if (mode === 'legacy') {
     return {
       mode: 'legacy',
@@ -3514,6 +3569,7 @@ function buildRuntimeChannelIdentityDescriptor(agent, descriptor = null) {
       sourceName: String(descriptor?.sourceName || ''),
       apiBase: normalizeRuntimeApiBase(descriptor?.apiBase),
       upstreamType: normalizeRuntimeUpstreamType(descriptor?.upstreamType),
+      ...(contextWindow ? { contextWindow } : {}),
     };
   }
   return {
@@ -3521,6 +3577,7 @@ function buildRuntimeChannelIdentityDescriptor(agent, descriptor = null) {
     templateName: String(descriptor?.templateName || ''),
     apiBase: normalizeRuntimeApiBase(descriptor?.apiBase),
     upstreamType: normalizeRuntimeUpstreamType(descriptor?.upstreamType),
+    ...(contextWindow ? { contextWindow } : {}),
   };
 }
 
@@ -3602,6 +3659,7 @@ function buildClaudeRuntimeChannelDescriptor(session, options = {}) {
       apiBase: String(tpl.apiBase || ''),
       upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
       defaultModel: String(tpl.defaultModel || ''),
+      contextWindow: normalizeContextWindow(tpl.contextWindow),
       explicitModel,
     };
   }
@@ -3638,6 +3696,7 @@ function buildCodexRuntimeChannelDescriptor(session, options = {}) {
     apiBase: String(source.apiBase || ''),
     upstreamType: String(source.upstreamType || 'openai'),
     defaultModel: String(source.defaultModel || ''),
+    contextWindow: normalizeContextWindow(source.contextWindow),
     explicitModel,
   };
 }
@@ -3671,6 +3730,7 @@ function buildPiRuntimeChannelDescriptor(session, options = {}) {
     apiBase: String(source.apiBase || ''),
     upstreamType: String(source.upstreamType || 'openai'),
     defaultModel: String(source.defaultModel || ''),
+    contextWindow: normalizeContextWindow(source.contextWindow),
     explicitModel,
     provider: PI_MANAGED_PROVIDER_ID,
   };
@@ -4080,12 +4140,16 @@ async function getClaudeModelMenuPayload(session) {
         entries: fetched.entries,
         defaultModel: provider.defaultModel,
         source: fetched.source,
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${provider.name}」`,
       });
     } catch (error) {
       plog('WARN', 'claude_model_fetch_failed', { error: error.message });
       return buildAgentModelMenuPayload(session, 'claude', {
         defaultModel: provider.defaultModel,
         source: 'provider-api',
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${provider.name}」`,
         error: `获取当前服务商模型失败：${error.message}`,
       });
     }
@@ -4095,6 +4159,8 @@ async function getClaudeModelMenuPayload(session) {
     entries: local.entries,
     defaultModel: local.defaultModel,
     source: local.source,
+    sourceKind: 'local',
+    sourceLabel: 'Claude 本地配置',
     ...(!local.entries.length ? {
       error: '未在 Claude 本地 settings、.claude.json 或环境变量中找到已配置的模型。',
     } : {}),
@@ -6200,6 +6266,9 @@ wss.on('connection', (ws, req) => {
       case 'get_model_config':
         wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
         break;
+      case 'fetch_provider_models':
+        handleFetchProviderModels(ws, msg);
+        break;
       case 'save_model_config':
         handleSaveModelConfig(ws, msg.config);
         break;
@@ -6403,6 +6472,47 @@ function handleChangePassword(ws, msg) {
 }
 
 // === Model Config Handler ===
+function handleFetchProviderModels(ws, msg) {
+  const requestId = String(msg?.requestId || '').slice(0, 160);
+  const input = msg?.provider && typeof msg.provider === 'object' ? msg.provider : {};
+  const config = loadModelConfig();
+  const lookupName = String(input.originalName || input.name || '').trim();
+  const storedTemplate = (Array.isArray(config.templates) ? config.templates : [])
+    .find((template) => template.name === lookupName);
+  const provider = {
+    name: String(input.name || storedTemplate?.name || '').trim(),
+    apiKey: mergeSecretField(input.apiKey, storedTemplate?.apiKey),
+    apiBase: String(input.apiBase || '').trim(),
+    upstreamType: input.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+  };
+
+  fetchProviderModelEntries(provider)
+    .then((result) => {
+      wsSend(ws, {
+        type: 'provider_model_list',
+        requestId,
+        success: true,
+        entries: result.entries,
+        source: result.source,
+      });
+    })
+    .catch((error) => {
+      const safeError = redactProviderSecret(error?.message || String(error), provider.apiKey);
+      plog('WARN', 'provider_settings_model_fetch_failed', {
+        provider: provider.name || null,
+        upstreamType: provider.upstreamType,
+        error: safeError,
+      });
+      wsSend(ws, {
+        type: 'provider_model_list',
+        requestId,
+        success: false,
+        entries: [],
+        error: `获取模型列表失败：${safeError}`,
+      });
+    });
+}
+
 function handleSaveModelConfig(ws, newConfig) {
   if (!newConfig || !['local', 'custom'].includes(newConfig.mode)) {
     return wsSend(ws, { type: 'error', message: '无效的模型配置' });
@@ -6430,6 +6540,7 @@ function handleSaveModelConfig(ws, newConfig) {
       apiBase: nt.apiBase || '',
       upstreamType: nt.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
       defaultModel: nt.defaultModel || '',
+      contextWindow: normalizeContextWindow(nt.contextWindow),
     });
   }
   if (merged.mode === 'custom' && !selectTemplateByName(merged.templates, merged.activeTemplate)) {
@@ -9871,18 +9982,26 @@ async function getPiModelMenuPayload(session) {
         entries: fetched.entries,
         defaultModel: activeSource.defaultModel,
         source: fetched.source,
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${activeSource.name}」`,
       });
     } catch (error) {
       plog('WARN', 'pi_model_fetch_failed', { error: error.message });
       return buildAgentModelMenuPayload(session, 'pi', {
         defaultModel: activeSource.defaultModel,
         source: 'provider-api',
+        sourceKind: 'provider',
+        sourceLabel: `AI 提供商「${activeSource.name}」`,
         error: `获取当前服务商模型失败：${error.message}`,
       });
     }
   }
   if (activeSource?.error) {
-    return buildAgentModelMenuPayload(session, 'pi', { error: activeSource.error });
+    return buildAgentModelMenuPayload(session, 'pi', {
+      sourceKind: 'provider',
+      sourceLabel: 'AI 提供商',
+      error: activeSource.error,
+    });
   }
 
   const local = loadPiLocalModelInfo();
@@ -9911,6 +10030,8 @@ async function getPiModelMenuPayload(session) {
       entries,
       defaultModel,
       source: runtimeEntries.length ? 'pi-rpc' : local.source,
+      sourceKind: 'local',
+      sourceLabel: 'Pi 本地配置',
       ...(!entries.length ? {
         error: runtimeError
           ? `读取 Pi 本地模型失败：${runtimeError.message}`

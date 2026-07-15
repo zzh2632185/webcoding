@@ -496,6 +496,116 @@
   background-position: right 12px center;
   padding-right: 32px;
 }
+.settings-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+.settings-input-row > input {
+  flex: 1;
+  min-width: 0;
+}
+.settings-field-action {
+  --nb-btn-bg: var(--bg-secondary);
+  --nb-btn-color: var(--button-secondary-text);
+  --nb-btn-hover-bg: var(--button-secondary-hover);
+  --nb-btn-hover-color: var(--button-secondary-text);
+
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 7px 12px;
+  font-size: 13px;
+  letter-spacing: var(--btn-letter-spacing);
+}
+.settings-field-action:disabled {
+  opacity: 0.5;
+  cursor: wait;
+  transform: none;
+}
+.settings-field-status {
+  margin-top: 8px;
+  min-height: 18px;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.settings-field-status.success { color: var(--success); }
+.settings-field-status.error { color: var(--danger); }
+.settings-field-help {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.settings-field-help code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+.settings-model-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: min(36vh, 260px);
+  margin-top: 8px;
+  padding: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-nav);
+  background: var(--surface-strong);
+}
+.settings-model-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-nav);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.settings-model-option:hover,
+.settings-model-option.active {
+  border-color: var(--line);
+  background: var(--accent-light);
+}
+.settings-model-option:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 1px;
+}
+.settings-model-option-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-model-option-label {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.settings-model-option-desc {
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.settings-model-option-check {
+  flex: 0 0 14px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
 .settings-actions {
   display: flex;
   gap: 8px;
