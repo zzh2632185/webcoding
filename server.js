@@ -4,9 +4,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, execFile } = require('child_process');
-const { WebSocketServer } = require('ws');
+const { pathToFileURL } = require('url');
+const { Blob } = require('buffer');
+const { spawn, execFile, execFileSync } = require('child_process');
+const { WebSocketServer, WebSocket } = require('ws');
 const {
+  buildCliSpawnCommand,
   createAgentRuntime,
   withClaudeOneMillionContext,
   withoutClaudeOneMillionContext,
@@ -19,6 +22,7 @@ const { CodexAppServerClient } = require('./lib/codex-app-server-client');
 const { ClaudeStreamClient } = require('./lib/claude-stream-client');
 const { buildVersionedEndpointUrl, detectConfiguredEndpoint } = require('./lib/api-endpoint');
 const PACKAGE_VERSION = require('./package.json').version || 'unknown';
+const IS_WIN = process.platform === 'win32';
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -180,14 +184,62 @@ const CLAUDE_PATH = resolveCliBinary(process.env.CLAUDE_PATH, 'claude');
 const CODEX_PATH = resolveCliBinary(process.env.CODEX_PATH, 'codex');
 const PI_PATH = resolveCliBinary(process.env.PI_PATH, 'pi');
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
+const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const CODEX_OPENAI_COMPAT_ENV_KEY = 'CODEX_OPENAI_COMPAT_KEY';
+const GENERATED_IMAGES_ROOT = path.join(CODEX_RUNTIME_HOME, 'generated_images');
+const GENERATED_MESSAGE_IMAGES_ROOT = path.join(CONFIG_DIR, 'generated-message-images');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
 const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
 const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const ONE_GB_BYTES = 1024 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_DOCUMENT_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_FILE_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_ATTACHMENT_SIZE = ONE_GB_BYTES;
+const MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS = 120000;
+const MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS = 240000;
+const MAX_ATTACHMENT_SNIFF_BYTES = 8192;
 const MAX_MESSAGE_ATTACHMENTS = 4;
+const CODEX_CAPACITY_RETRY_MAX = 2;
+const WS_HEARTBEAT_INTERVAL_MS = 25000;
+const MAX_CONTEXT_FILE_REFS = 8;
+const MAX_CONTEXT_FILE_SIZE = 256 * 1024;
+const MAX_CONTEXT_FILES_TOTAL_SIZE = 1024 * 1024;
+const FILE_VIEW_TEXT_MAX_SIZE = 1024 * 1024;
+const FILE_VIEW_BINARY_MAX_SIZE = 20 * 1024 * 1024;
+const FILE_VIEW_OFFICE_PREVIEW_MAX_SIZE = 50 * 1024 * 1024;
+const FILE_UPLOAD_MAX_SIZE = ONE_GB_BYTES;
+const FILE_VIEW_TABLE_MAX_ROWS = 1000;
+const FILE_VIEW_TABLE_MAX_COLS = 50;
+const FILE_TREE_MAX_DEPTH = Number.POSITIVE_INFINITY;
+const FILE_TREE_MAX_ENTRIES = parseInt(process.env.CC_WEB_FILE_TREE_MAX_ENTRIES || '', 10) || 800;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.ppt', '.pptx', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+const TEXT_ATTACHMENT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+const DOCUMENT_ATTACHMENT_MIME_TYPES = new Set([
+  'text/plain', 'text/markdown', 'text/csv', 'text/tab-separated-values', 'application/json', 'application/pdf', 'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.ms-excel',
+]);
+const FILE_TREE_IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.venv', 'venv', '__pycache__', '.pytest_cache', '.cache']);
+const TEXT_CONTEXT_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.json', '.jsonl', '.css', '.scss', '.sass',
+  '.html', '.htm', '.xml', '.svg', '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.example', '.sh', '.bash', '.zsh',
+  '.py', '.java', '.kt', '.kts', '.go', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.rb', '.swift', '.sql',
+  '.dockerfile', '.gitignore', '.gitattributes', '.editorconfig', '.csv', '.tsv', '.log'
+]);
+const FILE_VIEW_CODE_EXTENSIONS = new Set([
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.css', '.scss', '.sass', '.html', '.htm', '.xml', '.svg',
+  '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.example', '.sh', '.bash', '.zsh', '.py', '.java', '.kt', '.kts',
+  '.go', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.rb', '.swift', '.sql', '.dockerfile'
+]);
+const FILE_VIEW_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.avif']);
+const FILE_VIEW_BINARY_EXTENSIONS = new Set(['.pdf', '.xlsx', '.xls', '.docx', '.ppt', '.pptx']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
@@ -196,6 +248,7 @@ const PI_CONFIG_PATH = path.join(CONFIG_DIR, 'pi.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
 const BRIDGE_RUNTIME_PATH = path.join(CONFIG_DIR, 'bridge-runtime.json');
 const BRIDGE_STATE_PATH = path.join(CONFIG_DIR, 'bridge-state.json');
+const BRIDGE_USAGE_PATH = path.join(CONFIG_DIR, 'bridge-usage.jsonl');
 const TUNNEL_STATE_PATH = path.join(CONFIG_DIR, 'tunnel-state.json');
 const TUNNEL_SCRIPT_PATH = path.join(__dirname, 'lib', 'cf-tunnel.js');
 const TUNNEL_START_TIMEOUT_MS = 30000;
@@ -212,6 +265,14 @@ const BROWSE_ROOTS = (USER_HOME ? [USER_HOME] : [process.cwd()]).map((root) => {
     return resolved;
   }
 });
+const MUTATION_ROOTS = BROWSE_ROOTS.slice();
+if (IS_WIN) {
+  for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code += 1) {
+    const root = `${String.fromCharCode(code)}:\\`;
+    try { fs.statSync(root); BROWSE_ROOTS.push(root); } catch {}
+  }
+}
+const DRIVES_LIST_SENTINEL = '::drives::';
 const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_CLEANUP_MS = 60 * 60 * 1000;
 const HISTORY_CHUNK_BUFFER_LIMIT = 512 * 1024;
@@ -244,6 +305,7 @@ fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+fs.mkdirSync(GENERATED_MESSAGE_IMAGES_ROOT, { recursive: true });
 
 const jsonConfigCache = new Map();
 const authAttemptByIp = new Map();
@@ -1199,13 +1261,14 @@ function discoverClaudeSlashCommands(options = {}) {
 
     try {
       const modelConfig = loadModelConfig();
-      proc = spawn(CLAUDE_PATH, args, {
+      const commandSpec = buildCliSpawnCommand(CLAUDE_PATH, args);
+      proc = spawn(commandSpec.command, commandSpec.args, {
         env: buildClaudeEnv(modelConfig.mode !== 'custom'),
         cwd: options.cwd || process.env.HOME || process.env.USERPROFILE || __dirname,
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
         windowsHide: true,
-        shell: shouldUseShellForCommand(CLAUDE_PATH),
+        shell: commandSpec.useShell,
       });
 
       let buf = '';
@@ -1289,6 +1352,18 @@ function discoverCodexSlashCommands() {
   builtIn.forEach((c) => addCommand(c, SLASH_COMMAND_DESCRIPTIONS[c] || (
     c === 'goal' ? '设置/管理目标（Goals）' : c
   ), 'codex-cli'));
+
+  function addAliasIfSkillExists(skillName, alias) {
+    try {
+      if (fs.existsSync(path.join(skillsDir, skillName, 'SKILL.md'))) commands.add(alias);
+    } catch {}
+  }
+
+  // Local shortcut aliases used by Webcoding/Codex skills.
+  addAliasIfSkillExists('codex-planner', 'cp');
+  addAliasIfSkillExists('gm', 'gm');
+  addAliasIfSkillExists('ui', 'ui');
+  addAliasIfSkillExists('ui-aesthetics', 'ui');
 
   // 2. User-installed skills (directories under ~/.codex/skills/, excluding .system)
   try {
@@ -1380,6 +1455,8 @@ function discoverCodexSlashCommands() {
 
 // Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string, autoRetryCount: number }
 const pendingCompactRetries = new Map();
+const MAX_SERVER_QUEUED_MESSAGES = 10;
+
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, segments, lastCost, tailer }
 const activeProcesses = new Map();
@@ -1391,6 +1468,77 @@ const codexForkOperations = new Set();
 
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
+
+
+function isWsOpen(ws) {
+  return !!(ws && ws.readyState === 1);
+}
+
+function ensureProcessClients(entry) {
+  if (!entry) return new Set();
+  if (!(entry.clients instanceof Set)) entry.clients = new Set();
+  if (isWsOpen(entry.ws)) entry.clients.add(entry.ws);
+  return entry.clients;
+}
+
+function getConnectedProcessClients(entry) {
+  const clients = ensureProcessClients(entry);
+  const connected = [];
+  for (const client of Array.from(clients)) {
+    if (isWsOpen(client)) connected.push(client);
+    else clients.delete(client);
+  }
+  if (entry && entry.ws && !isWsOpen(entry.ws)) entry.ws = null;
+  return connected;
+}
+
+function getPrimaryProcessWs(entry) {
+  if (!entry) return null;
+  if (isWsOpen(entry.ws)) return entry.ws;
+  const [first] = getConnectedProcessClients(entry);
+  entry.ws = first || null;
+  return entry.ws;
+}
+
+function isProcessRealtimeConnected(entry) {
+  return !!getPrimaryProcessWs(entry);
+}
+
+function attachWebSocketToProcess(entry, ws) {
+  if (!entry || !isWsOpen(ws)) return false;
+  ensureProcessClients(entry).add(ws);
+  if (!isWsOpen(entry.ws)) entry.ws = ws;
+  entry.wsDisconnectTime = null;
+  return true;
+}
+
+function detachWebSocketFromProcess(entry, ws, options = {}) {
+  if (!entry || !ws) return false;
+  const clients = ensureProcessClients(entry);
+  const hadClient = clients.delete(ws);
+  const wasPrimary = entry.ws === ws;
+  if (wasPrimary) entry.ws = null;
+  const nextPrimary = getPrimaryProcessWs(entry);
+  if (!nextPrimary && (hadClient || wasPrimary) && options.markDisconnect === true) {
+    entry.wsDisconnectTime = new Date().toISOString();
+  }
+  return hadClient || wasPrimary;
+}
+
+function sendRuntimeMessage(entry, data) {
+  const clients = getConnectedProcessClients(entry);
+  if (clients.length === 0) {
+    if (entry) entry.ws = null;
+    return false;
+  }
+  for (const client of clients) wsSend(client, data);
+  if (entry && !isWsOpen(entry.ws)) entry.ws = clients[0] || null;
+  return true;
+}
+function sendSessionListToProcessClients(entry, options = {}) {
+  const clients = getConnectedProcessClients(entry);
+  for (const client of clients) sendSessionList(client, options);
+}
 
 const sessionListCache = {
   expiresAt: 0,
@@ -1453,6 +1601,35 @@ const DEFAULT_CODEX_CONFIG = {
   enableSearch: false,
   supportsSearch: false,
 };
+const CODEX_REASONING_EFFORTS = ['xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
+
+function normalizeCodexReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return CODEX_REASONING_EFFORTS.includes(normalized) ? normalized : '';
+}
+
+function isCodexFastModeEnabled() {
+  return String(process.env.CC_WEB_CODEX_FAST_MODE_ENABLED || '').trim() === '1';
+}
+
+function normalizeCodexFastMode(value) {
+  if (!isCodexFastModeEnabled()) return false;
+  if (value === true) return true;
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'fast' || normalized === 'on' || normalized === 'true' || normalized === '1';
+}
+
+function codexReasoningEffortLabel(value) {
+  const labels = {
+    none: 'None',
+    minimal: 'Minimal',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    xhigh: 'XHigh',
+  };
+  return labels[value] || '默认';
+}
 
 const DEFAULT_PI_CONFIG = {
   mode: 'local', // 'local' | 'unified'
@@ -2068,10 +2245,160 @@ function getModelConfigMasked() {
   };
 }
 
-const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const CODEX_LOCAL_CONFIG_PATH = path.join(USER_HOME, '.codex', 'config.toml');
+const CODEX_LOCAL_AUTH_PATH = path.join(USER_HOME, '.codex', 'auth.json');
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
+}
+
+function parseTomlStringLiteral(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    try { return JSON.parse(value); } catch { return value.slice(1, -1); }
+  }
+  return value.split(/\s+#/)[0].trim();
+}
+
+function readTopLevelTomlString(text, key) {
+  const beforeSections = String(text || '').split(/^\s*\[/m)[0] || '';
+  const re = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(.+?)\\s*$`, 'm');
+  const match = beforeSections.match(re);
+  return match ? parseTomlStringLiteral(match[1]) : '';
+}
+
+function findTomlSection(text, sectionName) {
+  const source = String(text || '');
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^\\s*\\[${escaped}\\]\\s*$`, 'm');
+  const match = re.exec(source);
+  if (!match) return null;
+  const start = match.index;
+  const bodyStart = match.index + match[0].length;
+  const rest = source.slice(bodyStart);
+  const nextMatch = /^\s*\[/m.exec(rest);
+  const end = nextMatch ? bodyStart + nextMatch.index : source.length;
+  return { start, bodyStart, end, header: match[0] };
+}
+
+function readTomlSectionString(text, sectionName, key) {
+  const section = findTomlSection(text, sectionName);
+  if (!section) return '';
+  const body = String(text || '').slice(section.bodyStart, section.end);
+  const re = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(.+?)\\s*$`, 'm');
+  const match = body.match(re);
+  return match ? parseTomlStringLiteral(match[1]) : '';
+}
+
+function setTomlSectionString(text, sectionName, key, value) {
+  let source = String(text || '');
+  let section = findTomlSection(source, sectionName);
+  if (!section) {
+    source = `${source.replace(/\s*$/, '')}\n\n[${sectionName}]\n`;
+    section = findTomlSection(source, sectionName);
+  }
+  if (!section) return source;
+  const before = source.slice(0, section.bodyStart);
+  let body = source.slice(section.bodyStart, section.end);
+  const after = source.slice(section.end);
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldRe = new RegExp(`(^\\s*${escapedKey}\\s*=).*$`, 'm');
+  const nextLine = `\n${key} = ${tomlString(value)}`;
+  if (fieldRe.test(body)) {
+    body = body.replace(fieldRe, `$1 ${tomlString(value)}`);
+  } else {
+    body = body.endsWith('\n') ? `${body}${key} = ${tomlString(value)}\n` : `${body}${nextLine}\n`;
+  }
+  return before + body + after;
+}
+
+function readCodexLocalAuthKey(envKey = CODEX_OPENAI_COMPAT_ENV_KEY) {
+  const keyName = String(envKey || CODEX_OPENAI_COMPAT_ENV_KEY).trim() || CODEX_OPENAI_COMPAT_ENV_KEY;
+  try {
+    const auth = JSON.parse(fs.readFileSync(CODEX_LOCAL_AUTH_PATH, 'utf8'));
+    // Backward compatibility: existing Codex auth.json commonly stores the upstream key
+    // under OPENAI_API_KEY. Read it from the file, but avoid trusting the globally
+    // inherited OPENAI_API_KEY process env, which can pollute unrelated projects.
+    const fileKey = String(auth?.[keyName] || auth?.OPENAI_API_KEY || auth?.api_key || '').trim();
+    if (fileKey) return fileKey;
+  } catch {}
+  if (keyName === 'OPENAI_API_KEY') return '';
+  return String(process.env[keyName] || '').trim();
+}
+
+function resolveCodexLocalBridgeSource() {
+  let configText = '';
+  try { configText = fs.readFileSync(CODEX_LOCAL_CONFIG_PATH, 'utf8'); } catch { return { mode: 'local' }; }
+  const provider = readTopLevelTomlString(configText, 'model_provider');
+  const model = readTopLevelTomlString(configText, 'model');
+  if (!provider) return { mode: 'local' };
+  const sectionName = `model_providers.${provider}`;
+  const apiBase = readTomlSectionString(configText, sectionName, 'base_url');
+  const envKey = readTomlSectionString(configText, sectionName, 'env_key') || CODEX_OPENAI_COMPAT_ENV_KEY;
+  const apiKey = readCodexLocalAuthKey(envKey);
+  if (!apiBase || !apiKey) return { mode: 'local' };
+  return {
+    mode: 'local_bridge',
+    name: `本地 Codex: ${provider}`,
+    provider,
+    apiKey,
+    apiBase,
+    upstreamType: 'openai',
+    defaultModel: model || '',
+    configText,
+  };
+}
+
+function createBackupPath(targetPath) {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const dir = path.dirname(targetPath);
+  const base = path.basename(targetPath);
+  let candidate = path.join(dir, `${base}.bak.symlink-${stamp}`);
+  let index = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${base}.bak.symlink-${stamp}-${index}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function ensureCodexRuntimeSymlink(sourcePath, targetPath) {
+  try {
+    if (!fs.existsSync(sourcePath)) return;
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    try {
+      const current = fs.lstatSync(targetPath);
+      if (current.isSymbolicLink()) {
+        const linked = fs.readlinkSync(targetPath);
+        const resolved = path.resolve(path.dirname(targetPath), linked);
+        if (resolved === path.resolve(sourcePath)) return;
+      }
+      fs.renameSync(targetPath, createBackupPath(targetPath));
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') throw err;
+    }
+    const sourceStat = fs.statSync(sourcePath);
+    fs.symlinkSync(sourcePath, targetPath, sourceStat.isDirectory() ? 'dir' : 'file');
+  } catch (err) {
+    console.warn(`[codex-runtime] Failed to link ${targetPath} -> ${sourcePath}: ${err.message}`);
+  }
+}
+
+function linkCodexSharedRuntimeFiles(localCodexHome) {
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'instruction.md'), path.join(CODEX_RUNTIME_HOME, 'instruction.md'));
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'AGENTS.md'), path.join(CODEX_RUNTIME_HOME, 'AGENTS.md'));
+  ensureCodexRuntimeSymlink(path.join(localCodexHome, 'skills'), path.join(CODEX_RUNTIME_HOME, 'skills'));
+}
+
+function writeCodexLocalBridgeConfig(source, bridge) {
+  fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
+  let configToml = String(source.configText || '');
+  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'base_url', bridge.openaiBaseUrl);
+  configToml = setTomlSectionString(configToml, `model_providers.${source.provider}`, 'env_key', CODEX_OPENAI_COMPAT_ENV_KEY);
+  configToml = `${configToml.replace(/\s*$/, '')}\n\n# webcoding_bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}\n`;
+  fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  linkCodexSharedRuntimeFiles(path.dirname(CODEX_LOCAL_CONFIG_PATH));
 }
 
 function resolveCodexCustomProfile(config) {
@@ -2148,12 +2475,15 @@ function resolveCodexActiveSource(config) {
 function getCodexRuntimeFingerprint(config) {
   const source = resolveCodexActiveSource(config || loadCodexConfig());
   if (!source || source.mode === 'local') {
+    const localBridgeSource = resolveCodexLocalBridgeSource();
     const codexHome = getUserCodexHome();
     const codexLocalConfigPath = path.join(codexHome, 'config.toml');
     const codexLocalAuthPath = path.join(codexHome, 'auth.json');
     return JSON.stringify({
-      runtimeVersion: 5,
-      mode: 'local',
+      runtimeVersion: 6,
+      mode: localBridgeSource?.mode === 'local_bridge' ? 'local_bridge' : 'local',
+      sourceName: localBridgeSource?.mode === 'local_bridge' ? String(localBridgeSource.name || '').trim() : '',
+      apiBase: localBridgeSource?.mode === 'local_bridge' ? String(localBridgeSource.apiBase || '').trim().replace(/\/+$/, '') : '',
       configFingerprint: fileContentFingerprint(codexLocalConfigPath),
       authFingerprint: fileContentFingerprint(codexLocalAuthPath),
     });
@@ -2161,7 +2491,7 @@ function getCodexRuntimeFingerprint(config) {
   if (source.error) return `error:${source.error}`;
   const contextWindow = normalizeContextWindow(source.contextWindow);
   return JSON.stringify({
-    runtimeVersion: 5,
+    runtimeVersion: 6,
     mode: 'remote',
     sourceName: String(source.name || '').trim(),
     apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
@@ -2390,23 +2720,30 @@ function getRuntimeCapabilities(agent) {
 }
 
 function prepareCodexCustomRuntime(config) {
-  const source = resolveCodexActiveSource(config);
+  let source = resolveCodexActiveSource(config);
   if (source?.error) return source;
   if (!source || source.mode === 'local') {
-    markCodexOverlayLocal();
-    return { mode: 'local' };
+    source = resolveCodexLocalBridgeSource();
+    if (!source || source.mode !== 'local_bridge') {
+      markCodexOverlayLocal();
+      return { mode: 'local' };
+    }
   }
 
   let bridge = null;
   try {
-    bridge = ensureBridgeRuntimeForTemplate(source);
+    bridge = ensureBridgeRuntimeForTemplate(source, { forceNewToken: true });
   } catch (error) {
     return { error: error.message || '本地 API 中间件初始化失败' };
   }
 
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
-  // Make user skills/prompts visible to the child (CODEX_HOME points here).
-  ensureCodexRuntimeOverlays(CODEX_RUNTIME_HOME);
+  if (source.mode === 'local_bridge') {
+    writeCodexLocalBridgeConfig(source, bridge);
+  } else {
+    // Make user skills/prompts visible to the child (CODEX_HOME points here).
+    ensureCodexRuntimeOverlays(CODEX_RUNTIME_HOME);
+  }
   const configToml = [
     '# Generated by webcoding. Codex startup is also forced via CLI -c overrides.',
     `# bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}`,
@@ -2419,11 +2756,13 @@ function prepareCodexCustomRuntime(config) {
     '[model_providers.openai_compat]',
     `name = ${tomlString(source.name || 'AI Provider')}`,
     `base_url = ${tomlString(bridge.openaiBaseUrl)}`,
-    'env_key = "OPENAI_API_KEY"',
+    `env_key = ${tomlString(CODEX_OPENAI_COMPAT_ENV_KEY)}`,
     'wire_api = "responses"',
     '',
   ].filter((line) => line !== null).join('\n');
-  fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  if (source.mode !== 'local_bridge') {
+    fs.writeFileSync(path.join(CODEX_RUNTIME_HOME, 'config.toml'), configToml);
+  }
 
   return {
     mode: 'custom',
@@ -2618,6 +2957,7 @@ function fetchProviderModelEntries(provider) {
         body += chunk;
       });
       res.on('end', () => {
+        clearTimeout(overallTimeout);
         if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
           const safeBody = redactProviderSecret(body.slice(0, 200), token);
           return reject(new Error(`HTTP ${res.statusCode}: ${safeBody}`));
@@ -2634,8 +2974,13 @@ function fetchProviderModelEntries(provider) {
         }
       });
     });
-    req.on('error', reject);
-    req.setTimeout(15_000, () => req.destroy(new Error('请求超时（15 秒）')));
+    const overallTimeout = setTimeout(() => req.destroy(new Error('请求超时（3 秒）')), 3_000);
+    overallTimeout.unref?.();
+    req.on('error', (error) => {
+      clearTimeout(overallTimeout);
+      reject(error);
+    });
+    req.setTimeout(3_000, () => req.destroy(new Error('请求超时（3 秒）')));
     req.end();
   });
 }
@@ -2966,23 +3311,6 @@ function usesOfficialClaudeModelCatalog(entries) {
   return entries.some((entry) => /^claude-(?:fable|opus|sonnet|haiku)-/i.test(String(entry?.value || '')));
 }
 
-const CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE = '检测到 Webcoding 正以 root 用户运行，Claude 的 YOLO 模式会被 CLI 拒绝；已自动降级为默认模式。';
-
-function isRootProcessOnUnix() {
-  return process.platform !== 'win32'
-    && typeof process.getuid === 'function'
-    && process.getuid() === 0;
-}
-
-function resolvePermissionModeForAgent(agent, mode) {
-  const normalizedAgent = normalizeAgent(agent);
-  const requestedMode = ['default', 'plan', 'yolo'].includes(mode) ? mode : 'yolo';
-  if (normalizedAgent === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
-    return { mode: 'default', requestedMode, downgraded: true, message: CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE };
-  }
-  return { mode: requestedMode, requestedMode, downgraded: false, message: '' };
-}
-
 function claudeLocalModelEntriesFromEnv(env) {
   const entries = [];
   for (const [key, desc] of CLAUDE_LOCAL_MODEL_FIELDS) {
@@ -3231,7 +3559,7 @@ function getClaudeRuntimeFingerprint(config = null) {
     runtimeVersion: 1,
     mode: 'local',
     settingsFingerprint: fileContentFingerprint(CLAUDE_SETTINGS_PATH),
-    claudeJsonFingerprint: fileContentFingerprint(path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json')),
+    claudeJsonFingerprint: fileContentFingerprint(path.join(USER_HOME, '.claude.json')),
   });
 }
 
@@ -3376,8 +3704,406 @@ function wsSend(ws, data) {
 }
 
 function isPathInside(filePath, rootDir) {
-  const relative = path.relative(rootDir, filePath);
+  const root = path.resolve(String(rootDir || ''));
+  const target = path.resolve(String(filePath || ''));
+  const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function normalizeWorkspaceCwd(cwd) {
+  const raw = String(cwd || '').trim();
+  if (!raw || !path.isAbsolute(raw)) return null;
+  const resolved = path.resolve(raw);
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return resolved;
+}
+
+function resolvePathWithinCwd(cwd, targetPath = '') {
+  const root = normalizeWorkspaceCwd(cwd);
+  if (!root) throw new Error('当前目录无效');
+  const raw = String(targetPath || '').trim();
+  const resolved = path.resolve(path.isAbsolute(raw) ? raw : path.join(root, raw));
+  if (!isPathInside(resolved, root)) throw new Error('文件不在当前目录内');
+  return { root, resolved };
+}
+
+function sanitizeUploadFilename(name) {
+  const raw = String(name || '').trim().replace(/[\\/]+/g, '_').replace(/[\u0000-\u001f\u007f]+/g, '');
+  const base = path.basename(raw).trim();
+  if (!base || base === '.' || base === '..') {
+    const err = new Error('文件名无效');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (Buffer.byteLength(base, 'utf8') > 255) {
+    const err = new Error('文件名过长');
+    err.statusCode = 400;
+    throw err;
+  }
+  return base;
+}
+
+function isLikelyTextFile(filePath, size = 0) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (TEXT_CONTEXT_EXTENSIONS.has(ext) || TEXT_CONTEXT_EXTENSIONS.has(base)) return true;
+  if (size > MAX_CONTEXT_FILE_SIZE) return false;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(Math.min(4096, Math.max(1, size || 4096)));
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      for (let i = 0; i < bytes; i += 1) {
+        if (buffer[i] === 0) return false;
+      }
+      return true;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function getFileMime(filePath) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'text/markdown; charset=utf-8';
+  if (ext === '.txt' || ext === '.log' || ext === '.gitignore' || ext === '.env') return 'text/plain; charset=utf-8';
+  if (ext === '.csv') return 'text/csv; charset=utf-8';
+  if (ext === '.tsv') return 'text/tab-separated-values; charset=utf-8';
+  if (ext === '.json' || ext === '.jsonl') return 'application/json; charset=utf-8';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.doc') return 'application/msword';
+  if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === '.xls') return 'application/vnd.ms-excel';
+  if (ext === '.pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  if (ext === '.ppt') return 'application/vnd.ms-powerpoint';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.bmp') return 'image/bmp';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.avif') return 'image/avif';
+  return MIME_TYPES[ext] || 'application/octet-stream';
+}
+
+function getFileViewType(filePath, stat) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'markdown';
+  if (ext === '.csv') return 'csv';
+  if (ext === '.tsv') return 'tsv';
+  if (ext === '.xlsx' || ext === '.xls') return 'xlsx';
+  if (ext === '.doc') return 'doc';
+  if (ext === '.docx') return 'docx';
+  if (ext === '.pptx' || ext === '.ppt') return 'pptx';
+  if (ext === '.pdf') return 'pdf';
+  if (FILE_VIEW_IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (ext === '.json') return 'json';
+  if (FILE_VIEW_CODE_EXTENSIONS.has(ext) || FILE_VIEW_CODE_EXTENSIONS.has(base)) return 'code';
+  if (isLikelyTextFile(filePath, stat?.size || 0)) return 'text';
+  return 'binary';
+}
+
+function fileViewLanguage(filePath, viewType) {
+  const base = path.basename(filePath).toLowerCase();
+  const ext = path.extname(base).toLowerCase().replace(/^\./, '');
+  if (viewType === 'markdown') return 'markdown';
+  if (viewType === 'json') return 'json';
+  if (viewType === 'csv') return 'csv';
+  if (viewType === 'tsv') return 'tsv';
+  if (base === 'dockerfile' || ext === 'dockerfile') return 'dockerfile';
+  if (ext === 'mjs' || ext === 'cjs') return 'javascript';
+  if (ext === 'jsx') return 'javascript';
+  if (ext === 'tsx') return 'typescript';
+  if (ext === 'htm') return 'html';
+  if (ext === 'yml') return 'yaml';
+  if (ext === 'sh' || ext === 'bash' || ext === 'zsh') return 'bash';
+  if (ext === 'cc' || ext === 'cpp' || ext === 'hpp') return 'cpp';
+  if (ext === 'py') return 'python';
+  if (ext === 'rb') return 'ruby';
+  if (ext === 'rs') return 'rust';
+  if (ext === 'go') return 'go';
+  if (ext === 'kt' || ext === 'kts') return 'kotlin';
+  return ext || 'plaintext';
+}
+
+function buildFileIdentity(root, filePath, stat, viewType) {
+  return {
+    ok: true,
+    type: viewType,
+    name: path.basename(filePath),
+    path: filePath,
+    relativePath: path.relative(root, filePath) || path.basename(filePath),
+    size: stat.size,
+    mime: getFileMime(filePath),
+    language: fileViewLanguage(filePath, viewType),
+  };
+}
+
+function readTextFileForView(filePath, stat) {
+  if (stat.size > FILE_VIEW_TEXT_MAX_SIZE) {
+    const err = new Error('文本文件超过 1MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function normalizeWorkbookCell(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function buildWorkbookView(filePath, stat) {
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+    const err = new Error('表格文件超过 20MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const workbook = XLSX.readFile(filePath, { cellDates: true });
+  const sheetNames = Array.isArray(workbook.SheetNames) ? workbook.SheetNames : [];
+  const activeSheet = sheetNames[0] || '';
+  const sheet = activeSheet ? workbook.Sheets[activeSheet] : null;
+  let rows = [];
+  let totalRows = 0;
+  let totalCols = 0;
+  if (sheet && sheet['!ref']) {
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    totalRows = Math.max(0, range.e.r - range.s.r + 1);
+    totalCols = Math.max(0, range.e.c - range.s.c + 1);
+    const limitedRange = {
+      s: range.s,
+      e: {
+        r: Math.min(range.e.r, range.s.r + FILE_VIEW_TABLE_MAX_ROWS - 1),
+        c: Math.min(range.e.c, range.s.c + FILE_VIEW_TABLE_MAX_COLS - 1),
+      },
+    };
+    rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      defval: '',
+      blankrows: false,
+      raw: false,
+      range: XLSX.utils.encode_range(limitedRange),
+    }).map((row) => Array.isArray(row) ? row.slice(0, FILE_VIEW_TABLE_MAX_COLS).map(normalizeWorkbookCell) : []);
+  }
+  return {
+    sheets: sheetNames,
+    activeSheet,
+    rows,
+    truncated: totalRows > FILE_VIEW_TABLE_MAX_ROWS || totalCols > FILE_VIEW_TABLE_MAX_COLS,
+    totalRows,
+    totalCols,
+    displayedRows: rows.length,
+    displayedCols: rows.reduce((max, row) => Math.max(max, row.length), 0),
+  };
+}
+
+async function buildDocxView(filePath, stat) {
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+    const err = new Error('Word 文件超过 20MB，不能直接预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const buffer = fs.readFileSync(filePath);
+  const result = await mammoth.convertToHtml({ buffer });
+  return {
+    html: result?.value || '',
+    messages: Array.isArray(result?.messages) ? result.messages.map((m) => String(m.message || '')).filter(Boolean) : [],
+  };
+}
+
+function buildOfficePdfPreview(filePath, stat) {
+  if (stat.size > FILE_VIEW_OFFICE_PREVIEW_MAX_SIZE) {
+    const err = new Error('Office 文件超过 50MB，不能直接转换预览');
+    err.statusCode = 413;
+    throw err;
+  }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-office-preview-'));
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-soffice-profile-'));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
+    };
+    const args = [
+      `-env:UserInstallation=${pathToFileURL(profileDir).href}`,
+      '--headless',
+      '--nologo',
+      '--nofirststartwizard',
+      '--convert-to',
+      'pdf',
+      '--outdir',
+      tmpDir,
+      filePath,
+    ];
+    execFile('soffice', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 90000 }, (err, stdout, stderr) => {
+      try {
+        if (err) {
+          const detail = String(stderr || stdout || err.message || err).trim();
+          const wrapped = new Error(`PPT 转 PDF 失败${detail ? `：${detail}` : ''}`);
+          wrapped.statusCode = 500;
+          reject(wrapped);
+          return;
+        }
+        const expected = path.join(tmpDir, `${path.basename(filePath).replace(/\.[^.]+$/, '')}.pdf`);
+        const candidates = [];
+        if (fs.existsSync(expected)) candidates.push(expected);
+        try {
+          for (const name of fs.readdirSync(tmpDir)) {
+            if (name.toLowerCase().endsWith('.pdf')) candidates.push(path.join(tmpDir, name));
+          }
+        } catch {}
+        const target = candidates.find((candidate) => {
+          try { return fs.statSync(candidate).isFile(); } catch { return false; }
+        });
+        if (!target) {
+          const wrapped = new Error('PPT 转 PDF 失败：LibreOffice 未生成 PDF 文件');
+          wrapped.statusCode = 500;
+          reject(wrapped);
+          return;
+        }
+        resolve(fs.readFileSync(target));
+      } catch (readErr) {
+        const wrapped = new Error(`PPT 转 PDF 失败：${readErr.message || readErr}`);
+        wrapped.statusCode = 500;
+        reject(wrapped);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+}
+
+function jsonErrorResponse(res, err, fallbackMessage = '请求失败') {
+  return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err?.message || fallbackMessage });
+}
+
+function normalizeFileTreeDepth(rawDepth) {
+  const text = String(rawDepth || '').trim().toLowerCase();
+  if (!text || text === 'all' || text === 'full' || text === 'infinite' || text === 'infinity' || text === 'unlimited') {
+    return FILE_TREE_MAX_DEPTH;
+  }
+  const parsed = Number.parseInt(text, 10);
+  if (!Number.isFinite(parsed)) return FILE_TREE_MAX_DEPTH;
+  return Math.max(1, Math.min(FILE_TREE_MAX_DEPTH, parsed));
+}
+
+function buildFileTree(root, currentPath, depth, state) {
+  if (state.count >= FILE_TREE_MAX_ENTRIES) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(currentPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  entries.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+  });
+  const items = [];
+  for (const entry of entries) {
+    if (state.count >= FILE_TREE_MAX_ENTRIES) break;
+    if (FILE_TREE_IGNORED_NAMES.has(entry.name)) continue;
+    if (entry.name.startsWith('.') && entry.name !== '.env' && entry.name !== '.gitignore') continue;
+    const abs = path.join(currentPath, entry.name);
+    let lst;
+    try { lst = fs.lstatSync(abs); } catch { continue; }
+    if (lst.isSymbolicLink()) continue;
+    const isDirectory = entry.isDirectory();
+    const isFile = entry.isFile();
+    if (!isDirectory && !isFile) continue;
+    state.count += 1;
+    const rel = path.relative(root, abs) || entry.name;
+    const item = {
+      name: entry.name,
+      path: abs,
+      relativePath: rel,
+      type: isDirectory ? 'directory' : 'file',
+    };
+    if (isDirectory) {
+      item.children = depth > 1 ? buildFileTree(root, abs, depth - 1, state) : [];
+    } else {
+      item.size = lst.size;
+      item.isText = isLikelyTextFile(abs, lst.size);
+      item.tooLarge = lst.size > MAX_CONTEXT_FILE_SIZE;
+    }
+    items.push(item);
+  }
+  return items;
+}
+
+function normalizeContextFileRefs(fileRefs, cwd) {
+  const refs = Array.isArray(fileRefs) ? fileRefs.slice(0, MAX_CONTEXT_FILE_REFS) : [];
+  if (refs.length === 0) return { refs: [], error: '' };
+  const seen = new Set();
+  const normalized = [];
+  for (const ref of refs) {
+    const rawPath = String(ref?.path || ref?.relativePath || '').trim();
+    if (!rawPath) continue;
+    let root;
+    let resolved;
+    try { ({ root, resolved } = resolvePathWithinCwd(cwd, rawPath)); }
+    catch (err) { return { refs: [], error: err.message || '引用路径无效' }; }
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    let stat;
+    try { stat = fs.statSync(resolved); }
+    catch { return { refs: [], error: `无法读取引用路径: ${path.basename(resolved)}` }; }
+    const relativePath = path.relative(root, resolved) || path.basename(resolved);
+    if (stat.isDirectory()) {
+      normalized.push({
+        type: 'directory',
+        path: resolved,
+        relativePath,
+        size: 0,
+      });
+      continue;
+    }
+    if (!stat.isFile()) return { refs: [], error: `只能引用文件或目录: ${relativePath}` };
+    normalized.push({
+      type: 'file',
+      path: resolved,
+      relativePath,
+      size: stat.size,
+    });
+  }
+  return { refs: normalized, error: '' };
+}
+
+function buildContextFilePrompt(text, fileRefs) {
+  const normalizedText = String(text || '');
+  if (!Array.isArray(fileRefs) || fileRefs.length === 0) return normalizedText;
+  const blocks = fileRefs.map((ref) => {
+    const safePath = String(ref.relativePath || ref.path || '').replace(/"/g, '&quot;');
+    if (ref.type === 'directory') {
+      return `<directory path="${safePath}" />`;
+    }
+    const sizeAttr = Number.isFinite(ref.size) ? ` size="${ref.size}"` : '';
+    return `<file path="${safePath}"${sizeAttr} />`;
+  }).join('\n');
+  return `下面是用户从当前工作目录引用的文件和目录。文件和目录引用只表示用户选中了这些路径；不要假设文件内容已经提供。如需查看内容，请基于 path 在当前工作目录自行读取或解析。
+
+${blocks}
+
+用户问题：
+${normalizedText}`;
+}
+
+function fileRefHistoryMeta(ref) {
+  return {
+    type: ref.type === 'directory' ? 'directory' : 'file',
+    path: ref.path,
+    relativePath: ref.relativePath,
+    size: ref.type === 'directory' ? 0 : ref.size,
+  };
 }
 
 function sanitizeId(id) {
@@ -3414,8 +4140,40 @@ function extFromMime(mime) {
     case 'image/jpeg': return '.jpg';
     case 'image/webp': return '.webp';
     case 'image/gif': return '.gif';
+    case 'text/plain': return '.txt';
+    case 'text/markdown': return '.md';
+    case 'text/csv': return '.csv';
+    case 'text/tab-separated-values': return '.tsv';
+    case 'application/json': return '.json';
+    case 'application/pdf': return '.pdf';
+    case 'application/msword': return '.doc';
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': return '.docx';
+    case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': return '.xlsx';
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': return '.pptx';
+    case 'application/vnd.ms-powerpoint': return '.ppt';
+    case 'application/vnd.ms-excel': return '.xls';
     default: return '';
   }
+}
+
+function imageMimeFromFilename(filename) {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  switch (ext) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.webp': return 'image/webp';
+    case '.gif': return 'image/gif';
+    default: return '';
+  }
+}
+
+function detectAttachmentImageMime(filename, declaredMime, sniffBuffer) {
+  const magicMime = detectMimeFromMagic(sniffBuffer);
+  if (IMAGE_MIME_TYPES.has(magicMime)) return magicMime;
+  const normalizedMime = String(declaredMime || '').split(';')[0].trim().toLowerCase();
+  if (IMAGE_MIME_TYPES.has(normalizedMime)) return normalizedMime;
+  return imageMimeFromFilename(filename);
 }
 
 function detectMimeFromMagic(buffer) {
@@ -3441,6 +4199,357 @@ function detectMimeFromMagic(buffer) {
     buffer.toString('ascii', 8, 12) === 'WEBP'
   ) return 'image/webp';
   return null;
+}
+
+function inferDocumentAttachmentType(filename, mime = '') {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  const normalizedMime = String(mime || '').split(';')[0].trim().toLowerCase();
+  if (DOCUMENT_ATTACHMENT_EXTENSIONS.has(ext)) {
+    if (ext === '.markdown') return { ext, mime: normalizedMime || 'text/markdown', type: 'markdown' };
+    if (ext === '.md') return { ext, mime: normalizedMime || 'text/markdown', type: 'markdown' };
+    if (ext === '.txt' || ext === '.log') return { ext, mime: normalizedMime || 'text/plain', type: 'text' };
+    if (ext === '.csv') return { ext, mime: normalizedMime || 'text/csv', type: 'csv' };
+    if (ext === '.tsv') return { ext, mime: normalizedMime || 'text/tab-separated-values', type: 'tsv' };
+    if (ext === '.json' || ext === '.jsonl') return { ext, mime: normalizedMime || 'application/json', type: 'json' };
+    if (ext === '.pdf') return { ext, mime: normalizedMime || 'application/pdf', type: 'pdf' };
+    if (ext === '.doc') return { ext, mime: normalizedMime || 'application/msword', type: 'doc' };
+    if (ext === '.docx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', type: 'docx' };
+    if (ext === '.xlsx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type: 'xlsx' };
+    if (ext === '.xls') return { ext, mime: normalizedMime || 'application/vnd.ms-excel', type: 'xlsx' };
+    if (ext === '.pptx') return { ext, mime: normalizedMime || 'application/vnd.openxmlformats-officedocument.presentationml.presentation', type: 'pptx' };
+    if (ext === '.ppt') return { ext, mime: normalizedMime || 'application/vnd.ms-powerpoint', type: 'pptx' };
+  }
+  if (DOCUMENT_ATTACHMENT_MIME_TYPES.has(normalizedMime)) {
+    const inferredExt = extFromMime(normalizedMime);
+    return inferDocumentAttachmentType(`attachment${inferredExt || '.txt'}`, normalizedMime);
+  }
+  return null;
+}
+
+function hasNullByte(buffer, limit = 8192) {
+  const size = Math.min(Buffer.isBuffer(buffer) ? buffer.length : 0, limit);
+  for (let i = 0; i < size; i += 1) {
+    if (buffer[i] === 0) return true;
+  }
+  return false;
+}
+
+function validateDocumentAttachmentBuffer(buffer, filename, mime) {
+  const info = inferDocumentAttachmentType(filename, mime);
+  if (!info) return { error: '不支持的文档格式' };
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return { error: '文档内容为空' };
+  if (TEXT_ATTACHMENT_EXTENSIONS.has(info.ext)) {
+    if (hasNullByte(buffer)) return { error: '文本文件内容看起来不是纯文本' };
+    return { ...info };
+  }
+  if (info.type === 'pdf') {
+    if (buffer.length < 5 || buffer.toString('ascii', 0, 5) !== '%PDF-') return { error: 'PDF 文件内容与扩展名不一致或已损坏' };
+    return { ...info, mime: 'application/pdf' };
+  }
+  if (info.type === 'doc' || info.type === 'docx' || info.type === 'xlsx' || info.type === 'pptx') {
+    const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
+    const isOle = buffer.length >= 8 && buffer[0] === 0xd0 && buffer[1] === 0xcf && buffer[2] === 0x11 && buffer[3] === 0xe0;
+    if (!isZip && !isOle) return { error: 'Office 文档内容与扩展名不一致或已损坏' };
+    return { ...info };
+  }
+  return { ...info };
+}
+
+function safeAttachmentDataExtension(filename, mime, kind = 'image') {
+  const ext = path.extname(String(filename || '').toLowerCase());
+  if (kind === 'document' && DOCUMENT_ATTACHMENT_EXTENSIONS.has(ext)) return ext;
+  if (kind === 'image' && ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return ext === '.jpeg' ? '.jpg' : ext;
+  if (kind === 'file') return ext || extFromMime(mime) || '.bin';
+  return extFromMime(mime) || (kind === 'document' ? '.txt' : '');
+}
+
+function truncateAttachmentText(text, maxChars = MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS) {
+  const normalized = String(text || '').replace(/\r\n/g, '\n');
+  if (normalized.length <= maxChars) return { text: normalized, truncated: false };
+  return {
+    text: `${normalized.slice(0, maxChars).trimEnd()}\n\n[文档内容超过 ${maxChars} 字符，已截断]`,
+    truncated: true,
+  };
+}
+
+function readTextAttachment(filePath) {
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function extractPdfAttachmentText(filePath) {
+  try {
+    return execFileSync('pdftotext', ['-layout', '-enc', 'UTF-8', filePath, '-'], {
+      encoding: 'utf8',
+      maxBuffer: MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS * 4,
+      timeout: 20000,
+    });
+  } catch (err) {
+    throw new Error(`PDF 文本提取失败：${err.message || err}`);
+  }
+}
+
+function extractDocxAttachmentText(filePath) {
+  const script = `
+    const mammoth = require('mammoth');
+    const file = process.argv[1];
+    mammoth.extractRawText({ path: file })
+      .then((result) => { process.stdout.write(result && result.value ? result.value : ''); })
+      .catch((err) => { console.error(err && err.message ? err.message : String(err)); process.exit(1); });
+  `;
+  try {
+    return execFileSync(process.execPath, ['-e', script, filePath], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      maxBuffer: MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS * 4,
+      timeout: 20000,
+    });
+  } catch (err) {
+    throw new Error(`DOCX 文本提取失败：${err.stderr || err.message || err}`);
+  }
+}
+
+function extractOfficeAttachmentTextWithLibreOffice(filePath) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-doc-'));
+  try {
+    execFileSync('soffice', ['--headless', '--convert-to', 'txt:Text', '--outdir', tmpDir, filePath], {
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      timeout: 30000,
+    });
+    const base = path.basename(filePath).replace(/\.[^.]+$/, '.txt');
+    const converted = path.join(tmpDir, base);
+    const candidates = fs.readdirSync(tmpDir).filter((name) => name.toLowerCase().endsWith('.txt'));
+    const target = fs.existsSync(converted) ? converted : (candidates[0] ? path.join(tmpDir, candidates[0]) : '');
+    if (!target || !fs.existsSync(target)) throw new Error('LibreOffice 未生成文本文件');
+    return fs.readFileSync(target, 'utf8');
+  } catch (err) {
+    throw new Error(`DOC 文本提取失败：${err.stderr || err.message || err}`);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function extractWorkbookAttachmentText(filePath) {
+  const workbook = XLSX.readFile(filePath, { cellDates: true });
+  const sheetNames = Array.isArray(workbook.SheetNames) ? workbook.SheetNames.slice(0, 6) : [];
+  const parts = [];
+  for (const sheetName of sheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
+    const csv = XLSX.utils.sheet_to_csv(sheet, { FS: '\t', RS: '\n', blankrows: false }).trim();
+    if (!csv) continue;
+    parts.push(`## Sheet: ${sheetName}\n${csv}`);
+  }
+  return parts.join('\n\n');
+}
+
+function extractDocumentAttachmentText(attachment) {
+  const ext = path.extname(String(attachment?.filename || attachment?.path || '').toLowerCase());
+  const documentType = attachment?.documentType || inferDocumentAttachmentType(attachment?.filename || '', attachment?.mime || '')?.type || '';
+  if (TEXT_ATTACHMENT_EXTENSIONS.has(ext) || ['text', 'markdown', 'csv', 'tsv', 'json'].includes(documentType)) {
+    return readTextAttachment(attachment.path);
+  }
+  if (documentType === 'pdf' || ext === '.pdf') return extractPdfAttachmentText(attachment.path);
+  if (documentType === 'doc' || ext === '.doc') return extractOfficeAttachmentTextWithLibreOffice(attachment.path);
+  if (documentType === 'docx' || ext === '.docx') return extractDocxAttachmentText(attachment.path);
+  if (documentType === 'xlsx' || ext === '.xlsx' || ext === '.xls') return extractWorkbookAttachmentText(attachment.path);
+  throw new Error('该文档类型暂不支持解析');
+}
+
+function buildAttachmentDocumentPrompt(text, attachments = []) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const docs = list.filter((attachment) => attachment?.kind === 'document');
+  const files = list.filter((attachment) => attachment?.kind === 'file');
+  const normalizedText = String(text || '');
+  if (docs.length === 0 && files.length === 0) return normalizedText;
+  const blocks = [];
+  let remaining = MAX_ATTACHMENT_DOCUMENTS_TOTAL_CHARS;
+  for (const doc of docs) {
+    const safeName = String(doc.filename || doc.id || 'document').replace(/"/g, '&quot;');
+    let body = '';
+    let note = '';
+    try {
+      const extracted = extractDocumentAttachmentText(doc);
+      const truncated = truncateAttachmentText(extracted, Math.max(0, Math.min(MAX_ATTACHMENT_DOCUMENT_TEXT_CHARS, remaining)));
+      body = truncated.text || '[文档没有提取到可读文本]';
+      remaining = Math.max(0, remaining - body.length);
+      if (truncated.truncated || remaining <= 0) note = '\n[后续文档内容可能已因总长度限制截断]';
+    } catch (err) {
+      body = `[文档解析失败：${err.message || err}]`;
+    }
+    blocks.push(`<document filename="${safeName}" mime="${doc.mime || ''}" size="${doc.size || 0}">\n${body}${note}\n</document>`);
+    if (remaining <= 0) break;
+  }
+  for (const file of files) {
+    const safeName = String(file.filename || file.id || 'file').replace(/"/g, '&quot;');
+    const safePath = String(file.path || '').replace(/"/g, '&quot;');
+    blocks.push(`<file filename="${safeName}" mime="${file.mime || ''}" size="${file.size || 0}" path="${safePath}">\n该附件是任意文件/二进制文件，已保存到本机临时附件路径；如需分析、解压或读取，请直接使用 path。\n</file>`);
+  }
+  return `下面是用户上传到聊天窗口的临时附件。文档会尽量提取文本；任意文件会提供本机临时路径。附件只存放在临时附件区，不在当前工作目录中。请基于这些内容回答用户；如果是压缩包或二进制文件，可按 path 自行读取或解压。\n\n${blocks.join('\n\n')}\n\n用户问题：\n${normalizedText}`;
+}
+
+function messageAttachmentHistoryMeta(attachment) {
+  return {
+    id: attachment.id,
+    kind: attachment.kind || 'image',
+    filename: attachment.filename,
+    mime: attachment.mime,
+    documentType: attachment.documentType || null,
+    size: attachment.size,
+    createdAt: attachment.createdAt,
+    expiresAt: attachment.expiresAt,
+    storageState: attachment.storageState,
+  };
+}
+
+
+function isGeneratedImageExtension(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
+}
+
+function localImageInfoForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!absPath || absPath.includes('\0')) return null;
+  let stat;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    return null;
+  }
+  if (!stat.isFile()) return null;
+  if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) return null;
+  let fd = null;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const sniff = Buffer.alloc(Math.min(MAX_ATTACHMENT_SNIFF_BYTES, Math.max(1, stat.size)));
+    const bytes = fs.readSync(fd, sniff, 0, sniff.length, 0);
+    const magicMime = detectMimeFromMagic(sniff.subarray(0, bytes));
+    const extMime = getFileMime(absPath).split(';')[0].trim().toLowerCase();
+    const mime = IMAGE_MIME_TYPES.has(magicMime) ? magicMime : (IMAGE_MIME_TYPES.has(extMime) ? extMime : '');
+    if (!mime) return null;
+    return { path: absPath, stat, mime };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function generatedImageRootEntries() {
+  return [
+    ['codex', GENERATED_IMAGES_ROOT],
+    ['cache', GENERATED_MESSAGE_IMAGES_ROOT],
+  ];
+}
+
+function generatedImageUrlForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!isGeneratedImageExtension(absPath)) return '';
+  for (const [rootKey, rootDir] of generatedImageRootEntries()) {
+    const root = path.resolve(rootDir);
+    if (!isPathInside(absPath, root)) continue;
+    const rel = path.relative(root, absPath).split(path.sep).filter(Boolean);
+    if (!rel.length || rel.some((part) => part === '..' || part.includes('\0'))) return '';
+    return `/api/generated-image/${encodeURIComponent(rootKey)}/${rel.map((part) => encodeURIComponent(part)).join('/')}`;
+  }
+  return '';
+}
+
+function findCodexGeneratedImageByCallId(callId, preferredThreadId = '') {
+  const safeCallId = String(callId || '').trim();
+  if (!safeCallId || !/^[A-Za-z0-9_-]+$/.test(safeCallId)) return null;
+  const root = path.resolve(GENERATED_IMAGES_ROOT);
+  const filename = `${safeCallId}.png`;
+  const preferred = String(preferredThreadId || '').trim();
+  if (preferred && /^[A-Za-z0-9_-]+$/.test(preferred)) {
+    const direct = path.resolve(root, preferred, filename);
+    if (isPathInside(direct, root) && fs.existsSync(direct)) return direct;
+  }
+  try {
+    for (const dirent of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!dirent.isDirectory()) continue;
+      if (!/^[A-Za-z0-9_-]+$/.test(dirent.name)) continue;
+      const candidate = path.resolve(root, dirent.name, filename);
+      if (isPathInside(candidate, root) && fs.existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return null;
+}
+
+function imageBufferFromCodexResult(result) {
+  let raw = typeof result === 'string' ? result.trim() : '';
+  if (!raw) return null;
+  const dataUrlMatch = raw.match(/^data:(image\/[a-z0-9.+-]+);base64,(.*)$/is);
+  if (dataUrlMatch) raw = dataUrlMatch[2].trim();
+  if (!/^[A-Za-z0-9+/=\r\n]+$/.test(raw)) return null;
+  try {
+    const buffer = Buffer.from(raw.replace(/\s+/g, ''), 'base64');
+    return buffer.length > 0 ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistGeneratedImageFromResult(result, sessionId, callId) {
+  const buffer = imageBufferFromCodexResult(result);
+  if (!buffer) return null;
+  const detectedMime = detectMimeFromMagic(buffer);
+  if (!IMAGE_MIME_TYPES.has(detectedMime)) return null;
+  const ext = extFromMime(detectedMime) || '.png';
+  const safeSessionId = sanitizeId(sessionId || 'unknown') || 'unknown';
+  const rawCallId = String(callId || '').trim();
+  const safeCallId = /^[A-Za-z0-9_-]+$/.test(rawCallId) ? rawCallId : crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 24);
+  const dir = path.join(GENERATED_MESSAGE_IMAGES_ROOT, safeSessionId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.resolve(dir, `${safeCallId}${ext}`);
+  const root = path.resolve(GENERATED_MESSAGE_IMAGES_ROOT);
+  if (!isPathInside(filePath, root)) return null;
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+function generatedImageInfoForFile(filePath) {
+  const absPath = path.resolve(String(filePath || ''));
+  if (!isGeneratedImageExtension(absPath)) return null;
+  for (const [rootKey, rootDir] of generatedImageRootEntries()) {
+    const root = path.resolve(rootDir);
+    if (!isPathInside(absPath, root)) continue;
+    const relativeParts = path.relative(root, absPath).split(path.sep).filter(Boolean);
+    if (!relativeParts.length || relativeParts.some((part) => part === '..' || part.includes('\0'))) return null;
+    return {
+      rootKey,
+      root,
+      path: absPath,
+      relativePath: relativeParts.join('/'),
+      rawUrl: generatedImageUrlForFile(absPath),
+    };
+  }
+  return null;
+}
+
+function createGeneratedImageSegmentFromCodexEvent(codexEvent = {}, options = {}) {
+  const callId = String(codexEvent.call_id || '').trim();
+  const preferredThreadId = String(options.threadId || options.runtimeSessionId || '').trim();
+  const existingPath = findCodexGeneratedImageByCallId(callId, preferredThreadId);
+  const filePath = existingPath || persistGeneratedImageFromResult(codexEvent.result, options.sessionId || preferredThreadId || 'unknown', callId);
+  const info = filePath ? generatedImageInfoForFile(filePath) : null;
+  const src = info?.rawUrl || '';
+  if (!src) return null;
+  const detectedMime = getFileMime(info.path) || 'image/png';
+  return {
+    id: callId || null,
+    src,
+    rawUrl: src,
+    path: info.path,
+    relativePath: info.relativePath,
+    rootKey: info.rootKey,
+    mime: detectedMime,
+    alt: 'Generated image',
+    prompt: codexEvent.revised_prompt || '',
+  };
 }
 
 function loadAttachmentMeta(id) {
@@ -3485,11 +4594,13 @@ function normalizeMessageAttachments(attachments) {
     const meta = loadAttachmentMeta(id);
     const state = currentAttachmentState(meta);
     if (state === 'expired') removeAttachmentById(id);
+    const kind = meta?.kind || attachment?.kind || 'image';
     normalized.push({
       id,
-      kind: 'image',
-      filename: meta?.filename || attachment?.filename || 'image',
-      mime: meta?.mime || attachment?.mime || 'image/png',
+      kind,
+      filename: meta?.filename || attachment?.filename || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file')),
+      mime: meta?.mime || attachment?.mime || (kind === 'image' ? 'image/png' : 'application/octet-stream'),
+      documentType: meta?.documentType || attachment?.documentType || null,
       size: meta?.size || attachment?.size || 0,
       createdAt: meta?.createdAt || attachment?.createdAt || null,
       expiresAt: meta?.expiresAt || attachment?.expiresAt || null,
@@ -3569,6 +4680,42 @@ const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
+}
+
+const VALID_PERMISSION_MODES = new Set(['default', 'plan', 'yolo']);
+const CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE = '检测到 Webcoding 正以 root 用户运行，Claude 的 YOLO 模式会触发 CLI 报错；已自动降级为默认模式。';
+
+function isRootProcessOnUnix() {
+  return process.platform !== 'win32'
+    && typeof process.getuid === 'function'
+    && process.getuid() === 0;
+}
+
+function defaultPermissionModeForAgent(agent) {
+  return normalizeAgent(agent) === 'codex' ? 'yolo' : 'default';
+}
+
+function normalizePermissionModeInput(mode, agent = 'claude') {
+  return VALID_PERMISSION_MODES.has(mode) ? mode : defaultPermissionModeForAgent(agent);
+}
+
+function resolvePermissionModeForAgent(agent, mode) {
+  const normalizedAgent = normalizeAgent(agent);
+  const requestedMode = normalizePermissionModeInput(mode, normalizedAgent);
+  if (normalizedAgent === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
+    return {
+      mode: 'default',
+      requestedMode,
+      downgraded: true,
+      message: CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE,
+    };
+  }
+  return {
+    mode: requestedMode,
+    requestedMode,
+    downgraded: false,
+    message: '',
+  };
 }
 
 function normalizeRuntimeContextEntry(entry) {
@@ -4107,9 +5254,156 @@ function getPreferredRuntimeSessionId(session, agent, options = {}) {
   return fallback?.entry?.runtimeId || null;
 }
 
+
+function normalizeQueuedMessageAttachments(attachments) {
+  return normalizeMessageAttachments(Array.isArray(attachments) ? attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : []);
+}
+
+function normalizeQueuedMessageFileRefs(fileRefs) {
+  if (!Array.isArray(fileRefs)) return [];
+  return fileRefs.slice(0, MAX_CONTEXT_FILE_REFS).map((ref) => {
+    if (!ref || typeof ref !== 'object') return null;
+    const relativePath = String(ref.relativePath || ref.path || '').trim();
+    if (!relativePath) return null;
+    const type = ref.type === 'directory' ? 'directory' : 'file';
+    return {
+      type,
+      path: String(ref.path || relativePath),
+      relativePath,
+      size: type === 'directory' ? 0 : Number(ref.size || 0) || 0,
+    };
+  }).filter(Boolean);
+}
+
+function normalizeQueuedMessagesForSession(session, value) {
+  if (!Array.isArray(value)) return [];
+  const queued = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const text = typeof raw.text === 'string' ? raw.text : '';
+    const attachments = normalizeQueuedMessageAttachments(raw.attachments);
+    const fileRefs = normalizeQueuedMessageFileRefs(raw.fileRefs);
+    if (!text.trim() && attachments.length === 0 && fileRefs.length === 0) continue;
+    queued.push({
+      id: sanitizeId(raw.id || '') || crypto.randomUUID(),
+      sessionId: session?.id || (typeof raw.sessionId === 'string' ? sanitizeId(raw.sessionId) : null),
+      text,
+      attachments,
+      fileRefs,
+      mode: typeof raw.mode === 'string' ? raw.mode : (session?.permissionMode || 'yolo'),
+      reasoningEffort: normalizeCodexReasoningEffort(raw.reasoningEffort),
+      fastMode: normalizeCodexFastMode(raw.fastMode),
+      agent: normalizeAgent(raw.agent || session?.agent),
+      createdAt: typeof raw.createdAt === 'string'
+        ? raw.createdAt
+        : (Number.isFinite(raw.createdAt) ? new Date(raw.createdAt).toISOString() : new Date().toISOString()),
+    });
+    if (queued.length >= MAX_SERVER_QUEUED_MESSAGES) break;
+  }
+  return queued;
+}
+
+function buildQueuedMessagesPayload(session) {
+  const normalized = normalizeQueuedMessagesForSession(session, session?.queuedMessages || []);
+  return normalized.map((item) => ({
+    id: item.id,
+    sessionId: item.sessionId || session?.id || null,
+    text: item.text || '',
+    attachments: item.attachments || [],
+    fileRefs: item.fileRefs || [],
+    mode: item.mode || session?.permissionMode || 'yolo',
+    reasoningEffort: item.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(item.fastMode),
+    agent: normalizeAgent(item.agent || session?.agent),
+    createdAt: item.createdAt || new Date().toISOString(),
+    serverQueued: true,
+  }));
+}
+
+function clipSideConversationText(value, limit = 1200) {
+  const text = String(value || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}…`;
+}
+
+function normalizeSideConversationMessageContext(raw, index = -1) {
+  if (!raw || typeof raw !== 'object') return null;
+  const text = clipSideConversationText(raw.text || raw.content || raw.messageText || '', 1200);
+  if (!text) return null;
+  const role = String(raw.role || 'message').slice(0, 40);
+  return {
+    role,
+    text,
+    index: Number.isFinite(raw.index) ? raw.index : index,
+    messageId: sanitizeId(raw.messageId || ''),
+    timestamp: String(raw.timestamp || '').slice(0, 80),
+  };
+}
+
+function normalizeSideConversationParentContext(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const recentMessages = Array.isArray(raw.recentMessages)
+    ? raw.recentMessages.slice(-8).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const nearbyBefore = Array.isArray(raw.nearbyBefore)
+    ? raw.nearbyBefore.slice(-2).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const nearbyAfter = Array.isArray(raw.nearbyAfter)
+    ? raw.nearbyAfter.slice(0, 2).map((item, index) => normalizeSideConversationMessageContext(item, index)).filter(Boolean)
+    : [];
+  const anchorRaw = raw.anchor && typeof raw.anchor === 'object' ? raw.anchor : null;
+  const anchor = anchorRaw ? {
+    messageId: sanitizeId(anchorRaw.messageId || ''),
+    role: String(anchorRaw.role || '').slice(0, 40),
+    index: Number.isFinite(anchorRaw.index) ? anchorRaw.index : -1,
+    timestamp: String(anchorRaw.timestamp || '').slice(0, 80),
+    messageText: clipSideConversationText(anchorRaw.messageText || anchorRaw.text || '', 1800),
+  } : null;
+  return {
+    title: String(raw.title || '').slice(0, 240),
+    cwd: String(raw.cwd || '').slice(0, 1000),
+    projectId: String(raw.projectId || '').slice(0, 120),
+    agent: normalizeAgent(raw.agent),
+    mode: String(raw.mode || '').slice(0, 40),
+    selectedText: clipSideConversationText(raw.selectedText || '', 12000),
+    anchor,
+    nearbyBefore,
+    nearbyAfter,
+    recentMessages,
+  };
+}
+
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
+  const kind = String(session.kind || '').trim();
+  const isSideConversation = kind === 'side_conversation' || session.sidecar === true;
+  session.kind = isSideConversation ? 'side_conversation' : 'main';
+  session.sidecar = session.kind === 'side_conversation';
+  session.parentSessionId = session.sidecar ? sanitizeId(session.parentSessionId || '') : null;
+  if (session.sidecar && session.anchor && typeof session.anchor === 'object') {
+    const anchorType = String(session.anchor.type || 'selection').trim() || 'selection';
+    const anchorText = String(session.anchor.text || session.contextSnippet || '').slice(0, 12000);
+    session.anchor = {
+      type: anchorType,
+      text: anchorText,
+      messageId: sanitizeId(session.anchor.messageId || ''),
+      filePath: String(session.anchor.filePath || '').slice(0, 1000),
+      createdAt: String(session.anchor.createdAt || session.created || new Date().toISOString()),
+    };
+  } else if (session.sidecar) {
+    session.anchor = {
+      type: 'selection',
+      text: String(session.contextSnippet || '').slice(0, 12000),
+      messageId: '',
+      filePath: '',
+      createdAt: String(session.created || new Date().toISOString()),
+    };
+  } else {
+    delete session.anchor;
+  }
+  session.contextSnippet = session.sidecar ? String(session.anchor?.text || session.contextSnippet || '').slice(0, 12000) : '';
+  session.parentContext = session.sidecar ? normalizeSideConversationParentContext(session.parentContext) : null;
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeRuntimeFingerprint')) session.claudeRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
@@ -4126,8 +5420,13 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
-    session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
   }
+  delete session.currentUsage;
+  if (session.lastUsage && typeof session.lastUsage !== 'object') delete session.lastUsage;
+  if (session.contextWindowTokens) session.contextWindowTokens = Number(session.contextWindowTokens) || null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'queuedMessages')) session.queuedMessages = [];
+  session.queuedMessages = normalizeQueuedMessagesForSession(session, session.queuedMessages);
   if (!Object.prototype.hasOwnProperty.call(session, 'messages')) session.messages = [];
   if (Array.isArray(session.messages)) {
     session.messages = session.messages.map((message) => {
@@ -4349,6 +5648,50 @@ function splitHistoryMessages(messages) {
   return { recentMessages, olderChunks };
 }
 
+function buildLatestSideConversationPayload(parentSessionId) {
+  const parentId = sanitizeId(parentSessionId || '');
+  if (!parentId) return null;
+  let latest = null;
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const session = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8')));
+        if (!session?.sidecar || session.kind !== 'side_conversation') continue;
+        if (sanitizeId(session.parentSessionId || '') !== parentId) continue;
+        if (!latest || String(session.updated || session.created || '') > String(latest.updated || latest.created || '')) {
+          latest = session;
+        }
+      } catch {}
+    }
+  } catch {
+    return null;
+  }
+  if (!latest) return null;
+  const { recentMessages } = splitHistoryMessages(latest.messages);
+  return {
+    sessionId: latest.id,
+    kind: latest.kind || 'side_conversation',
+    sidecar: true,
+    parentSessionId: latest.parentSessionId || parentId,
+    anchor: latest.anchor || null,
+    parentContext: latest.parentContext || null,
+    contextSnippet: latest.contextSnippet || '',
+    messages: recentMessages,
+    title: latest.title || '侧边聊天',
+    mode: latest.permissionMode || 'default',
+    reasoningEffort: latest.reasoningEffort || '',
+    fastMode: !!latest.fastMode,
+    model: sessionModelLabel(latest),
+    agent: getSessionAgent(latest),
+    cwd: latest.cwd || null,
+    projectId: latest.projectId || null,
+    updated: latest.updated || latest.created || null,
+    isRunning: activeProcesses.has(latest.id),
+    ...buildSessionRuntimeMeta(latest),
+  };
+}
+
 function normalizeReplayText(text) {
   return String(text || '')
     .replace(/\r\n?/g, '\n')
@@ -4388,6 +5731,16 @@ function messageTextForCarryover(message) {
       .filter(Boolean)
       .slice(0, 4);
     parts.push(`附件: ${names.join(', ')}${attachments.length > names.length ? ` 等 ${attachments.length} 项` : ''}`);
+  }
+  const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
+  if (fileRefs.length > 0) {
+    const names = fileRefs
+      .map((ref) => String(ref?.relativePath || ref?.path || '').trim())
+      .filter(Boolean)
+      .slice(0, 6);
+    if (names.length > 0) {
+      parts.push(`引用文件: ${names.join(', ')}${fileRefs.length > names.length ? ` 等 ${fileRefs.length} 项` : ''}`);
+    }
   }
   const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
   if (toolCalls.length > 0) {
@@ -4614,7 +5967,7 @@ function buildCarryoverSummary(session, historyMessages, currentInputText, attac
     || '继续当前会话中的最近任务';
   const pending = extractCarryoverLead(currentInputText)
     || (Array.isArray(attachments) && attachments.length > 0
-      ? `继续处理本次新增的 ${attachments.length} 张图片相关请求`
+      ? `继续处理本次新增的 ${attachments.length} 个附件相关请求`
       : '继续处理当前会话的下一步任务');
   const configLines = buildCarryoverConfigLines(session);
   const historyChars = (Array.isArray(historyMessages) ? historyMessages : [])
@@ -4670,7 +6023,7 @@ function formatCurrentInputForCarryover(text, attachments) {
       .map((attachment) => String(attachment?.filename || attachment?.id || 'image').trim())
       .filter(Boolean)
       .slice(0, 4);
-    blocks.push(`本次还附带图片: ${names.join(', ')}${list.length > names.length ? ` 等 ${list.length} 项` : ''}`);
+    blocks.push(`本次还附带附件: ${names.join(', ')}${list.length > names.length ? ` 等 ${list.length} 项` : ''}`);
   }
   if (blocks.length === 0) {
     blocks.push('请继续处理当前会话中的下一步任务。');
@@ -4689,6 +6042,8 @@ function buildThreadCarryoverPayload(session, text, attachments, historyMessages
     reasonText = '检测到这是旧版线程，当前必须按最新配置重建底层线程。';
   } else if (threadReset?.reason === 'channel_changed') {
     reasonText = '检测到当前会话切换到了新的渠道或模型，当前会在该渠道下建立新线程。';
+  } else if (threadReset?.reason === 'edited_message') {
+    reasonText = '用户修改了前面的一条消息，当前会丢弃旧回答并在新底层线程中重新生成。';
   }
   const prompt = [
     '[webcoding 自动上下文续接]',
@@ -4738,8 +6093,6 @@ function sendHistoryChunks(ws, sessionId, chunks, index = 0) {
     setImmediate(scheduleNext);
   }
 }
-
-const IS_WIN = process.platform === 'win32';
 
 function isProcessRunning(pid) {
   try {
@@ -5068,6 +6421,7 @@ function startTunnel() {
   const child = spawn(process.execPath, [TUNNEL_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CF_TUNNEL_STATE_PATH: TUNNEL_STATE_PATH,
@@ -5189,6 +6543,134 @@ function loadBridgeRuntime(token = '') {
   };
 }
 
+function normalizeBridgeUsageRecordUsage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const usage = {
+    inputTokens: Number(raw.inputTokens ?? raw.input_tokens ?? raw.prompt_tokens) || 0,
+    cachedInputTokens: Number(raw.cachedInputTokens ?? raw.cached_input_tokens ?? raw.cached_tokens ?? raw.cache_tokens ?? raw.input_tokens_details?.cached_tokens ?? raw.prompt_tokens_details?.cached_tokens) || 0,
+    outputTokens: Number(raw.outputTokens ?? raw.output_tokens ?? raw.completion_tokens) || 0,
+    reasoningOutputTokens: Number(raw.reasoningOutputTokens ?? raw.reasoning_tokens ?? raw.output_tokens_details?.reasoning_tokens ?? raw.completion_tokens_details?.reasoning_tokens) || 0,
+    totalTokens: Number(raw.totalTokens ?? raw.total_tokens) || 0,
+  };
+  const total = usage.totalTokens || usage.inputTokens + usage.outputTokens + usage.reasoningOutputTokens;
+  return total > 0 ? usage : null;
+}
+
+function readLatestBridgeUsageForToken(token, sinceMs = 0) {
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken || !fs.existsSync(BRIDGE_USAGE_PATH)) return null;
+  let content = '';
+  try {
+    content = fs.readFileSync(BRIDGE_USAGE_PATH, 'utf8');
+  } catch {
+    return null;
+  }
+  let latest = null;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let record = null;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (String(record?.token || '').trim() !== normalizedToken) continue;
+    const timestampMs = Date.parse(record.timestamp || '');
+    if (sinceMs && (!Number.isFinite(timestampMs) || timestampMs < sinceMs)) continue;
+    const usage = normalizeBridgeUsageRecordUsage(record.usage);
+    if (!usage) continue;
+    if (!latest || timestampMs >= latest.timestampMs) {
+      latest = { timestampMs, usage, record };
+    }
+  }
+  return latest;
+}
+
+function applyBridgeUsageToEntry(sessionId, entry) {
+  if (!entry || entry.agent !== 'codex' || entry.bridgeUsageApplied) return null;
+  const bridgeToken = String(entry.bridgeToken || '').trim();
+  if (!bridgeToken) return null;
+  const sinceMs = Number(entry.startedAtMs || 0) ? Math.max(0, Number(entry.startedAtMs) - 5000) : 0;
+  const latest = readLatestBridgeUsageForToken(bridgeToken, sinceMs);
+  if (!latest?.usage) return null;
+  entry.bridgeUsageApplied = true;
+  entry.lastUsage = latest.usage;
+  const session = loadSession(sessionId);
+  if (session) {
+    session.lastUsage = latest.usage;
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+  sendRuntimeMessage(entry, {
+    type: 'usage',
+    sessionId,
+    totalUsage: session?.totalUsage || null,
+    currentUsage: latest.usage,
+    contextWindowTokens: session?.contextWindowTokens || null,
+  });
+  return latest.usage;
+}
+
+function bridgeUsageRecordKey(record, usage) {
+  return JSON.stringify({
+    timestamp: record?.timestamp || '',
+    token: record?.token || '',
+    provider: record?.provider || '',
+    model: record?.model || '',
+    endpoint: record?.endpoint || '',
+    usage,
+  });
+}
+
+function applyRealtimeBridgeUsageRecord(record) {
+  const token = String(record?.token || '').trim();
+  if (!token || activeProcesses.size === 0) return false;
+  const usage = normalizeBridgeUsageRecordUsage(record?.usage);
+  if (!usage) return false;
+
+  const timestampMs = Date.parse(record?.timestamp || '');
+  const recordKey = bridgeUsageRecordKey(record, usage);
+  let applied = false;
+
+  for (const [sessionId, entry] of activeProcesses) {
+    if (!entry || entry.agent !== 'codex') continue;
+    if (String(entry.bridgeToken || '').trim() !== token) continue;
+    const sinceMs = Number(entry.startedAtMs || 0) ? Math.max(0, Number(entry.startedAtMs) - 5000) : 0;
+    if (sinceMs && Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
+    if (entry.lastRealtimeBridgeUsageRecordKey === recordKey) continue;
+
+    entry.lastRealtimeBridgeUsageRecordKey = recordKey;
+    entry.lastRealtimeBridgeUsageTimestampMs = Number.isFinite(timestampMs) ? timestampMs : Date.now();
+    entry.lastUsage = usage;
+
+    const session = loadSession(sessionId);
+    if (session) {
+      session.lastUsage = usage;
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+
+    sendRuntimeMessage(entry, {
+      type: 'usage',
+      sessionId,
+      totalUsage: session?.totalUsage || null,
+      currentUsage: usage,
+      contextWindowTokens: session?.contextWindowTokens || null,
+    });
+    applied = true;
+  }
+
+  return applied;
+}
+
+function processBridgeUsageLogLine(line) {
+  let record = null;
+  try { record = JSON.parse(line); } catch { return; }
+  try {
+    applyRealtimeBridgeUsageRecord(record);
+  } catch (error) {
+    plog('WARN', 'bridge_usage_realtime_error', {
+      error: error?.message || String(error),
+    });
+  }
+}
+
 function listBridgeRuntimeTokens() {
   return Object.keys(loadBridgeRuntimeStore().runtimes);
 }
@@ -5202,11 +6684,92 @@ function getBridgeScriptFingerprint() {
   }
 }
 
+
+function getProcessBridgeStatePath(pid) {
+  if (IS_WIN) return '';
+  const env = readProcEnvMap(pid);
+  return env.get('CC_WEB_BRIDGE_STATE_PATH') || '';
+}
+
+function bridgeStateBelongsToThisInstance(state) {
+  if (!state?.pid || !isProcessRunning(state.pid)) return false;
+  // Windows has no /proc/<pid>/environ. The state file already lives under
+  // this instance's isolated config directory and is atomically replaced by
+  // the bridge child, so PID + script fingerprint are the available identity.
+  if (IS_WIN) return true;
+  const runningStatePath = getProcessBridgeStatePath(state.pid);
+  return !!runningStatePath && path.resolve(runningStatePath) === path.resolve(BRIDGE_STATE_PATH);
+}
+
 function canReuseBridgeState(state) {
   if (!state?.pid || !state.port || !isProcessRunning(state.pid)) return false;
+  if (!bridgeStateBelongsToThisInstance(state)) return false;
   const currentFingerprint = getBridgeScriptFingerprint();
   if (!currentFingerprint) return true;
   return !!state.scriptFingerprint && state.scriptFingerprint === currentFingerprint;
+}
+
+function readProcNullSeparatedFile(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function readProcEnvMap(pid) {
+  const env = new Map();
+  for (const item of readProcNullSeparatedFile(path.join('/proc', String(pid), 'environ'))) {
+    const index = item.indexOf('=');
+    if (index <= 0) continue;
+    env.set(item.slice(0, index), item.slice(index + 1));
+  }
+  return env;
+}
+
+function listLocalBridgeProcesses() {
+  if (IS_WIN) return [];
+  let entries = [];
+  try { entries = fs.readdirSync('/proc', { withFileTypes: true }); } catch { return []; }
+  const scriptPath = path.resolve(BRIDGE_SCRIPT_PATH);
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
+    const cmdline = readProcNullSeparatedFile(path.join('/proc', entry.name, 'cmdline'));
+    if (!cmdline.some((arg) => path.resolve(String(arg || '')) === scriptPath)) continue;
+    const env = readProcEnvMap(pid);
+    matches.push({
+      pid,
+      cmdline,
+      statePath: env.get('CC_WEB_BRIDGE_STATE_PATH') || '',
+      runtimePath: env.get('CC_WEB_BRIDGE_RUNTIME_PATH') || '',
+      usagePath: env.get('CC_WEB_BRIDGE_USAGE_PATH') || '',
+    });
+  }
+  return matches;
+}
+
+function cleanupStaleLocalBridgeProcesses(options = {}) {
+  if (IS_WIN) return 0;
+  const targetStatePath = path.resolve(String(options.statePath || BRIDGE_STATE_PATH));
+  const keepPids = new Set((Array.isArray(options.keepPids) ? options.keepPids : [])
+    .map((pid) => Number(pid))
+    .filter((pid) => Number.isFinite(pid) && pid > 0));
+  let killed = 0;
+  for (const info of listLocalBridgeProcesses()) {
+    if (path.resolve(String(info.statePath || '')) !== targetStatePath) continue;
+    if (keepPids.has(info.pid)) continue;
+    killProcess(info.pid, true);
+    killed += 1;
+    plog('WARN', 'stale_bridge_process_killed', {
+      pid: info.pid,
+      statePath: info.statePath || null,
+      keepPids: Array.from(keepPids),
+    });
+  }
+  return killed;
 }
 
 function buildLocalBridgeBaseUrl(port, kind) {
@@ -5233,21 +6796,31 @@ function isBridgePortReachable(port) {
 
 function ensureLocalBridgeRunning() {
   const existing = readBridgeState();
-  if (canReuseBridgeState(existing)) {
+  const reusableExisting = canReuseBridgeState(existing);
+  cleanupStaleLocalBridgeProcesses({
+    statePath: BRIDGE_STATE_PATH,
+    keepPids: reusableExisting && existing?.pid ? [existing.pid] : [],
+  });
+  if (reusableExisting) {
     return existing;
   }
-  if (existing?.pid && isProcessRunning(existing.pid)) {
+  const existingBelongsHere = bridgeStateBelongsToThisInstance(existing);
+  if (existingBelongsHere && existing?.pid && isProcessRunning(existing.pid)) {
     killProcess(existing.pid, true);
     sleepSync(100);
   }
+  // Do not kill or delete state that was copied from another Webcoding instance.
+  // The new local bridge will overwrite this experiment copy's state file.
 
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     env: {
       ...process.env,
       CC_WEB_BRIDGE_RUNTIME_PATH: BRIDGE_RUNTIME_PATH,
       CC_WEB_BRIDGE_STATE_PATH: BRIDGE_STATE_PATH,
+      CC_WEB_BRIDGE_USAGE_PATH: BRIDGE_USAGE_PATH,
     },
   });
   child.unref();
@@ -5255,19 +6828,34 @@ function ensureLocalBridgeRunning() {
   const start = Date.now();
   while (Date.now() - start < BRIDGE_START_TIMEOUT_MS) {
     const state = readBridgeState();
-    if (state?.pid && isProcessRunning(state.pid) && state.port) return state;
+    if (canReuseBridgeState(state)) {
+      cleanupStaleLocalBridgeProcesses({ statePath: BRIDGE_STATE_PATH, keepPids: [state.pid] });
+      return state;
+    }
+    // A freshly copied experiment may still contain the production bridge-state.json.
+    // Wait until the newly spawned experiment bridge overwrites it instead of
+    // reusing another Webcoding instance's PID/port/token combination.
     sleepSync(50);
   }
   throw new Error('本地 API 桥接服务启动超时');
 }
 
-function ensureBridgeRuntimeForTemplate(tpl) {
+function ensureBridgeRuntimeForTemplate(tpl, options = {}) {
   const defaultModel = String(tpl.defaultModel || '').trim();
   const upstreamType = normalizeProviderUpstreamType(tpl.upstreamType, tpl.apiBase, `${tpl.name || ''}\n${tpl.defaultModel || ''}`);
   const upstreamKind = providerUpstreamKind(upstreamType);
   const store = loadBridgeRuntimeStore();
-  const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === String(tpl.name || '').trim()) || null;
-  const token = existing?.token || crypto.randomBytes(24).toString('hex');
+  const templateName = String(tpl.name || '').trim();
+  if (options.forceNewToken === true) {
+    const activeBridgeTokens = new Set(Array.from(activeProcesses.values()).map((entry) => String(entry?.bridgeToken || '').trim()).filter(Boolean));
+    for (const [runtimeToken, entry] of Object.entries(store.runtimes || {})) {
+      if (entry?.upstream?.name === templateName && !activeBridgeTokens.has(String(runtimeToken || '').trim())) {
+        delete store.runtimes[runtimeToken];
+      }
+    }
+  }
+  const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === templateName) || null;
+  const token = options.forceNewToken === true || !existing?.token ? crypto.randomBytes(24).toString('hex') : existing.token;
   const updatedAt = new Date().toISOString();
   store.runtimes[token] = {
     token,
@@ -5324,12 +6912,16 @@ function collectSessionListSnapshot() {
       const localMeta = getSessionAgent(s) === 'claude' && preferredClaudeRuntimeId && (!s.cwd || !s.importedFrom)
         ? resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId)
         : null;
+      if (s.kind === 'side_conversation' || s.sidecar) continue;
       sessions.push({
         id: s.id,
         title: s.title || 'Untitled',
         updated: s.updated,
         hasUnread: !!s.hasUnread,
         agent: getSessionAgent(s),
+        reasoningEffort: s.reasoningEffort || '',
+        fastMode: !!s.fastMode,
+        queuedCount: Array.isArray(s.queuedMessages) ? s.queuedMessages.length : 0,
         isRunning: activeProcesses.has(s.id),
         projectId: s.projectId || null,
         cwd: s.cwd || localMeta?.cwd || null,
@@ -5363,6 +6955,47 @@ function sendSessionList(ws, options = {}) {
     wsSend(ws, { type: 'session_list', sessions: [] });
   }
 }
+
+function broadcastSessionListRefresh() {
+  const sessions = getSessionListSnapshot({ forceRefresh: true });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated === true) {
+      sendSessionList(client, { sessions });
+    }
+  }
+}
+
+
+function getSessionViewerClients(sessionId) {
+  const viewers = [];
+  for (const client of wss.clients) {
+    if (client.readyState !== WebSocket.OPEN || client.isAuthenticated !== true) continue;
+    if (wsSessionMap.get(client) === sessionId) viewers.push(client);
+  }
+  return viewers;
+}
+
+function broadcastToSessionViewers(sessionId, data) {
+  for (const client of getSessionViewerClients(sessionId)) wsSend(client, data);
+}
+
+function sendQueueUpdateForSession(sessionId) {
+  const session = loadSession(sessionId);
+  if (!session) return;
+  const payload = {
+    type: 'queue_update',
+    sessionId,
+    queuedMessages: buildQueuedMessagesPayload(session),
+  };
+  broadcastToSessionViewers(sessionId, payload);
+  const sessions = getSessionListSnapshot({ forceRefresh: true });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated === true) {
+      sendSessionList(client, { sessions });
+    }
+  }
+}
+
 
 // === File Tailer ===
 // Tails a file and calls onLine for each new complete line.
@@ -5405,27 +7038,29 @@ class FileTailer {
       const stat = fs.statSync(this.filePath);
       if (stat.size <= this.offset) return;
 
-      const remaining = stat.size - this.offset;
-      const readLen = Math.min(remaining, FILE_TAIL_MAX_READ_BYTES);
-      const buf = Buffer.alloc(readLen);
+      const targetSize = stat.size;
       const fd = fs.openSync(this.filePath, 'r');
-      let bytesRead = 0;
       try {
-        bytesRead = fs.readSync(fd, buf, 0, buf.length, this.offset);
+        while (!this.stopped && this.offset < targetSize) {
+          const remaining = targetSize - this.offset;
+          const readLen = Math.min(remaining, FILE_TAIL_MAX_READ_BYTES);
+          const buf = Buffer.alloc(readLen);
+          const bytesRead = fs.readSync(fd, buf, 0, buf.length, this.offset);
+          if (bytesRead <= 0) break;
+
+          this.offset += bytesRead;
+          this.buffer += buf.toString('utf8', 0, bytesRead);
+          const lines = this.buffer.split('\n');
+          this.buffer = lines.pop();
+          for (const line of lines) {
+            if (line.trim()) this.onLine(line);
+          }
+        }
       } finally {
         fs.closeSync(fd);
       }
-
-      if (bytesRead <= 0) return;
-
-      this.offset += bytesRead;
-      this.buffer += buf.toString('utf8', 0, bytesRead);
-      const lines = this.buffer.split('\n');
-      this.buffer = lines.pop();
-      for (const line of lines) {
-        if (line.trim()) this.onLine(line);
-      }
     } catch (error) {
+      if (error?.code === 'ENOENT') return;
       plog('WARN', 'tailer_read_error', {
         file: this.filePath,
         offset: this.offset,
@@ -5441,6 +7076,9 @@ class FileTailer {
     if (this.readTimer) { clearTimeout(this.readTimer); this.readTimer = null; }
   }
 }
+
+const bridgeUsageTailer = new FileTailer(BRIDGE_USAGE_PATH, processBridgeUsageLogLine);
+bridgeUsageTailer.start();
 
 // === Process Lifecycle ===
 
@@ -5487,6 +7125,12 @@ function formatRuntimeError(agent, raw, context = {}) {
     }
     if (/authentication|unauthorized|forbidden|login|api key|credential/i.test(condensed)) {
       return 'Codex 鉴权失败。请确认本机 Codex CLI 已完成登录，且当前凭据仍然有效。';
+    }
+    if (isCodexCapacityError('codex', condensed)) {
+      return codexCapacityFinalMessage();
+    }
+    if (isCodexStreamDisconnectError('codex', `${condensed}\n${raw || ''}`)) {
+      return codexTransientFinalMessage('stream_disconnect');
     }
     if (/rate limit|quota|billing|credits/i.test(condensed)) {
       return 'Codex 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
@@ -5585,6 +7229,46 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
+function isCodexCapacityError(agent, raw) {
+  if (agent !== 'codex') return false;
+  const text = String(raw || '');
+  return /selected model is at capacity|model is at capacity|at capacity\b/i.test(text);
+}
+
+function isCodexStreamDisconnectError(agent, raw) {
+  if (agent !== 'codex') return false;
+  const text = String(raw || '');
+  return /stream disconnected before completion|error sending request for url|an error occurred while processing your request/i.test(text);
+}
+
+function getCodexTransientErrorKind(agent, raw) {
+  if (isCodexCapacityError(agent, raw)) return 'capacity';
+  if (isCodexStreamDisconnectError(agent, raw)) return 'stream_disconnect';
+  return '';
+}
+
+function codexTransientRetryMessage(kind, nextRetryCount) {
+  if (kind === 'stream_disconnect') {
+    return `Codex 上游流式连接中断，正在自动重试（${nextRetryCount}/${CODEX_CAPACITY_RETRY_MAX}）…`;
+  }
+  return `当前 Codex 模型繁忙，正在自动重试（${nextRetryCount}/${CODEX_CAPACITY_RETRY_MAX}）…`;
+}
+
+function codexCapacityRetryMessage(nextRetryCount) {
+  return codexTransientRetryMessage('capacity', nextRetryCount);
+}
+
+function codexTransientFinalMessage(kind) {
+  if (kind === 'stream_disconnect') {
+    return `Codex 上游流式连接中断，已自动重试 ${CODEX_CAPACITY_RETRY_MAX} 次仍失败。请稍后重试或切换模型。`;
+  }
+  return `当前 Codex 模型繁忙，已自动重试 ${CODEX_CAPACITY_RETRY_MAX} 次仍失败。请稍后重试或切换模型。`;
+}
+
+function codexCapacityFinalMessage() {
+  return codexTransientFinalMessage('capacity');
+}
+
 function readProcessStderrSnippet(sessionId) {
   try {
     const errPath = path.join(runDir(sessionId), 'error.log');
@@ -5596,14 +7280,15 @@ function readProcessStderrSnippet(sessionId) {
 
 function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
   const completeTime = new Date().toISOString();
-  const wsConnected = !!entry.ws;
+  const wsConnected = isProcessRealtimeConnected(entry);
+  const abortedByUser = !!entry.abortRequested;
   const disconnectGap = entry.wsDisconnectTime
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
   const stderrSnippet = readProcessStderrSnippet(sessionId);
-  const hasNonZeroExit = typeof exitCode === 'number' && exitCode !== 0;
-  const hasUnexpectedSignal = !!signal && signal !== 'SIGTERM';
+  const hasNonZeroExit = !abortedByUser && typeof exitCode === 'number' && exitCode !== 0;
+  const hasUnexpectedSignal = !abortedByUser && !!signal && signal !== 'SIGTERM';
   const rawCompletionError = entry.lastError || (
     (hasNonZeroExit || hasUnexpectedSignal)
       ? (stderrSnippet || null)
@@ -5614,7 +7299,10 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
       ? `process exited with non-zero status ${exitCode} but returned no stderr`
       : null
   );
-  const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
+  const diagnosticText = `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}\n${loggedCompletionError || ''}`;
+  const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', diagnosticText);
+  const codexTransientErrorKind = getCodexTransientErrorKind(entry.agent || 'claude', diagnosticText);
+  const capacityExceeded = codexTransientErrorKind === 'capacity';
   const completionError = rawCompletionError
     ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal })
     : hasNonZeroExit
@@ -5628,6 +7316,7 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     agent: entry.agent || 'claude',
     exitCode,
     signal,
+    abortedByUser,
     wsConnected,
     wsDisconnectTime: entry.wsDisconnectTime || null,
     disconnectToDeathGap: disconnectGap,
@@ -5638,9 +7327,132 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     error: loggedCompletionError,
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
+    modelCapacity: capacityExceeded,
+    transientErrorKind: codexTransientErrorKind || null,
   });
 
-  return { pendingRetry, contextLimitExceeded, completionError };
+  return { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError, abortedByUser };
+}
+
+
+function imageSegmentIdentity(segment) {
+  if (!segment || typeof segment !== 'object') return '';
+  return String(segment.id || segment.path || segment.rawUrl || segment.src || '').trim();
+}
+
+function addImageSegmentIdentities(target, segments) {
+  if (!target || !Array.isArray(segments)) return target;
+  for (const segment of segments) {
+    if (!segment || segment.type !== 'image') continue;
+    const identity = imageSegmentIdentity(segment);
+    if (identity) target.add(identity);
+  }
+  return target;
+}
+
+function collectSessionImageIdentities(session) {
+  const identities = new Set();
+  for (const message of Array.isArray(session?.messages) ? session.messages : []) {
+    addImageSegmentIdentities(identities, message?.segments);
+  }
+  return identities;
+}
+
+function collectEntryImageIdentities(entry) {
+  return addImageSegmentIdentities(new Set(), entry?.segments);
+}
+
+function collectAssistantImageSegments(messages) {
+  const images = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || message.role !== 'assistant') continue;
+    const timestampMs = Date.parse(message.timestamp || message.completedAt || message.createdAt || '') || 0;
+    for (const segment of Array.isArray(message.segments) ? message.segments : []) {
+      if (segment && segment.type === 'image') images.push({ image: segment, timestampMs });
+    }
+  }
+  return images;
+}
+
+function findLatestCodexRolloutForThread(threadId, startedAtMs = 0) {
+  const targetThreadId = String(threadId || '').trim();
+  if (!targetThreadId || typeof getCodexRolloutFiles !== 'function' || typeof parseCodexRolloutFile !== 'function') return null;
+  const minMtime = startedAtMs ? Math.max(0, Number(startedAtMs) - 60 * 1000) : 0;
+  let best = null;
+  for (const filePath of getCodexRolloutFiles()) {
+    let stat = null;
+    try { stat = fs.statSync(filePath); } catch { continue; }
+    const parsed = parseCodexRolloutFile(filePath);
+    if (parsed?.meta?.threadId !== targetThreadId) continue;
+    const updatedAtMs = parsed.meta.updatedAt ? Date.parse(parsed.meta.updatedAt) : 0;
+    const score = Math.max(stat.mtimeMs || 0, Number.isFinite(updatedAtMs) ? updatedAtMs : 0);
+    if (minMtime && score && score < minMtime) continue;
+    if (!best || score > best.score) best = { filePath, parsed, score };
+  }
+  return best;
+}
+
+function appendCodexRolloutImagesToEntry(sessionId, entry) {
+  if (!entry || entry.agent !== 'codex') return 0;
+  const session = loadSession(sessionId);
+  const threadIds = new Set();
+  if (entry.codexRuntimeSessionId) threadIds.add(String(entry.codexRuntimeSessionId));
+  if (session?.codexThreadId) threadIds.add(String(session.codexThreadId));
+  for (const runtimeId of getAllRuntimeSessionIds(session, 'codex')) threadIds.add(String(runtimeId));
+  if (threadIds.size === 0) return 0;
+
+  entry.segments = Array.isArray(entry.segments) ? entry.segments : [];
+  const known = collectSessionImageIdentities(session);
+  for (const identity of collectEntryImageIdentities(entry)) known.add(identity);
+  const startedAtMs = Number(entry.startedAtMs || 0) || 0;
+  const earliestImageTimestampMs = startedAtMs > 0 ? Math.max(0, startedAtMs - 10 * 1000) : 0;
+  let appended = 0;
+
+  for (const threadId of threadIds) {
+    const rollout = findLatestCodexRolloutForThread(threadId, entry.startedAtMs || 0);
+    const imageRecords = collectAssistantImageSegments(rollout?.parsed?.messages || []);
+    for (const record of imageRecords) {
+      if (earliestImageTimestampMs && record.timestampMs && record.timestampMs < earliestImageTimestampMs) continue;
+      const image = record.image;
+      const identity = imageSegmentIdentity(image);
+      if (identity && known.has(identity)) continue;
+      const segment = { type: 'image', ...image };
+      entry.segments.push(segment);
+      if (identity) known.add(identity);
+      appended += 1;
+      sendRuntimeMessage(entry, { type: 'image_delta', sessionId, ...image });
+    }
+    if (appended > 0) {
+      plog('INFO', 'codex_rollout_images_recovered', {
+        sessionId: sessionId.slice(0, 8),
+        threadId,
+        count: appended,
+        rolloutPath: rollout?.filePath || null,
+      });
+      break;
+    }
+  }
+  return appended;
+}
+
+function findRuntimeDraftCompletionIndex(session, entry) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const draftId = entry?.draftMessageId || '';
+  if (draftId) {
+    const byId = messages.findIndex((message) => message?.role === 'assistant' && message.runtimeDraftId === draftId);
+    if (byId !== -1) return byId;
+  }
+  const lastUserIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === 'user') return index;
+    }
+    return -1;
+  })();
+  for (let index = messages.length - 1; index > lastUserIndex; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'assistant' && message.streaming === true) return index;
+  }
+  return -1;
 }
 
 function hasPersistableSegments(entry) {
@@ -5724,20 +7536,9 @@ function handleConnectedProcessCompletion(sessionId, entry, session, pendingSlas
   }
 
   if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
-    const nextRetryCount = Number(pendingRetry?.autoRetryCount || 0) + 1;
-    if (nextRetryCount > MAX_AUTO_COMPACT_RETRIES) {
-      pendingCompactRetries.delete(sessionId);
-      wsSend(entry.ws, { type: 'system_message', sessionId, message: '自动 /compact 重试已达到上限，请手动缩短输入内容后再试。' });
-    } else {
-      pendingCompactRetries.set(sessionId, {
-        text: pendingRetry?.text || '',
-        mode: pendingRetry?.mode || entry.permissionMode || session.permissionMode || 'yolo',
-        reason: 'auto',
-        autoRetryCount: nextRetryCount,
-      });
-      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
-      shouldAutoCompact = true;
-    }
+    // Preserve the customized behavior: report the context-limit error and let
+    // the user decide when to compact instead of silently sending a hidden turn.
+    pendingCompactRetries.delete(sessionId);
   }
 
   if (completionError && !entry.errorSent && !shouldAutoCompact) {
@@ -5785,6 +7586,53 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
   );
 }
 
+function tryRetryCodexTransientFailure(sessionId, entry, transientErrorKind) {
+  if (!transientErrorKind || entry?.agent !== 'codex') return false;
+  const retryMessage = entry.capacityRetryMessage || null;
+  if (!retryMessage || !retryMessage.text && (!Array.isArray(retryMessage.attachments) || retryMessage.attachments.length === 0) && (!Array.isArray(retryMessage.fileRefs) || retryMessage.fileRefs.length === 0)) return false;
+  const currentRetryCount = Math.max(0, Number(retryMessage.retryCount || 0));
+  if (currentRetryCount >= CODEX_CAPACITY_RETRY_MAX) return false;
+  const nextRetryCount = currentRetryCount + 1;
+  const retryWs = getPrimaryProcessWs(entry) || entry.ws || createClosedQueueWs();
+  sendRuntimeMessage(entry, {
+    type: 'runtime_status',
+    sessionId,
+    code: 'retry',
+    message: codexTransientRetryMessage(transientErrorKind, nextRetryCount),
+    retryCount: nextRetryCount,
+    maxRetries: CODEX_CAPACITY_RETRY_MAX,
+  });
+  plog('INFO', 'codex_transient_auto_retry', {
+    sessionId: sessionId.slice(0, 8),
+    pid: entry.pid || null,
+    retryCount: nextRetryCount,
+    maxRetries: CODEX_CAPACITY_RETRY_MAX,
+    transientErrorKind,
+  });
+  setTimeout(() => {
+    try {
+      handleMessage(retryWs, {
+        type: 'message',
+        text: retryMessage.text || '',
+        sessionId,
+        mode: retryMessage.mode || 'yolo',
+        attachments: Array.isArray(retryMessage.attachments) ? retryMessage.attachments : [],
+        fileRefs: Array.isArray(retryMessage.fileRefs) ? retryMessage.fileRefs : [],
+        agent: 'codex',
+        reasoningEffort: retryMessage.reasoningEffort || '',
+        fastMode: !!retryMessage.fastMode,
+        __capacityRetryCount: nextRetryCount,
+      }, {
+        hideInHistory: true,
+        runtimeInputText: retryMessage.runtimeInputText || null,
+      });
+    } finally {
+      if (retryWs.isServerQueueClient) wsSessionMap.delete(retryWs);
+    }
+  }, 0);
+  return true;
+}
+
 function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, shouldReturnForFollowup, shouldAutoCompact) {
   if (entry?.abortRequested) {
     pendingCompactRetries.delete(sessionId);
@@ -5795,19 +7643,22 @@ function runProcessCompletionFollowup(sessionId, entry, session, pendingSlash, p
     pendingCompactRetries.delete(sessionId);
   }
 
-  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session && pendingSlash?.kind === 'compact') {
+  const followupWs = getPrimaryProcessWs(entry);
+  if (shouldReturnForFollowup && followupWs && session && pendingSlash?.kind === 'compact') {
     const retry = pendingCompactRetries.get(sessionId);
     if (retry?.text) {
       pendingCompactRetries.delete(sessionId);
-      handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+      handleMessage(followupWs, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
     }
     return;
   }
 
-  if (shouldAutoCompact && entry.ws && entry.ws.readyState === 1 && session) {
-    pendingSlashCommands.set(sessionId, { kind: 'compact' });
-    handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
-  }
+  // Webcoding-level auto /compact is disabled; do not send hidden `/compact`.
+  // const autoCompactWs = getPrimaryProcessWs(entry);
+  // if (shouldAutoCompact && autoCompactWs && session) {
+  //   pendingSlashCommands.set(sessionId, { kind: 'compact' });
+  //   handleMessage(autoCompactWs, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+  // }
 }
 
 function handleProcessComplete(sessionId, exitCode, signal) {
@@ -5819,15 +7670,44 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     entry.tailer.stop();
   }
 
+  applyBridgeUsageToEntry(sessionId, entry);
+  if (!entry.abortRequested) {
+    appendCodexRolloutImagesToEntry(sessionId, entry);
+  }
+
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   clearPendingSlashCommand(sessionId, pendingSlash);
-  const { pendingRetry, contextLimitExceeded, completionError } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
-  const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
+  const { pendingRetry, contextLimitExceeded, capacityExceeded, codexTransientErrorKind, completionError, abortedByUser } = resolveProcessCompletionState(sessionId, entry, exitCode, signal);
 
   removeActiveProcess(sessionId);
   cleanRunDir(sessionId);
 
-  const { shouldReturnForFollowup, shouldAutoCompact } = entry.ws
+  if (!entry.abortRequested && !pendingSlash && tryRetryCodexTransientFailure(sessionId, entry, codexTransientErrorKind || (capacityExceeded ? 'capacity' : ''))) {
+    sendSessionListToProcessClients(entry, { forceRefresh: true });
+    return;
+  }
+
+  const session = persistProcessCompletionSession(sessionId, entry, pendingSlash);
+
+  if (abortedByUser) {
+    if (isProcessRealtimeConnected(entry)) {
+      sendRuntimeMessage(entry, { type: 'system_message', sessionId, message: '已停止当前任务。' });
+      sendRuntimeMessage(entry, {
+        type: 'done',
+        sessionId,
+        costUsd: entry.lastCost ?? null,
+        completedAt: entry.completedAt || new Date().toISOString(),
+        interrupted: true,
+      });
+      sendSessionListToProcessClients(entry);
+    } else {
+      broadcastSessionListRefresh();
+    }
+    setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
+    return;
+  }
+
+  const { shouldReturnForFollowup, shouldAutoCompact } = isProcessRealtimeConnected(entry)
     ? handleConnectedProcessCompletion(sessionId, entry, session, pendingSlash, pendingRetry, contextLimitExceeded, completionError)
     : (handleDisconnectedProcessCompletion(sessionId, entry), { shouldReturnForFollowup: false, shouldAutoCompact: false });
 
@@ -5841,6 +7721,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     shouldReturnForFollowup,
     shouldAutoCompact
   );
+  setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
 }
 
 // Global PID monitor: detect process completion (especially after server restart)
@@ -5852,7 +7733,7 @@ setInterval(() => {
       plog('INFO', 'pid_monitor_detected_exit', {
         sessionId: sessionId.slice(0, 8),
         pid: entry.pid,
-        wsConnected: !!entry.ws,
+        wsConnected: isProcessRealtimeConnected(entry),
       });
       handleProcessComplete(sessionId, null, 'unknown (detected by monitor)');
     }
@@ -5941,6 +7822,7 @@ function recoverProcesses() {
           entry.tailer = new FileTailer(outputPath, (line) => {
             try {
               const event = JSON.parse(line);
+              entry.lastRuntimeEventAtMs = Date.now();
               processRuntimeEvent(entry, event, sessionId);
             } catch {}
           });
@@ -5984,11 +7866,12 @@ function recoverProcesses() {
               model: modelId,
               timestamp: new Date().toISOString(),
             });
-            session.updated = new Date().toISOString();
+            session.updated = completedAt;
             saveSession(session);
           }
         }
         try { fs.rmSync(dir, { recursive: true }); } catch {}
+        setTimeout(() => dispatchNextServerQueuedMessage(sessionId), 50);
       }
     }
   } catch (err) {
@@ -6000,86 +7883,597 @@ function recoverProcesses() {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
+
+  if (req.method === 'GET' && url.pathname === '/api/local-image') {
+    const requestedPath = url.searchParams.get('path') || '';
+    const info = localImageInfoForFile(requestedPath);
+    if (!info) {
+      writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Local image not found or not an allowed image file');
+    }
+    writeHeadWithSecurity(res, 200, {
+      'Content-Type': info.mime,
+      'Content-Length': String(info.stat.size),
+      'Content-Disposition': `inline; filename="${path.basename(info.path).replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
+      'Cache-Control': 'private, max-age=86400',
+    });
+    fs.createReadStream(info.path).on('error', () => {
+      try { res.destroy(); } catch {}
+    }).pipe(res);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/generated-image-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const requestedPath = url.searchParams.get('path') || '';
+      const info = generatedImageInfoForFile(requestedPath);
+      if (!info) {
+        return jsonResponse(res, 400, { ok: false, message: '生成图片路径无效或不在允许目录内' });
+      }
+      const stat = fs.statSync(info.path);
+      if (!stat.isFile()) {
+        return jsonResponse(res, 404, { ok: false, message: '图片不存在' });
+      }
+      return jsonResponse(res, 200, {
+        ...buildFileIdentity(info.root, info.path, stat, 'image'),
+        path: info.path,
+        relativePath: info.path,
+        generatedRelativePath: info.relativePath,
+        generatedRootKey: info.rootKey,
+        rawUrl: info.rawUrl,
+      });
+    } catch (err) {
+      return jsonErrorResponse(res, err, '无法打开生成图片');
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/generated-image/')) {
+    const prefix = '/api/generated-image/';
+    const rest = url.pathname.slice(prefix.length);
+    const parts = rest.split('/').filter(Boolean).map((part) => {
+      try { return decodeURIComponent(part); } catch { return ''; }
+    });
+    const rootKey = parts.shift() || '';
+    const roots = Object.fromEntries(generatedImageRootEntries().map(([key, dir]) => [key, path.resolve(dir)]));
+    const rootDir = roots[rootKey] || null;
+    if (!rootDir || parts.length === 0 || parts.some((part) => !part || part === '..' || part.includes('/') || part.includes('\\') || part.includes('\0'))) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Invalid generated image path');
+    }
+    const filePath = path.resolve(rootDir, ...parts);
+    if (!isPathInside(filePath, rootDir) || !isGeneratedImageExtension(filePath)) {
+      writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Forbidden');
+    }
+    fs.stat(filePath, (statErr, stat) => {
+      if (statErr || !stat.isFile()) {
+        writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Not Found');
+      }
+      writeHeadWithSecurity(res, 200, {
+        'Content-Type': getFileMime(filePath),
+        'Content-Length': String(stat.size),
+        'Content-Disposition': `inline; filename="${path.basename(filePath).replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
+        'Cache-Control': 'private, max-age=86400',
+      });
+      fs.createReadStream(filePath).on('error', () => {
+        try { res.destroy(); } catch {}
+      }).pipe(res);
+    });
+    return;
+  }
+
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    const id = sanitizeId(url.pathname.split('/').pop() || '');
+    if (!id) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Missing attachment ID');
+    }
+    const meta = loadAttachmentMeta(id);
+    const state = currentAttachmentState(meta);
+    if (state === 'expired') removeAttachmentById(id);
+    if (state !== 'available') {
+      writeHeadWithSecurity(res, state === 'expired' ? 410 : 404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(state === 'expired' ? 'Attachment expired' : 'Attachment not found');
+    }
+    const filePath = path.resolve(meta.path);
+    const root = path.resolve(ATTACHMENTS_DIR);
+    if (!isPathInside(filePath, root) || !['image', 'document', 'file'].includes(meta.kind || 'image')) {
+      writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Forbidden');
+    }
+    const asciiFilename = safeFilename(meta.filename).replace(/[^A-Za-z0-9._-]+/g, '_') || (meta.kind === 'image' ? 'image' : (meta.kind === 'document' ? 'document' : 'file'));
+    writeHeadWithSecurity(res, 200, {
+      'Content-Type': meta.mime,
+      'Content-Length': String(meta.size || fs.statSync(filePath).size),
+      'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(meta.filename || asciiFilename)}`,
+      'Cache-Control': 'private, max-age=300',
+    });
+    fs.createReadStream(filePath).on('error', () => {
+      try { res.destroy(); } catch {}
+    }).pipe(res);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/attachments') {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {
       return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     }
-    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    let rawName = 'image';
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase() || 'application/octet-stream';
+    let rawName = 'attachment';
     try {
-      rawName = decodeURIComponent(String(req.headers['x-filename'] || 'image'));
+      rawName = decodeURIComponent(String(req.headers['x-filename'] || 'attachment'));
     } catch {
-      rawName = String(req.headers['x-filename'] || 'image');
+      rawName = String(req.headers['x-filename'] || 'attachment');
     }
     const filename = safeFilename(rawName);
-    if (!IMAGE_MIME_TYPES.has(mime)) {
-      return jsonResponse(res, 400, { ok: false, message: '仅支持 PNG/JPG/WEBP/GIF 图片' });
-    }
-
-    const chunks = [];
+    const initialDocumentInfo = inferDocumentAttachmentType(filename, mime);
+    const initialKind = IMAGE_MIME_TYPES.has(mime) ? 'image' : (initialDocumentInfo ? 'document' : 'file');
+    const initialEffectiveMime = initialDocumentInfo?.mime || mime || 'application/octet-stream';
+    const sizeLimit = MAX_ATTACHMENT_SIZE;
+    const id = crypto.randomUUID();
+    const ext = safeAttachmentDataExtension(filename, initialEffectiveMime, initialKind);
+    const dataPath = attachmentDataPath(id, ext);
+    const writeStream = fs.createWriteStream(dataPath, { flags: 'wx' });
     let total = 0;
-    let aborted = false;
-    req.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > MAX_ATTACHMENT_SIZE) {
-        aborted = true;
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
+    let responded = false;
+    let finishedRequest = false;
+    let sniffTotal = 0;
+    const sniffChunks = [];
+
+    const cleanup = () => {
+      try { writeStream.destroy(); } catch {}
+      try { if (fs.existsSync(dataPath)) fs.unlinkSync(dataPath); } catch {}
+      try { if (fs.existsSync(attachmentMetaPath(id))) fs.unlinkSync(attachmentMetaPath(id)); } catch {}
+    };
+    const fail = (statusCode, message) => {
+      if (responded || res.headersSent) return;
+      responded = true;
+      cleanup();
+      jsonResponse(res, statusCode, { ok: false, message });
+    };
+
+    writeStream.on('error', (err) => {
+      if (!responded) fail(err?.code === 'EEXIST' ? 409 : 500, err?.code === 'EEXIST' ? `附件已存在：${filename}` : '保存附件失败，请稍后重试');
     });
-    req.on('end', () => {
-      if (aborted) {
-        return jsonResponse(res, 413, { ok: false, message: '图片大小不能超过 10MB' });
-      }
-      const buffer = Buffer.concat(chunks);
-      if (buffer.length === 0) {
-        return jsonResponse(res, 400, { ok: false, message: '图片内容为空' });
-      }
-      const actualMime = detectMimeFromMagic(buffer);
-      if (!actualMime || actualMime !== mime) {
-        return jsonResponse(res, 400, { ok: false, message: '图片内容与声明类型不一致或文件已损坏' });
-      }
-      const id = crypto.randomUUID();
-      const ext = extFromMime(mime) || path.extname(filename) || '';
-      const dataPath = attachmentDataPath(id, ext);
+    writeStream.on('finish', () => {
+      if (responded) return;
+      if (!finishedRequest) return;
+      if (total === 0) return fail(400, '附件内容为空');
+      const sniffBuffer = Buffer.concat(sniffChunks, sniffTotal);
+      const imageMime = detectAttachmentImageMime(filename, mime, sniffBuffer);
+      const documentInfo = imageMime ? null : inferDocumentAttachmentType(filename, mime);
+      const kind = imageMime ? 'image' : (documentInfo ? 'document' : 'file');
+      const effectiveMime = imageMime || documentInfo?.mime || mime || 'application/octet-stream';
+      const documentType = documentInfo?.type || null;
       const now = new Date();
       const meta = {
         id,
-        kind: 'image',
+        kind,
         filename,
-        mime,
-        size: buffer.length,
+        mime: effectiveMime,
+        documentType,
+        size: total,
         createdAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + ATTACHMENT_TTL_MS).toISOString(),
         path: dataPath,
       };
       try {
-        fs.writeFileSync(dataPath, buffer);
         saveAttachmentMeta(meta);
+        responded = true;
         return jsonResponse(res, 200, {
           ok: true,
           attachment: {
             id,
-            kind: 'image',
+            kind,
             filename,
-            mime,
-            size: buffer.length,
+            mime: effectiveMime,
+            documentType,
+            size: total,
             createdAt: meta.createdAt,
             expiresAt: meta.expiresAt,
             storageState: 'available',
           },
         });
       } catch (err) {
-        try { if (fs.existsSync(dataPath)) fs.unlinkSync(dataPath); } catch {}
-        try { if (fs.existsSync(attachmentMetaPath(id))) fs.unlinkSync(attachmentMetaPath(id)); } catch {}
-        return jsonResponse(res, 500, { ok: false, message: '保存附件失败，请稍后重试' });
+        return fail(500, '保存附件失败，请稍后重试');
+      }
+    });
+    writeStream.on('drain', () => {
+      try { req.resume(); } catch {}
+    });
+    req.on('data', (chunk) => {
+      if (responded) return;
+      total += chunk.length;
+      if (total > sizeLimit) {
+        fail(413, '上传文件不能超过 1GB');
+        try { req.destroy(); } catch {}
+        return;
+      }
+      if (sniffTotal < MAX_ATTACHMENT_SNIFF_BYTES) {
+        const slice = chunk.subarray(0, Math.min(chunk.length, MAX_ATTACHMENT_SNIFF_BYTES - sniffTotal));
+        sniffChunks.push(slice);
+        sniffTotal += slice.length;
+      }
+      if (!writeStream.write(chunk)) {
+        try { req.pause(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      if (responded) return;
+      finishedRequest = true;
+      writeStream.end();
+    });
+    req.on('error', () => {
+      if (!responded && !res.headersSent) fail(500, '上传过程中断');
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/files') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || cwd;
+      const depth = normalizeFileTreeDepth(url.searchParams.get('depth'));
+      const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isDirectory()) {
+        return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+      }
+      const state = { count: 0 };
+      const items = buildFileTree(root, resolved, depth, state);
+      return jsonResponse(res, 200, {
+        ok: true,
+        cwd: root,
+        path: resolved,
+        truncated: state.count >= FILE_TREE_MAX_ENTRIES,
+        items,
+      });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: err.message || '无法读取目录' });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/file-upload') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    const cwd = url.searchParams.get('cwd') || '';
+    const requestedDir = url.searchParams.get('path') || '';
+    const requestedName = url.searchParams.get('filename') || req.headers['x-file-name'] || '';
+    let root;
+    let targetDir;
+    let filename;
+    try {
+      ({ root, resolved: targetDir } = resolvePathWithinCwd(cwd, requestedDir));
+      const dirStat = fs.statSync(targetDir);
+      if (!dirStat.isDirectory()) {
+        return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+      }
+      filename = sanitizeUploadFilename(requestedName);
+    } catch (err) {
+      return jsonResponse(res, err?.statusCode || 400, { ok: false, message: err.message || '上传路径无效' });
+    }
+
+    const targetPath = path.join(targetDir, filename);
+    if (!isPathInside(targetPath, root)) {
+      return jsonResponse(res, 400, { ok: false, message: '文件不在当前目录内' });
+    }
+    if (fs.existsSync(targetPath)) {
+      return jsonResponse(res, 409, { ok: false, message: `文件已存在：${filename}` });
+    }
+
+    const writeStream = fs.createWriteStream(targetPath, { flags: 'wx' });
+    let total = 0;
+    let responded = false;
+    let finishedRequest = false;
+    const cleanup = () => {
+      try { writeStream.destroy(); } catch {}
+      try { if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath); } catch {}
+    };
+    const fail = (statusCode, message) => {
+      if (responded || res.headersSent) return;
+      responded = true;
+      cleanup();
+      jsonResponse(res, statusCode, { ok: false, message });
+    };
+    writeStream.on('error', (err) => {
+      if (responded) return;
+      const exists = err?.code === 'EEXIST';
+      if (exists) return fail(409, `文件已存在：${filename}`);
+      return fail(500, err?.message || '保存上传文件失败');
+    });
+    writeStream.on('finish', () => {
+      if (responded) return;
+      if (!finishedRequest) return;
+      try {
+        const stat = fs.statSync(targetPath);
+        responded = true;
+        return jsonResponse(res, 200, {
+          ok: true,
+          uploaded: true,
+          ...buildFileIdentity(root, targetPath, stat, getFileViewType(targetPath, stat)),
+          relativePath: path.relative(root, targetPath) || filename,
+        });
+      } catch (err) {
+        return fail(500, err?.message || '保存上传文件失败');
+      }
+    });
+    writeStream.on('drain', () => {
+      try { req.resume(); } catch {}
+    });
+    req.on('data', (chunk) => {
+      if (responded) return;
+      total += chunk.length;
+      if (total > FILE_UPLOAD_MAX_SIZE) {
+        fail(413, '上传文件不能超过 1GB');
+        try { req.destroy(); } catch {}
+        return;
+      }
+      if (!writeStream.write(chunk)) {
+        try { req.pause(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      if (responded) return;
+      finishedRequest = true;
+      writeStream.end();
+    });
+    req.on('error', () => {
+      if (!responded && !res.headersSent) fail(500, '上传过程中断');
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/file-move') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+      if (Buffer.byteLength(body, 'utf8') > 8192) {
+        tooLarge = true;
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      try {
+        if (tooLarge) return jsonResponse(res, 413, { ok: false, message: '移动请求过大' });
+        const payload = body ? JSON.parse(body) : {};
+        const cwd = String(payload.cwd || '');
+        const requestedPath = String(payload.path || '');
+        const requestedTargetDir = String(payload.targetDir || '');
+        const { root, resolved: sourcePath } = resolvePathWithinCwd(cwd, requestedPath);
+        const sourceStat = fs.statSync(sourcePath);
+        if (!sourceStat.isFile()) return jsonResponse(res, 400, { ok: false, message: '只能移动文件' });
+        const { resolved: targetDir } = resolvePathWithinCwd(root, requestedTargetDir);
+        const targetStat = fs.statSync(targetDir);
+        if (!targetStat.isDirectory()) return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+        const destPath = path.join(targetDir, path.basename(sourcePath));
+        if (!isPathInside(destPath, root)) return jsonResponse(res, 400, { ok: false, message: '目标不在当前目录内' });
+        if (sourcePath === destPath) {
+          return jsonResponse(res, 200, { ok: true, moved: false, message: '文件已在目标目录' });
+        }
+        if (fs.existsSync(destPath)) {
+          return jsonResponse(res, 409, { ok: false, message: `目标目录已存在同名文件：${path.basename(sourcePath)}` });
+        }
+        fs.renameSync(sourcePath, destPath);
+        const nextStat = fs.statSync(destPath);
+        return jsonResponse(res, 200, {
+          ok: true,
+          moved: true,
+          ...buildFileIdentity(root, destPath, nextStat, getFileViewType(destPath, nextStat)),
+        });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '移动文件失败');
       }
     });
     req.on('error', () => {
-      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '上传过程中断' });
+      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '移动请求中断' });
     });
+    return;
+  }
+
+  if (req.method === 'DELETE' && url.pathname === '/api/file-entry') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || '';
+      const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '只能删除文件' });
+      fs.unlinkSync(resolved);
+      return jsonResponse(res, 200, { ok: true, deleted: true, path: resolved });
+    } catch (err) {
+      return jsonErrorResponse(res, err, '删除文件失败');
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    (async () => {
+      try {
+        const cwd = url.searchParams.get('cwd') || '';
+        const requestedPath = url.searchParams.get('path') || '';
+        const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) {
+          return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+        }
+        const viewType = getFileViewType(resolved, stat);
+        const base = buildFileIdentity(root, resolved, stat, viewType);
+        const rawParams = new URLSearchParams({ cwd: root, path: path.relative(root, resolved) || path.basename(resolved) });
+        const rawUrl = `/api/file-raw?${rawParams.toString()}`;
+        if (viewType === 'xlsx') {
+          return jsonResponse(res, 200, { ...base, ...buildWorkbookView(resolved, stat), rawUrl });
+        }
+        if (viewType === 'docx') {
+          return jsonResponse(res, 200, { ...base, ...(await buildDocxView(resolved, stat)), rawUrl });
+        }
+        if (viewType === 'pptx') {
+          const previewParams = new URLSearchParams({ cwd: root, path: path.relative(root, resolved) || path.basename(resolved) });
+          return jsonResponse(res, 200, {
+            ...base,
+            rawUrl,
+            previewUrl: `/api/file-preview-pdf?${previewParams.toString()}`,
+            previewMime: 'application/pdf',
+          });
+        }
+        if (viewType === 'image' || viewType === 'pdf' || viewType === 'binary') {
+          return jsonResponse(res, 200, { ...base, rawUrl });
+        }
+        const content = readTextFileForView(resolved, stat);
+        return jsonResponse(res, 200, { ...base, content, rawUrl });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '无法读取文件');
+      }
+    })();
+    return;
+  }
+
+  if (req.method === 'PUT' && url.pathname === '/api/file-view') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+      if (Buffer.byteLength(body, 'utf8') > FILE_VIEW_TEXT_MAX_SIZE + 4096) {
+        tooLarge = true;
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('end', () => {
+      try {
+        if (tooLarge) return jsonResponse(res, 413, { ok: false, message: '保存内容超过 1MB' });
+        const payload = body ? JSON.parse(body) : {};
+        const cwd = String(payload.cwd || '');
+        const requestedPath = String(payload.path || '');
+        const content = String(payload.content ?? '');
+        if (Buffer.byteLength(content, 'utf8') > FILE_VIEW_TEXT_MAX_SIZE) {
+          return jsonResponse(res, 413, { ok: false, message: '保存内容超过 1MB' });
+        }
+        const { root, resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+        const viewType = getFileViewType(resolved, stat);
+        if (!['markdown', 'csv', 'tsv', 'json', 'code', 'text'].includes(viewType)) {
+          return jsonResponse(res, 400, { ok: false, message: '该文件类型不能文本编辑保存' });
+        }
+        fs.writeFileSync(resolved, content, 'utf8');
+        const nextStat = fs.statSync(resolved);
+        return jsonResponse(res, 200, {
+          ...buildFileIdentity(root, resolved, nextStat, getFileViewType(resolved, nextStat)),
+          content,
+          saved: true,
+        });
+      } catch (err) {
+        return jsonErrorResponse(res, err, '保存失败');
+      }
+    });
+    req.on('error', () => {
+      if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '保存请求中断' });
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-preview-pdf') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    (async () => {
+      try {
+        const cwd = url.searchParams.get('cwd') || '';
+        const requestedPath = url.searchParams.get('path') || '';
+        const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) {
+          writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('Target is not a file');
+        }
+        const viewType = getFileViewType(resolved, stat);
+        if (viewType !== 'pptx') {
+          writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('Only PPT/PPTX preview conversion is supported');
+        }
+        const pdfBuffer = await buildOfficePdfPreview(resolved, stat);
+        const pdfName = `${path.basename(resolved).replace(/\.[^.]+$/, '') || 'preview'}.pdf`;
+        const asciiFilename = pdfName.replace(/[^A-Za-z0-9._-]+/g, '_') || 'preview.pdf';
+        writeHeadWithSecurity(res, 200, {
+          'Content-Type': 'application/pdf',
+          'Content-Length': String(pdfBuffer.length),
+          'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(pdfName)}`,
+          'Cache-Control': 'no-cache',
+        });
+        return res.end(pdfBuffer);
+      } catch (err) {
+        writeHeadWithSecurity(res, err?.statusCode || 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end(err?.message || 'Unable to convert preview');
+      }
+    })();
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/file-raw') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    try {
+      const cwd = url.searchParams.get('cwd') || '';
+      const requestedPath = url.searchParams.get('path') || '';
+      const { resolved } = resolvePathWithinCwd(cwd, requestedPath);
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) {
+        writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Target is not a file');
+      }
+      if (stat.size > FILE_VIEW_BINARY_MAX_SIZE) {
+        writeHeadWithSecurity(res, 413, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('File is too large');
+      }
+      const asciiFilename = path.basename(resolved).replace(/[^A-Za-z0-9._-]+/g, '_') || 'file';
+      writeHeadWithSecurity(res, 200, {
+        'Content-Type': getFileMime(resolved),
+        'Content-Length': String(stat.size),
+        'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(path.basename(resolved))}`,
+        'Cache-Control': 'no-cache',
+      });
+      fs.createReadStream(resolved).pipe(res);
+    } catch (err) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(err?.message || 'Unable to read file');
+    }
     return;
   }
 
@@ -6286,14 +8680,28 @@ wss.on('connection', (ws, req) => {
           handleMessage(ws, msg);
         }
         break;
+      case 'edit_message':
+        handleEditMessage(ws, msg);
+        break;
+      case 'enqueue_message':
+        handleEnqueueMessage(ws, msg);
+        break;
+      case 'cancel_queued_message':
+        handleCancelQueuedMessage(ws, msg);
+        break;
       case 'abort':
-        handleAbort(ws);
+        handleAbort(ws, msg);
         break;
       case 'interactive_response':
         handleInteractiveResponse(ws, msg);
         break;
       case 'new_session':
         handleNewSession(ws, msg);
+        break;
+      case 'fork_session':
+        handleForkSession(ws, msg).catch((err) => {
+          wsSend(ws, { type: 'error', sessionId: msg.sessionId, message: `分叉失败：${err?.message || String(err)}` });
+        });
         break;
       case 'load_session':
         handleLoadSession(ws, msg.sessionId);
@@ -6305,7 +8713,13 @@ wss.on('connection', (ws, req) => {
         handleRenameSession(ws, msg.sessionId, msg.title);
         break;
       case 'set_mode':
-        handleSetMode(ws, msg.sessionId, msg.mode);
+        handleSetMode(ws, msg.sessionId, msg.mode, msg.agent);
+        break;
+      case 'set_reasoning_effort':
+        handleSetReasoningEffort(ws, msg.sessionId, msg.reasoningEffort);
+        break;
+      case 'set_fast_mode':
+        handleSetFastMode(ws, msg.sessionId, msg.fastMode);
         break;
       case 'list_sessions':
         sendSessionList(ws);
@@ -6447,6 +8861,9 @@ wss.on('connection', (ws, req) => {
       case 'rename_project':
         handleRenameProject(ws, msg);
         break;
+      case 'reorder_projects':
+        handleReorderProjects(ws, msg);
+        break;
       case 'git_command':
         handleGitCommand(ws, msg);
         break;
@@ -6456,10 +8873,28 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => handleDisconnect(ws, wsId));
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('error', (err) => {
     plog('WARN', 'ws_error', { wsId, error: err.message });
     handleDisconnect(ws, wsId);
   });
+});
+
+const wsHeartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, WS_HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+  clearInterval(wsHeartbeatTimer);
 });
 
 // === Notify Config Handlers ===
@@ -6818,6 +9253,252 @@ function sendMessageAccepted(ws, sessionId, clientMessageId, extra = {}) {
     clientMessageId,
     ...extra,
   });
+}
+
+function buildForkSessionTitle(sourceTitle, mode = 'normal') {
+  const base = String(sourceTitle || 'Untitled').trim() || 'Untitled';
+  const suffix = mode === 'worktree' ? ' · worktree 分叉' : ' · 分叉';
+  const maxBaseLen = Math.max(20, 80 - suffix.length);
+  const clipped = base.length > maxBaseLen ? `${base.slice(0, maxBaseLen - 1)}…` : base;
+  return `${clipped}${suffix}`;
+}
+
+function normalizeForkMessageIndex(value) {
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function getCompletedMessagesForFork(session, throughMessageIndex = null) {
+  const messages = Array.isArray(session?.messages) ? cloneJson(session.messages) : [];
+  const targetIndex = normalizeForkMessageIndex(throughMessageIndex);
+  if (targetIndex !== null) {
+    return messages.slice(0, Math.min(messages.length, targetIndex + 1));
+  }
+  if (!activeProcesses.has(session?.id)) return messages;
+  while (messages.length > 0) {
+    const tail = messages[messages.length - 1];
+    if (tail?.role === 'assistant') break;
+    messages.pop();
+    if (tail?.role === 'user') break;
+  }
+  return messages;
+}
+
+function countCodexRollbackTurnsForFork(sourceSession, targetMessages) {
+  const sourceMessages = getCompletedMessagesForFork(sourceSession);
+  const targetLength = Array.isArray(targetMessages) ? targetMessages.length : 0;
+  if (targetLength <= 0 || targetLength >= sourceMessages.length) return 0;
+  return sourceMessages.slice(targetLength).filter((message) => message?.role === 'user').length;
+}
+
+function forkPermissionParamsForCodex(mode) {
+  const normalized = String(mode || 'yolo').trim().toLowerCase();
+  if (normalized === 'plan') return { approvalPolicy: 'on-request', sandbox: 'read-only' };
+  if (normalized === 'default') return { approvalPolicy: 'on-failure', sandbox: 'workspace-write' };
+  return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+}
+
+function runGitText(cwd, args, options = {}) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: options.stdio || ['ignore', 'pipe', 'pipe'],
+    timeout: options.timeoutMs || 30000,
+  }).trim();
+}
+
+function createGitWorktreeForFork(sourceCwd, sourceSessionId) {
+  const cwd = normalizeProjectPathKey(sourceCwd);
+  if (!cwd) throw new Error('当前会话没有项目目录，不能创建 worktree 分叉。');
+  try {
+    fs.statSync(cwd);
+  } catch {
+    throw new Error(`当前项目目录不存在：${cwd}`);
+  }
+  const repoRoot = runGitText(cwd, ['rev-parse', '--show-toplevel']);
+  if (!repoRoot) throw new Error('当前目录不是 Git 仓库，不能创建 worktree 分叉。');
+  const repoName = path.basename(repoRoot) || 'repo';
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+  const shortSession = sanitizeId(sourceSessionId || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
+  const branchName = `webcoding/fork-${shortSession}-${stamp}`;
+  const targetPath = path.join(path.dirname(repoRoot), `${repoName}-fork-${shortSession}-${stamp}`);
+  if (fs.existsSync(targetPath)) throw new Error(`worktree 目标目录已存在：${targetPath}`);
+  runGitText(repoRoot, ['worktree', 'add', '-b', branchName, targetPath, 'HEAD'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeoutMs: 120000,
+  });
+  return {
+    cwd: normalizeProjectPathKey(targetPath),
+    repoRoot: normalizeProjectPathKey(repoRoot),
+    branchName,
+  };
+}
+
+async function forkCodexNativeThread(sourceSession, newSession, options = {}) {
+  const sourceThreadId = getRuntimeSessionId(sourceSession, { agent: 'codex' }) || sourceSession.codexThreadId || null;
+  if (!sourceThreadId) return { forked: false, reason: 'source_thread_missing' };
+
+  const spawnSpec = buildCodexSpawnSpec(sourceSession, { attachments: [], transport: 'app-server' });
+  if (spawnSpec?.error) throw new Error(spawnSpec.error);
+  const client = new CodexAppServerClient({
+    codexPath: spawnSpec.command || CODEX_PATH,
+    args: spawnSpec.args,
+    cwd: options.cwd || sourceSession.cwd || process.cwd(),
+    env: spawnSpec.env || process.env,
+    requestTimeoutMs: 45000,
+  });
+  try {
+    await client.initialize({ timeoutMs: 45000 });
+    const params = {
+      threadId: String(sourceThreadId),
+      cwd: options.cwd || sourceSession.cwd || null,
+      model: currentSessionModelOverride(sourceSession) || null,
+      threadSource: 'user',
+      ...forkPermissionParamsForCodex(sourceSession.permissionMode || 'yolo'),
+    };
+    const result = await client.request('thread/fork', params, 90000);
+    const forkedThreadId = result?.thread?.id || result?.threadId || result?.id || null;
+    if (!forkedThreadId) throw new Error('Codex thread/fork 未返回新 threadId。');
+    const rollbackTurns = Math.max(0, Number(options.rollbackTurns || 0) || 0);
+    if (rollbackTurns > 0) {
+      await client.request('thread/rollback', { threadId: String(forkedThreadId), numTurns: rollbackTurns }, 90000);
+    }
+    setRuntimeSessionState(newSession, {
+      runtimeId: forkedThreadId,
+      runtimeFingerprint: spawnSpec.runtimeFingerprint || null,
+    }, {
+      agent: 'codex',
+      channelKey: spawnSpec.channelKey || null,
+      channelDescriptor: spawnSpec.channelDescriptor || null,
+      codexConfig: loadCodexConfig(),
+    });
+    newSession.codexThreadId = forkedThreadId;
+    newSession.codexRuntimeFingerprint = spawnSpec.runtimeFingerprint || null;
+    return {
+      forked: true,
+      sourceThreadId: String(sourceThreadId),
+      threadId: String(forkedThreadId),
+      rollbackTurns,
+    };
+  } finally {
+    await client.shutdown().catch(() => {});
+  }
+}
+
+async function handleForkSession(ws, msg) {
+  const sourceId = sanitizeId(msg?.sessionId || '');
+  const sourceSession = loadSession(sourceId);
+  if (!sourceSession) {
+    return wsSend(ws, { type: 'error', sessionId: sourceId, message: 'Session not found' });
+  }
+
+  const requestedWorktree = msg?.worktree === true || msg?.mode === 'worktree';
+  const forkMode = requestedWorktree ? 'worktree' : 'normal';
+  const throughMessageIndex = normalizeForkMessageIndex(msg?.messageIndex);
+  let worktreeMeta = null;
+  let targetCwd = sourceSession.cwd || null;
+  let projectsChanged = false;
+
+  try {
+    if (requestedWorktree) {
+      worktreeMeta = createGitWorktreeForFork(sourceSession.cwd, sourceSession.id);
+      targetCwd = worktreeMeta.cwd;
+    }
+    const now = new Date().toISOString();
+    const completedMessages = getCompletedMessagesForFork(sourceSession, throughMessageIndex);
+    const newSession = {
+      ...cloneJson(sourceSession),
+      id: crypto.randomUUID(),
+      kind: 'main',
+      sidecar: false,
+      parentSessionId: null,
+      anchor: undefined,
+      parentContext: null,
+      contextSnippet: '',
+      title: buildForkSessionTitle(sourceSession.title, forkMode),
+      created: now,
+      updated: now,
+      hasUnread: false,
+      queuedMessages: [],
+      messages: completedMessages,
+      cwd: targetCwd ? normalizeProjectPathKey(targetCwd) : null,
+      projectId: requestedWorktree ? null : (sourceSession.projectId || null),
+      forkedFromSessionId: sourceSession.id,
+      forkedFromRuntimeId: getRuntimeSessionId(sourceSession, { agent: getSessionAgent(sourceSession) }) || null,
+      forkedAt: now,
+      forkMode,
+      worktree: worktreeMeta || null,
+      totalCost: sourceSession.totalCost || 0,
+      totalUsage: cloneJson(sourceSession.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 }),
+      lastUsage: sourceSession.lastUsage || null,
+    };
+    delete newSession.importedRolloutPath;
+    newSession.claudeSessionId = null;
+    newSession.claudeRuntimeFingerprint = null;
+    newSession.codexThreadId = null;
+    newSession.codexRuntimeFingerprint = null;
+    newSession.runtimeContexts = { claude: {}, codex: {} };
+    newSession.runtimeContexts.pi = {};
+
+    if (newSession.cwd) {
+      const ensured = ensureProjectForPath(newSession.cwd, {
+        name: requestedWorktree ? `${path.basename(newSession.cwd)}（分叉）` : undefined,
+      });
+      if (ensured.project?.id) {
+        newSession.projectId = ensured.project.id;
+        projectsChanged = !!ensured.created;
+      }
+    }
+
+    let nativeFork = { forked: false };
+    if (getSessionAgent(sourceSession) === 'codex') {
+      nativeFork = await forkCodexNativeThread(sourceSession, newSession, {
+        cwd: newSession.cwd || null,
+        rollbackTurns: countCodexRollbackTurnsForFork(sourceSession, completedMessages),
+      });
+    }
+    newSession.nativeFork = nativeFork;
+    saveSession(newSession);
+    plog('INFO', 'session_forked', {
+      sourceId: sourceSession.id.slice(0, 8),
+      forkId: newSession.id.slice(0, 8),
+      agent: getSessionAgent(sourceSession),
+      forkMode,
+      throughMessageIndex,
+      sourceThreadId: nativeFork.sourceThreadId || null,
+      forkedThreadId: nativeFork.threadId || null,
+      rollbackTurns: nativeFork.rollbackTurns || 0,
+      cwd: newSession.cwd || null,
+    });
+    if (projectsChanged) wsSend(ws, { type: 'projects_config', projects: loadProjectsConfig().projects });
+    sendSessionList(ws, { forceRefresh: true });
+    wsSend(ws, {
+      type: 'session_forked',
+      sourceSessionId: sourceSession.id,
+      sessionId: newSession.id,
+      title: newSession.title,
+      mode: forkMode,
+      cwd: newSession.cwd,
+      nativeThreadForked: !!nativeFork.forked,
+      sourceThreadId: nativeFork.sourceThreadId || null,
+      threadId: nativeFork.threadId || null,
+      messageIndex: throughMessageIndex,
+      rollbackTurns: nativeFork.rollbackTurns || 0,
+      worktree: worktreeMeta || null,
+    });
+    handleLoadSession(ws, newSession.id);
+  } catch (error) {
+    plog('ERROR', 'session_fork_failed', {
+      sourceId: sourceSession.id.slice(0, 8),
+      forkMode,
+      error: error?.message || String(error),
+    });
+    wsSend(ws, {
+      type: 'error',
+      sessionId: sourceSession.id,
+      message: `分叉失败：${error?.message || String(error)}`,
+    });
+  }
 }
 
 async function performCodexFork(ws, session) {
@@ -7990,6 +10671,7 @@ function handleNewSession(ws, msg) {
     projectId,
   };
   saveSession(session);
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.set(ws, id);
   if (projectsChanged) {
     wsSend(ws, { type: 'projects_config', projects: loadProjectsConfig().projects });
@@ -8047,11 +10729,9 @@ function handleLoadSession(ws, sessionId) {
   const { recentMessages, olderChunks } = splitHistoryMessages(session.messages);
   const effectiveCwd = session.cwd || activeProcesses.get(sessionId)?.cwd || null;
 
-  // Detach ws from any previous session's process
-  for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) entry.ws = null;
-  }
-
+  // One browser connection views one chat at a time. Keep other viewers
+  // attached, but remove this socket from every previous runtime client set.
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.set(ws, sessionId);
 
   // Read and clear unread flag
@@ -8183,6 +10863,37 @@ async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
       for (const logDbPath of [CODEX_LOG_DB_PATH, CODEX_RUNTIME_LOG_DB_PATH]) {
         if (!fs.existsSync(logDbPath)) continue;
         await execFileQuiet('sqlite3', [logDbPath, `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`]);
+      }
+    } else {
+      const { DatabaseSync } = require('node:sqlite');
+      for (const stateDbPath of [CODEX_STATE_DB_PATH, CODEX_RUNTIME_STATE_DB_PATH]) {
+        if (!fs.existsSync(stateDbPath)) continue;
+        const database = new DatabaseSync(stateDbPath);
+        try {
+          database.exec('PRAGMA foreign_keys = ON;');
+          const tables = new Set(database.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('thread_dynamic_tools','stage1_outputs','logs','threads')"
+          ).all().map((row) => row.name));
+          if (tables.has('thread_dynamic_tools')) database.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(threadId);
+          if (tables.has('stage1_outputs')) database.prepare('DELETE FROM stage1_outputs WHERE thread_id = ?').run(threadId);
+          if (tables.has('logs')) database.prepare('DELETE FROM logs WHERE thread_id = ?').run(threadId);
+          if (tables.has('threads')) {
+            database.prepare('DELETE FROM threads WHERE id = ?').run(threadId);
+            removedDbRows = true;
+          }
+        } finally {
+          database.close();
+        }
+      }
+      for (const logDbPath of [CODEX_LOG_DB_PATH, CODEX_RUNTIME_LOG_DB_PATH]) {
+        if (!fs.existsSync(logDbPath)) continue;
+        const database = new DatabaseSync(logDbPath);
+        try {
+          const table = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='logs'").get();
+          if (table) database.prepare('DELETE FROM logs WHERE thread_id = ?').run(threadId);
+        } finally {
+          database.close();
+        }
       }
     }
   } catch {}
@@ -8342,26 +11053,51 @@ function handleSetMode(ws, sessionId, mode) {
   wsSend(ws, { type: 'mode_changed', mode: resolvedMode.mode, sessionId: safeSessionId, appliesNextTurn: running });
 }
 
+function handleSetFastMode(ws, sessionId, rawFastMode) {
+  const fastMode = normalizeCodexFastMode(rawFastMode);
+  if (sessionId) {
+    const session = loadSession(sessionId);
+    if (session && getSessionAgent(session) === 'codex' && session.fastMode !== fastMode) {
+      session.fastMode = fastMode;
+      clearRuntimeSessionId(session);
+      session.updated = new Date().toISOString();
+      saveSession(session);
+      sendSessionList(ws, { forceRefresh: true });
+    }
+  }
+  wsSend(ws, { type: 'fast_mode_changed', fastMode });
+  if (!isCodexFastModeEnabled()) {
+    wsSend(ws, {
+      type: 'system_message',
+      message: 'Webcoding 内已关闭 Fast 速度选择；当前固定使用 Standard。',
+    });
+  }
+}
+
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];
   for (const [sid, entry] of activeProcesses) {
-    if (entry.ws === ws) {
-      entry.ws = null;
-      entry.wsDisconnectTime = new Date().toISOString();
-      affectedSessions.push({ sessionId: sid.slice(0, 8), pid: entry.pid });
+    if (detachWebSocketFromProcess(entry, ws, { markDisconnect: true })) {
+      affectedSessions.push({
+        sessionId: sid.slice(0, 8),
+        pid: entry.pid,
+        stillConnected: isProcessRealtimeConnected(entry),
+      });
     }
   }
   wsSessionMap.delete(ws);
   plog('INFO', 'ws_disconnect', { wsId, activeProcessesAffected: affectedSessions });
 }
 
-function handleDetachView(ws) {
+function detachWebSocketFromActiveProcesses(ws, options = {}) {
+  const markDisconnect = options.markDisconnect === true;
   for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) {
-      entry.ws = null;
-      entry.wsDisconnectTime = new Date().toISOString();
-    }
+    detachWebSocketFromProcess(entry, ws, { markDisconnect });
   }
+}
+
+function handleDetachView(ws) {
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.delete(ws);
 }
 
@@ -8375,19 +11111,17 @@ function forceLogoutClient(ws, message) {
   }
 }
 
-function handleAbort(ws) {
-  const sessionId = wsSessionMap.get(ws);
+function handleAbort(ws, msg = {}) {
+  const requestedSessionId = sanitizeId(msg?.sessionId || '');
+  const sessionId = requestedSessionId || wsSessionMap.get(ws);
   if (!sessionId) return;
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
 
   entry.abortRequested = true;
+  entry.abortRequestedAt = new Date().toISOString();
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
-  wsSend(ws, {
-    type: 'system_message',
-    sessionId,
-    message: '正在停止当前任务…',
-  });
+  sendRuntimeMessage(entry, { type: 'runtime_status', sessionId, code: 'stopping', message: '正在停止当前任务…' });
   if (entry.transport === 'pi-rpc') {
     const runtime = entry.rpcRuntime || piRpcRuntimes.get(sessionId);
     if (!runtime?.client?.isAlive) return;
@@ -8455,6 +11189,130 @@ function handleAbort(ws) {
   // handleProcessComplete will be triggered by the PID monitor / process close
 }
 
+function buildQueueItemFromClientMessage(session, msg) {
+  const textValue = typeof msg.text === 'string' ? msg.text : '';
+  const normalizedText = textValue.trim();
+  const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
+  const resolvedAttachments = resolveMessageAttachments(attachments);
+  if (attachments.length > 0 && resolvedAttachments.length === 0) {
+    return { error: '附件已过期或不可用，请重新上传后再发送。' };
+  }
+  const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, session?.cwd || process.cwd());
+  if (resolvedFileRefResult.error) return { error: resolvedFileRefResult.error };
+  const resolvedFileRefs = resolvedFileRefResult.refs;
+  if (!normalizedText && resolvedAttachments.length === 0 && resolvedFileRefs.length === 0) {
+    return { error: '消息内容为空。' };
+  }
+  if (normalizedText.startsWith('/') && (resolvedAttachments.length > 0 || resolvedFileRefs.length > 0)) {
+    return { error: '命令消息暂不支持同时附带附件或文件引用。请先发送普通消息，再单独使用命令。' };
+  }
+  const savedAttachments = resolvedAttachments.map((attachment) => ({
+    id: attachment.id,
+    kind: attachment.kind || 'image',
+    filename: attachment.filename,
+    mime: attachment.mime,
+    documentType: attachment.documentType || null,
+    size: attachment.size,
+    createdAt: attachment.createdAt,
+    expiresAt: attachment.expiresAt,
+    storageState: attachment.storageState,
+  }));
+  return {
+    item: {
+      id: sanitizeId(msg.id || '') || crypto.randomUUID(),
+      sessionId: session.id,
+      text: textValue,
+      attachments: savedAttachments,
+      fileRefs: resolvedFileRefs.map(fileRefHistoryMeta),
+      mode: typeof msg.mode === 'string' ? msg.mode : (session.permissionMode || 'yolo'),
+      reasoningEffort: normalizeCodexReasoningEffort(msg.reasoningEffort),
+      fastMode: normalizeCodexFastMode(msg.fastMode),
+      agent: normalizeAgent(msg.agent || session.agent),
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function handleEnqueueMessage(ws, msg) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  const session = sessionId ? loadSession(sessionId) : null;
+  if (!session) return wsSend(ws, { type: 'error', message: '当前会话尚未建立，无法加入服务端队列。' });
+  if (!Array.isArray(session.queuedMessages)) session.queuedMessages = [];
+  if (session.queuedMessages.length >= MAX_SERVER_QUEUED_MESSAGES) {
+    return wsSend(ws, { type: 'error', message: `最多排队 ${MAX_SERVER_QUEUED_MESSAGES} 条消息，请先撤销一部分。` });
+  }
+  const built = buildQueueItemFromClientMessage(session, msg);
+  if (built.error) return wsSend(ws, { type: 'error', message: built.error });
+  session.queuedMessages.push(built.item);
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sendQueueUpdateForSession(session.id);
+  wsSend(ws, { type: 'queue_update', sessionId: session.id, queuedMessages: buildQueuedMessagesPayload(session) });
+  plog('INFO', 'server_queue_enqueue', { sessionId: session.id.slice(0, 8), queueLen: session.queuedMessages.length });
+  if (!activeProcesses.has(session.id)) setTimeout(() => dispatchNextServerQueuedMessage(session.id), 20);
+}
+
+function handleCancelQueuedMessage(ws, msg) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  const id = sanitizeId(msg.id || '');
+  const session = sessionId ? loadSession(sessionId) : null;
+  if (!session || !id) return;
+  const before = Array.isArray(session.queuedMessages) ? session.queuedMessages.length : 0;
+  session.queuedMessages = (session.queuedMessages || []).filter((item) => item.id !== id);
+  if (session.queuedMessages.length === before) return;
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sendQueueUpdateForSession(session.id);
+  wsSend(ws, { type: 'queue_update', sessionId: session.id, queuedMessages: buildQueuedMessagesPayload(session) });
+  plog('INFO', 'server_queue_cancel', { sessionId: session.id.slice(0, 8), queueLen: session.queuedMessages.length });
+}
+
+function createClosedQueueWs() {
+  return { readyState: 0, isAuthenticated: true, isServerQueueClient: true, send() {} };
+}
+
+function dispatchNextServerQueuedMessage(sessionId) {
+  if (!sessionId || activeProcesses.has(sessionId)) return false;
+  const session = loadSession(sessionId);
+  if (!session || !Array.isArray(session.queuedMessages) || session.queuedMessages.length === 0) return false;
+  const [item] = session.queuedMessages;
+  session.queuedMessages = session.queuedMessages.slice(1);
+  session.updated = new Date().toISOString();
+  saveSession(session);
+  sendQueueUpdateForSession(sessionId);
+  const viewers = getSessionViewerClients(sessionId);
+  const dispatchWs = viewers[0] || createClosedQueueWs();
+  const payload = {
+    ...item,
+    sessionId,
+    type: 'message',
+    mode: item.mode || session.permissionMode || 'yolo',
+    reasoningEffort: item.reasoningEffort || session.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(item, 'fastMode') ? item.fastMode : session.fastMode),
+    agent: normalizeAgent(item.agent || session.agent),
+  };
+  const text = String(payload.text || '').trim();
+  if (!text.startsWith('/')) {
+    broadcastToSessionViewers(sessionId, {
+      type: 'queued_message_dispatched',
+      sessionId,
+      message: buildQueuedMessagesPayload({ ...session, queuedMessages: [item] })[0],
+    });
+  }
+  plog('INFO', 'server_queue_dispatch', { sessionId: sessionId.slice(0, 8), remaining: session.queuedMessages.length });
+  try {
+    if (text.startsWith('/')) handleSlashCommand(dispatchWs, text, sessionId, payload.agent);
+    else handleMessage(dispatchWs, payload);
+  } finally {
+    if (dispatchWs.isServerQueueClient) wsSessionMap.delete(dispatchWs);
+  }
+  broadcastSessionListRefresh();
+  setTimeout(() => {
+    if (!activeProcesses.has(sessionId)) dispatchNextServerQueuedMessage(sessionId);
+  }, 200);
+  return true;
+}
+
 function createRuntimeEntry(session, ws, spawnSpec, resolvedAttachments, pid, transport = 'headless') {
   const entryAgent = getSessionAgent(session);
   const sharedRuntimeIdOpts = {
@@ -8480,6 +11338,7 @@ function createRuntimeEntry(session, ws, spawnSpec, resolvedAttachments, pid, tr
     piRuntimeFingerprint: entryAgent === 'pi' ? (spawnSpec.runtimeFingerprint || null) : null,
     runtimeChannelKey: spawnSpec.channelKey || null,
     runtimeChannelDescriptor: spawnSpec.channelDescriptor || null,
+    bridgeToken: spawnSpec.bridgeToken || null,
     claudeRuntimeSessionId: entryAgent === 'claude' ? existingRuntimeId : null,
     persistedClaudeSessionId: entryAgent === 'claude' ? existingRuntimeId : null,
     piRuntimeSessionId: entryAgent === 'pi' ? existingRuntimeId : null,
@@ -8955,6 +11814,26 @@ function codexAppUsageFromRuntime(runtime) {
     input_tokens: usage.inputTokens || 0,
     cached_input_tokens: usage.cachedInputTokens || 0,
     output_tokens: usage.outputTokens || 0,
+    reasoning_output_tokens: usage.reasoningOutputTokens || 0,
+    total_tokens: usage.totalTokens || 0,
+    model_context_window: runtime.latestTokenUsage?.modelContextWindow || usage.modelContextWindow || null,
+  };
+}
+
+function codexAppTokenCountFromRuntime(runtime) {
+  const tokenUsage = runtime.latestTokenUsage || null;
+  if (!tokenUsage) return null;
+  const normalize = (usage) => usage ? ({
+    input_tokens: usage.inputTokens || 0,
+    cached_input_tokens: usage.cachedInputTokens || 0,
+    output_tokens: usage.outputTokens || 0,
+    reasoning_output_tokens: usage.reasoningOutputTokens || 0,
+    total_tokens: usage.totalTokens || 0,
+  }) : null;
+  return {
+    last_token_usage: normalize(tokenUsage.last || tokenUsage),
+    total_token_usage: normalize(tokenUsage.total),
+    model_context_window: tokenUsage.modelContextWindow || null,
   };
 }
 
@@ -9026,6 +11905,10 @@ function handleCodexAppNotification(runtime, method, params) {
     }
     case 'thread/tokenUsage/updated':
       runtime.latestTokenUsage = params.tokenUsage || null;
+      processRuntimeEvent(entry, {
+        type: 'token_count',
+        info: codexAppTokenCountFromRuntime(runtime),
+      }, runtime.sessionId);
       break;
     case 'thread/goal/updated':
       processRuntimeEvent(entry, {
@@ -9378,6 +12261,7 @@ async function ensureCodexAppRuntime(session, spawnSpec) {
       onProtocolError: (error) => plog('WARN', 'codex_app_server_protocol_error', {
         sessionId: sessionId.slice(0, 8),
         error: error.message,
+        stack: error.stack || null,
       }),
       onExit: (info) => handleCodexAppExit(runtime, info),
     });
@@ -10607,9 +13491,112 @@ function handleActivePiRpcMessage(ws, msg, session, entry, resolvedAttachments, 
 }
 
 // === Runtime Message Handler ===
+function editedMessageError(ws, sessionId, message) {
+  return wsSend(ws, { type: 'error', sessionId: sessionId || undefined, message });
+}
+
+function editedMessageTitle(text, fallback = 'Edited Chat') {
+  const title = String(text || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+  return title || fallback;
+}
+
+function buildEditedMessageRuntimeInput(session, text, attachments, historyMessages) {
+  const history = Array.isArray(historyMessages) ? historyMessages.filter(Boolean) : [];
+  if (history.length === 0) return null;
+  const carryover = buildThreadCarryoverPayload(session, text, attachments, history, { reason: 'edited_message' });
+  return carryover?.prompt || null;
+}
+
+function clearRuntimeForEditedMessage(session) {
+  const agent = getSessionAgent(session);
+  clearRuntimeSessionId(session, { agent, allChannels: true });
+  if (agent === 'codex') {
+    session.codexThreadId = null;
+    session.codexRuntimeFingerprint = null;
+  } else {
+    session.claudeSessionId = null;
+    session.claudeRuntimeFingerprint = null;
+  }
+  delete session.lastUsage;
+  delete session.contextWindowTokens;
+  delete session.currentUsage;
+}
+
+function handleEditMessage(ws, msg = {}) {
+  const sessionId = sanitizeId(msg.sessionId || '');
+  if (!sessionId) return editedMessageError(ws, null, '缺少会话 ID，无法修改消息。');
+  if (activeProcesses.has(sessionId)) {
+    return editedMessageError(ws, sessionId, '当前任务仍在运行，请先停止后再修改上一条消息。');
+  }
+
+  const session = loadSession(sessionId);
+  if (!session) return editedMessageError(ws, sessionId, '会话不存在，无法修改消息。');
+  normalizeSession(session);
+
+  const messageIndex = Number(msg.messageIndex);
+  if (!Number.isInteger(messageIndex) || messageIndex < 0 || messageIndex >= session.messages.length) {
+    return editedMessageError(ws, sessionId, '消息位置无效，无法修改。');
+  }
+  const original = session.messages[messageIndex];
+  if (!original || original.role !== 'user') {
+    return editedMessageError(ws, sessionId, '只能修改用户消息。');
+  }
+
+  const textValue = typeof msg.text === 'string' ? msg.text : '';
+  const normalizedText = textValue.trim();
+  const originalAttachments = normalizeMessageAttachments(original.attachments || []);
+  const originalFileRefs = Array.isArray(original.fileRefs) ? original.fileRefs.map((ref) => ({ ...ref })) : [];
+  if (!normalizedText && originalAttachments.length === 0 && originalFileRefs.length === 0) {
+    return editedMessageError(ws, sessionId, '修改后的消息不能为空。');
+  }
+  if (originalAttachments.length > 0 && resolveMessageAttachments(originalAttachments).length === 0) {
+    return editedMessageError(ws, sessionId, '原消息附件已过期，请重新发送新消息并重新上传附件。');
+  }
+  const fileRefCheck = normalizeContextFileRefs(originalFileRefs, session.cwd || process.cwd());
+  if (fileRefCheck.error) {
+    return editedMessageError(ws, sessionId, `原消息引用的文件无法复用：${fileRefCheck.error}`);
+  }
+
+  const historyBefore = session.messages.slice(0, messageIndex);
+  session.messages = historyBefore;
+  session.queuedMessages = [];
+  session.updated = new Date().toISOString();
+  if (messageIndex === 0) session.title = editedMessageTitle(textValue, session.title || 'Edited Chat');
+  clearRuntimeForEditedMessage(session);
+  pendingCompactRetries.delete(sessionId);
+  clearPendingSlashCommand(sessionId);
+  saveSession(session);
+
+  plog('INFO', 'message_edit_restart', {
+    sessionId: sessionId.slice(0, 8),
+    messageIndex,
+    agent: getSessionAgent(session),
+    historyBefore: historyBefore.length,
+    attachments: originalAttachments.length,
+    fileRefs: originalFileRefs.length,
+  });
+
+  const runtimeInputText = buildEditedMessageRuntimeInput(session, textValue, originalAttachments, historyBefore);
+  return handleMessage(ws, {
+    type: 'message',
+    sessionId,
+    text: textValue,
+    attachments: originalAttachments,
+    fileRefs: originalFileRefs,
+    mode: msg.mode || session.permissionMode || 'yolo',
+    agent: msg.agent || getSessionAgent(session),
+    reasoningEffort: Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort') ? msg.reasoningEffort : session.reasoningEffort,
+    fastMode: Object.prototype.hasOwnProperty.call(msg, 'fastMode') ? msg.fastMode : session.fastMode,
+  }, {
+    runtimeInputText,
+    emitSessionInfo: true,
+    sessionInfoExtra: { editReset: true, editedMessageIndex: messageIndex },
+  });
+}
+
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false } = options;
+  const { hideInHistory = false, runtimeInputText = null, emitSessionInfo = false, sessionInfoExtra = null } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -10628,18 +13615,34 @@ function handleMessage(ws, msg, options = {}) {
     }
     return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
   }
-  if (!normalizedText && resolvedAttachments.length === 0) return;
+  const pendingSession = sessionId ? loadSession(sessionId) : null;
+  const cwdForFileRefs = pendingSession?.cwd || process.cwd();
+  const resolvedFileRefResult = normalizeContextFileRefs(msg.fileRefs, cwdForFileRefs);
+  if (resolvedFileRefResult.error) {
+    return wsSend(ws, { type: 'error', message: resolvedFileRefResult.error });
+  }
+  const resolvedFileRefs = resolvedFileRefResult.refs;
+  if (!normalizedText && resolvedAttachments.length === 0 && resolvedFileRefs.length === 0) return;
 
   const savedAttachments = resolvedAttachments.map((attachment) => ({
     id: attachment.id,
-    kind: 'image',
+    kind: attachment.kind || 'image',
     filename: attachment.filename,
     mime: attachment.mime,
+    documentType: attachment.documentType || null,
     size: attachment.size,
     createdAt: attachment.createdAt,
     expiresAt: attachment.expiresAt,
     storageState: attachment.storageState,
   }));
+  const savedFileRefs = resolvedFileRefs.map(fileRefHistoryMeta);
+  const resolvedImageAttachments = resolvedAttachments.filter((attachment) => (attachment.kind || 'image') === 'image');
+  const contextInputText = buildContextFilePrompt(textValue, resolvedFileRefs);
+  const effectiveInputText = buildAttachmentDocumentPrompt(contextInputText, resolvedAttachments);
+  let runtimeInputBaseText = typeof runtimeInputText === 'string'
+    ? buildAttachmentDocumentPrompt(buildContextFilePrompt(runtimeInputText, resolvedFileRefs), resolvedAttachments)
+    : effectiveInputText;
+  const messageAgent = normalizeAgent(msg.agent);
 
   const clientMessageIdEarly = normalizeClientMessageId(msg.clientMessageId);
   if (sessionId && clientMessageIdEarly && wasClientMessageAccepted(sessionId, clientMessageIdEarly)) {
@@ -10705,7 +13708,9 @@ function handleMessage(ws, msg, options = {}) {
 
   const derivedTitle = normalizedText
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
-    : `图片: ${savedAttachments[0]?.filename || 'image'}`;
+    : (savedFileRefs.length > 0
+      ? `引用文件: ${savedFileRefs[0]?.relativePath || 'file'}`
+      : `${savedAttachments[0]?.kind === 'document' ? '文档' : '图片'}: ${savedAttachments[0]?.filename || 'attachment'}`);
 
   const clientMessageId = normalizeClientMessageId(msg.clientMessageId);
 
@@ -10720,8 +13725,8 @@ function handleMessage(ws, msg, options = {}) {
 
   if (!session) {
     const id = crypto.randomUUID();
-    const agent = normalizeAgent(msg.agent);
-    const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
+    const agent = messageAgent;
+    const resolvedCwd = agent === 'claude' ? (USER_HOME || process.cwd()) : null;
     session = {
       id,
       title: derivedTitle,
@@ -10735,12 +13740,15 @@ function handleMessage(ws, msg, options = {}) {
       model: null,
       permissionMode: resolvePermissionModeForAgent(agent, mode).mode,
       totalCost: 0,
-      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
       messages: [],
       cwd: resolvedCwd,
     };
   }
   normalizeSession(session);
+  if (session.kind === 'side_conversation') {
+    runtimeInputBaseText = buildSideConversationRuntimePrompt(session, runtimeInputBaseText);
+  }
 
   const permissionResolution = resolvePermissionModeForAgent(
     getSessionAgent(session),
@@ -10768,6 +13776,7 @@ function handleMessage(ws, msg, options = {}) {
       role: 'user',
       content: textValue,
       attachments: savedAttachments,
+      fileRefs: savedFileRefs,
       timestamp: new Date().toISOString(),
     });
   }
@@ -10781,9 +13790,7 @@ function handleMessage(ws, msg, options = {}) {
     sendMessageAccepted(ws, currentSessionId, clientMessageId, ack);
   }
 
-  for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) entry.ws = null;
-  }
+  detachWebSocketFromActiveProcesses(ws, { markDisconnect: true });
   wsSessionMap.set(ws, currentSessionId);
 
   if (!sessionId) {
@@ -10792,14 +13799,25 @@ function handleMessage(ws, msg, options = {}) {
     wsSend(ws, {
       type: 'session_info',
       sessionId: currentSessionId,
+      kind: session.kind || 'main',
+      sidecar: !!session.sidecar,
+      parentSessionId: session.parentSessionId || null,
+      anchor: session.anchor || null,
+      parentContext: session.parentContext || null,
       messages: session.messages,
       title: session.title,
       mode: session.permissionMode || 'yolo',
+      reasoningEffort: session.reasoningEffort || '',
+      fastMode: !!session.fastMode,
       model: sessionModelLabel(session),
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
+      projectId: session.projectId || null,
       totalCost: session.totalCost || 0,
       totalUsage: session.totalUsage || null,
+      lastUsage: session.lastUsage || null,
+      contextWindowTokens: session.contextWindowTokens || null,
+      queuedMessages: buildQueuedMessagesPayload(session),
       updated: session.updated,
       hasUnread: false,
       historyPending: false,
@@ -10815,7 +13833,7 @@ function handleMessage(ws, msg, options = {}) {
     : null;
   const spawnSpec = sessionAgent === 'codex'
     ? buildCodexSpawnSpec(session, {
-        attachments: resolvedAttachments,
+        attachments: resolvedImageAttachments,
         review: codexReviewMatch ? { instructions: codexReviewMatch[1] || '' } : null,
         transport: CODEX_TRANSPORT,
       })
@@ -10824,7 +13842,7 @@ function handleMessage(ws, msg, options = {}) {
           attachments: resolvedAttachments,
           transport: PI_TRANSPORT,
         })
-      : buildClaudeSpawnSpec(session, { attachments: resolvedAttachments });
+      : buildClaudeSpawnSpec(session, { attachments: resolvedImageAttachments });
   if (spawnSpec?.error) {
     // New-chat session_info may have advertised isRunning=true; clear client state.
     wsSend(ws, { type: 'error', sessionId: currentSessionId, message: spawnSpec.error });
@@ -10835,7 +13853,7 @@ function handleMessage(ws, msg, options = {}) {
     ? (Array.isArray(session.messages) ? session.messages.slice(0, -1) : [])
     : [];
   const threadCarryover = shouldInjectCarryover
-    ? buildThreadCarryoverPayload(session, textValue, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
+    ? buildThreadCarryoverPayload(session, runtimeInputBaseText, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
     : null;
   if (spawnSpec?.warningMessage) {
     wsSend(ws, { type: 'system_message', sessionId: currentSessionId, message: spawnSpec.warningMessage });
@@ -10843,19 +13861,19 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.threadReset) {
     wsSend(ws, { type: 'system_message', sessionId: currentSessionId, message: buildThreadCarryoverNotice(threadCarryover) });
   }
-  const runtimeInputText = threadCarryover?.prompt
-    || (Object.prototype.hasOwnProperty.call(spawnSpec, 'inputText') ? spawnSpec.inputText : textValue);
+  const effectiveRuntimeInputText = threadCarryover?.prompt
+    || (Object.prototype.hasOwnProperty.call(spawnSpec, 'inputText') ? spawnSpec.inputText : runtimeInputBaseText);
 
   if (sessionAgent === 'pi' && spawnSpec.transport === 'rpc') {
-    startPiRpcTurn(ws, session, spawnSpec, resolvedAttachments, runtimeInputText);
+    startPiRpcTurn(ws, session, spawnSpec, resolvedAttachments, effectiveRuntimeInputText);
     return;
   }
   if (sessionAgent === 'codex' && spawnSpec.transport === 'app-server') {
-    startCodexAppTurn(ws, session, spawnSpec, resolvedAttachments, runtimeInputText);
+    startCodexAppTurn(ws, session, spawnSpec, resolvedImageAttachments, effectiveRuntimeInputText);
     return;
   }
   if (sessionAgent === 'claude' && CLAUDE_TRANSPORT === 'stream-json') {
-    startClaudeStreamTurn(ws, session, spawnSpec, resolvedAttachments, runtimeInputText);
+    startClaudeStreamTurn(ws, session, spawnSpec, resolvedImageAttachments, effectiveRuntimeInputText);
     return;
   }
 
@@ -10868,7 +13886,7 @@ function handleMessage(ws, msg, options = {}) {
   const errorPath = path.join(dir, 'error.log');
 
   if (isClaudeSession(session)) {
-    const content = claudeStreamContent(runtimeInputText, resolvedAttachments);
+    const content = claudeStreamContent(effectiveRuntimeInputText, resolvedAttachments);
     fs.writeFileSync(inputPath, `${JSON.stringify({
       type: 'user',
       message: {
@@ -10877,7 +13895,7 @@ function handleMessage(ws, msg, options = {}) {
       },
     })}\n`);
   } else {
-    fs.writeFileSync(inputPath, runtimeInputText);
+    fs.writeFileSync(inputPath, effectiveRuntimeInputText);
   }
 
   const runId = crypto.randomUUID();
@@ -10942,6 +13960,13 @@ function handleMessage(ws, msg, options = {}) {
     startedAt: new Date().toISOString(),
   });
   proc.unref(); // Process survives Node.js exit
+
+  wsSend(ws, {
+    type: 'runtime_status',
+    sessionId: currentSessionId,
+    code: 'waiting',
+    message: '已连接模型，正在等待首个响应…',
+  });
 
   plog('INFO', 'process_spawn', {
     sessionId: currentSessionId.slice(0, 8),
@@ -11045,6 +14070,7 @@ const {
   preparePiCustomRuntime,
   getPiRuntimeFingerprint,
   wsSend,
+  sendRuntimeMessage,
   truncateObj,
   sanitizeToolInput,
   loadSession,
@@ -11057,6 +14083,7 @@ const {
   clearRuntimeSessionId,
   runtimeFingerprintsCompatible,
   onSlashCommandsDiscovered,
+  createGeneratedImageSegmentFromCodexEvent,
   plog,
 });
 
@@ -11159,7 +14186,35 @@ function parseJsonlToMessages(lines) {
       if (typeof raw === 'string') {
         content = raw;
       } else if (Array.isArray(raw)) {
-        // skip tool_result blocks, only take text blocks
+        const toolResultBlocks = raw.filter(b => b?.type === 'tool_result');
+        if (toolResultBlocks.length > 0) {
+          const lastAssistant = [...messages].reverse().find((message) => message?.role === 'assistant');
+          if (lastAssistant) {
+            for (const b of toolResultBlocks) {
+              const resultText = typeof b.content === 'string'
+                ? b.content
+                : Array.isArray(b.content)
+                  ? b.content.map((item) => item?.text || '').join('\n')
+                  : JSON.stringify(b.content || '');
+              const toolUseId = b.tool_use_id || b.id;
+              const tc = Array.isArray(lastAssistant.toolCalls)
+                ? lastAssistant.toolCalls.find((item) => item.id === toolUseId)
+                : null;
+              if (tc) {
+                tc.done = true;
+                tc.result = resultText.slice(0, 2000);
+              }
+              const segment = Array.isArray(lastAssistant.segments)
+                ? lastAssistant.segments.find((item) => item.type === 'tool_call' && item.id === toolUseId)
+                : null;
+              if (segment) {
+                segment.done = true;
+                segment.result = resultText.slice(0, 2000);
+              }
+            }
+          }
+        }
+        // user-visible content should only include text blocks; tool_result updates the previous assistant message.
         content = raw
           .filter(b => b.type === 'text')
           .map(b => b.text || '')
@@ -11181,7 +14236,7 @@ function parseJsonlToMessages(lines) {
           if (last && last.type === 'text') last.text = `${last.text || ''}${b.text}`;
           else segments.push({ type: 'text', text: b.text });
         } else if (b.type === 'tool_use') {
-          const tc = { name: b.name, id: b.id, input: b.input, done: true };
+          const tc = { name: b.name, id: b.id, input: b.input, done: false };
           toolCalls.push(tc);
           segments.push({ type: 'tool_call', ...tc });
         } else if (b.type === 'tool_result') {
@@ -11216,6 +14271,7 @@ const {
   sessionsDir: SESSIONS_DIR,
   normalizeSession,
   sanitizeToolInput,
+  createGeneratedImageSegmentFromCodexEvent,
 });
 
 function getImportedSessionIds() {
@@ -11417,6 +14473,8 @@ function handleImportNativeSession(ws, msg) {
     runtimeContexts: existingSession?.runtimeContexts || { claude: {}, codex: {} },
     importedFrom: projectDir,
     model: existingSession?.model || null,
+    reasoningEffort: existingSession?.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(existingSession?.fastMode),
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -11435,11 +14493,16 @@ function handleImportNativeSession(ws, msg) {
     messages: session.messages,
     title: session.title,
     mode: session.permissionMode,
+    reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -11538,9 +14601,13 @@ function handleImportCodexSession(ws, msg) {
     importedFrom: 'codex',
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
+    reasoningEffort: existingSession?.reasoningEffort || '',
+    fastMode: normalizeCodexFastMode(existingSession?.fastMode),
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
-    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+    lastUsage: parsed.lastUsage || existingSession?.lastUsage || null,
+    contextWindowTokens: parsed.contextWindowTokens || existingSession?.contextWindowTokens || null,
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };
@@ -11556,11 +14623,16 @@ function handleImportCodexSession(ws, msg) {
     messages: session.messages,
     title: session.title,
     mode: session.permissionMode,
+    reasoningEffort: session.reasoningEffort || '',
+    fastMode: !!session.fastMode,
     model: sessionModelLabel(session),
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastUsage: session.lastUsage || null,
+    contextWindowTokens: session.contextWindowTokens || null,
+    queuedMessages: buildQueuedMessagesPayload(session),
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -11757,7 +14829,7 @@ function handleImportPiSession(ws, msg) {
 function handleListCwdSuggestions(ws) {
   const paths = new Set();
   // Always include HOME
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const home = USER_HOME;
   if (home) paths.add(home);
   try {
     const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
@@ -11810,10 +14882,81 @@ function handleSaveProject(ws, msg) {
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 
+function decodeClaudeProjectDirName(projectDir) {
+  const raw = String(projectDir || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('-') && !raw.includes('/') && !raw.includes('\\')) {
+    const parts = raw.split('-').filter(Boolean);
+    if (parts.length > 0) return `/${parts.join('/')}`;
+  }
+  return raw;
+}
+
+function getSessionProjectPath(session) {
+  if (!session) return null;
+  if (session.cwd) return session.cwd;
+  const preferredClaudeRuntimeId = getSessionAgent(session) === 'claude'
+    ? getPreferredRuntimeSessionId(session, 'claude')
+    : null;
+  if (preferredClaudeRuntimeId) {
+    const localMeta = resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId);
+    if (localMeta?.cwd) return localMeta.cwd;
+  }
+  return decodeClaudeProjectDirName(session.importedFrom);
+}
+
+function sessionBelongsToConfiguredProject(session, targetProject, projects) {
+  if (!session || !targetProject?.id) return false;
+  const projectsById = new Map((Array.isArray(projects) ? projects : []).map((project) => [project.id, project]));
+  if (session.projectId && projectsById.has(session.projectId)) {
+    return session.projectId === targetProject.id;
+  }
+  const sessionProjectPath = getSessionProjectPath(session);
+  if (!sessionProjectPath) return false;
+  const matchedProject = findBestProjectForPath(projects, sessionProjectPath);
+  return matchedProject?.id === targetProject.id;
+}
+
+function collectProjectSessionIds(targetProject, projects) {
+  const ids = [];
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'));
+    for (const file of files) {
+      const sessionId = file.replace(/\.json$/, '');
+      const session = loadSession(sessionId);
+      if (sessionBelongsToConfiguredProject(session, targetProject, projects)) ids.push(session.id || sessionId);
+    }
+  } catch {}
+  return ids;
+}
+
 function handleDeleteProject(ws, msg) {
   const config = loadProjectsConfig();
+  const project = config.projects.find(p => p.id === msg.projectId);
+  if (project) {
+    const sessionIds = collectProjectSessionIds(project, config.projects);
+    let deletedSessions = 0;
+    for (const sessionId of sessionIds) {
+      try {
+        const result = deleteSessionById(sessionId);
+        if (result.deleted) deletedSessions++;
+      } catch (err) {
+        plog('WARN', 'project_session_delete_failed', {
+          projectId: project.id,
+          sessionId: String(sessionId || '').slice(0, 8),
+          error: err?.message || String(err),
+        });
+      }
+    }
+    plog('INFO', 'project_deleted', {
+      projectId: project.id,
+      projectPath: project.path,
+      sessions: deletedSessions,
+    });
+  }
   config.projects = config.projects.filter(p => p.id !== msg.projectId);
   saveProjectsConfig(config);
+  sendSessionList(ws, { forceRefresh: true });
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 
@@ -11824,6 +14967,29 @@ function handleRenameProject(ws, msg) {
     project.name = String(msg.name).trim();
     saveProjectsConfig(config);
   }
+  wsSend(ws, { type: 'projects_config', projects: config.projects });
+}
+
+function handleReorderProjects(ws, msg) {
+  const config = loadProjectsConfig();
+  const projectIds = Array.isArray(msg.projectIds) ? msg.projectIds.map((id) => String(id || '')).filter(Boolean) : [];
+  if (projectIds.length === 0) {
+    return wsSend(ws, { type: 'projects_config', projects: config.projects });
+  }
+  const byId = new Map(config.projects.map((project) => [project.id, project]));
+  const seen = new Set();
+  const reordered = [];
+  for (const id of projectIds) {
+    const project = byId.get(id);
+    if (!project || seen.has(id)) continue;
+    seen.add(id);
+    reordered.push(project);
+  }
+  for (const project of config.projects) {
+    if (!seen.has(project.id)) reordered.push(project);
+  }
+  config.projects = reordered;
+  saveProjectsConfig(config);
   wsSend(ws, { type: 'projects_config', projects: config.projects });
 }
 
@@ -12229,7 +15395,7 @@ function handleCreateDirectory(ws, msg) {
     return sendResult(false, { error: '父目录不存在或无法访问' });
   }
 
-  if (!BROWSE_ROOTS.some((root) => isPathInside(parentPath, root))) {
+  if (!MUTATION_ROOTS.some((root) => isPathInside(parentPath, root))) {
     return sendResult(false, { parentPath, error: '父目录不在允许范围内' });
   }
 
@@ -12244,7 +15410,7 @@ function handleCreateDirectory(ws, msg) {
   const targetPath = path.resolve(parentPath, directoryName);
   if (
     path.dirname(targetPath) !== parentPath
-    || !BROWSE_ROOTS.some((root) => isPathInside(targetPath, root))
+    || !MUTATION_ROOTS.some((root) => isPathInside(targetPath, root))
   ) {
     return sendResult(false, { parentPath, error: '文件夹名称不合法' });
   }
@@ -12269,6 +15435,23 @@ function handleCreateDirectory(ws, msg) {
 function handleBrowseDirectory(ws, msg) {
   const home = USER_HOME || '/';
   const requestedPath = msg && typeof msg.path === 'string' ? msg.path : '';
+
+  // Windows: show all available drives
+  if (requestedPath === DRIVES_LIST_SENTINEL && process.platform === 'win32') {
+    const drives = [];
+    for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+      const root = String.fromCharCode(code) + ':\\';
+      try { fs.statSync(root); drives.push(root); } catch {}
+    }
+    return wsSend(ws, {
+      type: 'directory_listing',
+      path: DRIVES_LIST_SENTINEL,
+      parent: home || null,
+      dirs: drives,
+      error: null,
+    });
+  }
+
   let targetPath;
   try {
     targetPath = requestedPath ? path.resolve(String(requestedPath)) : home;
@@ -12319,11 +15502,12 @@ function handleBrowseDirectory(ws, msg) {
   try {
     entries = fs.readdirSync(targetPath, { withFileTypes: true });
   } catch (e) {
-    const parentPath = path.dirname(targetPath);
+    const pp = path.dirname(targetPath);
+    const isWinRoot = process.platform === 'win32' && pp === targetPath;
     return wsSend(ws, {
       type: 'directory_listing',
       path: targetPath,
-      parent: parentPath !== targetPath ? parentPath : null,
+      parent: isWinRoot ? DRIVES_LIST_SENTINEL : (pp !== targetPath ? pp : null),
       dirs: [],
       error: e.code === 'EACCES' ? '权限不足，无法读取此目录' : '读取目录失败',
     });
@@ -12339,10 +15523,11 @@ function handleBrowseDirectory(ws, msg) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
   const parentPath = path.dirname(targetPath);
+  const isWinRoot = process.platform === 'win32' && parentPath === targetPath;
   wsSend(ws, {
     type: 'directory_listing',
     path: targetPath,
-    parent: parentPath !== targetPath ? parentPath : null,
+    parent: isWinRoot ? DRIVES_LIST_SENTINEL : (parentPath !== targetPath ? parentPath : null),
     dirs,
     error: null,
   });
@@ -12361,7 +15546,7 @@ setInterval(() => {
       sessionId: sid.slice(0, 8),
       pid: entry.pid,
       alive,
-      wsConnected: !!entry.ws,
+      wsConnected: isProcessRealtimeConnected(entry),
       wsDisconnectTime: entry.wsDisconnectTime || null,
       responseLen: (entry.fullText || '').length,
     });

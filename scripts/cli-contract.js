@@ -21,14 +21,15 @@ function isExecutable(filePath) {
 }
 
 function findExecutableCandidate(filePath) {
-  const candidates = [filePath];
+  const candidates = [];
   if (process.platform === 'win32' && !path.extname(filePath)) {
-    const extensions = String(process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+    const extensions = ['.PS1', ...String(process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
       .split(';')
       .map((extension) => extension.trim())
-      .filter(Boolean);
+      .filter(Boolean)];
     candidates.push(...extensions.map((extension) => `${filePath}${extension}`));
   }
+  candidates.push(filePath);
   return candidates.find(isExecutable) || null;
 }
 
@@ -69,7 +70,7 @@ const CLAUDE = resolveCommand(process.env.CLAUDE_PATH, 'claude');
 const CODEX = resolveCommand(process.env.CODEX_PATH, 'codex');
 const PI = resolveCommand(process.env.PI_PATH, 'pi');
 const CONTRACT_AGENTS = new Set(
-  String(process.env.CC_WEB_CONTRACT_AGENTS || 'claude,codex,pi')
+  String(process.env.CC_WEB_CONTRACT_AGENTS || 'claude,codex')
     .split(',')
     .map((agent) => agent.trim().toLowerCase())
     .filter(Boolean),
@@ -84,7 +85,10 @@ function assert(condition, message) {
 }
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+  const usePowerShellShim = process.platform === 'win32' && path.extname(command).toLowerCase() === '.ps1';
+  const spawnCommand = usePowerShellShim ? 'pwsh' : command;
+  const spawnArgs = usePowerShellShim ? ['-NoProfile', '-File', command, ...args] : args;
+  const result = spawnSync(spawnCommand, spawnArgs, {
     cwd: ROOT,
     env: { ...process.env, ...(options.env || {}) },
     encoding: 'utf8',

@@ -68,7 +68,7 @@ function runAppServer() {
     itemId,
     delta: text,
   });
-  const finishTurn = (threadId, turnId, status = 'completed', error = null) => {
+  const finishTurn = (threadId, turnId, status = 'completed', error = null, tokenUsage = null) => {
     const active = activeTurns.get(threadId);
     if (!active || active.id !== turnId || active.completed) return;
     active.completed = true;
@@ -76,7 +76,7 @@ function runAppServer() {
     notify('thread/tokenUsage/updated', {
       threadId,
       turnId,
-      tokenUsage: {
+      tokenUsage: tokenUsage || {
         last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 15 },
         total: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 15 },
         modelContextWindow: 200000,
@@ -104,6 +104,86 @@ function runAppServer() {
         id: 'item_cmd', type: 'commandExecution', command: '/bin/bash -lc pwd', commandActions: [],
         cwd: process.cwd(), aggregatedOutput: '/tmp/mock-codex\n', exitCode: 0, status: 'completed',
       });
+    }
+    if (input === 'trigger codex capacity retry') {
+      state.capacityAttempts = Number(state.capacityAttempts || 0) + 1;
+      if (state.capacityAttempts <= 2) {
+        const message = 'Selected model is at capacity. Please try a different model.';
+        notify('error', { threadId, turnId, error: { message }, willRetry: false });
+        finishTurn(threadId, turnId, 'failed', { message, codexErrorInfo: 'server_overloaded' });
+        return;
+      }
+      const text = 'Codex mock capacity retry succeeded.';
+      delta(threadId, turnId, 'item_capacity_retry_success', text);
+      item(threadId, turnId, 'completed', { id: 'item_capacity_retry_success', type: 'agentMessage', text });
+      state.capacityAttempts = 0;
+      finishTurn(threadId, turnId);
+      return;
+    }
+    if (input === 'trigger codex stream disconnect retry') {
+      state.streamDisconnectAttempts = Number(state.streamDisconnectAttempts || 0) + 1;
+      if (state.streamDisconnectAttempts <= 1) {
+        const message = 'stream disconnected before completion: error sending request for url (http://127.0.0.1:12345/openai/responses)';
+        notify('error', { threadId, turnId, error: { message }, willRetry: false });
+        finishTurn(threadId, turnId, 'failed', { message, codexErrorInfo: 'response_stream_disconnected' });
+        return;
+      }
+      const text = 'Codex mock stream disconnect retry succeeded.';
+      delta(threadId, turnId, 'item_stream_disconnect_retry_success', text);
+      item(threadId, turnId, 'completed', { id: 'item_stream_disconnect_retry_success', type: 'agentMessage', text });
+      state.streamDisconnectAttempts = 0;
+      finishTurn(threadId, turnId);
+      return;
+    }
+    if (input === 'trigger codex cumulative usage within window') {
+      const text = 'Codex mock cumulative usage handled.';
+      delta(threadId, turnId, 'item_msg_cumulative_usage', text);
+      item(threadId, turnId, 'completed', { id: 'item_msg_cumulative_usage', type: 'agentMessage', text });
+      finishTurn(threadId, turnId, 'completed', null, {
+        total: { inputTokens: 28201, cachedInputTokens: 16128, outputTokens: 40, reasoningOutputTokens: 0, totalTokens: 28241 },
+        last: { inputTokens: 15351, cachedInputTokens: 12672, outputTokens: 14, reasoningOutputTokens: 0, totalTokens: 15365 },
+        modelContextWindow: 258400,
+      });
+      return;
+    }
+    if (input === 'trigger codex anomalous usage') {
+      const text = 'Codex mock anomalous usage handled.';
+      delta(threadId, turnId, 'item_msg_usage', text);
+      item(threadId, turnId, 'completed', { id: 'item_msg_usage', type: 'agentMessage', text });
+      finishTurn(threadId, turnId, 'completed', null, {
+        total: { inputTokens: 35000000, cachedInputTokens: 32000000, outputTokens: 90000, reasoningOutputTokens: 0, totalTokens: 35090000 },
+        last: { inputTokens: 210000, cachedInputTokens: 207000, outputTokens: 900, reasoningOutputTokens: 0, totalTokens: 210900 },
+        modelContextWindow: 400000,
+      });
+      return;
+    }
+    if (input === 'trigger codex active goal auto continuation') {
+      const text = 'mock goal step 1 done; goal remains active.';
+      delta(threadId, turnId, 'item_goal_step_1', text);
+      item(threadId, turnId, 'completed', { id: 'item_goal_step_1', type: 'agentMessage', text });
+      if (state.goal) {
+        state.goal = { ...state.goal, status: 'active', tokensUsed: Number(state.goal.tokensUsed || 0) + 15, updatedAt: Date.now() };
+        notify('thread/goal/updated', { threadId, turnId, goal: state.goal });
+      }
+      finishTurn(threadId, turnId);
+      return;
+    }
+    if (/Continue working toward the active Codex thread goal/.test(input)
+      && /trigger codex active goal auto continuation/.test(input)) {
+      const commandItem = {
+        id: 'item_goal_continue_cmd', type: 'commandExecution', command: '/bin/bash -lc true', commandActions: [],
+        cwd: process.cwd(), aggregatedOutput: 'continued\n', exitCode: 0, status: 'completed',
+      };
+      item(threadId, turnId, 'completed', commandItem);
+      const text = 'mock goal step 2 complete.';
+      delta(threadId, turnId, 'item_goal_step_2', text);
+      item(threadId, turnId, 'completed', { id: 'item_goal_step_2', type: 'agentMessage', text });
+      if (state.goal) {
+        state.goal = { ...state.goal, status: 'complete', tokensUsed: Number(state.goal.tokensUsed || 0) + 15, updatedAt: Date.now() };
+        notify('thread/goal/updated', { threadId, turnId, goal: state.goal });
+      }
+      finishTurn(threadId, turnId);
+      return;
     }
     if (input === 'trigger codex auth error') {
       notify('error', {

@@ -4,14 +4,25 @@
   window.addEventListener('error', (e) => { console.error('[WEBCODING-INIT-ERROR]', e.message, e.filename, e.lineno); });
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-  const RENDER_DEBOUNCE = 100;
+  const RENDER_DEBOUNCE = 180;
+  const STREAMING_PLAIN_TEXT_THRESHOLD = 120_000;
 
-  const SHOW_SIDEBAR_COST = false;
+  // The live model catalog comes from the backend/CLI. Keep only a neutral
+  // fallback so stale hard-coded Claude aliases never override discovery.
+  const CLAUDE_MODEL_ENTRIES = [
+    { alias: 'default', value: 'default', label: '默认（推荐）', desc: '跟随当前 Claude 配置', pricing: '' },
+  ];
 
-  // Slash menu is populated from server discovery (platform + CLI + filesystem).
-  // Empty until the server responds with slash_commands_list.
-  let currentSlashCommands = [];
-  let currentRuntimeCapabilities = null;
+  const DEFAULT_SLASH_COMMANDS = [
+    { cmd: '/clear', desc: '清除当前会话' },
+    { cmd: '/model', desc: '查看/切换模型' },
+    { cmd: '/mode', desc: '查看/切换权限模式' },
+    { cmd: '/reasoning', desc: '查看/切换 Codex 思考级别' },
+    { cmd: '/cost', desc: '查看会话费用' },
+    { cmd: '/compact', desc: '压缩上下文' },
+    { cmd: '/help', desc: '显示帮助' },
+  ];
+  let currentSlashCommands = [...DEFAULT_SLASH_COMMANDS];
 
   const MODE_LABELS = {
     default: '默认',
@@ -26,10 +37,12 @@
   };
 
   const DEFAULT_AGENT = 'claude';
-  const SESSION_CACHE_LIMIT = 8;
-  const SESSION_CACHE_MAX_WEIGHT = 3_000_000;
-  const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
-  const ALLOWED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+  const DEFAULT_AGENT_MODES = {
+    claude: 'default',
+    codex: 'yolo',
+  };
+  const SESSION_CACHE_LIMIT = 4;
+  const SESSION_CACHE_MAX_WEIGHT = 1_500_000;
   const SIDEBAR_SWIPE_TRIGGER = 72;
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
   // Only start open-swipe from the left screen edge so horizontal table/code pans
@@ -43,9 +56,16 @@
   const GIT_PANEL_DEFAULT_WIDTH = 360;
   const GIT_PANEL_MIN_WIDTH = 280;
   const GIT_PANEL_MAX_WIDTH = 720;
+  const FILE_VIEWER_WIDTH_STORAGE_KEY = 'webcoding-file-viewer-width';
+  const FILE_VIEWER_DEFAULT_WIDTH = 520;
+  const FILE_VIEWER_MIN_WIDTH = 320;
+  const FILE_VIEWER_MAX_WIDTH = 980;
+  const SIDE_CHAT_WIDTH_STORAGE_KEY = 'webcoding-side-chat-width';
+  const SIDE_CHAT_DEFAULT_WIDTH = 360;
+  const SIDE_CHAT_MIN_WIDTH = 280;
+  const SIDE_CHAT_MAX_WIDTH = 720;
   const DESKTOP_INSIGHTS_BREAKPOINT = 1280;
   const VISIBILITY_RESYNC_THROTTLE_MS = 2500;
-  const SESSION_LIST_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
   const INPUT_MAX_HEIGHT_FALLBACK = 200;
   const RECONNECT_MAX_ATTEMPTS = 8;
   const SCROLL_NEAR_BOTTOM_PX = 96;
@@ -53,13 +73,74 @@
   const MESSAGE_ACK_TIMEOUT_MS = 12000;
   const THINKING_RENDER_DEBOUNCE = 80;
   const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
-  const COLOR_SCHEME_STORAGE_KEY = 'webcoding-color-scheme';
-  const LEGACY_THEME_STORAGE_KEY = 'webcoding-theme';
-  const SEND_ON_ENTER_STORAGE_KEY = 'webcoding-send-on-enter';
-  const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';
-  const DEFAULT_COLOR_SCHEME = 'light';
-  const HLJS_THEME_LIGHT = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
-  const HLJS_THEME_DARK = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
+  const FILE_REF_TRANSFER_TYPE = 'application/x-webcoding-file-ref';
+  const FILE_MOVE_TRANSFER_TYPE = 'application/x-webcoding-file-move';
+  const FILE_UPLOAD_MAX_SIZE = 1024 * 1024 * 1024;
+  const MAX_PENDING_FILE_REFS = 8;
+  const MAX_PENDING_FILE_REF_SIZE = 256 * 1024;
+  const MAX_PENDING_ATTACHMENTS = 4;
+  const DOCUMENT_UPLOAD_ACCEPT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.pdf', '.doc', '.docx', '.xlsx', '.xls', '.csv', '.tsv', '.json', '.jsonl', '.log']);
+  const MAX_QUEUED_MESSAGES = 10;
+  const MAX_QUEUED_ATTACHMENTS = 4;
+  const SIDE_CHAT_CONTEXT_LIMIT = 12000;
+  const SIDE_CHAT_SELECTION_LIMIT = 4000;
+  const SIDE_CHAT_PARENT_RECENT_LIMIT = 8;
+  const SIDE_CHAT_PARENT_NEARBY_LIMIT = 2;
+  const SIDE_CHAT_PARENT_MESSAGE_LIMIT = 1200;
+  const SIDE_CHAT_STATE_STORAGE_KEY = 'webcoding-side-chat-state-v1';
+  const SIDE_CHAT_MAX_PERSISTED_MESSAGES = 80;
+  const SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS = 60000;
+  const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
+  const THEME_STORAGE_KEY = 'webcoding-theme';
+  const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
+  const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
+  const OPEN_CHAT_TABS_STORAGE_KEY = 'webcoding-open-chat-tabs-v1';
+  const OPEN_CHAT_TABS_LIMIT = 18;
+  const PROJECT_TOUCH_DRAG_LONG_PRESS_MS = 260;
+  const PROJECT_TOUCH_DRAG_CANCEL_DISTANCE = 10;
+  const PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE = 56;
+  const PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP = 18;
+  const DEFAULT_THEME = 'auto';
+  const THEME_AUTO_VALUE = 'auto';
+  const THEME_DAY_VALUE = 'default';
+  const THEME_NIGHT_VALUE = 'night';
+  const THEME_LABELS = {
+    auto: '跟随时间',
+    default: '默认主题',
+    localhost: '极简主题',
+    night: '夜间模式',
+  };
+
+  const MODE_PICKER_OPTIONS = [
+    { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
+    { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
+    { value: 'default', label: '默认', desc: '标准权限审批' },
+  ];
+  const CODEX_REASONING_EFFORT_OPTIONS = [
+    { value: '', label: '默认', desc: '不传覆盖参数，沿用 Codex 配置文件或模型默认' },
+    { value: 'xhigh', label: 'XHigh', desc: '最深思考，延迟和消耗最高' },
+    { value: 'high', label: 'High', desc: '复杂调试、长规划和高价值任务' },
+    { value: 'medium', label: 'Medium', desc: '质量和速度均衡' },
+    { value: 'low', label: 'Low', desc: '更快，适合日常执行和简单规划' },
+    { value: 'minimal', label: 'Minimal', desc: '极轻量思考' },
+    { value: 'none', label: 'None', desc: '最低延迟，不适合复杂工具链任务' },
+  ];
+  const CODEX_REASONING_EFFORT_LABELS = CODEX_REASONING_EFFORT_OPTIONS.reduce((acc, item) => {
+    acc[item.value] = item.label;
+    return acc;
+  }, {});
+  const CODEX_FAST_MODE_ENABLED = false;
+
+  function normalizeCodexFastMode(value) {
+    if (!CODEX_FAST_MODE_ENABLED) return false;
+    if (value === true) return true;
+    const raw = String(value || '').trim().toLowerCase();
+    return raw === 'fast' || raw === 'on' || raw === 'true' || raw === '1';
+  }
+
+  function getCodexSpeedValue(value) {
+    return normalizeCodexFastMode(value) ? 'fast' : 'standard';
+  }
 
   // --- State ---
   let ws = null;
@@ -84,8 +165,10 @@
   let activeToolCalls = new Map();
   let cmdMenuIndex = -1;
   let cmdMenuDelegated = false;
-  let currentMode = 'yolo';
+  let currentMode = DEFAULT_AGENT_MODES[DEFAULT_AGENT];
   let currentModel = '';
+  let currentReasoningEffort = '';
+  let currentFastMode = false;
   let currentActiveRuntime = null;
   let currentRuntimeCount = 0;
   const savedAgent = localStorage.getItem('webcoding-agent');
@@ -110,14 +193,65 @@
   let pendingThinkingSessionId = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  const attachmentPreviewUrls = new Map();
+  let pendingFileRefs = [];
+  let queuedMessages = [];
+  let queuedDispatchTimer = null;
+  let queuedMessagesRestoredAt = 0;
+  let queuedMessagesRestoredSawRunning = false;
+  let generationIdleFinalizeTimer = null;
+  let streamingStatusTimer = null;
+  let streamingStatusState = null;
+  let awaitingRuntimeStart = false;
+  let awaitingRuntimeStartAt = 0;
+  let editingMessageState = null;
+  let pendingEditResetSessionId = null;
+  let fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+  let fileTreeUploadTargetRow = null;
+  let fileTreeUploadActive = false;
+  let fileRefPickerExpandedDirs = new Set();
+  let fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+  let fileViewerImageState = { activePath: '', scale: 0, fitScale: 1, offsetX: 0, offsetY: 0, mode: 'fit' };
+  let fileViewerImageResizeObserver = null;
+  let sideChatState = {
+    open: false,
+    ws: null,
+    authed: false,
+    creating: false,
+    sessionId: null,
+    parentSessionId: null,
+    contextSnippet: '',
+    parentContext: null,
+    pendingSendText: '',
+    messages: [],
+    pendingText: '',
+    isGenerating: false,
+    agent: null,
+    mode: null,
+    reasoningEffort: '',
+    fastMode: false,
+  };
+  let sideChatPersistTimer = null;
+  let sideChatSelectionPopover = null;
+  let sideChatSelectionTimer = null;
+  let contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
   let currentCwd = null;
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('webcoding-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
   let collapsedProjects = new Set();
+  let expandedProjectSessions = new Set();
+  const DEFAULT_VISIBLE_SESSIONS_PER_PROJECT = 5;
+  let selectedProject = { id: null, path: null };
+  let openChatTabs = loadPersistedOpenChatTabs();
+  let projectDragState = null;
+  let projectTouchDragState = null;
+  let suppressProjectHeaderClickUntil = 0;
   let sidebarResizeState = null;
   let gitPanelResizeState = null;
+  let fileViewerResizeState = null;
+  let sideChatResizeState = null;
   let lastVisibilityResyncAt = 0;
   let localIdCounter = 0;
   let cachedInputMaxHeight = INPUT_MAX_HEIGHT_FALLBACK;
@@ -165,6 +299,10 @@
     set currentMode(value) { currentMode = value; },
     get currentModel() { return currentModel; },
     set currentModel(value) { currentModel = value; },
+    get currentReasoningEffort() { return currentReasoningEffort; },
+    set currentReasoningEffort(value) { currentReasoningEffort = value; },
+    get currentFastMode() { return currentFastMode; },
+    set currentFastMode(value) { currentFastMode = value === true; },
     get currentActiveRuntime() { return currentActiveRuntime; },
     set currentActiveRuntime(value) { currentActiveRuntime = value; },
     get currentRuntimeCount() { return currentRuntimeCount; },
@@ -200,6 +338,13 @@
     set pendingAttachments(value) { pendingAttachments = value; },
     get uploadingAttachments() { return uploadingAttachments; },
     set uploadingAttachments(value) { uploadingAttachments = value; },
+    get pendingFileRefs() { return pendingFileRefs; },
+    set pendingFileRefs(value) { pendingFileRefs = value; },
+    get queuedMessages() { return queuedMessages; },
+    set queuedMessages(value) {
+      queuedMessages = normalizeQueuedMessages(value);
+      persistQueuedMessages();
+    },
   };
 
   // --- DOM ---
@@ -223,18 +368,43 @@
   const gitPanelEl = $('#git-panel');
   const gitPanelContent = $('#git-panel-content');
   const gitPanelBtn = $('#git-panel-btn');
+  const themeToggleBtn = $('#theme-toggle-btn');
+  const fileViewerPanel = $('#file-viewer-panel');
+  const fileViewerTitle = $('#file-viewer-title');
+  const fileViewerPath = $('#file-viewer-path');
+  const fileViewerMeta = $('#file-viewer-meta');
+  const fileViewerBody = $('#file-viewer-body');
+  const fileViewerSourceTab = $('#file-viewer-source-tab');
+  const fileViewerPreviewTab = $('#file-viewer-preview-tab');
+  const fileViewerDownload = $('#file-viewer-download');
+  const fileViewerRefresh = $('#file-viewer-refresh');
+  const fileViewerClose = $('#file-viewer-close');
+  const sideChatPanel = $('#side-chat-panel');
+  const sideChatContextLabel = $('#side-chat-context-label');
+  const sideChatContext = $('#side-chat-context');
+  const sideChatMessages = $('#side-chat-messages');
+  const sideChatInput = $('#side-chat-input');
+  const sideChatSend = $('#side-chat-send');
+  const sideChatAbort = $('#side-chat-abort');
+  const sideChatClose = $('#side-chat-close');
+  const sideChatRestoreBtn = $('#side-chat-restore-btn');
+  const sideChatResizer = $('#side-chat-resizer');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
   const newChatArrow = $('#new-chat-arrow');
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
-  const sessionSearchInput = $('#session-search-input');
-  const sessionSearchClear = $('#session-search-clear');
+  const sidebarFilePanel = $('#sidebar-file-panel');
+  const fileTree = $('#file-tree');
+  const filePanelRefresh = $('#file-panel-refresh');
+  const contextBar = $('#context-bar');
+  const contextRefList = $('#context-ref-list');
   const chatTitle = $('#chat-title');
   const chatAgentContext = $('#chat-agent-context');
   const chatRuntimeState = $('#chat-runtime-state');
-
+  const chatCwd = $('#topbar-chat-cwd');
+  const chatTabs = $('#chat-tabs');
   const costDisplay = $('#topbar-cost-display');
   const appStatusBanner = $('#app-status-banner');
   const appStatusBannerText = $('#app-status-banner-text');
@@ -246,12 +416,27 @@
   const piQueueMode = $('#pi-queue-mode');
   const piQueueModeButtons = Array.from(document.querySelectorAll('.pi-queue-mode-btn'));
   const attachmentTray = $('#attachment-tray');
-  const imageUploadInput = $('#image-upload-input');
+  const queuedMessageList = $('#queued-message-list');
+  const editMessageBar = $('#edit-message-bar');
+  const editMessageLabel = $('#edit-message-label');
+  const editMessageCancel = $('#edit-message-cancel');
+  const fileUploadInput = $('#file-upload-input');
   const attachBtn = $('#attach-btn');
+  const attachMenu = $('#attach-menu');
+  const attachUploadFile = $('#attach-upload-file');
+  const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
-  const scrollToBottomBtn = $('#scroll-to-bottom-btn');
+  const messagesWrap = messagesDiv?.closest('.messages-wrap');
+  const jumpToLatestBtn = document.createElement('button');
+  jumpToLatestBtn.type = 'button';
+  jumpToLatestBtn.className = 'jump-to-latest-btn';
+  jumpToLatestBtn.textContent = '到最后';
+  jumpToLatestBtn.hidden = true;
+  if (messagesWrap) messagesWrap.appendChild(jumpToLatestBtn);
   const msgInput = $('#msg-input');
+  const contextUsageIndicator = $('#context-usage-indicator');
   const inputWrapper = msgInput.closest('.input-wrapper');
+  const composerStatus = $('#composer-status');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
@@ -308,19 +493,108 @@
     });
   }
 
-  function applyColorScheme(scheme, options = {}) {
-    const nextScheme = scheme === 'dark' ? 'dark' : DEFAULT_COLOR_SCHEME;
-    document.documentElement.dataset.colorScheme = nextScheme;
-    delete document.documentElement.dataset.theme;
+  function isDayThemeValue(theme) {
+    return !!THEME_LABELS[theme] && theme !== THEME_AUTO_VALUE && theme !== THEME_NIGHT_VALUE;
+  }
+
+  function getStoredDayTheme() {
+    const dayTheme = localStorage.getItem(THEME_DAY_STORAGE_KEY);
+    if (isDayThemeValue(dayTheme)) return dayTheme;
+    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    if (isDayThemeValue(storedTheme)) return storedTheme;
+    return THEME_DAY_VALUE;
+  }
+
+  function rememberDayTheme(theme) {
+    if (!isDayThemeValue(theme)) return;
+    localStorage.setItem(THEME_DAY_STORAGE_KEY, theme);
+  }
+
+  function preserveCurrentDayThemeForAuto() {
+    const effectiveTheme = document.documentElement.dataset.theme;
+    if (isDayThemeValue(effectiveTheme)) {
+      rememberDayTheme(effectiveTheme);
+      return;
+    }
+    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    if (isDayThemeValue(storedTheme)) rememberDayTheme(storedTheme);
+  }
+
+  function isNightThemeHour(date = new Date()) {
+    const hour = date.getHours();
+    return hour >= 18 || hour < 6;
+  }
+
+  function resolveEffectiveTheme(theme, date = new Date()) {
+    const preference = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
+    if (preference === THEME_AUTO_VALUE) {
+      return isNightThemeHour(date) ? THEME_NIGHT_VALUE : getStoredDayTheme();
+    }
+    return preference;
+  }
+
+  function getThemePreferenceLabel(theme) {
+    const preference = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
+    if (preference !== THEME_AUTO_VALUE) return THEME_LABELS[preference];
+    const effectiveTheme = resolveEffectiveTheme(preference);
+    if (effectiveTheme === THEME_NIGHT_VALUE) return `跟随时间（当前夜间，白天恢复${THEME_LABELS[getStoredDayTheme()]}）`;
+    return `跟随时间（当前${THEME_LABELS[effectiveTheme]}）`;
+  }
+
+  function getNextAutoThemeRefreshDelay(date = new Date()) {
+    const next = new Date(date.getTime());
+    const hour = next.getHours();
+    if (hour < 6) {
+      next.setHours(6, 0, 1, 0);
+    } else if (hour < 18) {
+      next.setHours(18, 0, 1, 0);
+    } else {
+      next.setDate(next.getDate() + 1);
+      next.setHours(6, 0, 1, 0);
+    }
+    return Math.max(1000, next.getTime() - date.getTime());
+  }
+
+  let themeAutoTimer = null;
+
+  function scheduleAutoThemeRefresh(preference) {
+    if (themeAutoTimer) {
+      clearTimeout(themeAutoTimer);
+      themeAutoTimer = null;
+    }
+    if (preference !== THEME_AUTO_VALUE) return;
+    themeAutoTimer = setTimeout(() => {
+      applyTheme(THEME_AUTO_VALUE, { skipPersist: true });
+    }, getNextAutoThemeRefreshDelay());
+  }
+
+  function updateThemeToggleButton(preference, effectiveTheme) {
+    if (!themeToggleBtn) return;
+    const isNight = effectiveTheme === THEME_NIGHT_VALUE;
+    themeToggleBtn.textContent = isNight ? '☀' : '☾';
+    themeToggleBtn.classList.toggle('active', isNight);
+    themeToggleBtn.title = isNight ? '切换到日间主题' : '切换到夜间模式';
+    themeToggleBtn.setAttribute('aria-label', themeToggleBtn.title);
+    themeToggleBtn.dataset.themePreference = preference;
+    themeToggleBtn.dataset.themeEffective = effectiveTheme;
+  }
+
+  function applyTheme(theme, options = {}) {
+    const nextTheme = THEME_LABELS[theme] ? theme : DEFAULT_THEME;
+    if (nextTheme === THEME_AUTO_VALUE) {
+      preserveCurrentDayThemeForAuto();
+    } else if (isDayThemeValue(nextTheme)) {
+      rememberDayTheme(nextTheme);
+    }
+    const effectiveTheme = resolveEffectiveTheme(nextTheme);
+    document.documentElement.dataset.theme = effectiveTheme;
+    document.documentElement.dataset.themePreference = nextTheme;
     if (document.body) {
-      document.body.dataset.colorScheme = nextScheme;
-      delete document.body.dataset.theme;
+      document.body.dataset.theme = effectiveTheme;
+      document.body.dataset.themePreference = nextTheme;
     }
-    const hljsTheme = document.getElementById('hljs-theme');
-    if (hljsTheme) {
-      hljsTheme.href = nextScheme === 'dark' ? HLJS_THEME_DARK : HLJS_THEME_LIGHT;
-    }
-    updateColorSchemeButtons(nextScheme);
+    updateThemeToggleButton(nextTheme, effectiveTheme);
+    scheduleAutoThemeRefresh(nextTheme);
     if (!options.skipPersist) {
       localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, nextScheme);
     }
@@ -355,6 +629,13 @@
     }
   }
 
+  function toggleQuickTheme() {
+    const effectiveTheme = document.documentElement.dataset.theme || resolveEffectiveTheme(getStoredTheme());
+    const nextTheme = effectiveTheme === THEME_NIGHT_VALUE ? getStoredDayTheme() : THEME_NIGHT_VALUE;
+    applyTheme(nextTheme);
+    showToast(`已快速切换为 ${THEME_LABELS[nextTheme]}`);
+  }
+
   function parseStoredCollapsedProjects() {
     try {
       const raw = localStorage.getItem('webcoding-collapsed-projects') || '[]';
@@ -362,6 +643,18 @@
       return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
+    }
+  }
+
+  function parseStoredSelectedProject() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '{}');
+      return {
+        id: parsed && typeof parsed.id === 'string' ? parsed.id : null,
+        path: parsed && typeof parsed.path === 'string' ? parsed.path : null,
+      };
+    } catch {
+      return { id: null, path: null };
     }
   }
 
@@ -447,7 +740,98 @@
     resizer.classList.toggle('visible', gitState.panelOpen && canResizeGitPanel());
   }
 
+  function getFileViewerResizer() {
+    return document.getElementById('file-viewer-resizer');
+  }
+
+  function getFileViewerWidthLimit() {
+    const containerWidth = workspaceMain?.getBoundingClientRect().width || window.innerWidth || FILE_VIEWER_DEFAULT_WIDTH;
+    return Math.min(FILE_VIEWER_MAX_WIDTH, Math.max(FILE_VIEWER_MIN_WIDTH, containerWidth - 320));
+  }
+
+  function clampFileViewerWidth(width) {
+    const numericWidth = Number(width);
+    if (!Number.isFinite(numericWidth)) return FILE_VIEWER_DEFAULT_WIDTH;
+    return Math.max(FILE_VIEWER_MIN_WIDTH, Math.min(getFileViewerWidthLimit(), Math.round(numericWidth)));
+  }
+
+  function applyFileViewerWidth(width, options = {}) {
+    const nextWidth = clampFileViewerWidth(width);
+    document.documentElement.style.setProperty('--file-viewer-width', `${nextWidth}px`);
+    if (!options.skipPersist) {
+      localStorage.setItem(FILE_VIEWER_WIDTH_STORAGE_KEY, String(nextWidth));
+    }
+    return nextWidth;
+  }
+
+  function canResizeFileViewer() {
+    return !!fileViewerPanel && !!getFileViewerResizer() && window.matchMedia('(min-width: 769px) and (pointer: fine)').matches;
+  }
+
+  function syncFileViewerResizerVisibility() {
+    const resizer = getFileViewerResizer();
+    if (!resizer) return;
+    resizer.classList.toggle('visible', !!fileViewerState.open && canResizeFileViewer());
+  }
+
+  function syncFileViewerWidthForViewport() {
+    syncFileViewerResizerVisibility();
+    if (!canResizeFileViewer()) {
+      document.body.classList.remove('file-viewer-resizing');
+      fileViewerResizeState = null;
+      document.documentElement.style.setProperty('--file-viewer-width', `${FILE_VIEWER_DEFAULT_WIDTH}px`);
+      return;
+    }
+    const savedWidth = parseInt(localStorage.getItem(FILE_VIEWER_WIDTH_STORAGE_KEY) || `${FILE_VIEWER_DEFAULT_WIDTH}`, 10);
+    applyFileViewerWidth(savedWidth, { skipPersist: true });
+  }
+
+  function getSideChatWidthLimit() {
+    const containerWidth = workspaceMain?.getBoundingClientRect().width || window.innerWidth || SIDE_CHAT_DEFAULT_WIDTH;
+    const insightsWidth = window.matchMedia(`(min-width: ${DESKTOP_INSIGHTS_BREAKPOINT}px)`).matches
+      ? (workspaceInsights?.getBoundingClientRect().width || 0)
+      : 0;
+    return Math.min(SIDE_CHAT_MAX_WIDTH, Math.max(SIDE_CHAT_MIN_WIDTH, containerWidth - insightsWidth - 360));
+  }
+
+  function clampSideChatWidth(width) {
+    const numericWidth = Number(width);
+    if (!Number.isFinite(numericWidth)) return SIDE_CHAT_DEFAULT_WIDTH;
+    return Math.max(SIDE_CHAT_MIN_WIDTH, Math.min(getSideChatWidthLimit(), Math.round(numericWidth)));
+  }
+
+  function applySideChatWidth(width, options = {}) {
+    const nextWidth = clampSideChatWidth(width);
+    document.documentElement.style.setProperty('--side-chat-width', `${nextWidth}px`);
+    if (!options.skipPersist) {
+      localStorage.setItem(SIDE_CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
+    }
+    return nextWidth;
+  }
+
+  function canResizeSideChat() {
+    return !!sideChatPanel && !!sideChatResizer && window.matchMedia('(min-width: 769px) and (pointer: fine)').matches;
+  }
+
+  function syncSideChatResizerVisibility() {
+    if (!sideChatResizer) return;
+    sideChatResizer.classList.toggle('visible', !!sideChatState.open && canResizeSideChat());
+  }
+
+  function syncSideChatWidthForViewport() {
+    syncSideChatResizerVisibility();
+    if (!canResizeSideChat()) {
+      document.body.classList.remove('side-chat-resizing');
+      sideChatResizeState = null;
+      document.documentElement.style.setProperty('--side-chat-width', `${SIDE_CHAT_DEFAULT_WIDTH}px`);
+      return;
+    }
+    const savedWidth = parseInt(localStorage.getItem(SIDE_CHAT_WIDTH_STORAGE_KEY) || `${SIDE_CHAT_DEFAULT_WIDTH}`, 10);
+    applySideChatWidth(savedWidth, { skipPersist: true });
+  }
+
   collapsedProjects = new Set(parseStoredCollapsedProjects());
+  selectedProject = parseStoredSelectedProject();
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -510,8 +894,11 @@
   window.addEventListener('orientationchange', () => setTimeout(refreshInputMaxHeightCache, 100));
   syncSidebarWidthForViewport();
   syncGitPanelWidthForViewport();
+  syncFileViewerWidthForViewport();
   window.addEventListener('resize', syncSidebarWidthForViewport);
   window.addEventListener('resize', syncGitPanelWidthForViewport);
+  window.addEventListener('resize', syncFileViewerWidthForViewport);
+  window.addEventListener('resize', syncSideChatWidthForViewport);
 
   function buildWorkspaceActionButtons(actions, options = {}) {
     const className = options.compact ? 'workspace-action-row' : 'workspace-action-grid';
@@ -530,6 +917,11 @@
   }
 
   function getCurrentProjectContext() {
+    if (selectedProject?.id) {
+      const saved = projects.find((project) => project.id === selectedProject.id);
+      if (saved) return saved;
+      if (selectedProject.path) return buildVirtualProjectFromCwd(selectedProject.path);
+    }
     const currentMeta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
     if (!currentMeta) return null;
     const projectsById = new Map(projects.map((project) => [project.id, project]));
@@ -571,17 +963,21 @@
         ? '暂无 token 统计'
         : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
-    const modelLabel = getConcreteModelLabel() || '—';
+    const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '默认模型' : 'Default');
+    const reasoningLabel = sessionState.currentAgent === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '不适用';
     const channelLabel = sessionState.currentActiveRuntime?.channelLabel || '当前渠道未建立';
     const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent;
-    const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
+    const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : (currentMeta ? '待命中' : '未开始');
     const projectSessionCount = getCurrentProjectSessionCount(activeProject);
     const actionButtons = buildWorkspaceActionButtons([
       { action: 'new-session', label: '新建会话', primary: true },
       { action: 'import-session', label: '导入历史' },
       { action: 'switch-model', label: '切换模型' },
+      ...(sessionState.currentAgent === 'codex' ? [
+        { action: 'switch-reasoning', label: '切换思考' },
+      ] : []),
       { action: 'switch-mode', label: '切换模式' },
       ...(activeProject ? [{ action: 'focus-project', label: '定位项目', projectId: activeProject.id }] : []),
       { action: 'open-settings', label: '打开设置' },
@@ -618,6 +1014,7 @@
             <div class="insights-detail-item"><span>当前代理</span><strong>${escapeHtml(currentAgentLabel)}</strong></div>
             <div class="insights-detail-item"><span>当前渠道</span><strong>${escapeHtml(channelLabel)}</strong></div>
             <div class="insights-detail-item"><span>模型</span><strong>${escapeHtml(modelLabel)}</strong></div>
+            <div class="insights-detail-item"><span>思考</span><strong>${escapeHtml(reasoningLabel)}</strong></div>
             <div class="insights-detail-item"><span>模式</span><strong>${escapeHtml(modeLabel)}</strong></div>
             <div class="insights-detail-item"><span>子线程</span><strong>${escapeHtml(runtimeCountLabel)}</strong></div>
             <div class="insights-detail-item"><span>消息数</span><strong>${currentMessageCount > 0 ? `${currentMessageCount} 条` : '暂无'}</strong></div>
@@ -1055,6 +1452,7 @@
   }
 
   function openGitPanel(view) {
+    if (sideChatState.open) closeSideChat();
     gitState.panelOpen = true;
     gitState.activePanelView = view || 'status';
     if (gitPanelEl) gitPanelEl.classList.add('visible');
@@ -1477,17 +1875,59 @@
     const label = AGENT_LABELS[agent] || AGENT_LABELS.claude;
     const sessionCount = typeof getVisibleSessions === 'function' ? getVisibleSessions().length : 0;
     const projectCount = Array.isArray(projects) ? projects.length : 0;
+    const reasoningLabel = normalizeAgent(agent) === 'codex' ? getReasoningEffortLabel(sessionState.currentReasoningEffort) : '';
     return `
       <div class="welcome-msg">
-        <h3>${label}</h3>
-        <p>开始对话，或从侧边栏选择已有会话。</p>
-        <p class="welcome-meta">${sessionCount} 个会话 · ${projectCount} 个项目 · ${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode} 模式</p>
+        <div class="welcome-header">
+          <div class="welcome-icon">✦</div>
+          <h3>${label} 工作区</h3>
+        </div>
+        <div class="welcome-stats">
+          <div class="welcome-stat">
+            <strong>${sessionCount}</strong>
+            <span>会话数</span>
+          </div>
+          <div class="welcome-stat">
+            <strong>${projectCount}</strong>
+            <span>项目数</span>
+          </div>
+          <div class="welcome-stat">
+            <strong>${MODE_LABELS[sessionState.currentMode] || sessionState.currentMode}</strong>
+            <span>模式</span>
+          </div>
+          ${normalizeAgent(agent) === 'codex' ? `
+          <div class="welcome-stat">
+            <strong>${escapeHtml(reasoningLabel)}</strong>
+            <span>思考</span>
+          </div>
+          ` : ''}
+        </div>
         <div class="welcome-actions">
           ${buildWorkspaceActionButtons([
             { action: 'new-session', label: '新建会话', primary: true },
             { action: 'import-session', label: '导入历史' },
             { action: 'switch-model', label: '切换模型' },
+            ...(normalizeAgent(agent) === 'codex' ? [
+              { action: 'switch-reasoning', label: '切换思考' },
+            ] : []),
           ], { compact: true })}
+        </div>
+        <div class="welcome-panels">
+          <section class="welcome-panel">
+            <div class="welcome-panel-kicker">常用指令</div>
+            <ul class="welcome-list">
+              <li><code>/model</code> 查看或切换模型</li>
+              ${normalizeAgent(agent) === 'codex' ? '<li><code>/reasoning</code> 查看或切换思考级别</li>' : ''}
+              <li><code>/mode</code> 切换权限模式</li>
+              <li><code>/compact</code> 压缩上下文</li>
+            </ul>
+          </section>
+          <section class="welcome-panel">
+            <div class="welcome-panel-kicker">多模态协作</div>
+            <ul class="welcome-list">
+              <li>支持随消息附带图片，适合 UI、截图和报错定位。</li>
+            </ul>
+          </section>
         </div>
       </div>
     `;
@@ -1505,6 +1945,14 @@
     return `webcoding-mode-${normalizeAgent(agent)}`;
   }
 
+  function getAgentReasoningEffortStorageKey(agent) {
+    return `webcoding-reasoning-effort-${normalizeAgent(agent)}`;
+  }
+
+  function getAgentFastModeStorageKey(agent) {
+    return `webcoding-fast-mode-${normalizeAgent(agent)}`;
+  }
+
   function getLastSessionForAgent(agent) {
     return localStorage.getItem(getAgentSessionStorageKey(agent));
   }
@@ -1516,6 +1964,283 @@
 
   function getSessionMeta(sessionId) {
     return sessionState.sessions.find((s) => s.id === sessionId) || null;
+  }
+
+  function markSessionReadLocally(sessionId, snapshot = null) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    sessionState.sessions = sessionState.sessions.map((session) => {
+      if (session.id !== id) return session;
+      return {
+        ...session,
+        title: snapshot?.title || session.title,
+        agent: snapshot?.agent || session.agent,
+        reasoningEffort: Object.prototype.hasOwnProperty.call(snapshot || {}, 'reasoningEffort')
+          ? normalizeCodexReasoningEffort(snapshot.reasoningEffort)
+          : session.reasoningEffort,
+        fastMode: Object.prototype.hasOwnProperty.call(snapshot || {}, 'fastMode')
+          ? normalizeCodexFastMode(snapshot.fastMode)
+          : normalizeCodexFastMode(session.fastMode),
+        cwd: Object.prototype.hasOwnProperty.call(snapshot || {}, 'cwd') ? snapshot.cwd : session.cwd,
+        projectId: Object.prototype.hasOwnProperty.call(snapshot || {}, 'projectId') ? snapshot.projectId : session.projectId,
+        updated: snapshot?.updated || session.updated,
+        isRunning: Object.prototype.hasOwnProperty.call(snapshot || {}, 'isRunning') ? !!snapshot.isRunning : !!session.isRunning,
+        hasUnread: false,
+      };
+    });
+    const cacheEntry = sessionState.sessionCache.get(id);
+    if (cacheEntry?.meta) cacheEntry.meta.hasUnread = false;
+    if (cacheEntry?.snapshot) cacheEntry.snapshot.hasUnread = false;
+  }
+
+
+  function normalizeOpenChatTabId(entry) {
+    const raw = typeof entry === 'string' ? entry : (entry?.sessionId || entry?.id);
+    return String(raw || '').trim();
+  }
+
+  function loadPersistedOpenChatTabs() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(OPEN_CHAT_TABS_STORAGE_KEY) || '[]');
+      const source = Array.isArray(raw) ? raw : [];
+      const seen = new Set();
+      const tabs = [];
+      for (const entry of source) {
+        const sessionId = normalizeOpenChatTabId(entry);
+        if (!sessionId || seen.has(sessionId)) continue;
+        seen.add(sessionId);
+        tabs.push({ sessionId });
+        if (tabs.length >= OPEN_CHAT_TABS_LIMIT) break;
+      }
+      return tabs;
+    } catch {
+      return [];
+    }
+  }
+
+  function persistOpenChatTabs() {
+    const payload = openChatTabs
+      .map((tab) => ({ sessionId: normalizeOpenChatTabId(tab) }))
+      .filter((tab) => tab.sessionId);
+    if (payload.length === 0) {
+      localStorage.removeItem(OPEN_CHAT_TABS_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(OPEN_CHAT_TABS_STORAGE_KEY, JSON.stringify(payload));
+  }
+
+  function enforceOpenChatTabsLimit(preferredSessionId = sessionState.currentSessionId) {
+    while (openChatTabs.length > OPEN_CHAT_TABS_LIMIT) {
+      const removableIndex = openChatTabs.findIndex((tab) => tab.sessionId !== preferredSessionId);
+      openChatTabs.splice(removableIndex >= 0 ? removableIndex : 0, 1);
+    }
+  }
+
+  function getSessionLikeForTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return null;
+    const meta = getSessionMeta(id);
+    if (meta) return meta;
+    const cacheEntry = sessionState.sessionCache.get(id);
+    if (cacheEntry?.meta) return cacheEntry.meta;
+    if (cacheEntry?.snapshot) return cacheEntry.snapshot;
+    if (id === sessionState.currentSessionId) {
+      return {
+        id,
+        sessionId: id,
+        title: chatTitle?.textContent || '新会话',
+        agent: sessionState.currentAgent,
+        cwd: sessionState.currentCwd,
+        projectId: selectedProject?.id || null,
+        isRunning: !!sessionState.currentSessionRunning,
+      };
+    }
+    return null;
+  }
+
+  function getProjectForSessionLike(sessionLike) {
+    if (!sessionLike) return null;
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    return findBestProjectForSession(sessionLike, projectsById) || buildVirtualProjectFromSession(sessionLike);
+  }
+
+  function selectProjectForSessionLike(sessionLike, options = {}) {
+    const project = getProjectForSessionLike(sessionLike);
+    if (!project?.id) return false;
+    selectProjectGroup(project, {
+      collapseOthers: options.collapseOthers,
+      loadFiles: options.loadFiles,
+      render: options.render,
+    });
+    if (options.focus) {
+      focusProjectGroup(project.id, { instant: !!options.instant });
+    }
+    return true;
+  }
+
+  function selectProjectForSessionId(sessionId, options = {}) {
+    return selectProjectForSessionLike(getSessionLikeForTab(sessionId), options);
+  }
+
+  function ensureOpenChatTab(sessionId, options = {}) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    if (!openChatTabs.some((tab) => tab.sessionId === id)) {
+      openChatTabs.push({ sessionId: id });
+    }
+    enforceOpenChatTabsLimit(id);
+    persistOpenChatTabs();
+    if (options.render !== false) renderChatTabs();
+  }
+
+  function forgetOpenChatTabs(sessionIds, options = {}) {
+    const ids = new Set((Array.isArray(sessionIds) ? sessionIds : [sessionIds])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean));
+    if (ids.size === 0) return;
+    const before = openChatTabs.length;
+    openChatTabs = openChatTabs.filter((tab) => !ids.has(tab.sessionId));
+    if (openChatTabs.length === before) return;
+    persistOpenChatTabs();
+    if (options.render !== false) renderChatTabs();
+  }
+
+  function reconcileOpenChatTabsWithSessions() {
+    const knownIds = new Set(sessionState.sessions.map((session) => session.id));
+    const before = openChatTabs.length;
+    openChatTabs = openChatTabs.filter((tab) => {
+      const sessionId = tab.sessionId;
+      if (!sessionId) return false;
+      return knownIds.has(sessionId) || sessionId === sessionState.currentSessionId || sessionState.sessionCache.has(sessionId);
+    });
+    if (openChatTabs.length !== before) persistOpenChatTabs();
+  }
+
+  function getChatTabTitle(sessionLike) {
+    return sessionLike?.title || 'Untitled';
+  }
+
+  function getChatTabTooltip(sessionLike, title) {
+    const lines = [title];
+    const project = getProjectForSessionLike(sessionLike);
+    if (project?.name) lines.push(`目录：${project.name}`);
+    if (project?.path) lines.push(project.path);
+    const agentLabel = AGENT_LABELS[normalizeAgent(sessionLike?.agent)] || 'Agent';
+    lines.push(`Agent：${agentLabel}`);
+    return lines.filter(Boolean).join('\n');
+  }
+
+  function highlightActiveChatTab() {
+    if (!chatTabs) return;
+    chatTabs.querySelectorAll('.chat-tab').forEach((tab) => {
+      const active = tab.dataset.sessionId === sessionState.currentSessionId;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+    });
+  }
+
+  function closeOpenChatTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    const index = openChatTabs.findIndex((tab) => tab.sessionId === id);
+    if (index < 0) return;
+    const wasActive = id === sessionState.currentSessionId || id === sessionState.activeSessionLoad?.sessionId;
+    const meta = getSessionLikeForTab(id);
+    openChatTabs.splice(index, 1);
+    persistOpenChatTabs();
+
+    if (!wasActive) {
+      renderChatTabs();
+      return;
+    }
+
+    const fallback = openChatTabs[index] || openChatTabs[index - 1] || null;
+    if (fallback?.sessionId) {
+      renderChatTabs();
+      selectProjectForSessionId(fallback.sessionId, { focus: true, instant: true });
+      openSession(fallback.sessionId);
+      return;
+    }
+
+    if (localStorage.getItem('webcoding-session') === id) {
+      localStorage.removeItem('webcoding-session');
+    }
+    const sessionAgent = normalizeAgent(meta?.agent || sessionState.currentAgent);
+    if (getLastSessionForAgent(sessionAgent) === id) {
+      localStorage.removeItem(getAgentSessionStorageKey(sessionAgent));
+    }
+    if (connectionState.ws?.readyState === WebSocket.OPEN) {
+      send({ type: 'detach_view' });
+    }
+    resetChatView(selectedAgent);
+  }
+
+  function activateOpenChatTab(sessionId) {
+    const id = String(sessionId || '').trim();
+    if (!id) return;
+    ensureOpenChatTab(id, { render: false });
+    selectProjectForSessionId(id, { focus: true, instant: true });
+    openSession(id);
+    renderChatTabs();
+  }
+
+  function renderChatTabs() {
+    if (!chatTabs) return;
+    chatTabs.innerHTML = '';
+    chatTabs.hidden = openChatTabs.length === 0;
+    if (openChatTabs.length === 0) return;
+
+    for (const tab of openChatTabs) {
+      const sessionId = tab.sessionId;
+      if (!sessionId) continue;
+      const sessionLike = getSessionLikeForTab(sessionId) || { id: sessionId, sessionId, title: 'Untitled', agent: selectedAgent };
+      const title = getChatTabTitle(sessionLike);
+      const active = sessionId === sessionState.currentSessionId;
+      const tabEl = document.createElement('div');
+      const tabBusy = !!sessionLike?.isRunning;
+      tabEl.className = `chat-tab${active ? ' active' : ''}${tabBusy ? ' is-running' : ''}${sessionLike?.hasUnread ? ' has-unread' : ''}`;
+      tabEl.dataset.sessionId = sessionId;
+      tabEl.setAttribute('role', 'button');
+      tabEl.setAttribute('tabindex', '0');
+      tabEl.setAttribute('aria-selected', String(active));
+      tabEl.title = getChatTabTooltip(sessionLike, title);
+
+      const status = document.createElement('span');
+      status.className = 'chat-tab-status';
+      status.setAttribute('aria-hidden', 'true');
+      tabEl.appendChild(status);
+
+      const titleEl = document.createElement('span');
+      titleEl.className = 'chat-tab-title';
+      titleEl.textContent = title;
+      tabEl.appendChild(titleEl);
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'chat-tab-close';
+      closeBtn.type = 'button';
+      closeBtn.title = '关闭快捷标签';
+      closeBtn.setAttribute('aria-label', `关闭 ${title}`);
+      closeBtn.textContent = '×';
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeOpenChatTab(sessionId);
+      });
+      tabEl.appendChild(closeBtn);
+
+      tabEl.addEventListener('click', () => activateOpenChatTab(sessionId));
+      tabEl.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        activateOpenChatTab(sessionId);
+      });
+
+      chatTabs.appendChild(tabEl);
+    }
+
+    const activeTab = chatTabs.querySelector('.chat-tab.active');
+    if (activeTab) {
+      requestAnimationFrame(() => activeTab.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
+    }
   }
 
   function deepClone(value) {
@@ -1613,6 +2338,7 @@
     const base = JSON.stringify({
       title: snapshot.title || '',
       mode: snapshot.mode || '',
+      reasoningEffort: snapshot.reasoningEffort || '',
       model: snapshot.model || '',
       agent: snapshot.agent || '',
       activeRuntime: snapshot.activeRuntime || null,
@@ -1642,28 +2368,32 @@
   }
 
   function normalizeSessionSnapshot(payload, options = {}) {
-    const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, payload.agent, payload.model || '');
+    const normalizedAgent = normalizeAgent(payload.agent);
+    const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, normalizedAgent, payload.model || '');
     const hasPayloadModel = Object.prototype.hasOwnProperty.call(payload || {}, 'model');
     return {
       sessionId: payload.sessionId,
       messages: cloneMessages(payload.messages || []),
       title: payload.title || '新会话',
-      mode: payload.mode || 'yolo',
-      // Prefer explicit session model; if empty, fall back to channel default from activeRuntime.
-      model: hasPayloadModel
-        ? (payload.model || normalizedRuntime?.displayModel || normalizedRuntime?.defaultModel || '')
-        : (normalizedRuntime?.displayModel || normalizedRuntime?.defaultModel || ''),
+      mode: normalizeMode(payload.mode) || getDefaultModeForAgent(normalizedAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort),
+      fastMode: normalizeCodexFastMode(payload.fastMode),
+      model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
       activeRuntime: normalizedRuntime,
       activeChannelKey: payload.activeChannelKey || normalizedRuntime?.channelKey || null,
       runtimeCount: Number.isFinite(payload.runtimeCount)
         ? payload.runtimeCount
         : (normalizedRuntime?.runtimeCount || 0),
-      agent: normalizeAgent(payload.agent),
+      agent: normalizedAgent,
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
       projectId: payload.projectId || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
       totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
+      currentUsage: payload.currentUsage ? deepClone(payload.currentUsage) : null,
+      lastUsage: payload.lastUsage ? deepClone(payload.lastUsage) : null,
+      contextWindowTokens: Number(payload.contextWindowTokens || payload.modelContextWindow || 0) || null,
+      queuedMessages: normalizeQueuedMessages(payload.queuedMessages || []),
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       historyPending: !!payload.historyPending,
@@ -1760,6 +2490,8 @@
     if (meta) {
       snapshot.title = meta.title || snapshot.title;
       snapshot.agent = normalizeAgent(meta.agent || snapshot.agent);
+      snapshot.reasoningEffort = normalizeCodexReasoningEffort(meta.reasoningEffort || snapshot.reasoningEffort);
+      snapshot.fastMode = normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(meta, 'fastMode') ? meta.fastMode : snapshot.fastMode);
       snapshot.hasUnread = !!meta.hasUnread;
       snapshot.updated = meta.updated || snapshot.updated;
       snapshot.isRunning = !!meta.isRunning;
@@ -1849,6 +2581,134 @@
     } catch {}
   }
 
+  function rememberAttachmentPreviewUrl(id, url) {
+    const key = String(id || '').trim();
+    const value = String(url || '').trim();
+    if (!key || !value) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing !== value && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.set(key, value);
+  }
+
+  function forgetAttachmentPreviewUrl(id) {
+    const key = String(id || '').trim();
+    if (!key) return;
+    const existing = attachmentPreviewUrls.get(key);
+    if (existing && existing.startsWith('blob:')) {
+      try { URL.revokeObjectURL(existing); } catch {}
+    }
+    attachmentPreviewUrls.delete(key);
+  }
+
+  function attachmentRawUrl(id) {
+    const key = String(id || '').trim();
+    return key ? `/api/attachments/${encodeURIComponent(key)}` : '';
+  }
+
+  function getAttachmentPreviewSrc(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    return String((id ? attachmentPreviewUrls.get(id) : '') || attachment.previewUrl || '');
+  }
+
+  function attachmentKindLabel(attachment = {}) {
+    if (isImageAttachment(attachment)) return '图片';
+    return (attachment.kind || '') === 'document' ? '文档' : '文件';
+  }
+
+  function attachmentDefaultName(attachment = {}) {
+    if (isImageAttachment(attachment)) return 'image';
+    return (attachment.kind || '') === 'document' ? 'document' : 'file';
+  }
+
+  function isImageAttachment(attachment = {}) {
+    return (attachment.kind || 'image') === 'image' || /^image\//i.test(attachment.mime || '');
+  }
+
+  function documentUploadLooksSupported(file = {}) {
+    const name = String(file.name || '').toLowerCase();
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : '';
+    return DOCUMENT_UPLOAD_ACCEPT_EXTENSIONS.has(ext);
+  }
+
+  function attachmentTransportPayload(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id) return null;
+    const kind = attachment.kind || 'image';
+    return {
+      id,
+      kind,
+      filename: attachment.filename || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file')),
+      mime: attachment.mime || (kind === 'image' ? 'image/png' : 'application/octet-stream'),
+      documentType: attachment.documentType || null,
+      size: Number(attachment.size || 0) || 0,
+      createdAt: attachment.createdAt || null,
+      expiresAt: attachment.expiresAt || null,
+      storageState: attachment.storageState || 'available',
+    };
+  }
+
+  function attachmentTransportPayloads(attachments = []) {
+    return Array.isArray(attachments)
+      ? attachments.map(attachmentTransportPayload).filter(Boolean)
+      : [];
+  }
+
+  async function fetchAttachmentPreviewUrl(attachment = {}) {
+    const id = String(attachment.id || '').trim();
+    if (!id || attachment.storageState === 'expired') return '';
+    const existing = attachmentPreviewUrls.get(id);
+    if (existing) return existing;
+    await ensureAuthenticatedWs();
+    const response = await fetch(attachmentRawUrl(id), {
+      headers: { Authorization: `Bearer ${connectionState.authToken}` },
+    });
+    if (!response.ok) throw new Error(response.status === 410 ? '图片已过期' : `图片读取失败 (${response.status})`);
+    const blob = await response.blob();
+    if (!/^image\//i.test(blob.type || '')) throw new Error('附件不是图片');
+    const url = URL.createObjectURL(blob);
+    rememberAttachmentPreviewUrl(id, url);
+    return url;
+  }
+
+  function openAttachmentImagePreview({ src = '', title = '图片附件', meta = '' } = {}) {
+    const safeSrc = String(src || '').trim();
+    if (!safeSrc) return;
+    const { overlay, panel, close } = createOverlayPanel({
+      overlayClass: 'modal-overlay attachment-preview-overlay',
+      panelClass: 'modal-panel attachment-preview-panel',
+      maxWidth: 'min(980px, calc(100vw - 28px))',
+      panelHtml: `
+        <div class="modal-header">
+          <span class="modal-title">${escapeHtml(title || '图片附件')}</span>
+          <button class="modal-close-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="attachment-preview-body">
+          <img class="attachment-preview-image" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(title || '图片附件')}">
+        </div>
+        ${meta ? `<div class="attachment-preview-meta">${escapeHtml(meta)}</div>` : ''}
+      `,
+    });
+    const closePreview = () => {
+      document.removeEventListener('keydown', onKeydown);
+      close();
+    };
+    const onKeydown = (event) => {
+      if (event.key === 'Escape') closePreview();
+    };
+    panel.querySelector('.modal-close-btn')?.addEventListener('click', closePreview);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) closePreview(); });
+    document.addEventListener('keydown', onKeydown);
+  }
+
+  async function openAttachmentPreview(attachment = {}) {
+    const src = getAttachmentPreviewSrc(attachment) || await fetchAttachmentPreviewUrl(attachment);
+    const title = attachment.filename || '图片附件';
+    const meta = [formatFileSize(attachment.size), attachment.mime].filter(Boolean).join(' · ');
+    openAttachmentImagePreview({ src, title, meta });
+  }
+
   function ensureAuthenticatedWs() {
     return new Promise((resolve, reject) => {
       if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN && connectionState.authToken) {
@@ -1856,7 +2716,7 @@
         return;
       }
       if (!connectionState.authToken) {
-        reject(new Error('登录状态已失效，请重新登录后再上传图片。'));
+        reject(new Error('登录状态已失效，请重新登录后再上传附件。'));
         return;
       }
       const timeout = setTimeout(() => {
@@ -1874,7 +2734,7 @@
       };
       const onFailed = () => {
         cleanup();
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传附件。'));
       };
       document.addEventListener('webcoding-auth-restored', onRestored);
       document.addEventListener('webcoding-auth-failed', onFailed);
@@ -1887,14 +2747,106 @@
     });
   }
 
+  function renderFileRefLabels(fileRefs, options = {}) {
+    if (!Array.isArray(fileRefs) || fileRefs.length === 0) return '';
+    const labels = fileRefs.map((ref) => {
+      const isDir = ref?.type === 'directory';
+      const name = escapeHtml(ref.relativePath || ref.path || (isDir ? 'directory' : 'file'));
+      const size = !isDir && Number(ref.size) ? ` · ${formatFileSize(ref.size)}` : '';
+      return `<span class="msg-attachment-label file-ref">${isDir ? '目录' : '文件'}: ${name}${size}</span>`;
+    }).join('');
+    return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+  }
+
   function renderAttachmentLabels(attachments, options = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
     const labels = attachments.map((attachment) => {
       const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '';
-      const name = escapeHtml(attachment.filename || 'image');
-      return `<span class="msg-attachment-label">图片: ${name}${stateSuffix}</span>`;
+      const id = String(attachment.id || '').trim();
+      const kind = attachment.kind || 'image';
+      const kindLabel = attachmentKindLabel(attachment);
+      const name = escapeHtml(attachment.filename || attachmentDefaultName(attachment));
+      const src = getAttachmentPreviewSrc(attachment);
+      const disabled = !id && !src;
+      const subtitle = Number(attachment.size) ? formatFileSize(attachment.size) : (attachment.mime || kindLabel);
+      const isImage = isImageAttachment(attachment);
+      if (!isImage) {
+        return `
+          <button class="msg-attachment-label document-attachment-download" type="button"
+            ${id ? `data-attachment-id="${escapeHtml(id)}"` : ''}
+            data-filename="${name}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
+            aria-label="下载附件 ${name}">
+            <span class="attachment-thumb document" aria-hidden="true">${kind === 'document' ? '📄' : '📦'}</span>
+            <span class="attachment-thumb-meta">
+              <span class="attachment-thumb-title">${kindLabel}: ${name}${stateSuffix}</span>
+              <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
+            </span>
+          </button>
+        `;
+      }
+      return `
+        <button class="msg-attachment-label image-attachment-preview" type="button"
+          ${id ? `data-attachment-id="${escapeHtml(id)}"` : ''}
+          ${src ? `data-preview-src="${escapeHtml(src)}"` : ''}
+          data-filename="${name}"
+          data-size="${escapeHtml(String(attachment.size || ''))}"
+          data-mime="${escapeHtml(attachment.mime || '')}"
+          ${disabled || attachment.storageState === 'expired' ? 'disabled' : ''}
+          aria-label="查看图片 ${name}">
+          <span class="attachment-thumb" aria-hidden="true">${src ? `<img src="${escapeHtml(src)}" alt="">` : ''}</span>
+          <span class="attachment-thumb-meta">
+            <span class="attachment-thumb-title">图片: ${name}${stateSuffix}</span>
+            <span class="attachment-thumb-subtitle">${escapeHtml(subtitle)}</span>
+          </span>
+        </button>
+      `;
     }).join('');
     return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+  }
+
+  function hydrateAttachmentPreviews(root = document) {
+    const scope = root && typeof root.querySelectorAll === 'function' ? root : document;
+    scope.querySelectorAll('.image-attachment-preview[data-attachment-id]').forEach((button) => {
+      const id = button.dataset.attachmentId || '';
+      if (!id || button.dataset.previewHydrated === '1') return;
+      const existing = attachmentPreviewUrls.get(id);
+      if (existing) {
+        setAttachmentButtonPreview(button, existing);
+        return;
+      }
+      button.dataset.previewHydrated = '1';
+      fetchAttachmentPreviewUrl({
+        id,
+        filename: button.dataset.filename || 'image',
+        mime: button.dataset.mime || '',
+        size: Number(button.dataset.size || 0) || 0,
+      }).then((url) => {
+        setAttachmentButtonPreview(button, url);
+      }).catch(() => {
+        button.classList.add('preview-unavailable');
+      });
+    });
+  }
+
+  function setAttachmentButtonPreview(button, src) {
+    if (!button || !src) return;
+    button.dataset.previewSrc = src;
+    button.dataset.previewHydrated = '1';
+    const thumb = button.querySelector('.attachment-thumb');
+    if (thumb) {
+      let img = thumb.querySelector('img');
+      if (!img) {
+        img = document.createElement('img');
+        img.alt = '';
+        img.loading = 'lazy';
+        thumb.innerHTML = '';
+        thumb.appendChild(img);
+      }
+      img.src = src;
+    }
   }
 
   function renderPendingAttachments() {
@@ -1906,28 +2858,54 @@
       return;
     }
     attachmentTray.hidden = false;
-    const uploadingHtml = composeState.uploadingAttachments.map((attachment) => `
-      <div class="attachment-chip uploading">
-        <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
-          <span class="attachment-chip-note">上传中 · ${formatFileSize(attachment.size)}</span>
+    const uploadingHtml = composeState.uploadingAttachments.map((attachment) => {
+      const isImage = isImageAttachment(attachment);
+      const label = attachmentKindLabel(attachment);
+      const name = attachment.filename || attachmentDefaultName(attachment);
+      return `
+        <div class="attachment-chip uploading">
+          <button class="attachment-chip-thumb" type="button"
+            ${isImage && attachment.previewUrl ? `data-preview-src="${escapeHtml(attachment.previewUrl)}"` : ''}
+            data-filename="${escapeHtml(name)}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            aria-label="查看附件 ${escapeHtml(name)}">
+            ${isImage && attachment.previewUrl ? `<img src="${escapeHtml(attachment.previewUrl)}" alt="">` : ((attachment.kind || '') === 'document' ? '📄' : '📦')}
+          </button>
+          <div class="attachment-chip-meta">
+            <span class="attachment-chip-name">${escapeHtml(name)}</span>
+            <span class="attachment-chip-note">${label}上传中 · ${formatFileSize(attachment.size)}</span>
+          </div>
         </div>
-      </div>
-    `).join('');
-    const readyHtml = composeState.pendingAttachments.map((attachment, index) => `
-      <div class="attachment-chip" data-index="${index}">
-        <div class="attachment-chip-meta">
-          <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
-          <span class="attachment-chip-note">${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
+      `;
+    }).join('');
+    const readyHtml = composeState.pendingAttachments.map((attachment, index) => {
+      const isImage = isImageAttachment(attachment);
+      const label = attachmentKindLabel(attachment);
+      const name = attachment.filename || attachmentDefaultName(attachment);
+      const previewSrc = isImage ? getAttachmentPreviewSrc(attachment) : '';
+      return `
+        <div class="attachment-chip" data-index="${index}">
+          <button class="attachment-chip-thumb" type="button"
+            ${attachment.id ? `data-attachment-id="${escapeHtml(attachment.id)}"` : ''}
+            ${previewSrc ? `data-preview-src="${escapeHtml(previewSrc)}"` : ''}
+            data-filename="${escapeHtml(name)}"
+            data-size="${escapeHtml(String(attachment.size || ''))}"
+            data-mime="${escapeHtml(attachment.mime || '')}"
+            aria-label="查看附件 ${escapeHtml(name)}">
+            ${previewSrc ? `<img src="${escapeHtml(previewSrc)}" alt="">` : (isImage ? '' : ((attachment.kind || '') === 'document' ? '📄' : '📦'))}
+          </button>
+          <div class="attachment-chip-meta">
+            <span class="attachment-chip-name">${escapeHtml(name)}</span>
+            <span class="attachment-chip-note">${label} · ${formatFileSize(attachment.size)} · 将随下一条消息发送</span>
+          </div>
+          <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
         </div>
-        <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
-      </div>
-    `).join('');
-    const noteHtml = [
-      composeState.uploadingAttachments.length > 0
-        ? '<div class="attachment-tray-note">图片上传中，此时发送不会包含尚未完成的图片。</div>'
-        : '',
-    ].join('');
+      `;
+    }).join('');
+    const noteHtml = composeState.uploadingAttachments.length > 0
+      ? '<div class="attachment-tray-note">附件上传中，此时发送不会包含尚未完成的附件。</div>'
+      : '';
     attachmentTray.innerHTML = `${uploadingHtml}${readyHtml}${noteHtml}`;
     attachmentTray.querySelectorAll('.attachment-chip-remove').forEach((btn) => {
       btn.addEventListener('click', (e) => {
@@ -1936,17 +2914,1606 @@
         const [removed] = composeState.pendingAttachments.splice(index, 1);
         renderPendingAttachments();
         deleteUploadedAttachment(removed?.id);
+        forgetAttachmentPreviewUrl(removed?.id);
+      });
+    });
+    attachmentTray.querySelectorAll('.attachment-chip-thumb').forEach((btn) => {
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = btn.dataset.attachmentId || '';
+        const attachment = [...composeState.pendingAttachments, ...composeState.uploadingAttachments]
+          .find((item) => (id && item.id === id) || item.previewUrl === btn.dataset.previewSrc || item.filename === btn.dataset.filename);
+        if (attachment && !isImageAttachment(attachment)) {
+          if (id) window.open(attachmentRawUrl(id), '_blank', 'noopener');
+          return;
+        }
+        openAttachmentPreview({
+          id,
+          filename: btn.dataset.filename || attachment?.filename || 'image',
+          size: Number(btn.dataset.size || attachment?.size || 0) || 0,
+          mime: btn.dataset.mime || attachment?.mime || '',
+          previewUrl: btn.dataset.previewSrc || attachment?.previewUrl || '',
+        }).catch((error) => appendError(error.message || '无法打开图片'));
       });
     });
     syncAttachmentActions();
   }
 
-  async function uploadImageFile(file) {
+  function formatTokenCount(tokens, options = {}) {
+    const value = Math.max(0, Number(tokens) || 0);
+    const trimTrailingZero = options.trimTrailingZero === true;
+    if (value >= 1000000) {
+      const formatted = (value / 1000000).toFixed(value >= 10000000 ? 0 : 1);
+      return `${trimTrailingZero ? formatted.replace(/\.0$/, '') : formatted}M`;
+    }
+    if (value >= 1000) {
+      if (trimTrailingZero) {
+        const formatted = (value / 1000).toFixed(1).replace(/\.0$/, '');
+        return `${formatted}K`;
+      }
+      return `${Math.round(value / 1000)}K`;
+    }
+    return String(Math.round(value));
+  }
+
+  function getUsageTotalTokens(usage, options = {}) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return 0;
+    if (normalized.totalTokens > 0) return normalized.totalTokens;
+    const inputTotal = Number(normalized.inputTokens) || 0;
+    const cached = Number(normalized.cachedInputTokens) || 0;
+    const output = Number(normalized.outputTokens) || 0;
+    const reasoning = Number(normalized.reasoningOutputTokens) || 0;
+    const contextLimit = Number(options.contextLimit || 0) || 0;
+
+    if (contextLimit && cached > 0 && inputTotal + cached > contextLimit) {
+      const aggregateCalls = Math.max(1, Math.ceil((inputTotal + cached) / contextLimit));
+      const averageCallTokens = (inputTotal + output + reasoning) / aggregateCalls;
+      // Adjacent Codex/CPAP calls are not equal-sized: the latest call is usually
+      // a little larger than the aggregate average because the conversation grew
+      // during the turn. Bias the estimate toward the latest CPAP request.
+      return Math.ceil(Math.min(contextLimit, averageCallTokens * 1.08));
+    }
+
+    let effectiveInput = inputTotal;
+    // Codex CLI can aggregate adjacent CPAP Responses calls into one
+    // last_token_usage. When total_tokens is missing and the cached prefix is
+    // repeated, collapse one duplicated cached prefix so the indicator follows
+    // CPAP's latest-request scale instead of aggregate spend.
+    if (cached > 0 && inputTotal > 0 && cached / inputTotal > 0.5) {
+      effectiveInput = Math.max(0, inputTotal - Math.round(cached / 2));
+    }
+    return effectiveInput + output + reasoning;
+  }
+
+  function usageLooksCumulativeForContext(usage, limit) {
+    const windowLimit = Number(limit || 0) || 0;
+    const used = getUsageTotalTokens(usage, { contextLimit: windowLimit });
+    if (!used) return false;
+    if (windowLimit) return used > windowLimit * 1.5;
+    return used > 1500000;
+  }
+
+  function validContextUsage(usage, limit) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return null;
+    if (usageLooksCumulativeForContext(normalized, limit)) return null;
+    const used = getUsageTotalTokens(normalized, { contextLimit: limit });
+    if (limit && used > limit) return null;
+    return normalized;
+  }
+
+  function getContextUsageMetrics() {
+    // Context window usage must describe the current runtime request / latest turn,
+    // not the lifetime token spend accumulated by the whole chat session.
+    const limit = Number(contextRuntimeUsage.contextWindowTokens || inferContextWindowTokens() || 0) || 0;
+    if (!limit) return null;
+    const currentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
+    const used = getUsageTotalTokens(currentUsage, { contextLimit: limit });
+    if (!used) {
+      return {
+        used: 0,
+        limit,
+        percentage: 0,
+        pending: true,
+        displayUsed: '暂无',
+        displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
+      };
+    }
+    const percentage = Math.max(0, used / limit * 100);
+    return {
+      used,
+      limit,
+      percentage,
+      pending: false,
+      displayUsed: formatTokenCount(used, { trimTrailingZero: true }),
+      displayLimit: formatTokenCount(limit, { trimTrailingZero: true }),
+    };
+  }
+
+  function renderContextUsageIndicator() {
+    if (!contextUsageIndicator) return;
+    const metrics = getContextUsageMetrics();
+    if (!metrics) {
+      contextUsageIndicator.hidden = true;
+      contextUsageIndicator.innerHTML = '';
+      contextUsageIndicator.removeAttribute('title');
+      return;
+    }
+    const size = 24;
+    const stroke = 2.5;
+    const radius = (size - stroke) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const dashOffset = circumference - Math.min(100, metrics.percentage) / 100 * circumference;
+    const level = metrics.pending ? 'pending' : (metrics.percentage > 90 ? 'danger' : (metrics.percentage > 70 ? 'warning' : 'normal'));
+    const popoverText = metrics.pending
+      ? `等待本轮 token 数据 · 上限 ${metrics.displayLimit}`
+      : `${metrics.percentage.toFixed(1)}% · ${metrics.displayUsed} / ${metrics.displayLimit} 上下文已使用`;
+    contextUsageIndicator.hidden = false;
+    contextUsageIndicator.dataset.level = level;
+    contextUsageIndicator.title = popoverText;
+    contextUsageIndicator.innerHTML = `
+      <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true">
+        <circle class="context-usage-track" cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke-width="${stroke}"></circle>
+        <circle class="context-usage-progress" cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${circumference.toFixed(3)}" stroke-dashoffset="${dashOffset.toFixed(3)}"></circle>
+      </svg>
+      <div class="context-usage-popover" role="tooltip">${escapeHtml(popoverText)}</div>
+    `;
+  }
+
+  function estimateTokensFromText(text) {
+    const value = String(text || '');
+    if (!value) return 0;
+    let ascii = 0;
+    let nonAscii = 0;
+    for (const ch of value) {
+      if (ch.charCodeAt(0) < 128) ascii += 1;
+      else nonAscii += 1;
+    }
+    return Math.ceil(ascii / 4) + nonAscii;
+  }
+
+  function getTotalUsageTokens(totalUsage) {
+    const normalized = normalizeUsageShape(totalUsage);
+    if (!normalized) return 0;
+    if (normalized.totalTokens > 0) return normalized.totalTokens;
+    return (Number(normalized.inputTokens) || 0)
+      + (Number(normalized.outputTokens) || 0)
+      + (Number(normalized.reasoningOutputTokens) || 0);
+  }
+
+  function normalizeUsageShape(usage) {
+    if (!usage) return null;
+    return {
+      inputTokens: Number(usage.inputTokens ?? usage.input_tokens ?? usage.prompt_tokens) || 0,
+      cachedInputTokens: Number(
+        usage.cachedInputTokens
+        ?? usage.cached_input_tokens
+        ?? usage.cached_tokens
+        ?? usage.cache_tokens
+        ?? usage.input_tokens_details?.cached_tokens
+        ?? usage.prompt_tokens_details?.cached_tokens
+      ) || 0,
+      outputTokens: Number(usage.outputTokens ?? usage.output_tokens ?? usage.completion_tokens) || 0,
+      reasoningOutputTokens: Number(
+        usage.reasoningOutputTokens
+        ?? usage.reasoning_output_tokens
+        ?? usage.reasoning_tokens
+        ?? usage.output_tokens_details?.reasoning_tokens
+        ?? usage.completion_tokens_details?.reasoning_tokens
+      ) || 0,
+      totalTokens: Number(usage.totalTokens ?? usage.total_tokens) || 0,
+    };
+  }
+
+  function formatUsageStatsText(usage) {
+    const normalized = normalizeUsageShape(usage);
+    if (!normalized) return '';
+    const inputTotal = Number(normalized.inputTokens) || 0;
+    const cached = Number(normalized.cachedInputTokens) || 0;
+    const displayInput = cached > 0 && inputTotal >= cached ? inputTotal - cached : inputTotal;
+    const cacheText = cached ? ` · cache ${cached}` : '';
+    return `in ${displayInput} · out ${normalized.outputTokens}${cacheText}`;
+  }
+
+  function diffUsageTotals(nextTotal, prevTotal) {
+    const next = normalizeUsageShape(nextTotal);
+    const prev = normalizeUsageShape(prevTotal);
+    if (!next || !prev) return null;
+    const delta = {
+      inputTokens: Math.max(0, next.inputTokens - prev.inputTokens),
+      cachedInputTokens: Math.max(0, next.cachedInputTokens - prev.cachedInputTokens),
+      outputTokens: Math.max(0, next.outputTokens - prev.outputTokens),
+      reasoningOutputTokens: Math.max(0, next.reasoningOutputTokens - prev.reasoningOutputTokens),
+      totalTokens: Math.max(0, next.totalTokens - prev.totalTokens),
+    };
+    return (delta.inputTokens || delta.outputTokens || delta.cachedInputTokens || delta.reasoningOutputTokens || delta.totalTokens) ? delta : null;
+  }
+
+  function inferContextWindowTokens() {
+    const raw = [
+      sessionState.currentModel,
+      sessionState.currentActiveRuntime?.displayModel,
+      sessionState.currentActiveRuntime?.model,
+      sessionState.currentActiveRuntime?.defaultModel,
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (/\b1m\b|\[1m\]|1000k|1,000k|1000000/.test(raw)) return 1000000;
+    if (sessionState.currentAgent === 'codex' || /gpt-5|codex/.test(raw)) return 400000;
+    if (/opus|sonnet|haiku|claude/.test(raw) || sessionState.currentAgent === 'claude') return 200000;
+    return null;
+  }
+
+  function updateContextUsageFromSnapshot(snapshot) {
+    const contextWindowTokens = Number(snapshot?.contextWindowTokens || snapshot?.modelContextWindow || 0) || null;
+    contextRuntimeUsage = {
+      currentUsage: validContextUsage(snapshot?.currentUsage || snapshot?.lastUsage, contextWindowTokens || inferContextWindowTokens()),
+      totalUsage: normalizeUsageShape(snapshot?.totalUsage),
+      contextWindowTokens,
+    };
+    renderContextBar();
+    renderContextUsageIndicator();
+  }
+
+  function renderContextBar() {
+    if (!contextBar || !contextRefList) return;
+    if (composeState.pendingFileRefs.length === 0) {
+      contextRefList.innerHTML = '';
+      contextBar.classList.toggle('has-file-refs', false);
+      contextBar.hidden = true;
+      return;
+    }
+    contextBar.hidden = false;
+    contextBar.classList.toggle('has-file-refs', true);
+    contextRefList.innerHTML = composeState.pendingFileRefs.map((ref, index) => `
+      <button class="context-ref-chip" type="button" data-index="${index}" title="${escapeHtml(ref.relativePath || ref.path || '')}">
+        <span>${escapeHtml(ref.relativePath || ref.name || (ref.type === 'directory' ? 'directory' : 'file'))}</span>
+        <span class="context-ref-size">${ref.type === 'directory' ? '目录' : formatFileSize(ref.size)}</span>
+        <span class="context-ref-remove">×</span>
+      </button>
+    `).join('');
+    contextRefList.querySelectorAll('.context-ref-chip').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const index = Number(chip.dataset.index);
+        if (Number.isInteger(index)) {
+          composeState.pendingFileRefs.splice(index, 1);
+          renderContextBar();
+        }
+      });
+    });
+  }
+
+  function clearFileTree() {
+    fileTreeState = { cwd: null, loading: false, error: '', items: [], expandedDirs: new Set() };
+    composeState.pendingFileRefs = [];
+    if (fileViewerState.open) closeFileViewer();
+    renderFileTree();
+    renderContextBar();
+  }
+
+  function renderFileTreeItems(items, level = 0) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    return items.map((item) => {
+      const isDir = item.type === 'directory';
+      const canAttach = isDir || (item.isText && !item.tooLarge);
+      const isActiveFile = !isDir && fileViewerState.activePath && item.path === fileViewerState.activePath;
+      const expanded = isDir && fileTreeState.expandedDirs instanceof Set && fileTreeState.expandedDirs.has(item.path);
+      const classes = ['file-tree-row', isDir ? 'directory' : 'file'];
+      if (expanded) classes.push('expanded');
+      if (!isDir && !canAttach) classes.push('not-context');
+      if (isActiveFile) classes.push('active');
+      const icon = isDir ? (expanded ? '▾' : '▸') : '•';
+      const sizeText = !isDir && Number.isFinite(item.size) ? `<span class="file-tree-size">${formatFileSize(item.size)}</span>` : '';
+      const fileOpenPayload = !isDir ? { path: item.path, relativePath: item.relativePath, name: item.name, size: item.size } : null;
+      const refPayload = canAttach ? {
+        type: isDir ? 'directory' : 'file',
+        path: item.path,
+        relativePath: item.relativePath || item.name || item.path,
+        name: item.name || item.relativePath || item.path,
+        size: isDir ? 0 : Number(item.size) || 0,
+      } : null;
+      const movePayload = !isDir ? {
+        type: 'file',
+        path: item.path,
+        relativePath: item.relativePath || item.name || item.path,
+        name: item.name || item.relativePath || item.path,
+        size: Number(item.size) || 0,
+      } : null;
+      const dragAttrs = isDir
+        ? (refPayload ? ` draggable="true" data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : '')
+        : ` draggable="true" data-file-move="${escapeHtml(JSON.stringify(movePayload))}"${refPayload ? ` data-file-ref="${escapeHtml(JSON.stringify(refPayload))}"` : ''}`;
+      const attrs = isDir
+        ? `role="button" tabindex="0" data-dir-path="${escapeHtml(item.path)}"${dragAttrs}`
+        : `role="button" tabindex="0" data-file-open="${escapeHtml(JSON.stringify(fileOpenPayload))}"${dragAttrs}`;
+      const children = isDir && expanded ? renderFileTreeItems(item.children || [], level + 1) : '';
+      const nodeAttrs = isDir ? ` data-tree-dir-path="${escapeHtml(item.path)}"` : '';
+      return `
+        <div class="file-tree-node" style="--level:${level}"${nodeAttrs}>
+          <div class="${classes.join(' ')}" ${attrs} title="${escapeHtml(item.relativePath || item.name)}">
+            <span class="file-tree-icon">${icon}</span>
+            <span class="file-tree-name">${escapeHtml(item.name)}</span>
+            ${sizeText}
+          </div>
+          ${children}
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderFileTree() {
+    if (!fileTree) return;
+    if (!getFileTreeCwd()) {
+      fileTree.innerHTML = '<div class="file-tree-empty">选择目录后显示文件。</div>';
+      return;
+    }
+    if (fileTreeState.loading) {
+      fileTree.innerHTML = '<div class="file-tree-empty">正在读取文件…</div>';
+      return;
+    }
+    if (fileTreeState.error) {
+      fileTree.innerHTML = `<div class="file-tree-empty error">${escapeHtml(fileTreeState.error)}</div>`;
+      return;
+    }
+    if (!fileTreeState.items.length) {
+      fileTree.innerHTML = '<div class="file-tree-empty">当前目录没有可显示文件。</div>';
+      return;
+    }
+    fileTree.innerHTML = renderFileTreeItems(fileTreeState.items);
+    fileTree.querySelectorAll('.file-tree-row.directory[data-dir-path]').forEach((row) => {
+      const toggle = () => {
+        const dirPath = row.getAttribute('data-dir-path') || '';
+        if (!dirPath) return;
+        if (!(fileTreeState.expandedDirs instanceof Set)) fileTreeState.expandedDirs = new Set();
+        if (fileTreeState.expandedDirs.has(dirPath)) fileTreeState.expandedDirs.delete(dirPath);
+        else fileTreeState.expandedDirs.add(dirPath);
+        renderFileTree();
+      };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      });
+    });
+    fileTree.querySelectorAll('.file-tree-row.file[data-file-open]').forEach((row) => {
+      const open = () => {
+        const raw = row.getAttribute('data-file-open') || '';
+        try { openFileViewer(JSON.parse(raw)); }
+        catch { appendError('文件打开数据无效。'); }
+      };
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open();
+        }
+      });
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const raw = row.getAttribute('data-file-open') || '';
+        try { showFileTreeContextMenu(JSON.parse(raw), e); }
+        catch { appendError('文件菜单数据无效。'); }
+      });
+    });
+    fileTree.querySelectorAll('.file-tree-row[draggable="true"]').forEach((row) => {
+      row.addEventListener('dragstart', (e) => {
+        const refRaw = row.getAttribute('data-file-ref') || '';
+        const moveRaw = row.getAttribute('data-file-move') || '';
+        try {
+          let label = 'file';
+          if (refRaw) {
+            const ref = JSON.parse(refRaw);
+            e.dataTransfer?.setData(FILE_REF_TRANSFER_TYPE, refRaw);
+            label = ref.relativePath || ref.path || (ref.type === 'directory' ? 'directory' : 'file');
+          }
+          if (moveRaw) {
+            const moveRef = JSON.parse(moveRaw);
+            e.dataTransfer?.setData(FILE_MOVE_TRANSFER_TYPE, moveRaw);
+            label = moveRef.relativePath || moveRef.path || label;
+          }
+          if (!refRaw && !moveRaw) {
+            e.preventDefault();
+            return;
+          }
+          e.dataTransfer?.setData('text/plain', label);
+          if (e.dataTransfer) e.dataTransfer.effectAllowed = moveRaw ? 'copyMove' : 'copy';
+        } catch {
+          e.preventDefault();
+        }
+      });
+    });
+  }
+
+  async function loadFileTree(cwd = getFileTreeCwd()) {
+    if (!cwd || !fileTree) {
+      clearFileTree();
+      return;
+    }
+    fileTreeState = { ...fileTreeState, cwd, loading: true, error: '', items: [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    renderFileTree();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, depth: 'all' });
+      const response = await fetch(`/api/files?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (cwd !== getFileTreeCwd()) return;
+      fileTreeState = { cwd, loading: false, error: '', items: Array.isArray(data.items) ? data.items : [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    } catch (err) {
+      if (cwd !== getFileTreeCwd()) return;
+      fileTreeState = { cwd, loading: false, error: err.message || '无法读取目录', items: [], expandedDirs: fileTreeState.expandedDirs instanceof Set ? fileTreeState.expandedDirs : new Set() };
+    }
+    renderFileTree();
+  }
+
+  function hasExternalFilesDrag(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes('Files') && !types.includes(FILE_REF_TRANSFER_TYPE);
+  }
+
+  function hasFileTreeMoveDrag(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes(FILE_MOVE_TRANSFER_TYPE);
+  }
+
+  function clearFileTreeUploadTarget() {
+    if (fileTreeUploadTargetRow) fileTreeUploadTargetRow.classList.remove('upload-target');
+    fileTreeUploadTargetRow = null;
+    if (fileTree) fileTree.classList.toggle('upload-drag-over', false);
+    fileTreeUploadActive = false;
+  }
+
+  function getParentPathFromFileTreePath(filePath) {
+    const raw = String(filePath || '');
+    const normalized = raw.replace(/\\/g, '/');
+    const slashIndex = normalized.lastIndexOf('/');
+    if (slashIndex <= 0) return getFileTreeCwd();
+    return raw.slice(0, slashIndex);
+  }
+
+  function getFileTreeUploadTargetInfo(event) {
+    if (!fileTree || !(event.target instanceof Element)) return { path: getFileTreeCwd(), row: null };
+    const directDirRow = event.target.closest('.file-tree-row.directory[data-dir-path]');
+    if (directDirRow) return { path: directDirRow.getAttribute('data-dir-path') || getFileTreeCwd(), row: directDirRow };
+
+    const fileRow = event.target.closest('.file-tree-row.file[data-file-open]');
+    if (fileRow) {
+      try {
+        const payload = JSON.parse(fileRow.getAttribute('data-file-open') || '{}');
+        const containingDir = getParentPathFromFileTreePath(payload.path || '');
+        const dirNode = fileRow.closest('.file-tree-node[data-tree-dir-path]');
+        const dirRow = dirNode?.querySelector('.file-tree-row.directory[data-dir-path]') || null;
+        return { path: containingDir, row: dirRow };
+      } catch {}
+    }
+
+    const dirNode = event.target.closest('.file-tree-node[data-tree-dir-path]');
+    const dirPath = dirNode?.getAttribute('data-tree-dir-path') || '';
+    const dirRow = dirNode?.querySelector('.file-tree-row.directory[data-dir-path]') || null;
+    return { path: dirPath || getFileTreeCwd(), row: dirRow };
+  }
+
+  function updateFileTreeUploadTarget(event) {
+    if (!fileTree) return getFileTreeCwd();
+    const { path, row } = getFileTreeUploadTargetInfo(event);
+    if (fileTreeUploadTargetRow && fileTreeUploadTargetRow !== row) {
+      fileTreeUploadTargetRow.classList.remove('upload-target');
+    }
+    fileTreeUploadTargetRow = row || null;
+    if (fileTreeUploadTargetRow) fileTreeUploadTargetRow.classList.add('upload-target');
+    fileTree.classList.toggle('upload-drag-over', true);
+    fileTreeUploadActive = true;
+    return path || getFileTreeCwd();
+  }
+
+  async function uploadExternalFilesToFileTree(files, targetPath) {
+    const cwd = getFileTreeCwd();
+    if (!cwd) {
+      appendError('请先选择当前目录再上传文件。');
+      return;
+    }
+    const uploadFiles = Array.from(files || []).filter(Boolean);
+    if (uploadFiles.length === 0) return;
+    const tooLarge = uploadFiles.filter((file) => file.size > FILE_UPLOAD_MAX_SIZE);
+    const validFiles = uploadFiles.filter((file) => file.size <= FILE_UPLOAD_MAX_SIZE);
+    if (tooLarge.length > 0) {
+      appendError(`${tooLarge.length} 个文件超过 1GB，已跳过。`);
+    }
+    if (validFiles.length === 0) return;
+    let okCount = 0;
+    const failures = [];
+    try {
+      await ensureAuthenticatedWs();
+      for (const file of validFiles) {
+        const params = new URLSearchParams({
+          cwd,
+          path: targetPath || cwd,
+          filename: file.name || 'upload.bin',
+        });
+        const response = await fetch(`/api/file-upload?${params.toString()}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${connectionState.authToken}`,
+            'Content-Type': file.type || 'application/octet-stream',
+          },
+          body: file,
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data?.ok) {
+          failures.push(`${file.name || '未命名文件'}：${data?.message || `上传失败 (${response.status})`}`);
+          continue;
+        }
+        okCount += 1;
+      }
+      await loadFileTree(cwd);
+      if (okCount > 0) showToast(`已上传 ${okCount} 个文件`);
+      if (failures.length > 0) appendError(failures.slice(0, 3).join('；') + (failures.length > 3 ? `；另有 ${failures.length - 3} 个失败` : ''));
+    } catch (err) {
+      appendError(err.message || '上传失败');
+    }
+  }
+
+  async function moveFileInFileTree(fileRef, targetDir) {
+    const cwd = getFileTreeCwd();
+    const sourcePath = fileRef?.path || '';
+    if (!cwd || !sourcePath || !targetDir) return;
+    if (getParentPathFromFileTreePath(sourcePath) === targetDir) {
+      showToast('文件已在目标目录');
+      return;
+    }
+    try {
+      await ensureAuthenticatedWs();
+      const response = await fetch('/api/file-move', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${connectionState.authToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ cwd, path: sourcePath, targetDir }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `移动失败 (${response.status})`);
+      composeState.pendingFileRefs = composeState.pendingFileRefs.filter((ref) => ref.path !== sourcePath);
+      renderContextBar();
+      if (fileViewerState.activePath === sourcePath) closeFileViewer();
+      await loadFileTree(cwd);
+      showToast(data.moved === false ? '文件已在目标目录' : '文件已移动');
+    } catch (err) {
+      appendError(err.message || '移动文件失败');
+    }
+  }
+
+  async function deleteFileFromFileTree(fileRef) {
+    const cwd = getFileTreeCwd();
+    const filePath = fileRef?.path || '';
+    if (!cwd || !filePath) return;
+    const confirmed = await showGitConfirmModal({
+      title: '删除文件',
+      message: `确认删除「${fileRef.relativePath || fileRef.name || filePath}」？`,
+      detail: '只会删除当前目录内的这个文件，不能撤销。',
+      confirmLabel: '删除',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: filePath });
+      const response = await fetch(`/api/file-entry?${params.toString()}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `删除失败 (${response.status})`);
+      composeState.pendingFileRefs = composeState.pendingFileRefs.filter((ref) => ref.path !== filePath);
+      renderContextBar();
+      if (fileViewerState.activePath === filePath) closeFileViewer();
+      await loadFileTree(cwd);
+      showToast('文件已删除');
+    } catch (err) {
+      appendError(err.message || '删除文件失败');
+    }
+  }
+
+  function closeFileTreeContextMenu() {
+    document.querySelectorAll('.file-tree-context-menu').forEach((menu) => menu.remove());
+  }
+
+  function showFileTreeContextMenu(fileRef, event) {
+    closeFileTreeContextMenu();
+    const menu = document.createElement('div');
+    menu.className = 'project-group-menu file-tree-context-menu';
+    menu.hidden = false;
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'project-group-menu-item project-group-menu-item--danger';
+    deleteBtn.textContent = '删除文件';
+    deleteBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFileTreeContextMenu();
+      deleteFileFromFileTree(fileRef);
+    });
+    menu.appendChild(deleteBtn);
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(4, Math.min(event.clientX, window.innerWidth - rect.width - 4));
+    const top = Math.max(4, Math.min(event.clientY, window.innerHeight - rect.height - 4));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    const closeOnClick = (e) => {
+      if (menu.contains(e.target)) return;
+      closeFileTreeContextMenu();
+      document.removeEventListener('click', closeOnClick, true);
+    };
+    setTimeout(() => document.addEventListener('click', closeOnClick, true), 0);
+  }
+
+  function bindFileTreeExternalUpload() {
+    if (!fileTree || fileTree.dataset.externalUploadBound === '1') return;
+    fileTree.dataset.externalUploadBound = '1';
+    fileTree.addEventListener('dragenter', (e) => {
+      if (!hasExternalFilesDrag(e.dataTransfer) && !hasFileTreeMoveDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      updateFileTreeUploadTarget(e);
+    });
+    fileTree.addEventListener('dragover', (e) => {
+      const isMove = hasFileTreeMoveDrag(e.dataTransfer);
+      if (!hasExternalFilesDrag(e.dataTransfer) && !isMove) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = isMove ? 'move' : 'copy';
+      updateFileTreeUploadTarget(e);
+    });
+    fileTree.addEventListener('dragleave', (e) => {
+      if (!fileTreeUploadActive) return;
+      const related = e.relatedTarget;
+      if (related instanceof Node && fileTree.contains(related)) return;
+      clearFileTreeUploadTarget();
+    });
+    fileTree.addEventListener('drop', (e) => {
+      const isMove = hasFileTreeMoveDrag(e.dataTransfer);
+      if (!hasExternalFilesDrag(e.dataTransfer) && !isMove) return;
+      e.preventDefault();
+      const targetPath = updateFileTreeUploadTarget(e);
+      if (isMove) {
+        let ref = null;
+        try { ref = JSON.parse(e.dataTransfer?.getData(FILE_MOVE_TRANSFER_TYPE) || '{}'); }
+        catch {}
+        clearFileTreeUploadTarget();
+        if (!ref?.path) {
+          appendError('移动文件数据无效。');
+          return;
+        }
+        moveFileInFileTree(ref, targetPath);
+        return;
+      }
+      const files = Array.from(e.dataTransfer?.files || []);
+      clearFileTreeUploadTarget();
+      uploadExternalFilesToFileTree(files, targetPath);
+    });
+  }
+
+  function addPendingFileRef(ref) {
+    if (!ref?.path) return;
+    const isDir = ref.type === 'directory';
+    if (composeState.pendingFileRefs.some((item) => item.path === ref.path)) {
+      renderContextBar();
+      return;
+    }
+    if (composeState.pendingFileRefs.length >= MAX_PENDING_FILE_REFS) {
+      appendError(`最多一次引用 ${MAX_PENDING_FILE_REFS} 个项目。`);
+      return;
+    }
+    composeState.pendingFileRefs.push({
+      type: isDir ? 'directory' : 'file',
+      path: ref.path,
+      relativePath: ref.relativePath || ref.path,
+      size: isDir ? 0 : Number(ref.size) || 0,
+    });
+    renderContextBar();
+  }
+
+
+  function toAttachableFileRef(item) {
+    if (!item || item.type === 'directory') return null;
+    return {
+      type: 'file',
+      path: item.path,
+      relativePath: item.relativePath || item.name || item.path,
+      name: item.name || item.relativePath || item.path,
+      size: Number(item.size) || 0,
+    };
+  }
+
+  function toAttachableDirectoryRef(item) {
+    if (!item || item.type !== 'directory') return null;
+    return {
+      type: 'directory',
+      path: item.path,
+      relativePath: item.relativePath || item.name || item.path,
+      name: item.name || item.relativePath || item.path,
+      size: 0,
+    };
+  }
+
+  function countAttachableFileRefs(items) {
+    if (!Array.isArray(items)) return 0;
+    return items.reduce((count, item) => {
+      if (!item) return count;
+      if (item.type === 'directory') return count + countAttachableFileRefs(item.children || []);
+      return count + (toAttachableFileRef(item) ? 1 : 0);
+    }, 0);
+  }
+
+  function collectDefaultExpandedFileRefDirs(items, level = 0, dirs = new Set()) {
+    if (!Array.isArray(items)) return dirs;
+    for (const item of items) {
+      if (!item || item.type !== 'directory') continue;
+      if (countAttachableFileRefs(item.children || []) === 0) continue;
+      if (level === 0) dirs.add(item.path);
+      collectDefaultExpandedFileRefDirs(item.children || [], level + 1, dirs);
+    }
+    return dirs;
+  }
+
+  function renderFileRefPickerTree(items, level = 0) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    const selectedPaths = new Set(composeState.pendingFileRefs.map((ref) => ref.path));
+    return items.map((item) => {
+      if (!item) return '';
+      const isDir = item.type === 'directory';
+      if (isDir) {
+        const dirRef = toAttachableDirectoryRef(item);
+        const selected = selectedPaths.has(item.path);
+        const expanded = fileRefPickerExpandedDirs.has(item.path);
+        const childCount = countAttachableFileRefs(item.children || []);
+        const children = expanded ? renderFileRefPickerTree(item.children || [], level + 1) : '';
+        return `
+          <div class="file-ref-picker-node">
+            <div class="file-ref-picker-row directory${expanded ? ' expanded' : ''}${selected ? ' selected' : ''}" data-dir-path="${escapeHtml(item.path)}" style="--level:${level}">
+              <button class="file-ref-picker-main" type="button" data-dir-toggle="${escapeHtml(item.path)}">
+                <span class="file-ref-picker-icon">${expanded ? '▾' : '▸'}</span>
+                <span class="file-ref-picker-name">${escapeHtml(item.name || item.relativePath || item.path)}</span>
+                <span class="file-ref-picker-size">${childCount > 0 ? `${childCount} 个文件` : '目录'}</span>
+              </button>
+              <button class="file-ref-picker-action" type="button" data-dir-ref="${escapeHtml(JSON.stringify(dirRef))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>
+            </div>
+            ${children}
+          </div>
+        `;
+      }
+      const ref = toAttachableFileRef(item);
+      const fallbackSize = Number(item.size) || 0;
+      const fallbackName = item.name || item.relativePath || item.path || '文件';
+      const selected = !!ref && selectedPaths.has(ref.path);
+      const unavailableReason = !ref
+        ? (fallbackSize > MAX_PENDING_FILE_REF_SIZE ? '文件超过 256KB，不能直接作为文本上下文引用' : '该文件类型不能直接作为文本上下文引用')
+        : '';
+      return `
+        <div class="file-ref-picker-node">
+          <div class="file-ref-picker-row file${selected ? ' selected' : ''}${!ref ? ' unavailable' : ''}" style="--level:${level}" ${unavailableReason ? `title="${escapeHtml(unavailableReason)}"` : ''}>
+            <span class="file-ref-picker-icon">•</span>
+            <span class="file-ref-picker-name">${escapeHtml(fallbackName)}</span>
+            <span class="file-ref-picker-size">${formatFileSize(fallbackSize)}</span>
+            ${ref
+              ? `<button class="file-ref-picker-action" type="button" data-file-ref="${escapeHtml(JSON.stringify(ref))}" ${selected ? 'disabled' : ''}>${selected ? '已引用' : '引用'}</button>`
+              : `<button class="file-ref-picker-action" type="button" disabled>不可引用</button>`}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function closeFileRefPicker() {
+    document.getElementById('file-ref-picker-overlay')?.remove();
+  }
+
+  function closeAttachMenu() {
+    if (!attachMenu) return;
+    attachMenu.hidden = true;
+    if (attachBtn) attachBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleAttachMenu() {
+    if (!attachMenu) {
+      fileUploadInput?.click();
+      return;
+    }
+    const nextHidden = !attachMenu.hidden;
+    attachMenu.hidden = nextHidden;
+    if (attachBtn) attachBtn.setAttribute('aria-expanded', nextHidden ? 'false' : 'true');
+  }
+
+  function bindFileRefPickerTreeEvents(overlay, items) {
+    overlay.querySelectorAll('[data-dir-toggle]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const dirPath = btn.getAttribute('data-dir-toggle') || '';
+        if (!dirPath) return;
+        if (fileRefPickerExpandedDirs.has(dirPath)) fileRefPickerExpandedDirs.delete(dirPath);
+        else fileRefPickerExpandedDirs.add(dirPath);
+        renderFileRefPicker(items);
+      });
+    });
+    overlay.querySelectorAll('[data-dir-ref]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const raw = btn.getAttribute('data-dir-ref') || '';
+        try {
+          const ref = JSON.parse(raw);
+          addPendingFileRef(ref);
+          showToast(`已引用目录 ${ref.relativePath || ref.name || '目录'}`);
+          renderFileRefPicker(items);
+        } catch {
+          appendError('目录引用数据无效。');
+        }
+      });
+    });
+    overlay.querySelectorAll('[data-file-ref]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const raw = btn.getAttribute('data-file-ref') || '';
+        try {
+          const ref = JSON.parse(raw);
+          addPendingFileRef(ref);
+          showToast(`已引用 ${ref.relativePath || ref.name || '文件'}`);
+          renderFileRefPicker(items);
+        } catch {
+          appendError('文件引用数据无效。');
+        }
+      });
+    });
+  }
+
+  function renderFileRefPicker(items) {
+    closeFileRefPicker();
+    const overlay = document.createElement('div');
+    overlay.id = 'file-ref-picker-overlay';
+    overlay.className = 'file-ref-picker-overlay';
+    const treeHtml = renderFileRefPickerTree(items || []);
+    overlay.innerHTML = `
+      <div class="file-ref-picker-card" role="dialog" aria-modal="true" aria-label="引用附件">
+        <div class="file-ref-picker-header">
+          <div>
+            <div class="file-ref-picker-title">引用附件</div>
+            <div class="file-ref-picker-subtitle">按目录展开当前项目，目录和文件都会作为路径引用。</div>
+          </div>
+          <button class="file-ref-picker-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="file-ref-picker-list">
+          ${treeHtml || '<div class="file-ref-picker-empty">当前目录没有可引用的文件或目录。</div>'}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay || event.target.closest('.file-ref-picker-close')) {
+        closeFileRefPicker();
+      }
+    });
+    bindFileRefPickerTreeEvents(overlay, items || []);
+  }
+
+  async function openFileRefPicker() {
+    const cwd = getFileTreeCwd();
+    if (!cwd) {
+      appendError('请先打开项目目录，再引用附件。');
+      return;
+    }
+    try {
+      await loadFileTree(cwd);
+      // 引用附件弹窗每次打开时默认全部折叠，避免手机端一进来就铺满文件列表。
+      fileRefPickerExpandedDirs = new Set();
+      renderFileRefPicker(fileTreeState.items || []);
+    } catch (err) {
+      appendError(err.message || '读取可引用文件失败');
+    }
+  }
+
+  function clearFileViewerObjectUrl() {
+    if (fileViewerState.objectUrl) {
+      try { URL.revokeObjectURL(fileViewerState.objectUrl); } catch {}
+      fileViewerState.objectUrl = '';
+    }
+  }
+
+  function resetFileViewerImageState(activePath = '') {
+    fileViewerImageState = { activePath, scale: 0, fitScale: 1, offsetX: 0, offsetY: 0, mode: 'fit' };
+  }
+
+  function disconnectFileViewerImageObserver() {
+    if (fileViewerImageResizeObserver) {
+      try { fileViewerImageResizeObserver.disconnect(); } catch {}
+      fileViewerImageResizeObserver = null;
+    }
+  }
+
+  function closeFileViewer() {
+    handleFileViewerResizeEnd();
+    disconnectFileViewerImageObserver();
+    clearFileViewerObjectUrl();
+    resetFileViewerImageState();
+    fileViewerState = { open: false, loading: false, error: '', data: null, activePath: '', activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.remove('visible');
+    syncFileViewerResizerVisibility();
+    renderFileTree();
+  }
+
+  function setFileViewerTab(tab) {
+    fileViewerState.activeTab = tab === 'source' ? 'source' : 'preview';
+    renderFileViewer();
+  }
+
+  function fileCanPreview(data) {
+    if (!data) return false;
+    if (['markdown', 'csv', 'tsv', 'xlsx', 'docx', 'pptx', 'image', 'pdf', 'json'].includes(data.type)) return true;
+    if (data.type === 'code') return ['html', 'svg'].includes(String(data.language || '').toLowerCase());
+    return false;
+  }
+
+  function fileHasSource(data) {
+    return !!(data && (typeof data.content === 'string' || typeof data.html === 'string'));
+  }
+
+  function fileEditable(data) {
+    return !!(data && typeof data.content === 'string' && ['markdown', 'csv', 'tsv', 'json', 'code', 'text'].includes(data.type));
+  }
+
+  function normalizeFileViewerTab(data, preferred = fileViewerState.activeTab) {
+    const canPreview = fileCanPreview(data);
+    const hasSource = fileHasSource(data);
+    if (preferred === 'source' && hasSource) return 'source';
+    if (canPreview) return 'preview';
+    if (hasSource) return 'source';
+    return 'preview';
+  }
+
+  function buildFileViewerSrcdoc(bodyHtml, extraCss = '') {
+    return `${PREVIEW_SRCDOC_CSP}<style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.65;margin:0;padding:20px;color:#1f2937;background:#fff}pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow:auto}code{background:#eef2f7;padding:1px 5px;border-radius:4px}pre code{background:none;padding:0}img{max-width:100%}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee8;padding:6px 9px;text-align:left;vertical-align:top}th{background:#f8fafc;font-weight:700;position:sticky;top:0}tr:nth-child(even){background:#fbfcfe}blockquote{border-left:3px solid #cbd5e1;margin:0;padding-left:12px;color:#64748b}${extraCss}</style>${bodyHtml}`;
+  }
+
+  function parseDelimitedTable(text, delimiter = ',') {
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let inQuotes = false;
+    const input = String(text || '');
+    for (let i = 0; i < input.length; i += 1) {
+      const ch = input[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (input[i + 1] === '"') { cell += '"'; i += 1; }
+          else inQuotes = false;
+        } else {
+          cell += ch;
+        }
+      } else if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        row.push(cell);
+        cell = '';
+      } else if (ch === '\n') {
+        row.push(cell);
+        rows.push(row);
+        row = [];
+        cell = '';
+      } else if (ch !== '\r') {
+        cell += ch;
+      }
+    }
+    row.push(cell);
+    if (row.length > 1 || row[0] !== '' || rows.length === 0) rows.push(row);
+    return rows;
+  }
+
+  function renderRowsAsTable(rows, options = {}) {
+    const maxRows = Number(options.maxRows || 1000);
+    const maxCols = Number(options.maxCols || 50);
+    const limitedRows = (Array.isArray(rows) ? rows : []).slice(0, maxRows);
+    const colCount = Math.min(maxCols, limitedRows.reduce((max, row) => Math.max(max, Array.isArray(row) ? row.length : 0), 0));
+    if (!limitedRows.length || colCount === 0) return '<div class="file-viewer-empty">没有可显示的数据。</div>';
+    const head = limitedRows[0] || [];
+    const body = limitedRows.slice(1);
+    const th = Array.from({ length: colCount }, (_, i) => `<th>${escapeHtml(head[i] ?? '')}</th>`).join('');
+    const trs = body.map((row) => `<tr>${Array.from({ length: colCount }, (_, i) => `<td>${escapeHtml((row || [])[i] ?? '')}</td>`).join('')}</tr>`).join('');
+    return `<div class="file-viewer-table-wrap"><table class="file-viewer-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>`;
+  }
+
+  function renderFileSource(data) {
+    const raw = typeof data?.content === 'string' ? data.content : (typeof data?.html === 'string' ? data.html : '');
+    const lang = data?.language || (data?.type === 'docx' ? 'html' : 'plaintext');
+    const codeClass = lang ? `language-${escapeHtml(lang)}` : '';
+    if (fileEditable(data)) {
+      return `
+        <div class="file-editor-toolbar">
+          <span class="file-editor-label">文本编辑</span>
+          <span id="file-editor-status" class="file-editor-status"></span>
+          <button id="file-editor-save" class="file-editor-save" type="button">保存</button>
+        </div>
+        <textarea id="file-editor-textarea" class="file-editor-textarea" spellcheck="false">${escapeHtml(raw)}</textarea>
+      `;
+    }
+    return `<pre class="file-viewer-pre"><code class="${codeClass}">${escapeHtml(raw || '暂无内容')}</code></pre>`;
+  }
+
+  function renderJsonPreview(data) {
+    let value = data?.content || '';
+    try { value = JSON.stringify(JSON.parse(value), null, 2); } catch {}
+    return `<pre class="file-viewer-pre"><code class="language-json">${escapeHtml(value)}</code></pre>`;
+  }
+
+  function renderFilePreview(data) {
+    if (!data) return '';
+    if (data.type === 'markdown') {
+      return `<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildMarkdownSrcdoc(data.content || ''))}"></iframe>`;
+    }
+    if (data.type === 'docx') {
+      const warnings = Array.isArray(data.messages) && data.messages.length
+        ? `<div class="file-viewer-warning">${escapeHtml(data.messages[0])}</div>`
+        : '';
+      return `${warnings}<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildFileViewerSrcdoc(data.html || ''))}"></iframe>`;
+    }
+    if (data.type === 'xlsx') {
+      const note = data.truncated ? `<div class="file-viewer-warning">内容较大，仅显示前 ${data.displayedRows || 0} 行、${data.displayedCols || 0} 列。</div>` : '';
+      const sheets = Array.isArray(data.sheets) && data.sheets.length ? `<div class="file-viewer-sheet-list">Sheet：${escapeHtml(data.activeSheet || data.sheets[0])}</div>` : '';
+      return `${sheets}${note}${renderRowsAsTable(data.rows || [])}`;
+    }
+    if (data.type === 'csv' || data.type === 'tsv') {
+      const rows = parseDelimitedTable(data.content || '', data.type === 'tsv' ? '\t' : ',');
+      return renderRowsAsTable(rows);
+    }
+    if (data.type === 'json') {
+      return renderJsonPreview(data);
+    }
+    if (data.type === 'image') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载图片…</div>';
+      return `
+        <div class="file-viewer-image-wrap" data-image-viewer="1">
+          <div class="file-viewer-image-toolbar" aria-label="图片缩放工具">
+            <button type="button" class="file-viewer-image-btn" data-image-action="zoom-out" title="缩小">−</button>
+            <button type="button" class="file-viewer-image-scale" data-image-action="actual" title="按原始像素显示">100%</button>
+            <button type="button" class="file-viewer-image-btn" data-image-action="zoom-in" title="放大">＋</button>
+            <button type="button" class="file-viewer-image-fit" data-image-action="fit" title="适应窗口">适应</button>
+          </div>
+          <div class="file-viewer-image-hint">滚轮缩放 · 拖拽移动 · 双击切换 100%/适应</div>
+          <img class="file-viewer-image" draggable="false" src="${escapeHtml(fileViewerState.objectUrl)}" alt="${escapeHtml(data.name || 'image')}">
+        </div>`;
+    }
+    if (data.type === 'pdf') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在加载 PDF…</div>';
+      return `<iframe class="file-viewer-iframe" src="${escapeHtml(fileViewerState.objectUrl)}" title="${escapeHtml(data.name || 'PDF')}"></iframe>`;
+    }
+    if (data.type === 'pptx') {
+      if (!fileViewerState.objectUrl) return '<div class="file-viewer-empty">正在转换 PPT 预览…</div>';
+      return `<iframe class="file-viewer-iframe" src="${escapeHtml(fileViewerState.objectUrl)}" title="${escapeHtml(data.name || 'PPT 预览')}"></iframe>`;
+    }
+    if (data.type === 'code' && ['html', 'svg'].includes(String(data.language || '').toLowerCase())) {
+      return `<iframe class="file-viewer-iframe" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="${escapeHtml(buildSafePreviewSrcdoc(data.content || ''))}"></iframe>`;
+    }
+    if (fileHasSource(data)) return renderFileSource(data);
+    return `<div class="file-viewer-empty">该文件类型暂不支持直接预览。<br>${escapeHtml(data.name || '')} · ${formatFileSize(data.size || 0)}</div>`;
+  }
+
+  function measureFileViewerIframeContentWidth(iframe) {
+    try {
+      const doc = iframe.contentDocument || iframe.contentWindow?.document;
+      const win = iframe.contentWindow;
+      const docEl = doc?.documentElement;
+      const body = doc?.body;
+      const widths = [
+        docEl?.scrollWidth,
+        body?.scrollWidth,
+        docEl?.offsetWidth,
+        body?.offsetWidth,
+      ];
+      if (body?.children?.length && win) {
+        Array.from(body.children).forEach((child) => {
+          try {
+            const rect = child.getBoundingClientRect();
+            widths.push(rect.right + (win.scrollX || 0));
+            widths.push(rect.width);
+          } catch {}
+        });
+      }
+      return Math.ceil(Math.max(0, ...widths.filter((value) => Number.isFinite(value))));
+    } catch {
+      return 0;
+    }
+  }
+
+  function syncFileViewerIframeOverflow(iframe) {
+    if (!iframe || !fileViewerBody || !iframe.hasAttribute('srcdoc')) return;
+    const viewportWidth = Math.ceil(fileViewerBody.clientWidth || iframe.parentElement?.clientWidth || 0);
+    const contentWidth = measureFileViewerIframeContentWidth(iframe);
+    if (!viewportWidth || !contentWidth || contentWidth <= viewportWidth + 2) {
+      iframe.classList.remove('content-wide');
+      iframe.style.width = '100%';
+      return;
+    }
+    iframe.classList.add('content-wide');
+    iframe.style.width = `${Math.min(contentWidth, 10000)}px`;
+  }
+
+  function bindFileViewerPreviewIframeOverflow() {
+    if (!fileViewerBody || fileViewerState.activeTab !== 'preview') return;
+    const iframes = Array.from(fileViewerBody.querySelectorAll('.file-viewer-iframe[srcdoc]'));
+    iframes.forEach((iframe) => {
+      const sync = () => syncFileViewerIframeOverflow(iframe);
+      iframe.addEventListener('load', () => {
+        sync();
+        setTimeout(sync, 80);
+        setTimeout(sync, 260);
+      }, { once: true });
+      requestAnimationFrame(sync);
+      setTimeout(sync, 80);
+    });
+  }
+
+  function clampFileViewerImageScale(value, fitScale = fileViewerImageState.fitScale || 1) {
+    const min = Math.max(0.05, Math.min(fitScale || 1, 1) * 0.35);
+    const max = 12;
+    return Math.min(max, Math.max(min, Number(value) || fitScale || 1));
+  }
+
+  function getFileViewerImageElements() {
+    const wrap = fileViewerBody?.querySelector('.file-viewer-image-wrap[data-image-viewer="1"]');
+    const img = wrap?.querySelector('.file-viewer-image');
+    const scaleLabel = wrap?.querySelector('.file-viewer-image-scale');
+    return { wrap, img, scaleLabel };
+  }
+
+  function measureFileViewerImageFitScale(wrap, img) {
+    const naturalWidth = img?.naturalWidth || 0;
+    const naturalHeight = img?.naturalHeight || 0;
+    if (!wrap || !naturalWidth || !naturalHeight) return 1;
+    const toolbarSafeHeight = 76;
+    const availableWidth = Math.max(80, (wrap.clientWidth || 0) - 32);
+    const availableHeight = Math.max(80, (wrap.clientHeight || 0) - toolbarSafeHeight);
+    return Math.min(1, availableWidth / naturalWidth, availableHeight / naturalHeight);
+  }
+
+  function applyFileViewerImageTransform() {
+    const { wrap, img, scaleLabel } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const activePath = fileViewerState.data?.path || fileViewerState.activePath || '';
+    if (activePath && fileViewerImageState.activePath !== activePath) resetFileViewerImageState(activePath);
+    const naturalWidth = img.naturalWidth || 0;
+    const naturalHeight = img.naturalHeight || 0;
+    if (!naturalWidth || !naturalHeight) return;
+    const fitScale = measureFileViewerImageFitScale(wrap, img);
+    const shouldFit = !fileViewerImageState.scale || fileViewerImageState.mode === 'fit';
+    fileViewerImageState.fitScale = fitScale;
+    if (shouldFit) {
+      fileViewerImageState.scale = fitScale;
+      fileViewerImageState.offsetX = 0;
+      fileViewerImageState.offsetY = 0;
+      fileViewerImageState.mode = 'fit';
+    } else {
+      fileViewerImageState.scale = clampFileViewerImageScale(fileViewerImageState.scale, fitScale);
+    }
+    img.style.width = `${naturalWidth}px`;
+    img.style.height = `${naturalHeight}px`;
+    img.style.transform = `translate(-50%, -50%) translate(${fileViewerImageState.offsetX}px, ${fileViewerImageState.offsetY}px) scale(${fileViewerImageState.scale})`;
+    if (scaleLabel) scaleLabel.textContent = `${Math.round(fileViewerImageState.scale * 100)}%`;
+    wrap.classList.toggle('is-actual-size', Math.abs(fileViewerImageState.scale - 1) < 0.01);
+  }
+
+  function zoomFileViewerImage(nextScale, origin = null) {
+    const { wrap, img } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const currentScale = fileViewerImageState.scale || fileViewerImageState.fitScale || measureFileViewerImageFitScale(wrap, img);
+    const scale = clampFileViewerImageScale(nextScale, fileViewerImageState.fitScale);
+    const rect = wrap.getBoundingClientRect();
+    const pointX = origin ? origin.clientX - rect.left : rect.width / 2;
+    const pointY = origin ? origin.clientY - rect.top : rect.height / 2;
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const imageX = (pointX - centerX - fileViewerImageState.offsetX) / currentScale;
+    const imageY = (pointY - centerY - fileViewerImageState.offsetY) / currentScale;
+    fileViewerImageState.scale = scale;
+    fileViewerImageState.offsetX = pointX - centerX - imageX * scale;
+    fileViewerImageState.offsetY = pointY - centerY - imageY * scale;
+    fileViewerImageState.mode = Math.abs(scale - fileViewerImageState.fitScale) < 0.01 ? 'fit' : 'manual';
+    applyFileViewerImageTransform();
+  }
+
+  function fitFileViewerImage() {
+    fileViewerImageState.mode = 'fit';
+    fileViewerImageState.scale = fileViewerImageState.fitScale || 1;
+    fileViewerImageState.offsetX = 0;
+    fileViewerImageState.offsetY = 0;
+    applyFileViewerImageTransform();
+  }
+
+  function setFileViewerImageActualSize() {
+    fileViewerImageState.mode = 'manual';
+    fileViewerImageState.scale = 1;
+    fileViewerImageState.offsetX = 0;
+    fileViewerImageState.offsetY = 0;
+    applyFileViewerImageTransform();
+  }
+
+  function bindFileViewerImageControls() {
+    disconnectFileViewerImageObserver();
+    const { wrap, img } = getFileViewerImageElements();
+    if (!wrap || !img) return;
+    const activePath = fileViewerState.data?.path || fileViewerState.activePath || '';
+    if (activePath && fileViewerImageState.activePath !== activePath) resetFileViewerImageState(activePath);
+    const init = () => requestAnimationFrame(applyFileViewerImageTransform);
+    if (img.complete) init();
+    else img.addEventListener('load', init, { once: true });
+
+    if (typeof ResizeObserver !== 'undefined') {
+      fileViewerImageResizeObserver = new ResizeObserver(() => applyFileViewerImageTransform());
+      fileViewerImageResizeObserver.observe(wrap);
+    }
+
+    wrap.querySelectorAll('[data-image-action]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const action = button.dataset.imageAction;
+        if (action === 'zoom-in') zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) * 1.25);
+        else if (action === 'zoom-out') zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) / 1.25);
+        else if (action === 'fit') fitFileViewerImage();
+        else if (action === 'actual') setFileViewerImageActualSize();
+      });
+    });
+
+    wrap.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+      zoomFileViewerImage((fileViewerImageState.scale || fileViewerImageState.fitScale || 1) * factor, event);
+    }, { passive: false });
+
+    wrap.addEventListener('dblclick', (event) => {
+      if (event.target.closest('[data-image-action]')) return;
+      event.preventDefault();
+      if (Math.abs((fileViewerImageState.scale || 0) - 1) < 0.03) fitFileViewerImage();
+      else zoomFileViewerImage(1, event);
+    });
+
+    const pointers = new Map();
+    let dragStart = null;
+    let pinchStart = null;
+    const pointerDistance = () => {
+      const values = Array.from(pointers.values());
+      if (values.length < 2) return 0;
+      return Math.hypot(values[0].clientX - values[1].clientX, values[0].clientY - values[1].clientY);
+    };
+    const pointerCenter = () => {
+      const values = Array.from(pointers.values());
+      if (!values.length) return null;
+      return {
+        clientX: values.reduce((sum, point) => sum + point.clientX, 0) / values.length,
+        clientY: values.reduce((sum, point) => sum + point.clientY, 0) / values.length,
+      };
+    };
+
+    wrap.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('[data-image-action]')) return;
+      pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      wrap.setPointerCapture?.(event.pointerId);
+      if (pointers.size === 1) {
+        dragStart = { clientX: event.clientX, clientY: event.clientY, offsetX: fileViewerImageState.offsetX, offsetY: fileViewerImageState.offsetY };
+        pinchStart = null;
+        wrap.classList.add('is-dragging');
+      } else if (pointers.size === 2) {
+        pinchStart = { distance: pointerDistance(), scale: fileViewerImageState.scale || fileViewerImageState.fitScale || 1, center: pointerCenter() };
+        dragStart = null;
+      }
+    });
+
+    wrap.addEventListener('pointermove', (event) => {
+      if (!pointers.has(event.pointerId)) return;
+      pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      if (pointers.size >= 2 && pinchStart?.distance) {
+        event.preventDefault();
+        const distance = pointerDistance();
+        const center = pointerCenter() || pinchStart.center;
+        zoomFileViewerImage(pinchStart.scale * (distance / pinchStart.distance), center);
+        return;
+      }
+      if (!dragStart) return;
+      event.preventDefault();
+      fileViewerImageState.offsetX = dragStart.offsetX + event.clientX - dragStart.clientX;
+      fileViewerImageState.offsetY = dragStart.offsetY + event.clientY - dragStart.clientY;
+      fileViewerImageState.mode = Math.abs((fileViewerImageState.scale || 0) - fileViewerImageState.fitScale) < 0.01 ? 'fit' : 'manual';
+      applyFileViewerImageTransform();
+    });
+
+    const endPointer = (event) => {
+      pointers.delete(event.pointerId);
+      if (pointers.size === 0) {
+        dragStart = null;
+        pinchStart = null;
+        wrap.classList.remove('is-dragging');
+      } else if (pointers.size === 1) {
+        const point = Array.from(pointers.values())[0];
+        dragStart = { clientX: point.clientX, clientY: point.clientY, offsetX: fileViewerImageState.offsetX, offsetY: fileViewerImageState.offsetY };
+        pinchStart = null;
+      }
+    };
+    wrap.addEventListener('pointerup', endPointer);
+    wrap.addEventListener('pointercancel', endPointer);
+    wrap.addEventListener('lostpointercapture', endPointer);
+  }
+
+  async function fetchFileViewerBlob(data) {
+    const blobUrl = data?.type === 'pptx' ? data?.previewUrl : data?.rawUrl;
+    if (!blobUrl || !['image', 'pdf', 'pptx'].includes(data?.type)) return;
+    const expectedPath = data.path || fileViewerState.activePath;
+    try {
+      const response = await fetch(blobUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`${data.type === 'pptx' ? '转换 PPT 预览失败' : '读取原始文件失败'} (${response.status})${detail ? `：${detail}` : ''}`);
+      }
+      const blob = await response.blob();
+      if (fileViewerState.activePath !== expectedPath) return;
+      clearFileViewerObjectUrl();
+      fileViewerState.objectUrl = URL.createObjectURL(blob);
+      renderFileViewer();
+    } catch (err) {
+      if (fileViewerState.activePath === expectedPath) {
+        fileViewerState.error = err.message || (data?.type === 'pptx' ? '转换 PPT 预览失败' : '读取原始文件失败');
+        renderFileViewer();
+      }
+    }
+  }
+
+  function renderFileViewer() {
+    if (!fileViewerPanel || !fileViewerBody) return;
+    disconnectFileViewerImageObserver();
+    fileViewerPanel.classList.toggle('visible', !!fileViewerState.open);
+    syncFileViewerResizerVisibility();
+    const data = fileViewerState.data;
+    if (fileViewerTitle) fileViewerTitle.textContent = data?.name || (fileViewerState.loading ? '正在打开文件' : '文件');
+    if (fileViewerPath) fileViewerPath.textContent = data?.relativePath || '';
+    if (fileViewerMeta) fileViewerMeta.textContent = data?.size ? formatFileSize(data.size) : '';
+    const canPreview = fileCanPreview(data);
+    const hasSource = fileHasSource(data);
+    fileViewerState.activeTab = normalizeFileViewerTab(data, fileViewerState.activeTab);
+    if (fileViewerPreviewTab) {
+      fileViewerPreviewTab.hidden = !canPreview;
+      fileViewerPreviewTab.classList.toggle('active', fileViewerState.activeTab === 'preview');
+    }
+    if (fileViewerSourceTab) {
+      fileViewerSourceTab.hidden = !hasSource;
+      fileViewerSourceTab.classList.toggle('active', fileViewerState.activeTab === 'source');
+    }
+    if (fileViewerRefresh) fileViewerRefresh.hidden = !fileViewerState.activePath;
+    if (fileViewerRefresh) fileViewerRefresh.disabled = !!fileViewerState.loading;
+    if (fileViewerDownload) fileViewerDownload.hidden = !data;
+    if (fileViewerState.loading) {
+      fileViewerBody.innerHTML = '<div class="file-viewer-empty">正在读取文件…</div>';
+      return;
+    }
+    if (fileViewerState.error) {
+      fileViewerBody.innerHTML = `<div class="file-viewer-empty error">${escapeHtml(fileViewerState.error)}</div>`;
+      return;
+    }
+    if (!data) {
+      fileViewerBody.innerHTML = '<div class="file-viewer-empty">从左侧文件树点击文件后显示内容。</div>';
+      return;
+    }
+    fileViewerBody.innerHTML = fileViewerState.activeTab === 'source' ? renderFileSource(data) : renderFilePreview(data);
+    fileViewerBody.querySelectorAll('pre code').forEach((codeEl) => {
+      if (window.hljs) {
+        try { window.hljs.highlightElement(codeEl); } catch {}
+      }
+    });
+    bindFileEditorEvents();
+    bindFileViewerPreviewIframeOverflow();
+    bindFileViewerImageControls();
+  }
+
+  function bindFileEditorEvents() {
+    const textarea = document.getElementById('file-editor-textarea');
+    const saveBtn = document.getElementById('file-editor-save');
+    const status = document.getElementById('file-editor-status');
+    if (!textarea || !saveBtn || !fileEditable(fileViewerState.data)) return;
+    const original = String(fileViewerState.data.content || '');
+    const updateDirtyState = () => {
+      const dirty = textarea.value !== original;
+      saveBtn.disabled = !dirty || !!fileViewerState.saving;
+      if (status && dirty) status.textContent = '未保存';
+      if (status && !dirty && !fileViewerState.saving) status.textContent = '';
+    };
+    textarea.addEventListener('input', updateDirtyState);
+    saveBtn.addEventListener('click', () => saveFileViewerEdits(textarea.value));
+    updateDirtyState();
+  }
+
+  async function saveFileViewerEdits(content) {
+    const data = fileViewerState.data;
+    const cwd = getFileTreeCwd();
+    if (!fileEditable(data) || !cwd || !data.path) return;
+    const saveBtn = document.getElementById('file-editor-save');
+    const status = document.getElementById('file-editor-status');
+    fileViewerState.saving = true;
+    if (saveBtn) saveBtn.disabled = true;
+    if (status) status.textContent = '保存中…';
+    try {
+      await ensureAuthenticatedWs();
+      const response = await fetch('/api/file-view', {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${connectionState.authToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ cwd, path: data.path, content }),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.ok) throw new Error(result?.message || `保存失败 (${response.status})`);
+      if (fileViewerState.activePath !== data.path) return;
+      fileViewerState.data = { ...data, ...result, content };
+      fileViewerState.saving = false;
+      if (fileViewerMeta) fileViewerMeta.textContent = result.size ? formatFileSize(result.size) : '';
+      showToast('文件已保存');
+      renderFileViewer();
+      loadFileTree(cwd);
+    } catch (err) {
+      fileViewerState.saving = false;
+      if (saveBtn) saveBtn.disabled = false;
+      if (status) status.textContent = err.message || '保存失败';
+      appendError(err.message || '保存失败');
+    }
+  }
+
+  async function downloadFileViewerFile() {
+    const data = fileViewerState.data;
+    if (!data) return;
+    const filename = data.name || 'file';
+    try {
+      await ensureAuthenticatedWs();
+      let blob;
+      if (data.rawUrl) {
+        const response = await fetch(data.rawUrl, { headers: { Authorization: `Bearer ${connectionState.authToken}` } });
+        if (!response.ok) throw new Error(`下载失败 (${response.status})`);
+        blob = await response.blob();
+      } else if (typeof data.content === 'string') {
+        blob = new Blob([data.content], { type: data.mime || 'text/plain;charset=utf-8' });
+      } else if (typeof data.html === 'string') {
+        blob = new Blob([data.html], { type: 'text/html;charset=utf-8' });
+      } else {
+        throw new Error('该文件不能下载');
+      }
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 1000);
+    } catch (err) {
+      appendError(err.message || '下载失败');
+    }
+  }
+
+  async function refreshFileViewer() {
+    const activePath = fileViewerState.activePath;
+    const cwd = getFileTreeCwd();
+    if (!activePath || !cwd) return;
+    const preferredTab = fileViewerState.activeTab;
+    clearFileViewerObjectUrl();
+    resetFileViewerImageState(activePath);
+    fileViewerState = { ...fileViewerState, open: true, loading: true, error: '', activePath, objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: activePath });
+      const response = await fetch(`/api/file-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== activePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, preferredTab);
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+      loadFileTree(cwd);
+      showToast('文件已刷新');
+    } catch (err) {
+      if (fileViewerState.activePath !== activePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '刷新文件失败';
+      renderFileViewer();
+    }
+  }
+
+  async function openFileViewer(file) {
+    const cwd = getFileTreeCwd();
+    if (!file?.path || !cwd) return;
+    if (sideChatState.open) closeSideChat();
+    clearFileViewerObjectUrl();
+    resetFileViewerImageState(file.path);
+    fileViewerState = { open: true, loading: true, error: '', data: null, activePath: file.path, activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    syncFileViewerWidthForViewport();
+    renderFileTree();
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ cwd, path: file.path });
+      const response = await fetch(`/api/file-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== file.path) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, 'preview');
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+    } catch (err) {
+      if (fileViewerState.activePath !== file.path) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '无法打开文件';
+      fileViewerState.data = null;
+      renderFileViewer();
+    }
+  }
+
+  function handleDroppedFileRef(dataTransfer) {
+    const raw = dataTransfer?.getData(FILE_REF_TRANSFER_TYPE);
+    if (!raw) return false;
+    try {
+      addPendingFileRef(JSON.parse(raw));
+      return true;
+    } catch {
+      appendError('文件引用数据无效。');
+      return true;
+    }
+  }
+
+  function isComposeDropData(dataTransfer) {
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes('Files') || types.includes(FILE_REF_TRANSFER_TYPE);
+  }
+
+  function setComposeDropActive(active) {
+    inputWrapper?.classList.toggle('drag-active', Boolean(active));
+    messagesWrap?.classList.toggle('drag-active', Boolean(active));
+  }
+
+  function bindComposeDropTarget(target) {
+    if (!target || target.dataset.composeDropBound === '1') return;
+    target.dataset.composeDropBound = '1';
+    target.addEventListener('dragover', (e) => {
+      if (!isComposeDropData(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      setComposeDropActive(true);
+    });
+    target.addEventListener('dragleave', (e) => {
+      const related = e.relatedTarget;
+      if (related instanceof Node && target.contains(related)) return;
+      setComposeDropActive(false);
+    });
+    target.addEventListener('drop', (e) => {
+      if (!isComposeDropData(e.dataTransfer)) return;
+      e.preventDefault();
+      setComposeDropActive(false);
+      if (handleDroppedFileRef(e.dataTransfer)) return;
+      handleSelectedAttachmentFiles(e.dataTransfer?.files);
+    });
+  }
+
+  async function uploadAttachmentFile(file, { kind = 'image' } = {}) {
     await ensureAuthenticatedWs();
     const headers = {
       'Authorization': `Bearer ${connectionState.authToken}`,
       'Content-Type': file.type || 'application/octet-stream',
-      'X-Filename': encodeURIComponent(file.name || 'image'),
+      'X-Filename': encodeURIComponent(file.name || (kind === 'image' ? 'image' : (kind === 'document' ? 'document' : 'file'))),
     };
     const response = await fetch('/api/attachments', {
       method: 'POST',
@@ -1961,10 +4528,10 @@
       data = null;
     }
     if (response.status === 401) {
-      throw new Error('登录状态已失效，请刷新页面后重新登录再上传图片。');
+      throw new Error('登录状态已失效，请刷新页面后重新登录再上传附件。');
     }
     if (response.status === 413) {
-      throw new Error('图片大小超过当前上传限制，请压缩到 10MB 以内后重试。');
+      throw new Error('文件大小超过当前上传限制，请控制到 1GB 以内后重试。');
     }
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || `上传失败 (${response.status})`);
@@ -1972,94 +4539,80 @@
     return data.attachment;
   }
 
-  function describeImageUploadError(file, error) {
-    const name = file?.name ? `「${file.name}」` : '图片';
-    const raw = String(error?.message || error || '').trim();
-    if (!file) return raw || '图片上传失败';
-    if (!file.type || !ALLOWED_IMAGE_TYPES.has(String(file.type).toLowerCase())) {
-      return `${name} 格式不支持，请使用 PNG / JPG / WEBP / GIF。`;
-    }
-    if (Number(file.size) > MAX_IMAGE_UPLOAD_BYTES) {
-      return `${name} 过大（${formatFileSize(file.size)}），请压缩到 10MB 以内。`;
-    }
-    if (/登录|401|未认证|auth/i.test(raw)) {
-      return `${name} 上传失败：登录状态已失效，请重新登录。`;
-    }
-    if (/413|过大|too large|limit/i.test(raw)) {
-      return `${name} 超过服务器上传限制，请压缩后重试。`;
-    }
-    if (/network|failed to fetch|timeout|断网/i.test(raw)) {
-      return `${name} 上传失败：网络异常，请检查连接后重试。`;
-    }
-    return raw ? `${name} 上传失败：${raw}` : `${name} 上传失败，请重试。`;
+  function fileUploadLooksLikeImage(file = {}) {
+    const type = String(file.type || '').toLowerCase();
+    if (/^image\//.test(type)) return true;
+    const name = String(file.name || '').toLowerCase();
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : '';
+    return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
   }
 
-  async function handleSelectedImageFiles(fileList) {
-    const rawFiles = Array.from(fileList || []).filter(Boolean);
-    if (!rawFiles.length) return;
+  function attachmentUploadKindForFile(file = {}) {
+    if (fileUploadLooksLikeImage(file)) return 'image';
+    if (documentUploadLooksSupported(file)) return 'document';
+    return 'file';
+  }
 
-    const rejected = [];
-    const files = [];
-    for (const file of rawFiles) {
-      const mime = String(file.type || '').toLowerCase();
-      if (!ALLOWED_IMAGE_TYPES.has(mime)) {
-        rejected.push(describeImageUploadError(file, new Error('unsupported type')));
-        continue;
-      }
-      if (Number(file.size) > MAX_IMAGE_UPLOAD_BYTES) {
-        rejected.push(describeImageUploadError(file, new Error('too large')));
-        continue;
-      }
-      files.push(file);
-    }
-    if (rejected.length > 0) {
-      appendError(rejected[0]);
-    }
-    if (!files.length) {
-      if (imageUploadInput) imageUploadInput.value = '';
-      return;
-    }
-
+  async function handleSelectedAttachmentFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
     const totalAttachments = composeState.pendingAttachments.length + composeState.uploadingAttachments.length + files.length;
-    if (totalAttachments > 4) {
-      appendError('单条消息最多附带 4 张图片。请先移除部分图片后再添加。');
-      if (imageUploadInput) imageUploadInput.value = '';
+    if (totalAttachments > MAX_PENDING_ATTACHMENTS) {
+      appendError(`单条消息最多附带 ${MAX_PENDING_ATTACHMENTS} 个附件。`);
       return;
     }
-    const batch = files.map((file, index) => ({
-      id: nextLocalId(`upload-${index}`),
-      filename: file.name || 'image',
-      size: file.size || 0,
-    }));
+    const batch = files.map((file, index) => {
+      const kind = attachmentUploadKindForFile(file);
+      const previewUrl = kind === 'image' ? URL.createObjectURL(file) : '';
+      return {
+        id: nextLocalId(`upload-${index}`),
+        kind,
+        filename: file.name || attachmentDefaultName({ kind }),
+        size: file.size || 0,
+        mime: file.type || 'application/octet-stream',
+        previewUrl,
+      };
+    });
     composeState.uploadingAttachments.push(...batch);
     renderPendingAttachments();
     try {
-      const results = await Promise.allSettled(files.map(async (file) => {
-        const optimized = await compressImageFile(file);
-        return uploadImageFile(optimized);
+      const results = await Promise.allSettled(files.map(async (file, index) => {
+        const kind = attachmentUploadKindForFile(file);
+        let uploadFile = file;
+        if (kind === 'image') {
+          try { uploadFile = await compressImageFile(file); } catch {}
+        }
+        const attachment = await uploadAttachmentFile(uploadFile, { kind });
+        const previewUrl = batch[index]?.previewUrl || '';
+        if (attachment.kind === 'image' && previewUrl) {
+          return { ...attachment, previewUrl };
+        }
+        if (previewUrl) {
+          try { URL.revokeObjectURL(previewUrl); } catch {}
+        }
+        return attachment;
       }));
       const errors = [];
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
           composeState.pendingAttachments.push(result.value);
+          if (result.value?.kind === 'image' && result.value.previewUrl) {
+            rememberAttachmentPreviewUrl(result.value.id, result.value.previewUrl);
+          }
         } else {
-          errors.push(describeImageUploadError(files[index], result.reason));
+          errors.push(result.reason?.message || '文件上传失败');
         }
       });
-      if (errors.length > 0) {
-        appendError(errors[0]);
-        if (errors.length > 1) {
-          showToast(`另有 ${errors.length - 1} 张图片上传失败`);
-        }
-      }
+      if (errors.length > 0) appendError(errors[0]);
     } catch (err) {
-      appendError(describeImageUploadError(null, err));
+      appendError(err.message || '文件上传失败');
     } finally {
       composeState.uploadingAttachments = composeState.uploadingAttachments.filter((item) => !batch.some((entry) => entry.id === item.id));
       renderPendingAttachments();
-      if (imageUploadInput) imageUploadInput.value = '';
+      if (fileUploadInput) fileUploadInput.value = '';
     }
   }
+
 
   function getVisibleSessions() {
     const query = String(sessionSearchQuery || '').trim().toLowerCase();
@@ -2445,6 +4998,7 @@
       id: item.id || nextQueueId(),
       text: item.text || '',
       attachments: Array.isArray(item.attachments) ? item.attachments.map((a) => ({ ...a })) : [],
+      fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
       sessionId: normalizeQueueSessionId(item.sessionId ?? sessionState.currentSessionId),
       mode: item.mode || sessionState.currentMode,
       agent: item.agent || sessionState.currentAgent,
@@ -2683,6 +5237,9 @@
     if (!isCommand && Array.isArray(item.attachments) && item.attachments.length > 0) {
       payload.attachments = item.attachments;
     }
+    if (!isCommand && Array.isArray(item.fileRefs) && item.fileRefs.length > 0) {
+      payload.fileRefs = item.fileRefs;
+    }
     if (!send(payload, { silent: options.silent === true })) {
       return false;
     }
@@ -2803,64 +5360,61 @@
     const headerMeta = document.getElementById('chat-session-meta');
     let short = '';
     if (sessionState.currentCwd) {
-      const parts = sessionState.currentCwd.replace(/\/+$/, '').split('/');
-      short = '~/' + (parts.slice(-2).join('/') || sessionState.currentCwd);
-    }
-    const hideForOverlay = sessionState.currentSessionRunning && shouldOverlayRuntimeBadge();
-    const showCwd = !!(sessionState.currentCwd && !hideForOverlay);
-    if (headerCwd) {
-      headerCwd.textContent = showCwd ? short : '';
-      headerCwd.title = sessionState.currentCwd || '';
-    }
-    if (headerMeta) {
-      headerMeta.hidden = !showCwd;
+      const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/);
+      const short = parts.slice(-2).join('/') || sessionState.currentCwd;
+      chatCwd.textContent = '~/' + short;
+      chatCwd.title = sessionState.currentCwd;
+    } else {
+      chatCwd.textContent = '';
+      chatCwd.title = '';
     }
   }
 
-  function setCurrentSessionRunningState(isRunning, options = {}) {
-    const running = !!isRunning;
+  function markAwaitingRuntimeStart() {
+    awaitingRuntimeStart = true;
+    awaitingRuntimeStartAt = Date.now();
+  }
+
+  function clearAwaitingRuntimeStart() {
+    awaitingRuntimeStart = false;
+    awaitingRuntimeStartAt = 0;
+  }
+
+  function shouldHoldOptimisticRunningState(nextRunning) {
+    if (nextRunning) return false;
+    if (!awaitingRuntimeStart || !composeState.isGenerating) return false;
+    return Date.now() - awaitingRuntimeStartAt < 5000;
+  }
+
+  function setCurrentSessionRunningState(isRunning, label = '运行中') {
+    let running = !!isRunning;
+    if (shouldHoldOptimisticRunningState(running)) {
+      running = true;
+    } else if (running) {
+      clearAwaitingRuntimeStart();
+    }
+    const wasRunning = !!sessionState.currentSessionRunning;
+    if (running && queuedMessagesRestoredAt) queuedMessagesRestoredSawRunning = true;
     sessionState.currentSessionRunning = running;
     if (chatRuntimeState) {
-      const phase = options.phase || (running ? 'running' : '');
-      if (phase === 'interrupted') {
-        chatRuntimeState.hidden = false;
-        chatRuntimeState.textContent = '已中断';
-        chatRuntimeState.classList.add('is-interrupted');
-        chatRuntimeState.classList.remove('is-aborting');
-        // Brief flash then hide
-        setTimeout(() => {
-          if (!sessionState.currentSessionRunning && chatRuntimeState.textContent === '已中断') {
-            chatRuntimeState.hidden = true;
-            chatRuntimeState.classList.remove('is-interrupted');
-          }
-        }, 2200);
-      } else if (phase === 'aborting') {
-        chatRuntimeState.hidden = false;
-        chatRuntimeState.textContent = '正在停止';
-        chatRuntimeState.classList.add('is-aborting');
-        chatRuntimeState.classList.remove('is-interrupted', 'is-waiting');
-      } else if (phase === 'waiting') {
-        chatRuntimeState.hidden = false;
-        chatRuntimeState.textContent = '等待交互';
-        chatRuntimeState.classList.add('is-waiting');
-        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted');
-      } else if (running) {
-        chatRuntimeState.hidden = false;
-        chatRuntimeState.textContent = '运行中';
-        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted', 'is-waiting');
-      } else {
-        chatRuntimeState.hidden = true;
-        chatRuntimeState.textContent = '';
-        chatRuntimeState.classList.remove('is-aborting', 'is-interrupted', 'is-waiting');
-      }
+      chatRuntimeState.hidden = !running;
+      chatRuntimeState.textContent = running ? label : '';
     }
+    updateComposerActionButtons();
     updateCwdBadge();
     renderWorkspaceInsights();
+    if (wasRunning && !running) {
+      scheduleQueuedMessageFollowupAfterIdle();
+    }
   }
 
   function updateAgentScopedUI() {
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = sessionState.currentSessionId ? (AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent) : '未开始';
+    if (sessionState.currentAgent !== 'codex' && selectedAgent !== 'codex') {
+      if (sessionState.currentReasoningEffort) sessionState.currentReasoningEffort = '';
+      if (sessionState.currentFastMode) sessionState.currentFastMode = false;
+    }
     // Sync agent tabs
     document.querySelectorAll('.agent-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.agent === selectedAgent);
@@ -2871,17 +5425,21 @@
       const tip = getModeTooltip(btn.dataset.mode);
       if (tip) btn.title = tip;
     });
-    if (mobileModeSelect) {
-      Array.from(mobileModeSelect.options || []).forEach((opt) => {
-        const tip = getModeTooltip(opt.value);
-        if (tip) opt.title = tip;
-      });
+    // Sync topbar selects
+    const mas = document.getElementById('mobile-agent-select');
+    const mms = document.getElementById('mobile-mode-select');
+    const mrs = document.getElementById('mobile-reasoning-select');
+    const drs = document.getElementById('desktop-reasoning-select');
+    if (mas) mas.value = selectedAgent;
+    if (mms) mms.value = sessionState.currentMode;
+    if (mrs) {
+      mrs.value = sessionState.currentReasoningEffort;
+      mrs.hidden = selectedAgent !== 'codex';
     }
-    // Sync mobile selects
-    if (mobileAgentSelect) mobileAgentSelect.value = selectedAgent;
-    if (mobileModeSelect) mobileModeSelect.value = sessionState.currentMode;
-    syncMobilePickerState(mobileAgentPicker, selectedAgent, AGENT_LABELS, '切换 Agent');
-    syncMobilePickerState(mobileModePicker, sessionState.currentMode, MODE_LABELS, '切换权限模式');
+    if (drs) {
+      drs.value = sessionState.currentReasoningEffort;
+      drs.hidden = selectedAgent !== 'codex';
+    }
     if (importSessionBtn) {
       if (selectedAgent === 'codex') importSessionBtn.textContent = '导入本地 Codex 会话';
       else if (selectedAgent === 'pi') importSessionBtn.textContent = '导入本地 Pi 会话';
@@ -2892,53 +5450,82 @@
     }
   }
 
-  function getModeTooltip(mode) {
-    const agent = sessionState.currentSessionId ? sessionState.currentAgent : selectedAgent;
-    if (mode === 'yolo') {
-      if (agent === 'codex') return 'YOLO：Codex 跳过审批与沙箱限制';
-      if (agent === 'pi') return 'YOLO：Pi 信任项目本地扩展和技能（--approve），工具不受限';
-      return 'YOLO：Claude 跳过权限检查（bypassPermissions）';
-    }
-    if (mode === 'plan') {
-      if (agent === 'codex') return 'Plan：Codex 原生 Plan 协作模式 + 只读沙箱';
-      if (agent === 'pi') return 'Plan：Pi 仅启用 read、grep、find、ls 只读工具';
-      return 'Plan：Claude 原生 plan 权限模式';
-    }
-    if (agent === 'codex') {
-      return currentRuntimeCapabilities?.interactiveApproval === false
-        ? '默认：Codex exec 自动策略（兼容模式不支持网页审批）'
-        : '默认：Codex workspace-write；需要确认时在网页显示审批';
-    }
-    if (agent === 'pi') return '默认：Pi 使用完整工具，但忽略项目本地扩展和技能的自动信任（--no-approve）';
-    return currentRuntimeCapabilities?.interactiveApproval === false
-      ? '默认：Claude 使用兼容单轮模式，无法在网页回应权限请求'
-      : '默认：Claude 使用原生权限流程；审批和用户问题会在网页中显示';
+  function normalizeMode(value) {
+    return Object.prototype.hasOwnProperty.call(MODE_LABELS, value) ? value : '';
   }
 
-  function getModePickerOptions() {
-    return ['yolo', 'default', 'plan'].map((value) => ({
-      value,
-      label: MODE_LABELS[value],
-      desc: getModeTooltip(value),
-    }));
+  function getDefaultModeForAgent(agent) {
+    const normalized = normalizeAgent(agent);
+    return DEFAULT_AGENT_MODES[normalized] || 'default';
   }
 
   function getSavedModeForAgent(agent) {
-    return localStorage.getItem(getAgentModeStorageKey(agent)) || 'yolo';
+    const normalized = normalizeAgent(agent);
+    const saved = normalizeMode(localStorage.getItem(getAgentModeStorageKey(normalized)));
+    return saved || getDefaultModeForAgent(normalized);
   }
 
-  function setMobilePickerOpen(picker, open, options = {}) {
-    if (!picker) return;
-    const trigger = picker.querySelector('.mobile-picker-trigger');
-    const menu = picker.querySelector('.mobile-picker-menu');
-    if (!trigger || !menu) return;
-    picker.classList.toggle('is-open', open);
-    trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
-    menu.hidden = !open;
-    if (open && options.focusSelected) {
-      const selected = menu.querySelector('.mobile-picker-option[aria-selected="true"]')
-        || menu.querySelector('.mobile-picker-option');
-      selected?.focus({ preventScroll: true });
+  function saveModeForAgent(agent, mode) {
+    const normalized = normalizeAgent(agent);
+    const resolvedMode = normalizeMode(mode) || getDefaultModeForAgent(normalized);
+    localStorage.setItem(getAgentModeStorageKey(normalized), resolvedMode);
+    return resolvedMode;
+  }
+
+  function buildPermissionModeOptionsHtml(selectedMode) {
+    const selected = normalizeMode(selectedMode) || 'default';
+    return Object.entries(MODE_LABELS).map(([value, label]) => (
+      `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`
+    )).join('');
+  }
+
+  function applyNewSessionAgentPreference(agent, mode = getSavedModeForAgent(agent), options = {}) {
+    const targetAgent = normalizeAgent(agent);
+    const targetMode = saveModeForAgent(targetAgent, mode);
+    setSelectedAgent(targetAgent, { syncMode: options.syncMode === true });
+    return { agent: targetAgent, mode: targetMode };
+  }
+
+  function normalizeProjectSessionPayload(project, isVirtualCwd, agent, mode) {
+    const targetAgent = normalizeAgent(agent);
+    const targetMode = saveModeForAgent(targetAgent, mode);
+    const reasoningEffort = getSavedReasoningEffortForAgent(targetAgent);
+    const fastMode = getSavedFastModeForAgent(targetAgent);
+    return isVirtualCwd
+      ? { type: 'new_session', cwd: project.path, agent: targetAgent, mode: targetMode, reasoningEffort, fastMode }
+      : { type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort, fastMode };
+  }
+
+  function normalizeCodexReasoningEffort(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(CODEX_REASONING_EFFORT_LABELS, raw) ? raw : '';
+  }
+
+  function getReasoningEffortLabel(value) {
+    const normalized = normalizeCodexReasoningEffort(value);
+    return CODEX_REASONING_EFFORT_LABELS[normalized] || CODEX_REASONING_EFFORT_LABELS[''];
+  }
+
+  function getSavedReasoningEffortForAgent(agent) {
+    return normalizeAgent(agent) === 'codex'
+      ? normalizeCodexReasoningEffort(localStorage.getItem(getAgentReasoningEffortStorageKey(agent)))
+      : '';
+  }
+
+  function getSavedFastModeForAgent(agent) {
+    return normalizeAgent(agent) === 'codex'
+      ? normalizeCodexFastMode(localStorage.getItem(getAgentFastModeStorageKey(agent)))
+      : false;
+  }
+
+  function setSelectedAgent(agent, options = {}) {
+    selectedAgent = normalizeAgent(agent);
+    localStorage.setItem('webcoding-agent', selectedAgent);
+    if (options.syncMode) {
+      sessionState.currentMode = getSavedModeForAgent(selectedAgent);
+      sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(selectedAgent);
+      sessionState.currentFastMode = getSavedFastModeForAgent(selectedAgent);
+      modeSelect.value = sessionState.currentMode;
     }
     if (!open && options.restoreFocus) trigger.focus({ preventScroll: true });
   }
@@ -3102,92 +5689,106 @@
     composeState.pendingText = '';
     composeState.pendingAttachments = [];
     composeState.uploadingAttachments = [];
+    composeState.pendingFileRefs = [];
+    clearEditingMessageState({ clearInput: true });
+    contextRuntimeUsage = { currentUsage: null, totalUsage: null, contextWindowTokens: null };
+    renderContextUsageIndicator();
+    clearFileTree();
     composeState.activeToolCalls.clear();
     piNativeQueueCounts = { steering: 0, followUp: 0 };
     _previewCodeMap.clear();
     _previewCodeId = 0;
-    abortBtn.disabled = false;
-    abortBtn.classList.remove('is-aborting');
-    abortBtn.title = '停止生成';
-    if (scrollToBottomBtn) scrollToBottomBtn.hidden = true;
+    updateComposerActionButtons();
     sessionState.currentMode = getSavedModeForAgent(baseAgent);
+    sessionState.currentReasoningEffort = getSavedReasoningEffortForAgent(baseAgent);
+    sessionState.currentFastMode = getSavedFastModeForAgent(baseAgent);
     modeSelect.value = sessionState.currentMode;
     updateAgentScopedUI();
     syncComposerRuntimeControls();
     chatTitle.textContent = '新会话';
     document.title = 'Webcoding';
     updateCwdBadge();
+    renderChatTabs();
     messagesDiv.innerHTML = buildWelcomeMarkup(baseAgent);
     setStatsDisplay(null);
     renderPendingAttachments();
-    restoreQueuedBubblesForCurrentView();
+    renderQueuedMessages();
     highlightActiveSession();
     renderWorkspaceInsights();
+    if (sideChatState.open) closeSideChat();
+    syncSideChatRestoreButton();
   }
 
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
-    if (sessionState.currentSessionId && snapshot.sessionId !== sessionState.currentSessionId) {
-      piNativeQueueCounts = { steering: 0, followUp: 0 };
-    }
-    if (!snapshot.isRunning) {
-      for (const [id, item] of Array.from(piNativeQueue.entries())) {
-        if (queueItemMatchesSession(item, snapshot.sessionId)) piNativeQueue.delete(id);
-      }
-      if (snapshot.sessionId === sessionState.currentSessionId || !sessionState.currentSessionId) {
-        piNativeQueueCounts = { steering: 0, followUp: 0 };
-      }
-    }
-    // New chat bind: attach null-session queued items to the created session id.
-    if (!sessionState.currentSessionId && snapshot.sessionId) {
-      rebindNullQueueItemsToSession(snapshot.sessionId);
-    }
-    // Preserve live streaming for this session until `done` finishes the turn.
-    // Do NOT require snapshot.isRunning — a late session_info with isRunning=false
-    // used to wipe pending text and leave a blank assistant bubble.
-    const isNewSessionBind = !sessionState.currentSessionId && !!snapshot.sessionId && composeState.isGenerating;
-    const sameSession = !sessionState.currentSessionId
-      || snapshot.sessionId === sessionState.currentSessionId
-      || isNewSessionBind;
     const preserveStreaming = !!(
-      composeState.isGenerating
-      && sameSession
-      && options.preserveStreaming !== false
+      (options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId) ||
+      (composeState.isGenerating && !sessionState.currentSessionId && snapshot.sessionId && !options.immediate)
     );
     if (composeState.isGenerating && !preserveStreaming) {
       // Flush any buffered tokens before tearing down the stream.
       drainThinkingBuffer();
       if (composeState.pendingText) flushRender();
       composeState.isGenerating = false;
-      composeState.isAborting = false;
-      syncComposerRuntimeControls();
-      abortBtn.disabled = false;
-      abortBtn.classList.remove('is-aborting');
-      abortBtn.title = '停止生成';
+      updateComposerActionButtons();
       composeState.pendingText = '';
       composeState.activeToolCalls.clear();
       const streamEl = document.getElementById('streaming-msg');
       if (streamEl) streamEl.removeAttribute('id');
     }
+    const previousSessionId = sessionState.currentSessionId;
+    if (editingMessageState && previousSessionId && previousSessionId !== snapshot.sessionId) {
+      clearEditingMessageState();
+    }
     sessionState.currentSessionId = snapshot.sessionId;
+    if (
+      previousSessionId &&
+      previousSessionId !== snapshot.sessionId &&
+      sideChatState.open &&
+      sideChatState.parentSessionId &&
+      sideChatState.parentSessionId !== snapshot.sessionId
+    ) {
+      closeSideChat();
+    }
+    syncSideChatRestoreButton();
+    if ((!previousSessionId || composeState.isGenerating) && snapshot.sessionId) {
+      bindUnassignedQueuedMessagesToSession(snapshot.sessionId);
+    }
     sessionState.loadedHistorySessionId = snapshot.sessionId;
     setLastSessionForAgent(snapshot.agent, sessionState.currentSessionId);
     chatTitle.textContent = snapshot.title || '新会话';
-    document.title = `${snapshot.title || '新会话'} · Webcoding`;
+    ensureOpenChatTab(snapshot.sessionId, { render: false });
+    const wasUnread = !!snapshot.hasUnread;
+    markSessionReadLocally(snapshot.sessionId, snapshot);
+    snapshot.hasUnread = false;
     setCurrentAgent(snapshot.agent);
     requestSlashCommands(snapshot.agent);
-    setCurrentSessionRunningState(snapshot.isRunning);
+    const snapshotRunning = !!snapshot.isRunning;
+    const effectiveSnapshotRunning = preserveStreaming && composeState.isGenerating
+      ? (snapshotRunning || sessionState.currentSessionRunning || composeState.isGenerating)
+      : snapshotRunning;
+    setCurrentSessionRunningState(effectiveSnapshotRunning, '运行中');
     setStatsDisplay(snapshot);
     const nextGitCwd = snapshot.cwd || null;
     const gitCwdChanged = gitState.cwd !== nextGitCwd;
     sessionState.currentCwd = nextGitCwd;
-    if (gitCwdChanged) resetGitState(nextGitCwd ? { cwd: nextGitCwd } : {});
+    selectProjectForSessionLike(snapshot, { render: false, loadFiles: false });
+    if (gitCwdChanged) {
+      resetGitState(nextGitCwd ? { cwd: nextGitCwd } : {});
+      if (nextGitCwd) loadFileTree(nextGitCwd);
+      else clearFileTree();
+    }
     updateCwdBadge();
+    updateContextUsageFromSnapshot(snapshot);
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       sessionState.currentMode = snapshot.mode;
       modeSelect.value = sessionState.currentMode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     }
+    sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(snapshot.reasoningEffort);
+    sessionState.currentFastMode = normalizeCodexFastMode(snapshot.fastMode);
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(sessionState.currentFastMode));
     updateAgentScopedUI();
     sessionState.currentModel = snapshot.model || '';
     sessionState.currentActiveRuntime = snapshot.activeRuntime ? deepClone(snapshot.activeRuntime) : null;
@@ -3199,10 +5800,13 @@
     highlightActiveSession();
     renderSessionList();
     if (!options.skipCloseSidebar) closeSidebar();
-    if (snapshot.hasUnread && !options.suppressUnreadToast) {
+    if (wasUnread && !options.suppressUnreadToast) {
       showToast('后台任务已完成', snapshot.sessionId);
     }
     renderWorkspaceInsights();
+    composeState.queuedMessages = snapshot.queuedMessages || [];
+    renderContextUsageIndicator();
+    renderQueuedMessages();
     if (nextGitCwd && (gitCwdChanged || !gitState.status)) {
       requestGitStatus({ silent: true });
     }
@@ -3235,6 +5839,7 @@
   function clearSessionLoading(sessionId) {
     if (sessionId && sessionState.activeSessionLoad && sessionState.activeSessionLoad.sessionId !== sessionId) return;
     setSessionLoading(null, { blocking: false });
+    scheduleQueuedMessageFollowupAfterIdle();
   }
 
   function isBlockingSessionLoad(sessionId) {
@@ -3287,6 +5892,7 @@
 
   function openSession(sessionId, options = {}) {
     if (!sessionId) return;
+    ensureOpenChatTab(sessionId);
     if (options.forceSync) {
       beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
       return;
@@ -3310,9 +5916,7 @@
     if ((sessionState.currentAgent === 'codex' || sessionState.currentAgent === 'pi') && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
-        const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
-        costDisplay.textContent = `in ${usage.inputTokens} · out ${usage.outputTokens}${cacheText}`;
-        costDisplay.hidden = false;
+        costDisplay.textContent = formatUsageStatsText(usage);
         return;
       }
     }
@@ -3325,11 +5929,38 @@
     costDisplay.hidden = true;
   }
 
+  function sendCoreMessage(text) {
+    markAwaitingRuntimeStart();
+    return send({
+      type: 'message',
+      text,
+      sessionId: sessionState.currentSessionId,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+      agent: sessionState.currentAgent,
+    });
+  }
+
+  function sendUserMessage(payload = {}) {
+    markAwaitingRuntimeStart();
+    return send({
+      type: 'message',
+      sessionId: sessionState.currentSessionId,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+      agent: sessionState.currentAgent,
+      ...payload,
+    });
+  }
+
   // --- marked config ---
   const PREVIEW_LANGS = new Set(['html', 'svg']);
   const RENDER_LANGS = new Set(['md', 'markdown', 'json', 'csv']);
   const _previewCodeMap = new Map();
   let _previewCodeId = 0;
+  let markdownRenderMode = 'final';
   const PREVIEW_SRCDOC_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:; media-src data:; script-src 'none';">`;
 
   function sanitizePreviewMarkup(markup) {
@@ -3386,25 +6017,36 @@
     return `<a href="${escapeHtml(safeHref)}"${safeTitle}${externalAttrs}>${text || ''}</a>`;
   };
   renderer.image = function (href, title, text) {
-    const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: false, allowDataImage: true });
+    const rawHref = String(href || '').trim();
+    const isAllowedLocalImageApi = rawHref.startsWith('/api/local-image?') || rawHref.startsWith('/api/generated-image/');
+    const safeHref = isAllowedLocalImageApi
+      ? rawHref
+      : normalizeSafeHref(href, { externalOnly: false, allowRelative: false, allowDataImage: true });
     if (!safeHref) return '';
     const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
-    return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text || '')}"${safeTitle}>`;
+    const alt = escapeHtml(text || '');
+    if (isAllowedLocalImageApi) {
+      return `<a href="${escapeHtml(safeHref)}" class="markdown-local-image-link" data-full-src="${escapeHtml(safeHref)}" title="点击查看大图"><img class="markdown-local-image" src="${escapeHtml(safeHref)}" alt="${alt}"${safeTitle}></a>`;
+    }
+    return `<img src="${escapeHtml(safeHref)}" alt="${alt}"${safeTitle}>`;
   };
   renderer.code = function (code, language) {
     const lang = (language || 'plaintext').toLowerCase();
+    const isStreamingRender = markdownRenderMode === 'streaming';
     let highlighted;
     try {
-      if (hljs.getLanguage(lang)) {
+      if (!isStreamingRender && window.hljs && hljs.getLanguage(lang)) {
         highlighted = hljs.highlight(code, { language: lang }).value;
       } else {
-        highlighted = hljs.highlightAuto(code).value;
+        // highlightAuto is very expensive on long/partial streaming code blocks.
+        // Unknown languages are kept as escaped text instead of guessing.
+        highlighted = escapeHtml(code);
       }
     } catch {
       highlighted = escapeHtml(code);
     }
-    const canPreview = PREVIEW_LANGS.has(lang);
-    const canRender = RENDER_LANGS.has(lang);
+    const canPreview = !isStreamingRender && PREVIEW_LANGS.has(lang);
+    const canRender = !isStreamingRender && RENDER_LANGS.has(lang);
     const hasAction = canPreview || canRender;
     const btnLabel = canRender ? '查看' : '预览';
     const renderType = canPreview ? 'html' : ((['md','markdown'].includes(lang)) ? 'md' : lang);
@@ -3596,20 +6238,786 @@
     };
   }
 
-  function send(data, options = {}) {
+  function send(data) {
     if (connectionState.ws && connectionState.ws.readyState === WebSocket.OPEN) {
       try {
         connectionState.ws.send(JSON.stringify(data));
         return true;
       } catch (error) {
-        console.warn('[WEBCODING-WS-SEND]', error);
-        if (options.silent !== true) showToast('发送失败，请重试');
-        return false;
+        console.warn('[WEBCODING]', 'websocket send failed', error);
       }
     }
-    if (options.silent !== true) showToast('连接已断开，正在重连…');
-    scheduleReconnect();
+    // Warn user if trying to send while disconnected
+    showToast('连接已断开，正在重连…');
     return false;
+  }
+
+  // --- Side Conversation ---
+  function getSideChatDefaultMode(agent) {
+    const normalized = normalizeAgent(agent || sessionState.currentAgent);
+    if (sessionState.currentMode === 'plan') return 'plan';
+    return normalized === 'claude' || normalized === 'codex' ? 'default' : 'default';
+  }
+
+  function resetSideChatRuntimeState() {
+    sideChatState.pendingText = '';
+    sideChatState.isGenerating = false;
+    updateSideChatButtons();
+  }
+
+  function closeSideChatSocket() {
+    const socket = sideChatState.ws;
+    sideChatState.ws = null;
+    sideChatState.authed = false;
+    sideChatState.creating = false;
+    if (socket) {
+      try { socket.send(JSON.stringify({ type: 'detach_view' })); } catch {}
+      try { socket.close(); } catch {}
+    }
+  }
+
+  function sideSend(data) {
+    const socket = sideChatState.ws;
+    if (socket && socket.readyState === WebSocket.OPEN && sideChatState.authed) {
+      try {
+        socket.send(JSON.stringify(data));
+        return true;
+      } catch (error) {
+        console.warn('[WEBCODING]', 'side websocket send failed', error);
+      }
+    }
+    return false;
+  }
+
+  function updateSideChatButtons() {
+    if (sideChatSend) {
+      sideChatSend.hidden = !!sideChatState.isGenerating;
+      sideChatSend.disabled = !sideChatState.open || sideChatState.creating;
+    }
+    if (sideChatAbort) {
+      sideChatAbort.hidden = !sideChatState.isGenerating;
+      sideChatAbort.disabled = !sideChatState.sessionId;
+    }
+  }
+
+  function truncateSideContext(text, limit = SIDE_CHAT_SELECTION_LIMIT) {
+    const raw = String(text || '').trim().replace(/\s+$/g, '');
+    if (raw.length <= limit) return raw;
+    return `${raw.slice(0, limit)}\n…`;
+  }
+
+  function renderSideChatContext() {
+    if (!sideChatContext || !sideChatContextLabel) return;
+    const text = truncateSideContext(sideChatState.contextSnippet, SIDE_CHAT_SELECTION_LIMIT);
+    sideChatContext.hidden = !text;
+    sideChatContext.textContent = text ? `已选内容：\n${text}` : '';
+    sideChatContextLabel.textContent = text ? '1 个已选文本片段' : '当前线程里的临时旁路讨论';
+  }
+
+  function renderSideChatMessages() {
+    if (!sideChatMessages) return;
+    sideChatMessages.innerHTML = '';
+    const list = Array.isArray(sideChatState.messages) ? sideChatState.messages : [];
+    if (list.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'side-chat-empty';
+      empty.textContent = sideChatState.contextSnippet
+        ? '可以针对左侧选中的片段临时提问，不会写入主线程。'
+        : '侧边聊天不会占用左侧主线程。';
+      sideChatMessages.appendChild(empty);
+      schedulePersistSideChatState();
+      return;
+    }
+    for (const item of list) {
+      const row = document.createElement('div');
+      row.className = `side-chat-msg ${item.role || 'assistant'}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'side-chat-bubble';
+      if (item.role === 'assistant') {
+        if (item.content) bubble.innerHTML = renderMarkdown(item.content);
+        else bubble.appendChild(createStreamingPlaceholder());
+      } else if (item.role === 'system') {
+        bubble.textContent = item.content || '';
+      } else {
+        bubble.textContent = item.content || '';
+      }
+      row.appendChild(bubble);
+      sideChatMessages.appendChild(row);
+    }
+    sideChatMessages.scrollTop = sideChatMessages.scrollHeight;
+    schedulePersistSideChatState();
+  }
+
+  function normalizeSideChatPersistedMessages(messages) {
+    return (Array.isArray(messages) ? messages : [])
+      .slice(-SIDE_CHAT_MAX_PERSISTED_MESSAGES)
+      .map((item) => ({
+        role: item?.role === 'user' || item?.role === 'assistant' || item?.role === 'system' ? item.role : 'assistant',
+        content: String(item?.content || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        streaming: !!item?.streaming,
+      }))
+      .filter((item) => item.content || item.streaming);
+  }
+
+  function buildPersistableSideChatState() {
+    const hasContent = !!(
+      sideChatState.sessionId ||
+      sideChatState.contextSnippet ||
+      sideChatState.parentSessionId ||
+      sideChatState.pendingSendText ||
+      (Array.isArray(sideChatState.messages) && sideChatState.messages.length > 0)
+    );
+    if (!hasContent) return null;
+    return {
+      version: 1,
+      savedAt: Date.now(),
+      open: !!sideChatState.open,
+      sessionId: sideChatState.sessionId || null,
+      parentSessionId: sideChatState.parentSessionId || null,
+      contextSnippet: String(sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext: sideChatState.parentContext || null,
+      pendingSendText: String(sideChatState.pendingSendText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+      messages: normalizeSideChatPersistedMessages(sideChatState.messages),
+      pendingText: String(sideChatState.pendingText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+      isGenerating: !!sideChatState.isGenerating,
+      agent: normalizeAgent(sideChatState.agent || sessionState.currentAgent),
+      mode: sideChatState.mode || getSideChatDefaultMode(sideChatState.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(sideChatState.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(sideChatState.fastMode),
+    };
+  }
+
+  function persistSideChatStateNow() {
+    if (sideChatPersistTimer) {
+      clearTimeout(sideChatPersistTimer);
+      sideChatPersistTimer = null;
+    }
+    try {
+      const snapshot = buildPersistableSideChatState();
+      if (!snapshot) {
+        localStorage.removeItem(SIDE_CHAT_STATE_STORAGE_KEY);
+      } else {
+        localStorage.setItem(SIDE_CHAT_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+      }
+    } catch (error) {
+      console.warn('[WEBCODING]', 'persist side chat failed', error);
+    }
+    syncSideChatRestoreButton();
+  }
+
+  function schedulePersistSideChatState() {
+    if (sideChatPersistTimer) return;
+    sideChatPersistTimer = setTimeout(persistSideChatStateNow, 180);
+  }
+
+  function loadPersistedSideChatState() {
+    try {
+      const raw = localStorage.getItem(SIDE_CHAT_STATE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return {
+        open: !!parsed.open,
+        sessionId: parsed.sessionId ? String(parsed.sessionId) : null,
+        parentSessionId: parsed.parentSessionId ? String(parsed.parentSessionId) : null,
+        contextSnippet: String(parsed.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+        parentContext: parsed.parentContext && typeof parsed.parentContext === 'object' ? parsed.parentContext : null,
+        pendingSendText: String(parsed.pendingSendText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        messages: normalizeSideChatPersistedMessages(parsed.messages),
+        pendingText: String(parsed.pendingText || '').slice(0, SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS),
+        isGenerating: !!parsed.isGenerating,
+        agent: normalizeAgent(parsed.agent || sessionState.currentAgent),
+        mode: parsed.mode || getSideChatDefaultMode(parsed.agent || sessionState.currentAgent),
+        reasoningEffort: normalizeCodexReasoningEffort(parsed.reasoningEffort || ''),
+        fastMode: normalizeCodexFastMode(parsed.fastMode),
+      };
+    } catch (error) {
+      console.warn('[WEBCODING]', 'load side chat snapshot failed', error);
+      return null;
+    }
+  }
+
+  function hasRestorableSideChat(snapshot = loadPersistedSideChatState()) {
+    return !!(
+      snapshot &&
+      (snapshot.sessionId || snapshot.contextSnippet || snapshot.parentSessionId || (Array.isArray(snapshot.messages) && snapshot.messages.length > 0))
+    );
+  }
+
+  function getRestorableSideChatForCurrentSession(snapshot = loadPersistedSideChatState()) {
+    if (!hasRestorableSideChat(snapshot)) return null;
+    const parentId = snapshot.parentSessionId ? String(snapshot.parentSessionId) : '';
+    const currentId = sessionState.currentSessionId ? String(sessionState.currentSessionId) : '';
+    if (parentId && currentId && parentId !== currentId) return null;
+    if (parentId && !currentId) return null;
+    return snapshot;
+  }
+
+  function syncSideChatRestoreButton() {
+    if (!sideChatRestoreBtn) return;
+    const restorable = !!getRestorableSideChatForCurrentSession();
+    sideChatRestoreBtn.hidden = false;
+    sideChatRestoreBtn.classList.toggle('active', !!sideChatState.open);
+    sideChatRestoreBtn.setAttribute('aria-pressed', sideChatState.open ? 'true' : 'false');
+    sideChatRestoreBtn.title = sideChatState.open
+      ? '收起侧边聊天'
+      : (restorable ? '打开上次侧边聊天' : '打开空侧边聊天');
+    sideChatRestoreBtn.setAttribute('aria-label', sideChatRestoreBtn.title);
+  }
+
+  function restoreSideChatFromSnapshot(snapshot = loadPersistedSideChatState(), options = {}) {
+    if (!hasRestorableSideChat(snapshot)) {
+      syncSideChatRestoreButton();
+      return false;
+    }
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    sideChatState = {
+      open: options.open !== false,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: snapshot.sessionId || null,
+      parentSessionId: snapshot.parentSessionId || sessionState.currentSessionId || null,
+      contextSnippet: snapshot.contextSnippet || '',
+      parentContext: snapshot.parentContext || null,
+      pendingSendText: snapshot.pendingSendText || '',
+      messages: normalizeSideChatPersistedMessages(snapshot.messages),
+      pendingText: snapshot.pendingText || '',
+      isGenerating: !!snapshot.isGenerating,
+      agent: normalizeAgent(snapshot.agent || sessionState.currentAgent),
+      mode: snapshot.mode || getSideChatDefaultMode(snapshot.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(snapshot.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(snapshot.fastMode),
+    };
+    setSideChatVisible(sideChatState.open);
+    renderSideChatContext();
+    renderSideChatMessages();
+    if (sideChatState.open) {
+      connectSideChatSocket();
+      requestAnimationFrame(() => sideChatInput?.focus());
+    }
+    persistSideChatStateNow();
+    return true;
+  }
+
+  function openBlankSideChat() {
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开一个主线程，再使用侧边聊天');
+      return false;
+    }
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    hideSideChatSelectionPopover();
+    sideChatState = {
+      open: true,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: null,
+      parentSessionId: sessionState.currentSessionId,
+      contextSnippet: '',
+      parentContext: null,
+      pendingSendText: '',
+      messages: [],
+      pendingText: '',
+      isGenerating: false,
+      agent: sessionState.currentAgent,
+      mode: getSideChatDefaultMode(sessionState.currentAgent),
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+    };
+    setSideChatVisible(true);
+    renderSideChatContext();
+    renderSideChatMessages();
+    if (sideChatInput) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
+    requestAnimationFrame(() => sideChatInput?.focus());
+    return true;
+  }
+
+  function toggleSideChatPanel() {
+    if (sideChatState.open) {
+      closeSideChat();
+      return;
+    }
+    const snapshot = getRestorableSideChatForCurrentSession(loadPersistedSideChatState());
+    if (snapshot && restoreSideChatFromSnapshot(snapshot, { open: true })) return;
+    openBlankSideChat();
+  }
+
+  function rememberSideConversationFromServer(payload) {
+    if (!payload || !payload.sessionId || sideChatState.open) return;
+    const snapshot = {
+      version: 1,
+      savedAt: Date.now(),
+      open: false,
+      sessionId: String(payload.sessionId),
+      parentSessionId: payload.parentSessionId ? String(payload.parentSessionId) : (sessionState.currentSessionId || null),
+      contextSnippet: String(payload.anchor?.text || payload.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext: payload.parentContext && typeof payload.parentContext === 'object' ? payload.parentContext : null,
+      pendingSendText: '',
+      messages: normalizeSideChatPersistedMessages(payload.messages),
+      pendingText: '',
+      isGenerating: !!payload.isRunning,
+      agent: normalizeAgent(payload.agent || sessionState.currentAgent),
+      mode: payload.mode || getSideChatDefaultMode(payload.agent || sessionState.currentAgent),
+      reasoningEffort: normalizeCodexReasoningEffort(payload.reasoningEffort || ''),
+      fastMode: normalizeCodexFastMode(payload.fastMode),
+    };
+    try {
+      localStorage.setItem(SIDE_CHAT_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch (error) {
+      console.warn('[WEBCODING]', 'remember side conversation failed', error);
+    }
+    syncSideChatRestoreButton();
+  }
+
+  function setSideChatVisible(open) {
+    sideChatState.open = !!open;
+    if (sideChatPanel) sideChatPanel.classList.toggle('visible', sideChatState.open);
+    syncSideChatWidthForViewport();
+    updateSideChatButtons();
+    schedulePersistSideChatState();
+    syncSideChatRestoreButton();
+  }
+
+  function closeSideChat() {
+    setSideChatVisible(false);
+    closeSideChatSocket();
+    hideSideChatSelectionPopover();
+    sideChatState.pendingSendText = '';
+    sideChatState.creating = false;
+    sideChatState.authed = false;
+    updateSideChatButtons();
+    persistSideChatStateNow();
+  }
+
+  function pruneEmptySideChatStreamingPlaceholders() {
+    sideChatState.messages = sideChatState.messages.filter((item) => {
+      if (!item || item.role !== 'assistant' || !item.streaming) return true;
+      return !!String(item.content || '').trim();
+    });
+  }
+
+  function ensureSideChatAssistantMessage() {
+    pruneEmptySideChatStreamingPlaceholders();
+    const list = sideChatState.messages;
+    const last = list[list.length - 1];
+    if (last && last.role === 'assistant' && last.streaming) return last;
+    const item = { role: 'assistant', content: '', streaming: true };
+    list.push(item);
+    return item;
+  }
+
+  function startSideChatGenerating() {
+    sideChatState.isGenerating = true;
+    sideChatState.pendingText = '';
+    ensureSideChatAssistantMessage();
+    updateSideChatButtons();
+    renderSideChatMessages();
+  }
+
+  function finishSideChatGenerating() {
+    sideChatState.isGenerating = false;
+    sideChatState.pendingText = '';
+    for (const item of sideChatState.messages) {
+      if (item && item.role === 'assistant' && item.streaming) item.streaming = false;
+    }
+    pruneEmptySideChatStreamingPlaceholders();
+    updateSideChatButtons();
+    renderSideChatMessages();
+  }
+
+  function appendSideSystemMessage(text) {
+    pruneEmptySideChatStreamingPlaceholders();
+    sideChatState.messages.push({ role: 'system', content: String(text || '') });
+    renderSideChatMessages();
+  }
+
+  function createSideChatSession() {
+    if (!sideChatState.authed || sideChatState.creating || sideChatState.sessionId) return;
+    sideChatState.creating = true;
+    updateSideChatButtons();
+    const agent = normalizeAgent(sideChatState.agent || sessionState.currentAgent);
+    const mode = sideChatState.mode || getSideChatDefaultMode(agent);
+    const currentMeta = getSessionMeta(sessionState.currentSessionId);
+    const payload = {
+      type: 'new_session',
+      kind: 'side_conversation',
+      sidecar: true,
+      title: '侧边聊天',
+      parentSessionId: sideChatState.parentSessionId || sessionState.currentSessionId || '',
+      agent,
+      mode,
+      reasoningEffort: agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort || sessionState.currentReasoningEffort) : '',
+      fastMode: agent === 'codex' ? normalizeCodexFastMode(sideChatState.fastMode) : false,
+      parentContext: sideChatState.parentContext || null,
+      anchor: {
+        type: 'selection',
+        text: String(sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+        messageId: sideChatState.parentContext?.anchor?.messageId || '',
+        role: sideChatState.parentContext?.anchor?.role || '',
+        messageText: sideChatState.parentContext?.anchor?.messageText || '',
+        nearbyBefore: sideChatState.parentContext?.nearbyBefore || [],
+        nearbyAfter: sideChatState.parentContext?.nearbyAfter || [],
+        createdAt: new Date().toISOString(),
+      },
+    };
+    const projectId = currentMeta?.projectId || selectedProject?.id || null;
+    const cwd = sessionState.currentCwd || currentMeta?.cwd || selectedProject?.path || null;
+    if (projectId) payload.projectId = projectId;
+    else if (cwd) payload.cwd = cwd;
+    sideSend(payload);
+  }
+
+  function connectSideChatSocket() {
+    const socket = sideChatState.ws;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+    const next = new WebSocket(WS_URL);
+    sideChatState.ws = next;
+    sideChatState.authed = false;
+    next.onopen = () => {
+      if (connectionState.authToken) {
+        try { next.send(JSON.stringify({ type: 'auth', token: connectionState.authToken })); } catch {}
+      } else {
+        appendSideSystemMessage('侧边聊天需要先完成登录。');
+      }
+    };
+    next.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      handleSideChatServerMessage(msg);
+    };
+    next.onclose = () => {
+      if (sideChatState.ws === next) {
+        sideChatState.ws = null;
+        sideChatState.authed = false;
+        sideChatState.creating = false;
+        updateSideChatButtons();
+      }
+    };
+    next.onerror = () => {
+      appendSideSystemMessage('侧边聊天连接异常。');
+    };
+  }
+
+  function handleSideChatServerMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'auth_result') {
+      if (msg.success) {
+        sideChatState.authed = true;
+        if (sideChatState.sessionId) {
+          sideSend({ type: 'load_session', sessionId: sideChatState.sessionId });
+        } else {
+          createSideChatSession();
+        }
+      } else {
+        appendSideSystemMessage(msg.error || '侧边聊天认证失败。');
+      }
+      updateSideChatButtons();
+      return;
+    }
+    if (msg.type === 'session_info') {
+      if (msg.kind && msg.kind !== 'side_conversation' && !msg.sidecar) return;
+      const wasCreating = !!sideChatState.creating;
+      sideChatState.sessionId = msg.sessionId || sideChatState.sessionId;
+      sideChatState.creating = false;
+      sideChatState.parentSessionId = msg.parentSessionId || sideChatState.parentSessionId || null;
+      sideChatState.contextSnippet = String(msg.anchor?.text || msg.contextSnippet || sideChatState.contextSnippet || '').slice(0, SIDE_CHAT_CONTEXT_LIMIT);
+      sideChatState.parentContext = msg.parentContext || sideChatState.parentContext || null;
+      sideChatState.agent = normalizeAgent(msg.agent || sideChatState.agent || sessionState.currentAgent);
+      sideChatState.mode = msg.mode || sideChatState.mode || getSideChatDefaultMode(sideChatState.agent);
+      sideChatState.reasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort || sideChatState.reasoningEffort || '');
+      sideChatState.fastMode = normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(msg, 'fastMode') ? msg.fastMode : sideChatState.fastMode);
+      if (Array.isArray(msg.messages) && (!wasCreating || msg.messages.length > 0) && !sideChatState.pendingSendText) {
+        sideChatState.messages = msg.messages.map((item) => ({ role: item.role || 'assistant', content: item.content || '' }));
+      }
+      updateSideChatButtons();
+      renderSideChatContext();
+      renderSideChatMessages();
+      persistSideChatStateNow();
+      if (sideChatState.pendingSendText) {
+        const pending = sideChatState.pendingSendText;
+        sideChatState.pendingSendText = '';
+        sendSideChatMessage(pending, { fromPending: true });
+      }
+      return;
+    }
+    if (msg.sessionId && sideChatState.sessionId && msg.sessionId !== sideChatState.sessionId) return;
+    switch (msg.type) {
+      case 'text_delta': {
+        if (!sideChatState.isGenerating) startSideChatGenerating();
+        const item = ensureSideChatAssistantMessage();
+        item.content = `${item.content || ''}${msg.text || ''}`;
+        renderSideChatMessages();
+        break;
+      }
+      case 'tool_start': {
+        appendSideSystemMessage(`正在使用工具：${msg.name || 'Tool'}`);
+        break;
+      }
+      case 'image_delta': {
+        appendSideSystemMessage('侧边聊天收到图片结果，请回到主线程查看完整图片能力。');
+        break;
+      }
+      case 'done': {
+        finishSideChatGenerating();
+        break;
+      }
+      case 'system_message':
+      case 'runtime_warning': {
+        appendSideSystemMessage(msg.message || '');
+        break;
+      }
+      case 'error': {
+        appendSideSystemMessage(msg.message || '侧边聊天发生错误。');
+        finishSideChatGenerating();
+        break;
+      }
+      case 'resume_generating': {
+        startSideChatGenerating();
+        const item = ensureSideChatAssistantMessage();
+        item.content = msg.text || '';
+        renderSideChatMessages();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  function openSideChatWithSelection(text, selectionInfo = null) {
+    const snippet = String(text || '').trim();
+    if (!snippet) return;
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开一个主线程，再使用侧边聊天');
+      return;
+    }
+    const parentContext = buildSideChatParentContext(selectionInfo, snippet);
+    if (fileViewerState.open) closeFileViewer();
+    if (gitState.panelOpen) closeGitPanel();
+    closeSideChatSocket();
+    sideChatState = {
+      open: true,
+      ws: null,
+      authed: false,
+      creating: false,
+      sessionId: null,
+      parentSessionId: sessionState.currentSessionId,
+      contextSnippet: snippet.slice(0, SIDE_CHAT_CONTEXT_LIMIT),
+      parentContext,
+      pendingSendText: '',
+      messages: [],
+      pendingText: '',
+      isGenerating: false,
+      agent: sessionState.currentAgent,
+      mode: getSideChatDefaultMode(sessionState.currentAgent),
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+    };
+    setSideChatVisible(true);
+    renderSideChatContext();
+    renderSideChatMessages();
+    if (sideChatInput) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
+    connectSideChatSocket();
+    requestAnimationFrame(() => sideChatInput?.focus());
+  }
+
+  function sendSideChatMessage(forcedText = '', options = {}) {
+    const text = String(forcedText || sideChatInput?.value || '').trim();
+    if (!text) return;
+    if (!options.fromPending) {
+      sideChatState.messages.push({ role: 'user', content: text });
+      renderSideChatMessages();
+    }
+    if (sideChatInput && !forcedText) {
+      sideChatInput.value = '';
+      autoResizeSideChatInput();
+    }
+    if (!sideChatState.sessionId) {
+      sideChatState.pendingSendText = text;
+      connectSideChatSocket();
+      if (sideChatState.authed) createSideChatSession();
+      return;
+    }
+    startSideChatGenerating();
+    sideSend({
+      type: 'message',
+      sessionId: sideChatState.sessionId,
+      text,
+      agent: sideChatState.agent || sessionState.currentAgent,
+      mode: sideChatState.mode || getSideChatDefaultMode(sideChatState.agent || sessionState.currentAgent),
+      reasoningEffort: sideChatState.agent === 'codex' ? normalizeCodexReasoningEffort(sideChatState.reasoningEffort) : '',
+      fastMode: sideChatState.agent === 'codex' ? normalizeCodexFastMode(sideChatState.fastMode) : false,
+    });
+  }
+
+  function abortSideChat() {
+    if (!sideChatState.sessionId) return;
+    sideSend({ type: 'abort', sessionId: sideChatState.sessionId });
+    appendSideSystemMessage('已请求停止侧边聊天。');
+    finishSideChatGenerating();
+  }
+
+  function autoResizeSideChatInput() {
+    if (!sideChatInput) return;
+    sideChatInput.style.height = 'auto';
+    sideChatInput.style.height = `${Math.min(sideChatInput.scrollHeight, 140)}px`;
+  }
+
+  function hideSideChatSelectionPopover() {
+    if (sideChatSelectionTimer) {
+      clearTimeout(sideChatSelectionTimer);
+      sideChatSelectionTimer = null;
+    }
+    if (sideChatSelectionPopover) {
+      sideChatSelectionPopover.remove();
+      sideChatSelectionPopover = null;
+    }
+  }
+
+  function refreshSideChatSelectionPopover() {
+    const info = getSelectionInsideMessages();
+    if (info) showSideChatSelectionPopover(info);
+    else hideSideChatSelectionPopover();
+  }
+
+  function scheduleSideChatSelectionPopover(delay = 0) {
+    if (sideChatSelectionTimer) clearTimeout(sideChatSelectionTimer);
+    sideChatSelectionTimer = setTimeout(() => {
+      sideChatSelectionTimer = null;
+      refreshSideChatSelectionPopover();
+    }, delay);
+  }
+
+  function clipSideChatContextText(value, limit = SIDE_CHAT_PARENT_MESSAGE_LIMIT) {
+    const text = String(value || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text.length <= limit) return text;
+    return `${text.slice(0, limit)}…`;
+  }
+
+  function getSideChatMessageText(el) {
+    if (!el) return '';
+    const stored = el.dataset?.copyText || '';
+    if (stored.trim()) return clipSideChatContextText(stored);
+    const bubble = el.querySelector('.msg-bubble');
+    return clipSideChatContextText(bubble?.innerText || el.innerText || '');
+  }
+
+  function buildSideChatMessageContext(el, index = -1) {
+    if (!el) return null;
+    const role = el.classList.contains('user') ? 'user'
+      : (el.classList.contains('assistant') ? 'assistant'
+        : (el.classList.contains('system') ? 'system' : 'message'));
+    const text = getSideChatMessageText(el);
+    if (!text) return null;
+    return {
+      role,
+      text,
+      index,
+      messageId: el.dataset?.messageId || el.id || '',
+      timestamp: el.dataset?.startedAt || el.querySelector('.msg-time')?.dateTime || '',
+    };
+  }
+
+  function getSideChatVisibleMessageElements() {
+    if (!messagesDiv) return [];
+    return Array.from(messagesDiv.querySelectorAll('.msg'))
+      .filter((el) => !el.classList.contains('welcome-msg'));
+  }
+
+  function buildSideChatParentContext(selectionInfo, selectedText) {
+    const messageEls = getSideChatVisibleMessageElements();
+    const anchorEl = selectionInfo?.messageEl || null;
+    const anchorIndex = anchorEl ? messageEls.indexOf(anchorEl) : -1;
+    const nearbyBefore = anchorIndex >= 0
+      ? messageEls.slice(Math.max(0, anchorIndex - SIDE_CHAT_PARENT_NEARBY_LIMIT), anchorIndex)
+          .map((el, offset) => buildSideChatMessageContext(el, anchorIndex - SIDE_CHAT_PARENT_NEARBY_LIMIT + offset))
+          .filter(Boolean)
+      : [];
+    const nearbyAfter = anchorIndex >= 0
+      ? messageEls.slice(anchorIndex + 1, anchorIndex + 1 + SIDE_CHAT_PARENT_NEARBY_LIMIT)
+          .map((el, offset) => buildSideChatMessageContext(el, anchorIndex + 1 + offset))
+          .filter(Boolean)
+      : [];
+    const recentMessages = messageEls
+      .slice(-SIDE_CHAT_PARENT_RECENT_LIMIT)
+      .map((el, index) => buildSideChatMessageContext(el, Math.max(0, messageEls.length - SIDE_CHAT_PARENT_RECENT_LIMIT) + index))
+      .filter(Boolean);
+    const currentMeta = getSessionMeta(sessionState.currentSessionId) || {};
+    const anchorMessage = buildSideChatMessageContext(anchorEl, anchorIndex);
+    return {
+      kind: 'side_conversation_parent_context',
+      title: chatTitle?.textContent?.trim() || currentMeta.title || '',
+      cwd: sessionState.currentCwd || currentMeta.cwd || selectedProject?.path || '',
+      projectId: currentMeta.projectId || selectedProject?.id || '',
+      agent: sessionState.currentAgent,
+      mode: sessionState.currentMode,
+      selectedText: clipSideChatContextText(selectedText, SIDE_CHAT_CONTEXT_LIMIT),
+      anchor: anchorMessage ? {
+        messageId: anchorMessage.messageId || '',
+        role: anchorMessage.role,
+        index: anchorMessage.index,
+        timestamp: anchorMessage.timestamp || '',
+        messageText: anchorMessage.text,
+      } : null,
+      nearbyBefore,
+      nearbyAfter,
+      recentMessages,
+    };
+  }
+
+  function getSelectionInsideMessages() {
+    const selection = window.getSelection();
+    const text = selection ? selection.toString().trim() : '';
+    if (!selection || !text || selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
+    const anchor = selection.anchorNode;
+    const focus = selection.focusNode;
+    if (!messagesDiv?.contains(anchor) || !messagesDiv.contains(focus)) return null;
+    const container = range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer?.parentElement;
+    const messageEl = container?.closest?.('.msg') || anchor?.parentElement?.closest?.('.msg') || null;
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return null;
+    return { text, rect, messageEl };
+  }
+
+  function showSideChatSelectionPopover(selectionInfo) {
+    if (!selectionInfo?.text) return;
+    hideSideChatSelectionPopover();
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'side-chat-selection-popover';
+    btn.textContent = '在侧边聊天中提问';
+    const top = Math.max(52, selectionInfo.rect.top - 42);
+    const left = Math.min(window.innerWidth - 190, Math.max(12, selectionInfo.rect.left + selectionInfo.rect.width / 2 - 88));
+    btn.style.top = `${top}px`;
+    btn.style.left = `${left}px`;
+    let activated = false;
+    const activate = (event) => {
+      if (activated) return;
+      activated = true;
+      event?.preventDefault?.();
+      const selected = selectionInfo.text.slice(0, SIDE_CHAT_CONTEXT_LIMIT);
+      hideSideChatSelectionPopover();
+      try { window.getSelection()?.removeAllRanges(); } catch {}
+      openSideChatWithSelection(selected, selectionInfo);
+    };
+    btn.addEventListener('mousedown', (event) => event.preventDefault());
+    btn.addEventListener('touchend', activate, { passive: false });
+    btn.addEventListener('click', activate);
+    document.body.appendChild(btn);
+    sideChatSelectionPopover = btn;
   }
 
   function scheduleReconnect() {
@@ -3716,11 +7124,25 @@
   }
 
   function handleSessionListMessage(msg) {
-    sessionState.sessions = msg.sessions || [];
+    sessionState.sessions = (msg.sessions || []).map((session) => ({
+      ...session,
+      reasoningEffort: normalizeCodexReasoningEffort(session.reasoningEffort),
+      fastMode: normalizeCodexFastMode(session.fastMode),
+      hasUnread: session.id === sessionState.currentSessionId ? false : !!session.hasUnread,
+    }));
     reconcileSessionCacheWithSessions();
+    reconcileOpenChatTabsWithSessions();
     renderSessionList();
     if (sessionState.currentSessionId) {
-      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+      const currentMeta = getSessionMeta(sessionState.currentSessionId);
+      const currentMetaRunning = !!currentMeta?.isRunning;
+      setCurrentSessionRunningState(currentMetaRunning, '运行中');
+      if (currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))) {
+        startGenerating();
+      }
+      if (!shouldHoldOptimisticRunningState(currentMetaRunning)) {
+        scheduleQueuedMessageFollowupAfterIdle();
+      }
     }
     if (connectionState.pendingReconnectResync) {
       connectionState.pendingReconnectResync = false;
@@ -3752,18 +7174,14 @@
 
   function handleSessionInfoMessage(msg) {
     const snapshot = normalizeSessionSnapshot(msg);
-    if (msg.forked === true && msg.agent === 'pi') {
-      queueMicrotask(() => {
-        if (sessionState.currentSessionId !== msg.sessionId) return;
-        closePiForkPicker();
-        const draftText = String(msg.draftText || '');
-        if (draftText) {
-          msgInput.value = draftText;
-          autoResize();
-          msgInput.focus();
-        }
-        showToast(draftText ? 'Pi 分支已创建，原提示可修改后发送' : 'Pi 分支已创建');
-      });
+    if (!msg.sidecar && msg.sideConversation) {
+      rememberSideConversationFromServer(msg.sideConversation);
+    } else if (!msg.sidecar && !sideChatState.open) {
+      const existingSideChat = loadPersistedSideChatState();
+      if (existingSideChat?.parentSessionId && existingSideChat.parentSessionId !== msg.sessionId) {
+        localStorage.removeItem(SIDE_CHAT_STATE_STORAGE_KEY);
+        syncSideChatRestoreButton();
+      }
     }
 
     // Imported sessions bypass the stale-response guard so the user always
@@ -3794,15 +7212,14 @@
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
       sessionState.activeSessionLoad.snapshot = snapshot;
     }
+    const isEditResetSnapshot = msg.editReset === true || (pendingEditResetSessionId && pendingEditResetSessionId === msg.sessionId);
     applySessionSnapshot(snapshot, {
-      immediate: isBlockingSessionLoad(msg.sessionId),
+      immediate: isBlockingSessionLoad(msg.sessionId) || !!isEditResetSnapshot,
       suppressUnreadToast: false,
-      // Keep live streaming across session_info for this session until `done`.
-      // Do not gate on msg.isRunning — a late isRunning:false snapshot must not wipe the bubble.
-      preserveStreaming: !!(composeState.isGenerating && (
-        !sessionState.currentSessionId || msg.sessionId === sessionState.currentSessionId
-      )),
+      preserveStreaming: !isEditResetSnapshot && msg.sessionId === sessionState.currentSessionId
+        && (msg.isRunning || composeState.isGenerating || sessionState.currentSessionRunning),
     });
+    if (isEditResetSnapshot) pendingEditResetSessionId = null;
     if (msg.historyPending) return;
     if (sessionState.activeSessionLoad?.sessionId === msg.sessionId) {
       finalizeLoadedSession(msg.sessionId);
@@ -3834,6 +7251,16 @@
     }
   }
 
+  function isMessageForCurrentSession(msg) {
+    if (!msg || !msg.sessionId) return true;
+    return msg.sessionId === sessionState.currentSessionId;
+  }
+
+  function isMessageForCurrentAgent(msg) {
+    const msgAgent = AGENT_LABELS[msg?.agent] ? msg.agent : '';
+    return !msgAgent || msgAgent === sessionState.currentAgent;
+  }
+
   function handleSessionRenamedMessage(msg) {
     sessionState.sessions = sessionState.sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
     updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
@@ -3841,6 +7268,7 @@
       chatTitle.textContent = msg.title;
     }
     renderSessionList();
+    renderChatTabs();
   }
 
   /** Stream/runtime events for another session must not mutate the current view. */
@@ -3895,16 +7323,18 @@
   }
 
   function handleTextDeltaMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
-    // Ensure any buffered thinking is committed before answer text arrives.
-    drainThinkingBuffer();
+    if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
+    clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     composeState.pendingText += msg.text;
     scheduleRender();
   }
 
   function handleToolStartMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
+    if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
+    clearAwaitingRuntimeStart();
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
     // Flush thinking before tools so order stays: thinking → tool → answer.
@@ -3916,7 +7346,7 @@
   }
 
   function handleToolEndMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
+    if (!isMessageForCurrentSession(msg)) return;
     if (composeState.activeToolCalls.has(msg.toolUseId)) {
       composeState.activeToolCalls.get(msg.toolUseId).done = true;
       if (msg.kind) composeState.activeToolCalls.get(msg.toolUseId).kind = msg.kind;
@@ -3927,12 +7357,39 @@
     updateLiveProcessIndicator();
   }
 
+  function appendStreamingImageSegment(image = {}) {
+    const bubble = getStreamingBubble();
+    if (!bubble || !image.src) return;
+    clearStreamingPlaceholder(bubble);
+    const segmentEl = buildMessageSegmentElement({
+      type: 'image',
+      src: image.src,
+      rawUrl: image.rawUrl || '',
+      path: image.path || '',
+      relativePath: image.relativePath || '',
+      rootKey: image.rootKey || '',
+      mime: image.mime || '',
+      alt: image.alt || 'Generated image',
+      id: image.id || null,
+      prompt: image.prompt || '',
+    });
+    if (segmentEl) bubble.appendChild(segmentEl);
+    scrollToBottom({ onlyIfFollowing: true });
+  }
+
+  function handleImageDeltaMessage(msg) {
+    if (!isMessageForCurrentSession(msg)) return;
+    markStreamingRuntimeActivity();
+    clearAwaitingRuntimeStart();
+    if (!composeState.isGenerating) startGenerating();
+    if (composeState.pendingText) flushRender();
+    markStreamingProcessTextSegments();
+    appendStreamingImageSegment(msg);
+  }
+
   function handleCostMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
-    if (SHOW_SIDEBAR_COST && costDisplay && typeof msg.costUsd === 'number') {
-      costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
-      costDisplay.hidden = false;
-    }
+    if (!isMessageForCurrentSession(msg)) return;
+    costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
     }
@@ -3940,25 +7397,44 @@
   }
 
   function handleUsageMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
-    if (msg.totalUsage) {
-      const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
-      if (SHOW_SIDEBAR_COST && costDisplay) {
-        costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
-        costDisplay.hidden = false;
+    if (!isMessageForCurrentSession(msg)) return;
+    if (msg.totalUsage || msg.currentUsage || msg.usage) {
+      const contextWindowTokens = Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null;
+      const limit = contextWindowTokens || inferContextWindowTokens();
+      const totalUsage = normalizeUsageShape(msg.totalUsage) || contextRuntimeUsage.totalUsage;
+      const rawCurrentUsage = validContextUsage(msg.currentUsage || msg.usage, limit);
+      const diffCurrentUsage = validContextUsage(diffUsageTotals(totalUsage, contextRuntimeUsage.totalUsage), limit);
+      const previousCurrentUsage = validContextUsage(contextRuntimeUsage.currentUsage, limit);
+      const currentUsage = rawCurrentUsage || diffCurrentUsage || previousCurrentUsage;
+      if (msg.totalUsage) {
+        costDisplay.textContent = formatUsageStatsText(msg.totalUsage);
       }
-      if (sessionState.currentSessionId) {
-        updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
+      contextRuntimeUsage = {
+        currentUsage,
+        totalUsage,
+        contextWindowTokens,
+      };
+      renderContextBar();
+      renderContextUsageIndicator();
+      if (sessionState.currentSessionId && (msg.totalUsage || currentUsage || msg.contextWindowTokens || msg.modelContextWindow)) {
+        updateCachedSession(sessionState.currentSessionId, (snapshot) => {
+          if (msg.totalUsage) snapshot.totalUsage = deepClone(msg.totalUsage);
+          if (currentUsage) snapshot.lastUsage = deepClone(currentUsage);
+          const contextWindowTokens = Number(msg.contextWindowTokens || msg.modelContextWindow || contextRuntimeUsage.contextWindowTokens || 0) || null;
+          if (contextWindowTokens) snapshot.contextWindowTokens = contextWindowTokens;
+          delete snapshot.currentUsage;
+        });
       }
     }
     renderWorkspaceInsights();
+    renderContextUsageIndicator();
   }
 
   function handleModeChangedMessage(msg) {
     if (!msg.mode || !MODE_LABELS[msg.mode]) return;
     sessionState.currentMode = msg.mode;
     modeSelect.value = sessionState.currentMode;
-    localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+    saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
     updateAgentScopedUI();
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
@@ -3966,11 +7442,45 @@
     renderWorkspaceInsights();
   }
 
+  function handleReasoningEffortChangedMessage(msg) {
+    const effort = normalizeCodexReasoningEffort(msg.reasoningEffort);
+    sessionState.currentReasoningEffort = effort;
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.reasoningEffort = effort; });
+    }
+    updateAgentScopedUI();
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  function handleFastModeChangedMessage(msg) {
+    const fastMode = normalizeCodexFastMode(msg.fastMode);
+    sessionState.currentFastMode = fastMode;
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(fastMode));
+    if (sessionState.currentSessionId) {
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.fastMode = fastMode; });
+    }
+    updateAgentScopedUI();
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
   function handleModelChangedMessage(msg) {
     if (msg.sessionId && msg.sessionId !== sessionState.currentSessionId) return;
     if (msg.model === undefined) return;
     const normalizedRuntime = normalizeActiveRuntime(msg.activeRuntime, sessionState.currentAgent, msg.model || '');
     sessionState.currentModel = msg.model || '';
+    if (Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) {
+      sessionState.currentReasoningEffort = normalizeCodexReasoningEffort(msg.reasoningEffort);
+      localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), sessionState.currentReasoningEffort);
+    }
+    if (Object.prototype.hasOwnProperty.call(msg, 'fastMode')) {
+      sessionState.currentFastMode = normalizeCodexFastMode(msg.fastMode);
+      localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(sessionState.currentFastMode));
+    }
     sessionState.currentActiveRuntime = normalizedRuntime;
     sessionState.currentRuntimeCount = Number.isFinite(msg.runtimeCount)
       ? msg.runtimeCount
@@ -3978,6 +7488,8 @@
     if (sessionState.currentSessionId) {
       updateCachedSession(sessionState.currentSessionId, (snapshot) => {
         snapshot.model = msg.model || '';
+        if (Object.prototype.hasOwnProperty.call(msg, 'reasoningEffort')) snapshot.reasoningEffort = sessionState.currentReasoningEffort;
+        if (Object.prototype.hasOwnProperty.call(msg, 'fastMode')) snapshot.fastMode = sessionState.currentFastMode;
         snapshot.activeRuntime = normalizedRuntime ? deepClone(normalizedRuntime) : null;
         snapshot.activeChannelKey = msg.activeChannelKey || normalizedRuntime?.channelKey || null;
         snapshot.runtimeCount = Number.isFinite(msg.runtimeCount)
@@ -3986,6 +7498,7 @@
       });
     }
     renderWorkspaceInsights();
+    renderContextUsageIndicator();
   }
 
   function handleModelListMessage(msg) {
@@ -3996,7 +7509,7 @@
       appendError(msg.error || '当前配置没有返回可用模型。');
       return;
     }
-    showOptionPicker(`选择 ${AGENT_LABELS[agent]} 模型`, options, msg.current || 'default', (value) => {
+    showOptionPicker(`选择 ${AGENT_LABELS[agent]} 模型`, options, msg.currentFull || msg.current || 'default', (value) => {
       send({
         type: 'message',
         text: `/model ${value}`,
@@ -4257,7 +7770,8 @@
   }
 
   function handleResumeGeneratingMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
+    if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     setCurrentSessionRunningState(true);
     composeState.isAborting = false;
     abortBtn.disabled = false;
@@ -4266,10 +7780,13 @@
     if (!composeState.isGenerating || !document.getElementById('streaming-msg')) {
       startGenerating();
     } else {
-      syncComposerRuntimeControls();
+      updateComposerActionButtons();
       composeState.activeToolCalls.clear();
       const bubble = document.querySelector('#streaming-msg .msg-bubble');
-      if (bubble) bubble.innerHTML = '';
+      if (bubble) {
+        bubble.innerHTML = '';
+        ensurePendingPlaceholder(bubble);
+      }
     }
     // Prefer spawn-time mode from server run-meta; fall back to current UI selection.
     if (msg.permissionMode && MODE_LABELS[msg.permissionMode]) {
@@ -4293,7 +7810,11 @@
       return;
     }
     composeState.pendingText = msg.text || '';
-    flushRender();
+    if (composeState.pendingText) {
+      flushRender();
+    } else if (!(msg.toolCalls && msg.toolCalls.length > 0)) {
+      ensurePendingPlaceholder(document.querySelector('#streaming-msg .msg-bubble'));
+    }
     if (!(msg.toolCalls && msg.toolCalls.length > 0)) return;
     for (const tc of msg.toolCalls) {
       composeState.activeToolCalls.set(tc.id, {
@@ -4341,9 +7862,8 @@
   }
 
   function handleErrorMessage(msg) {
-    if (!isEventForCurrentSession(msg)) return;
-    // Do not wait for ack timeout when the server already rejected the turn.
-    failInflightAcksForSession(msg.sessionId || sessionState.currentSessionId, 'failed');
+    if (!isMessageForCurrentSession(msg)) return;
+    clearAwaitingRuntimeStart();
     const errorMsg = msg.message || '发生未知错误';
     pendingTurnErrorSessionId = msg.sessionId || sessionState.currentSessionId || null;
     markPiForkPickerError(msg.sessionId, errorMsg);
@@ -4362,7 +7882,8 @@
     }
     clearSessionLoading();
     if (!composeState.isGenerating && sessionState.currentSessionId) {
-      setCurrentSessionRunningState(!!getSessionMeta(sessionState.currentSessionId)?.isRunning);
+      const meta = getSessionMeta(sessionState.currentSessionId);
+      setCurrentSessionRunningState(!!meta?.isRunning, '运行中');
     }
     if (composeState.isGenerating) {
       finishGenerating(msg.sessionId, { skipResync: true });
@@ -4379,16 +7900,33 @@
     }
   }
 
-  function refreshAssistantAvatarModels() {
-    const modelId = getConcreteModelLabel();
-    if (!modelId || !messagesDiv) return;
-    messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
-      // Prefer per-message stored model when present.
-      const stored = msgEl.dataset.model || '';
-      const col = msgEl.querySelector('.msg-avatar-col');
-      applyModelToAvatarCol(col, stored || modelId);
-      if (!msgEl.dataset.model && modelId) msgEl.dataset.model = modelId;
-    });
+  function handleSessionForkedMessage(msg) {
+    const modeText = msg.mode === 'worktree' ? 'worktree 分叉' : '分叉';
+    const suffix = msg.cwd ? `：${msg.cwd}` : '';
+    showToast(`已创建${modeText}${suffix}`, msg.sessionId);
+  }
+
+
+  function handleQueueUpdateMessage(msg) {
+    if (msg.sessionId !== sessionState.currentSessionId) return;
+    composeState.queuedMessages = normalizeQueuedMessages(msg.queuedMessages || []);
+    queuedMessagesRestoredAt = 0;
+    queuedMessagesRestoredSawRunning = false;
+    renderQueuedMessages();
+  }
+
+  function handleQueuedMessageDispatched(msg) {
+    if (msg.sessionId !== sessionState.currentSessionId) return;
+    const item = normalizeQueuedMessages([msg.message || {}])[0];
+    if (!item) return;
+    composeState.queuedMessages = composeState.queuedMessages.filter((queued) => queued.id !== item.id);
+    renderQueuedMessages();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    messagesDiv.appendChild(createMsgElement('user', item.text || '', item.attachments || [], item.fileRefs || [], item.createdAt || new Date().toISOString()));
+    refreshRenderedMessageIndexes();
+    scrollToBottom();
+    if (!composeState.isGenerating) startGenerating();
   }
 
   function handleModelConfigMessage(msg) {
@@ -4411,6 +7949,7 @@
 
   function handleProjectsConfigMessage(msg) {
     projects = msg.projects || [];
+    reconcileSelectedProjectWithSavedProjects();
     renderSessionList();
     if (pendingProjectSaveCallback) {
       const cb = pendingProjectSaveCallback;
@@ -4469,31 +8008,33 @@
     pi_queued_turn_start: handlePiQueuedTurnStartMessage,
     tool_start: handleToolStartMessage,
     tool_end: handleToolEndMessage,
+    image_delta: handleImageDeltaMessage,
     cost: handleCostMessage,
     usage: handleUsageMessage,
+    runtime_status: handleRuntimeStatusMessage,
     done: (msg) => {
-      if (!isEventForCurrentSession(msg)) return;
+      if (!isMessageForCurrentSession(msg)) return;
       const doneSessionId = msg.sessionId || sessionState.currentSessionId || null;
       const preserveError = !!doneSessionId && pendingTurnErrorSessionId === doneSessionId;
       finishGenerating(msg.sessionId, {
+        completedAt: msg.completedAt || new Date().toISOString(),
         interrupted: !!msg.interrupted,
         skipResync: preserveError,
       });
       if (preserveError) pendingTurnErrorSessionId = null;
     },
-    system_message: (msg) => {
-      if (!isEventForCurrentSession(msg)) return;
-      appendSystemMessage(msg.message);
-    },
-    interactive_request: handleInteractiveRequestMessage,
-    interactive_response_result: handleInteractiveResponseResultMessage,
-    goal_update: handleGoalUpdateMessage,
+    system_message: (msg) => { if (isMessageForCurrentSession(msg)) appendSystemMessage(msg.message); },
+    runtime_warning: (msg) => { if (isMessageForCurrentSession(msg)) appendError(msg.message, { type: 'warning', icon: '⚠️', dismissible: true, style: 'border-color:var(--yellow);color:var(--text-primary);background:rgba(245,158,11,0.08)' }); },
     mode_changed: handleModeChangedMessage,
+    reasoning_effort_changed: handleReasoningEffortChangedMessage,
+    fast_mode_changed: handleFastModeChangedMessage,
     model_changed: handleModelChangedMessage,
     model_list: handleModelListMessage,
     effort_list: handleEffortListMessage,
     pi_extension_ui: handlePiExtensionUiMessage,
     resume_generating: handleResumeGeneratingMessage,
+    queue_update: handleQueueUpdateMessage,
+    queued_message_dispatched: handleQueuedMessageDispatched,
     error: handleErrorMessage,
     notify_config: (msg) => {
       emitWsEvent('notify_config', msg.config);
@@ -4525,6 +8066,7 @@
     directory_created: (msg) => { if (typeof _onDirectoryCreated === 'function') _onDirectoryCreated(msg); },
     update_info: (msg) => { if (typeof window._ccOnUpdateInfo === 'function') window._ccOnUpdateInfo(msg); },
     git_result: handleGitResultMessage,
+    session_forked: handleSessionForkedMessage,
     projects_config: handleProjectsConfigMessage,
     slash_commands_list: handleSlashCommandsListMessage,
   });
@@ -4555,54 +8097,238 @@
   }
 
   // --- Generating State ---
-  function appendStreamingAssistantBubble() {
-    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
+  function updateComposerActionButtons() {
+    const busy = composeState.isGenerating;
+    sendBtn.hidden = false;
+    abortBtn.hidden = !busy;
+    abortBtn.disabled = busy ? isBlockingSessionLoad() : false;
+    abortBtn.title = '停止';
+    abortBtn.setAttribute('aria-label', '停止');
+    const sendLabel = editingMessageState ? '发送修改并重置后续回答' : (busy ? '加入发送队列' : '发送');
+    sendBtn.title = sendLabel;
+    sendBtn.setAttribute('aria-label', sendLabel);
+    if (composerStatus) {
+      composerStatus.hidden = true;
+      composerStatus.textContent = '';
+      composerStatus.title = '';
+    }
+  }
+
+  function bubbleHasRenderableContent(bubble) {
+    if (!bubble) return false;
+    const hasText = Array.from(bubble.querySelectorAll('.msg-text, .msg-segment-text'))
+      .some((node) => String(node.dataset.rawText || node.textContent || '').trim());
+    const hasTool = !!bubble.querySelector('.tool-call, .tool-group');
+    const hasImage = !!bubble.querySelector('.msg-image-segment, .msg-generated-image');
+    const hasAttachment = !!bubble.querySelector('.msg-attachment-label');
+    return hasText || hasTool || hasImage || hasAttachment;
+  }
+
+  function isEmptyAssistantPlaceholder(msgEl) {
+    if (!msgEl || !msgEl.classList?.contains('assistant')) return false;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return true;
+    return !bubbleHasRenderableContent(bubble);
+  }
+
+  function getLastMessageElement() {
+    const children = Array.from(messagesDiv.children);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child?.classList?.contains('msg')) return child;
+    }
+    return null;
+  }
+
+  function getLatestUserMessageElement() {
+    const children = Array.from(messagesDiv.children);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child?.classList?.contains('msg') && child.classList.contains('user')) return child;
+    }
+    return null;
+  }
+
+  function isStreamingMessageAfterLatestUser(msgEl) {
+    const latestUser = getLatestUserMessageElement();
+    return !latestUser || msgEl?.previousElementSibling === latestUser;
+  }
+
+  function findReusableAssistantPlaceholder() {
+    const lastMsg = getLastMessageElement();
+    if (!lastMsg || lastMsg.id === 'streaming-msg') return null;
+    return isEmptyAssistantPlaceholder(lastMsg) ? lastMsg : null;
+  }
+
+  function ensurePendingPlaceholder(bubble) {
+    if (!bubble || bubbleHasRenderableContent(bubble) || bubble.querySelector('.msg-segment-pending')) return;
+    bubble.appendChild(createStreamingPlaceholder());
+    refreshStreamingStatusText();
+  }
+
+  function removeStaleEmptyAssistantPlaceholders(keepEl = null) {
+    messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
+      if (msgEl === keepEl || msgEl.id === 'streaming-msg') return;
+      if (isEmptyAssistantPlaceholder(msgEl)) msgEl.remove();
+    });
+  }
+
+  function getMessageStartedAtFromElement(msgEl) {
+    if (!msgEl) return null;
+    const stored = msgEl.dataset?.startedAt || '';
+    if (stored) return stored;
+    const timeEl = msgEl.querySelector('.msg-time');
+    return timeEl?.dateTime || timeEl?.getAttribute('datetime') || null;
+  }
+
+  function createStreamingMessageElement() {
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+
+    const latestUser = getLatestUserMessageElement();
+    const startedAt = getMessageStartedAtFromElement(latestUser) || new Date().toISOString();
+    const msgEl = createMsgElement('assistant', '', [], [], startedAt);
     msgEl.id = 'streaming-msg';
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';
     bubble.appendChild(createStreamingPlaceholder());
-    messagesDiv.appendChild(msgEl);
+    if (latestUser?.parentElement === messagesDiv) latestUser.insertAdjacentElement('afterend', msgEl);
+    else messagesDiv.appendChild(msgEl);
     return msgEl;
+  }
+
+  function claimStreamingMessageElement({ createIfMissing = false, cleanupStale = false, requireAfterLatestUser = false } = {}) {
+    const existing = document.getElementById('streaming-msg');
+    if (existing) {
+      if (requireAfterLatestUser && !isStreamingMessageAfterLatestUser(existing)) {
+        if (isEmptyAssistantPlaceholder(existing)) existing.remove();
+        else existing.removeAttribute('id');
+      } else {
+        if (cleanupStale) removeStaleEmptyAssistantPlaceholders(existing);
+        return existing;
+      }
+    }
+
+    const reusable = findReusableAssistantPlaceholder();
+    if (reusable) {
+      reusable.id = 'streaming-msg';
+      ensurePendingPlaceholder(reusable.querySelector('.msg-bubble'));
+      if (cleanupStale) removeStaleEmptyAssistantPlaceholders(reusable);
+      return reusable;
+    }
+
+    if (!createIfMissing) return null;
+    const created = createStreamingMessageElement();
+    if (cleanupStale) removeStaleEmptyAssistantPlaceholders(created);
+    return created;
+  }
+
+  function formatStreamingElapsed(ms) {
+    const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+  }
+
+  function getStreamingStatusElement() {
+    return document.querySelector('#streaming-msg .msg-segment-pending .streaming-status');
+  }
+
+  function buildStreamingStatusText(now = Date.now()) {
+    const state = streamingStatusState || {};
+    const startedAt = Number(state.startedAt || now) || now;
+    const lastActivityAt = Number(state.lastActivityAt || startedAt) || startedAt;
+    const elapsed = formatStreamingElapsed(now - startedAt);
+    const idleMs = Math.max(0, now - lastActivityAt);
+    const mode = state.mode || 'waiting';
+    const retryText = state.retryCount ? `第 ${state.retryCount}${state.maxRetries ? `/${state.maxRetries}` : ''} 次` : '';
+    if (mode === 'stopping') return { text: state.message || '正在停止当前任务…', level: 'warn' };
+    if (mode === 'retry') {
+      if (idleMs >= 90000) return { text: `自动重试后已等待 ${formatStreamingElapsed(idleMs)} 暂无输出，可能仍在恢复…`, level: 'warn' };
+      return { text: state.message || `模型连接中断，正在自动重试${retryText ? retryText : ''}…`, level: 'warn' };
+    }
+    if (mode === 'bridge') {
+      if (idleMs >= 90000) return { text: `本地桥接服务重连已等待 ${formatStreamingElapsed(idleMs)}，可能卡住…`, level: 'warn' };
+      return { text: state.message || '本地桥接服务重连中，正在恢复任务…', level: 'info' };
+    }
+    if (idleMs >= 90000) return { text: `已 ${formatStreamingElapsed(idleMs)} 没有新内容，可能卡住；可以继续等待或点击停止。`, level: 'warn' };
+    if (idleMs >= 60000) return { text: `已等待 ${formatStreamingElapsed(idleMs)} 暂无输出，仍在处理中…`, level: 'warn' };
+    if (idleMs >= 15000) return { text: `仍在处理中，暂无输出… ${elapsed}`, level: 'info' };
+    return { text: state.message || `正在等待模型响应… ${elapsed}`, level: 'info' };
+  }
+
+  function refreshStreamingStatusText() {
+    const statusEl = getStreamingStatusElement();
+    if (!statusEl) return;
+    const { text, level } = buildStreamingStatusText();
+    statusEl.textContent = text;
+    statusEl.dataset.level = level || 'info';
+  }
+
+  function startStreamingStatus(mode = 'waiting', options = {}) {
+    const now = Date.now();
+    streamingStatusState = {
+      mode,
+      message: options.message || '',
+      retryCount: Number(options.retryCount || 0) || 0,
+      maxRetries: Number(options.maxRetries || 0) || 0,
+      startedAt: options.startedAt || streamingStatusState?.startedAt || now,
+      lastActivityAt: now,
+    };
+    refreshStreamingStatusText();
+    if (!streamingStatusTimer) {
+      streamingStatusTimer = setInterval(refreshStreamingStatusText, 1000);
+    }
+  }
+
+  function stopStreamingStatusTimer() {
+    if (streamingStatusTimer) {
+      clearInterval(streamingStatusTimer);
+      streamingStatusTimer = null;
+    }
+  }
+
+  function resetStreamingStatus() {
+    stopStreamingStatusTimer();
+    streamingStatusState = null;
+  }
+
+  function markStreamingRuntimeActivity() {
+    if (streamingStatusState) streamingStatusState.lastActivityAt = Date.now();
+    refreshStreamingStatusText();
+  }
+
+  function handleRuntimeStatusMessage(msg) {
+    if (!isMessageForCurrentSession(msg) || !isMessageForCurrentAgent(msg)) return;
+    const code = String(msg.code || msg.status || 'waiting');
+    if (code === 'codex_goal') return;
+    if (!composeState.isGenerating) startGenerating();
+    const mode = code === 'retry' || code === 'stream_disconnect' ? 'retry'
+      : (code === 'bridge' || code === 'bridge_reconnect' || code === 'bridge_wait' ? 'bridge'
+        : (code === 'stopping' || code === 'abort' ? 'stopping' : 'waiting'));
+    startStreamingStatus(mode, {
+      message: msg.message || '',
+      retryCount: msg.retryCount,
+      maxRetries: msg.maxRetries,
+    });
   }
 
   function startGenerating() {
     composeState.isGenerating = true;
-    composeState.isAborting = false;
     pendingTurnErrorSessionId = null;
-    // Snapshot turn mode at start so next-turn /mode changes don't open Plan mid-send.
-    composeState.activeTurnMode = sessionState.currentMode;
     setCurrentSessionRunningState(true);
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
-    abortBtn.disabled = false;
-    abortBtn.classList.remove('is-aborting');
-    abortBtn.title = '停止生成';
-    syncComposerRuntimeControls();
-    updateSendQueueIndicator();
+    startStreamingStatus(streamingStatusState?.mode || 'waiting', { message: streamingStatusState?.message || '' });
+    updateComposerActionButtons();
+    // 不禁用输入框：生成中继续输入会进入本地发送队列，可在发送前撤销。
 
-    const welcome = messagesDiv.querySelector('.welcome-msg');
-    if (welcome) welcome.remove();
-
-    appendStreamingAssistantBubble();
-    forceScrollToBottom();
-  }
-
-  function finalizeStreamingAssistantForPiContinuation() {
-    drainThinkingBuffer();
-    if (composeState.pendingText) flushRender();
-    collapseStreamingProcessForCompletedTurn();
-    const streamEl = document.getElementById('streaming-msg');
-    if (streamEl) {
-      const bubble = streamEl.querySelector('.msg-bubble');
-      const hasContent = !!(bubble && (
-        bubble.querySelector('.msg-segment-text, .tool-call, .msg-process-group, .msg-text')
-        || String(bubble.textContent || '').trim()
-      ));
-      if (hasContent) streamEl.removeAttribute('id');
-      else streamEl.remove();
+    const msgEl = claimStreamingMessageElement({ createIfMissing: true, cleanupStale: true, requireAfterLatestUser: true });
+    if (msgEl) {
+      ensurePendingPlaceholder(msgEl.querySelector('.msg-bubble'));
+      scrollToBottom();
     }
-    composeState.pendingText = '';
-    composeState.activeToolCalls.clear();
   }
 
   function handlePiQueuedTurnStartMessage(msg) {
@@ -4651,6 +8377,9 @@
   }
 
   function finishGenerating(sessionId, options = {}) {
+    const finishOptions = typeof options === 'string'
+      ? { completedAt: options }
+      : (options && typeof options === 'object' ? options : {});
     // Ignore done events for other sessions so background completion cannot
     // clear the current view's generating state or steal the stream bubble.
     if (sessionId && sessionState.currentSessionId && sessionId !== sessionState.currentSessionId) {
@@ -4658,6 +8387,8 @@
       return;
     }
 
+    clearAwaitingRuntimeStart();
+    resetStreamingStatus();
     composeState.isGenerating = false;
     composeState.isAborting = false;
     composeState.activeTurnMode = null;
@@ -4665,7 +8396,8 @@
     abortBtn.classList.remove('is-aborting');
     abortBtn.title = '停止生成';
     syncComposerRuntimeControls();
-    setCurrentSessionRunningState(false, options.interrupted ? { phase: 'interrupted' } : {});
+    updateComposerActionButtons();
+    setCurrentSessionRunningState(false, finishOptions.interrupted ? { phase: 'interrupted' } : {});
     // Avoid popping the mobile keyboard after every turn.
     if (!isMobileInputMode()) {
       msgInput.focus({ preventScroll: true });
@@ -4677,30 +8409,29 @@
     }
     if (pendingThinkingText) flushThinkingRender();
     if (composeState.pendingText) flushRender();
+    finalizeStreamingMarkdown();
 
     // Collapse thinking/process/tools under a summary, leave the final answer expanded.
     collapseStreamingProcessForCompletedTurn();
 
     const sid = sessionId || sessionState.currentSessionId;
-    const needsResync = !options.interrupted && !options.skipResync && sid && !streamingBubbleHasVisibleAnswer();
+    const needsResync = !finishOptions.interrupted && !finishOptions.skipResync && sid && !streamingBubbleHasVisibleAnswer();
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) {
-      // Drop empty assistant shell left by failed/blank turns.
-      const bubble = streamEl.querySelector('.msg-bubble');
-      const hasContent = !!(bubble && (
-        bubble.querySelector('.msg-segment-text, .tool-call, .msg-process-group, .msg-text')
-        || String(bubble.textContent || '').trim()
-      ));
-      if (!hasContent) {
+      if (isEmptyAssistantPlaceholder(streamEl)) {
         streamEl.remove();
       } else {
+        if (finishOptions.completedAt) setMessageCompletedAt(streamEl, finishOptions.completedAt);
         streamEl.removeAttribute('id');
       }
     }
+    removeStaleEmptyAssistantPlaceholders();
+    refreshRenderedMessageIndexes();
 
-    if (sid && (!sessionState.currentSessionId || sessionState.currentSessionId === sid)) {
-      sessionState.currentSessionId = sid;
+    if (sessionId && (!sessionState.currentSessionId || sessionState.currentSessionId === sessionId)) {
+      sessionState.currentSessionId = sessionId;
+      bindUnassignedQueuedMessagesToSession(sessionId);
     }
     for (const [id, item] of Array.from(piNativeQueue.entries())) {
       if (!queueItemMatchesSession(item, sid)) continue;
@@ -4710,13 +8441,12 @@
     piNativeQueueCounts = { steering: 0, followUp: 0 };
     composeState.pendingText = '';
     composeState.activeToolCalls.clear();
-
-    // If the stream ended with no visible answer (lost deltas / race), re-sync from server.
+    queuedMessagesRestoredAt = 0;
+    queuedMessagesRestoredSawRunning = false;
+    scheduleQueuedMessageDispatch();
     if (needsResync) {
       openSession(sid, { forceSync: true, blocking: false, skipCloseSidebar: true });
     }
-
-    // Auto-send next queued message for this session after the turn completes.
     updateSendQueueIndicator();
     scheduleFlushSendQueue(80);
   }
@@ -4736,21 +8466,39 @@
     if (!textDiv) return;
     const nextText = `${textDiv.dataset.rawText || ''}${composeState.pendingText}`;
     textDiv.dataset.rawText = nextText;
-    textDiv.innerHTML = renderMarkdown(nextText);
+    textDiv.innerHTML = renderMarkdown(nextText, { streaming: true });
     composeState.pendingText = '';
-    maybeScrollToBottom();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
-  function renderMarkdown(text) {
+  function finalizeStreamingMarkdown() {
+    const bubble = document.querySelector('#streaming-msg .msg-bubble');
+    if (!bubble) return;
+    bubble.querySelectorAll('.msg-segment-text').forEach((textDiv) => {
+      const raw = textDiv.dataset.rawText || '';
+      if (!raw) return;
+      textDiv.innerHTML = renderMarkdown(raw, { streaming: false });
+    });
+  }
+
+  function renderMarkdown(text, options = {}) {
     if (!text) return '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-    try { return marked.parse(text); }
+    const previousMode = markdownRenderMode;
+    markdownRenderMode = options.streaming ? 'streaming' : 'final';
+    try {
+      if (options.streaming && String(text).length > STREAMING_PLAIN_TEXT_THRESHOLD) {
+        return `<pre class="streaming-plain-text">${escapeHtml(text)}</pre>`;
+      }
+      return marked.parse(text);
+    }
     catch { return escapeHtml(text); }
+    finally { markdownRenderMode = previousMode; }
   }
 
   function createStreamingPlaceholder() {
     const placeholder = document.createElement('div');
     placeholder.className = 'msg-segment msg-segment-pending';
-    placeholder.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+    placeholder.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div><div class="streaming-status" data-level="info">正在等待模型响应…</div>';
     return placeholder;
   }
 
@@ -4767,95 +8515,462 @@
   function appendMessageAttachments(bubble, attachments = []) {
     if (!bubble || !Array.isArray(attachments) || attachments.length === 0) return;
     bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
+    hydrateAttachmentPreviews(bubble);
+  }
+
+  function appendMessageFileRefs(bubble, fileRefs = []) {
+    if (!bubble || !Array.isArray(fileRefs) || fileRefs.length === 0) return;
+    bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
   }
 
   function getStreamingBubble() {
-    return document.querySelector('#streaming-msg .msg-bubble');
+    const msgEl = claimStreamingMessageElement({ createIfMissing: true, cleanupStale: true });
+    return msgEl ? msgEl.querySelector('.msg-bubble') : null;
   }
 
   function clearStreamingPlaceholder(bubble) {
     const placeholder = bubble?.querySelector('.msg-segment-pending');
-    if (placeholder) placeholder.remove();
+    if (placeholder) {
+      placeholder.remove();
+      stopStreamingStatusTimer();
+    }
   }
 
   function ensureStreamingTextSegment() {
     const bubble = getStreamingBubble();
     if (!bubble) return null;
     clearStreamingPlaceholder(bubble);
-    // Keep the live process indicator at the top if present.
     const last = bubble.lastElementChild;
-    // Continue the latest final-phase text segment; process/thinking segments stay separate.
-    if (
-      last
-      && last.classList.contains('msg-segment-text')
-      && !last.classList.contains('msg-segment-thinking')
-      && last.dataset.phase !== 'process'
-      && !last.classList.contains('msg-process-live')
-    ) {
-      return last;
-    }
+    if (last && last.classList.contains('msg-segment-text')) return last;
     const textDiv = createTextSegmentElement('', { phase: 'final' });
     bubble.appendChild(textDiv);
     return textDiv;
   }
 
-  function ensureStreamingThinkingSegment() {
-    const bubble = getStreamingBubble();
-    if (!bubble) return null;
-    clearStreamingPlaceholder(bubble);
-    // Only continue a thinking segment if it is still the trailing content node.
-    // After tools / final text, open a NEW thinking segment to preserve order.
-    let cursor = bubble.lastElementChild;
-    while (cursor && cursor.classList.contains('msg-process-live')) {
-      cursor = cursor.previousElementSibling;
+  function copyTextFallback(text) {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-1000px';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch {
+      return false;
     }
-    if (cursor && cursor.classList.contains('msg-segment-thinking')) {
-      return cursor;
-    }
-    const thinking = createTextSegmentElement('', { phase: 'process' });
-    thinking.classList.add('msg-segment-thinking');
-    bubble.appendChild(thinking);
-    updateLiveProcessIndicator();
-    return thinking;
   }
 
-  function removeLiveProcessIndicator(bubble = getStreamingBubble()) {
-    bubble?.querySelector('.msg-process-live')?.remove();
+  function writeClipboardText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(text).catch(() => {
+        if (copyTextFallback(text)) return;
+        throw new Error('clipboard fallback failed');
+      });
+    }
+    if (copyTextFallback(text)) return Promise.resolve();
+    return Promise.reject(new Error('clipboard unavailable'));
   }
 
-  function updateLiveProcessIndicator() {
-    const bubble = getStreamingBubble();
-    if (!bubble || !composeState.isGenerating) return;
-    const hasProcess = !!(
-      bubble.querySelector('.msg-segment-thinking')
-      || bubble.querySelector('.msg-segment-process')
-      || bubble.querySelector('.tool-call, .tool-group')
+  function getMessageBaseCopyTextFromData(message) {
+    if (!message) return '';
+    if (typeof message.content === 'string' && message.content.trim()) return message.content;
+    if (Array.isArray(message.segments)) {
+      return message.segments
+        .map((segment) => {
+          if (segment && typeof segment.text === 'string') return segment.text;
+          if (segment?.type === 'image') {
+            const label = `[图片] ${segment.prompt || segment.alt || ''}`.trim();
+            return segment.path ? `${label}\n${segment.path}` : label;
+          }
+          return '';
+        })
+        .filter((text) => text.trim())
+        .join('\n\n');
+    }
+    return '';
+  }
+
+  function formatAttachmentCopyLines(attachments = []) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return [];
+    return attachments
+      .map((attachment) => {
+        if (!attachment) return '';
+        const id = String(attachment.id || '').trim();
+        const kindLabel = attachmentKindLabel(attachment);
+        const name = attachment.filename || attachmentDefaultName(attachment);
+        const meta = [
+          Number(attachment.size) ? formatFileSize(attachment.size) : '',
+          attachment.storageState === 'expired' ? '已过期' : '',
+        ].filter(Boolean).join('，');
+        const serverRef = id ? new URL(attachmentRawUrl(id), window.location.origin).href : '';
+        return `- ${kindLabel}：${name}${meta ? `（${meta}）` : ''}${serverRef ? `\n  服务器引用：${serverRef}` : ''}${id ? `\n  附件ID：${id}` : ''}`;
+      })
+      .filter((line) => line.trim());
+  }
+
+  function formatFileRefCopyLines(fileRefs = []) {
+    if (!Array.isArray(fileRefs) || fileRefs.length === 0) return [];
+    return fileRefs
+      .map((ref) => {
+        if (!ref) return '';
+        const isDir = ref.type === 'directory';
+        const name = ref.relativePath || ref.path || (isDir ? 'directory' : 'file');
+        const size = !isDir && Number(ref.size) ? `（${formatFileSize(ref.size)}）` : '';
+        return `- ${isDir ? '目录' : '文件'}：${name}${size}`;
+      })
+      .filter((line) => line.trim());
+  }
+
+  function buildMessageCopyText(baseText = '', attachments = [], fileRefs = []) {
+    const sections = [];
+    const text = String(baseText || '').trim();
+    if (text) sections.push(text);
+    const attachmentLines = formatAttachmentCopyLines(attachments);
+    if (attachmentLines.length > 0) sections.push(`附件：\n${attachmentLines.join('\n')}`);
+    const fileRefLines = formatFileRefCopyLines(fileRefs);
+    if (fileRefLines.length > 0) sections.push(`引用：\n${fileRefLines.join('\n')}`);
+    return sections.join('\n\n');
+  }
+
+  function getMessageCopyTextFromData(message) {
+    if (!message) return '';
+    return buildMessageCopyText(
+      getMessageBaseCopyTextFromData(message),
+      message.attachments || [],
+      message.fileRefs || [],
     );
-    if (!hasProcess) {
-      removeLiveProcessIndicator(bubble);
+  }
+
+  function getMessageCopyTextFromElement(msgEl) {
+    if (!msgEl) return '';
+    const stored = msgEl.dataset.copyText || '';
+    if (stored.trim()) return stored;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return '';
+    const textParts = Array.from(bubble.querySelectorAll('.msg-segment-text, .msg-text'))
+      .map((el) => {
+        if (typeof el.dataset.rawText === 'string') return el.dataset.rawText;
+        return el.innerText || el.textContent || '';
+      })
+      .filter((text) => text.trim());
+    if (textParts.length > 0) return textParts.join('\n\n');
+    return bubble.innerText || bubble.textContent || '';
+  }
+
+  function getMessageRawTextFromElement(msgEl) {
+    if (!msgEl) return '';
+    const stored = msgEl.dataset.rawText || '';
+    if (stored.trim()) return stored;
+    const bubble = msgEl.querySelector('.msg-bubble');
+    if (!bubble) return '';
+    const textParts = Array.from(bubble.querySelectorAll('.msg-segment-text, .msg-text'))
+      .map((el) => {
+        if (typeof el.dataset.rawText === 'string') return el.dataset.rawText;
+        return el.innerText || el.textContent || '';
+      })
+      .filter((text) => text.trim());
+    if (textParts.length > 0) return textParts.join('\n\n');
+    return '';
+  }
+
+  function setMessageCopyButtonState(btn, label, copied = false) {
+    if (!btn) return;
+    btn.textContent = label;
+    btn.classList.toggle('copied', !!copied);
+  }
+
+  function handleMessageCopyClick(btn) {
+    const msgEl = btn?.closest('.msg');
+    const text = getMessageCopyTextFromElement(msgEl).trim();
+    if (!text) {
+      showToast('暂无可复制内容');
       return;
     }
-    let live = bubble.querySelector('.msg-process-live');
-    if (!live) {
-      live = document.createElement('div');
-      live.className = 'msg-process-live msg-segment';
-      bubble.insertBefore(live, bubble.firstChild);
-    }
-    const runningTools = bubble.querySelectorAll('.tool-call-state.running').length;
-    const toolCount = bubble.querySelectorAll('.tool-call').length;
-    const thinking = bubble.querySelector('.msg-segment-thinking');
-    if (runningTools > 0) {
-      live.innerHTML = `<span class="msg-process-live-dot"></span>正在执行工具（${runningTools}/${Math.max(toolCount, runningTools)}）…`;
-    } else if (thinking) {
-      live.innerHTML = '<span class="msg-process-live-dot"></span>思考中…';
-    } else {
-      live.innerHTML = '<span class="msg-process-live-dot"></span>处理中…';
-    }
+    writeClipboardText(text).then(() => {
+      setMessageCopyButtonState(btn, '已复制', true);
+      setTimeout(() => setMessageCopyButtonState(btn, '复制', false), 1400);
+    }).catch(() => {
+      setMessageCopyButtonState(btn, '复制失败', false);
+      showToast('复制失败，请手动选择文本复制');
+      setTimeout(() => setMessageCopyButtonState(btn, '复制', false), 1600);
+    });
   }
 
-  function createMsgElement(role, content, attachments = [], model = '') {
+  function beginForkFromAssistantButton(btn, event) {
+    const msgEl = btn?.closest('.msg.assistant');
+    if (!msgEl) return;
+    const session = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+    if (!session?.id) {
+      showToast('请先打开会话');
+      return;
+    }
+    if (sessionState.currentSessionRunning || composeState.isGenerating) {
+      showToast('请等当前回复完成后再分叉');
+      return;
+    }
+    const messageIndex = Number(msgEl.dataset.messageIndex);
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+      showToast('这条回复暂时不能分叉，请刷新会话后重试');
+      return;
+    }
+    startForkSession(session, event, { messageIndex });
+  }
+
+  function scrollMessageToTop(msgEl) {
+    if (!msgEl || !messagesDiv) return;
+    const containerRect = messagesDiv.getBoundingClientRect();
+    const messageRect = msgEl.getBoundingClientRect();
+    const targetTop = Math.max(0, messagesDiv.scrollTop + messageRect.top - containerRect.top - 12);
+    messageScrollProgrammatic = true;
+    shouldFollowMessageStream = false;
+    setJumpToLatestVisible(true);
+    messagesDiv.scrollTo({ top: targetTop, behavior: 'smooth' });
+    updateScrollbar();
+    setTimeout(() => {
+      messageScrollProgrammatic = false;
+      updateScrollbar();
+    }, 360);
+  }
+
+  function handleMessageJumpTopClick(btn) {
+    const msgEl = btn?.closest('.msg');
+    scrollMessageToTop(msgEl);
+  }
+
+  function clearEditingMessageState(options = {}) {
+    editingMessageState = null;
+    if (editMessageBar) editMessageBar.hidden = true;
+    messagesDiv?.querySelectorAll('.msg.editing-source').forEach((el) => el.classList.remove('editing-source'));
+    if (options.clearInput) {
+      msgInput.value = '';
+      autoResize();
+      renderContextBar();
+    }
+    updateComposerActionButtons();
+  }
+
+  function renderEditingMessageState() {
+    const active = !!editingMessageState;
+    if (editMessageBar) {
+      editMessageBar.hidden = !active;
+      if (editMessageLabel && active) {
+        const displayIndex = Number(editingMessageState.messageIndex || 0) + 1;
+        editMessageLabel.textContent = `正在修改第 ${displayIndex} 条消息；发送后会重置后续回答`;
+      }
+    }
+    messagesDiv?.querySelectorAll('.msg.editing-source').forEach((el) => el.classList.remove('editing-source'));
+    if (active) {
+      const source = messagesDiv?.querySelector(`.msg.user[data-message-index="${editingMessageState.messageIndex}"]`);
+      if (source) source.classList.add('editing-source');
+    }
+    updateComposerActionButtons();
+  }
+
+  function beginEditMessageFromButton(btn) {
+    const msgEl = btn?.closest('.msg.user');
+    if (!msgEl) return;
+    if (!sessionState.currentSessionId) {
+      showToast('请先打开会话');
+      return;
+    }
+    if (composeState.isGenerating || sessionState.currentSessionRunning) {
+      showToast('请先停止当前任务，再修改上一条消息');
+      return;
+    }
+    const messageIndex = Number(msgEl.dataset.messageIndex);
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+      showToast('这条消息暂时不能修改，请刷新会话后重试');
+      return;
+    }
+    const draft = msgInput.value.trim();
+    if (draft && !editingMessageState && !window.confirm('输入框里已有草稿，是否用这条历史消息覆盖草稿？')) return;
+    const text = getMessageRawTextFromElement(msgEl);
+    editingMessageState = {
+      sessionId: sessionState.currentSessionId,
+      messageIndex,
+      originalText: text,
+    };
+    msgInput.value = text;
+    hideCmdMenu();
+    hideOptionPicker();
+    autoResize();
+    renderContextBar();
+    renderEditingMessageState();
+    msgInput.focus();
+    scrollMessageToTop(msgEl);
+  }
+
+  function submitEditedMessage(text) {
+    if (!editingMessageState) return false;
+    if (composeState.isGenerating || sessionState.currentSessionRunning) {
+      showToast('请先停止当前任务，再提交修改');
+      return true;
+    }
+    const edited = String(text || '').trim();
+    if (!edited) {
+      showToast('修改后的消息不能为空');
+      return true;
+    }
+    const payload = {
+      type: 'edit_message',
+      sessionId: editingMessageState.sessionId,
+      messageIndex: editingMessageState.messageIndex,
+      text,
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+      agent: sessionState.currentAgent,
+    };
+    markAwaitingRuntimeStart();
+    const sent = send(payload);
+    if (!sent) return true;
+    pendingEditResetSessionId = editingMessageState.sessionId;
+    msgInput.value = '';
+    composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
+    renderPendingAttachments();
+    renderContextBar();
+    autoResize();
+    clearEditingMessageState();
+    showToast('已按修改内容重置后续回答');
+    // Do not optimistically start the streaming placeholder here. The backend
+    // first sends a fresh session_info with truncated history; if we mark the
+    // composer as generating too early, applySessionSnapshot() preserves the
+    // stale DOM and old assistant/tool cards remain visible until refresh.
+    return true;
+  }
+
+  function createMessageActions(role, completedAt = null, messageMeta = {}) {
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    if (role === 'assistant') {
+      const topBtn = document.createElement('button');
+      topBtn.type = 'button';
+      topBtn.className = 'msg-action-btn msg-jump-top-btn';
+      topBtn.textContent = '本条顶部 ↑';
+      topBtn.title = '跳到这条回复的开头';
+      topBtn.setAttribute('aria-label', '跳到这条回复的开头');
+      topBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        handleMessageJumpTopClick(topBtn);
+      });
+      actions.appendChild(topBtn);
+    }
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'msg-action-btn msg-copy-btn';
+    copyBtn.textContent = '复制';
+    copyBtn.setAttribute('aria-label', '复制这条消息');
+    copyBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handleMessageCopyClick(copyBtn);
+    });
+    actions.appendChild(copyBtn);
+    if (role === 'assistant' && Number.isInteger(Number(messageMeta.messageIndex))) {
+      const forkBtn = document.createElement('button');
+      forkBtn.type = 'button';
+      forkBtn.className = 'msg-action-btn msg-fork-btn';
+      forkBtn.textContent = '分叉';
+      forkBtn.title = '从这条回复创建新分支';
+      forkBtn.setAttribute('aria-label', '从这条回复创建新分支');
+      forkBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        beginForkFromAssistantButton(forkBtn, event);
+      });
+      actions.appendChild(forkBtn);
+    }
+    if (role === 'user' && Number.isInteger(Number(messageMeta.messageIndex))) {
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'msg-action-btn msg-edit-btn';
+      editBtn.textContent = '✎';
+      editBtn.title = '修改这条消息并重置后续回答';
+      editBtn.setAttribute('aria-label', '修改这条消息并重置后续回答');
+      editBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        beginEditMessageFromButton(editBtn);
+      });
+      actions.appendChild(editBtn);
+    }
+    if (role === 'assistant') {
+      const completedTime = createMessageCompletionTimeElement(completedAt);
+      if (completedTime) actions.appendChild(completedTime);
+    }
+    return actions;
+  }
+
+
+  function formatMessageTimestamp(timestamp) {
+    if (!timestamp) return '';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    const time = date.getTime();
+    if (!Number.isFinite(time)) return '';
+    const pad = (value) => String(value).padStart(2, '0');
+    const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${clock}`;
+  }
+
+  function createMessageTimeElement(timestamp) {
+    const label = formatMessageTimestamp(timestamp);
+    if (!label) return null;
+    const time = document.createElement('time');
+    time.className = 'msg-time';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    if (Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString();
+    }
+    time.textContent = label;
+    return time;
+  }
+
+  function createMessageCompletionTimeElement(timestamp) {
+    const label = formatMessageTimestamp(timestamp);
+    if (!label) return null;
+    const time = document.createElement('time');
+    time.className = 'msg-completion-time';
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+    if (Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString();
+    }
+    time.textContent = label;
+    return time;
+  }
+
+  function setMessageCompletedAt(msgEl, completedAt) {
+    if (!msgEl || !completedAt || !msgEl.classList?.contains('assistant')) return;
+    const actions = msgEl.querySelector('.msg-actions');
+    if (!actions) return;
+    const nextTime = createMessageCompletionTimeElement(completedAt);
+    if (!nextTime) return;
+    msgEl.dataset.completedAt = nextTime.dateTime || String(completedAt);
+    const existing = actions.querySelector('.msg-completion-time');
+    if (existing) existing.replaceWith(nextTime);
+    else actions.appendChild(nextTime);
+  }
+
+  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null, messageMeta = {}) {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
+    div.dataset.messageRole = role;
+    if (Number.isInteger(Number(messageMeta.messageIndex))) {
+      div.dataset.messageIndex = String(Number(messageMeta.messageIndex));
+    }
+    if (role === 'user' || role === 'assistant') {
+      const rawText = typeof content === 'string' ? content : '';
+      div.dataset.rawText = rawText;
+      div.dataset.copyText = buildMessageCopyText(rawText, attachments, fileRefs);
+    }
 
     if (role === 'system') {
       const bubble = document.createElement('div');
@@ -4901,15 +9016,32 @@
       if (attachments.length > 0) {
         bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
       }
+      if (fileRefs.length > 0) {
+        bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
+      }
     } else {
       bubble.innerHTML = content ? renderMarkdown(content) : '';
       if (attachments.length > 0) {
         bubble.insertAdjacentHTML('beforeend', renderAttachmentLabels(attachments));
       }
+      if (fileRefs.length > 0) {
+        bubble.insertAdjacentHTML('beforeend', renderFileRefLabels(fileRefs));
+      }
     }
 
-    div.appendChild(avatarCol);
-    div.appendChild(bubble);
+    const contentWrap = document.createElement('div');
+    contentWrap.className = 'msg-content';
+    const timeEl = createMessageTimeElement(timestamp);
+    if (timeEl) {
+      div.dataset.startedAt = timeEl.dateTime || String(timestamp);
+      contentWrap.appendChild(timeEl);
+    }
+    contentWrap.appendChild(bubble);
+    contentWrap.appendChild(createMessageActions(role, completedAt, messageMeta));
+
+    div.appendChild(avatar);
+    div.appendChild(contentWrap);
+    hydrateAttachmentPreviews(bubble);
     return div;
   }
 
@@ -5051,6 +9183,20 @@
             done: segment.done !== false,
           };
         }
+        if (segment.type === 'image') {
+          return {
+            type: 'image',
+            src: typeof segment.src === 'string' ? segment.src : '',
+            rawUrl: typeof segment.rawUrl === 'string' ? segment.rawUrl : '',
+            path: typeof segment.path === 'string' ? segment.path : '',
+            relativePath: typeof segment.relativePath === 'string' ? segment.relativePath : '',
+            rootKey: typeof segment.rootKey === 'string' ? segment.rootKey : '',
+            mime: typeof segment.mime === 'string' ? segment.mime : '',
+            alt: typeof segment.alt === 'string' ? segment.alt : 'Generated image',
+            id: segment.id || null,
+            prompt: typeof segment.prompt === 'string' ? segment.prompt : '',
+          };
+        }
         return {
           type: 'text',
           text: typeof segment.text === 'string' ? segment.text : '',
@@ -5058,7 +9204,7 @@
           thinking: segment.thinking === true || segment.phase === 'thinking',
         };
       })
-      .filter((segment) => segment.type === 'tool_call' || segment.text);
+      .filter((segment) => segment.type === 'tool_call' || segment.type === 'image' || segment.text);
     return annotateMessageSegmentPhases(collapseToolSegmentsForDisplay(normalized));
   }
 
@@ -5427,6 +9573,87 @@
     return group;
   }
 
+  async function openGeneratedImageInViewer(segment = {}) {
+    const imagePath = String(segment.path || '').trim();
+    if (!imagePath) {
+      if (segment.src) window.open(segment.src, '_blank', 'noopener');
+      return;
+    }
+    clearFileViewerObjectUrl();
+    resetFileViewerImageState(imagePath);
+    fileViewerState = { open: true, loading: true, error: '', data: null, activePath: imagePath, activeTab: 'preview', objectUrl: '' };
+    if (fileViewerPanel) fileViewerPanel.classList.add('visible');
+    syncFileViewerWidthForViewport();
+    renderFileTree();
+    renderFileViewer();
+    try {
+      await ensureAuthenticatedWs();
+      const params = new URLSearchParams({ path: imagePath });
+      const response = await fetch(`/api/generated-image-view?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${connectionState.authToken}` },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok) throw new Error(data?.message || `读取失败 (${response.status})`);
+      if (fileViewerState.activePath !== imagePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = '';
+      fileViewerState.data = data;
+      fileViewerState.activeTab = normalizeFileViewerTab(data, 'preview');
+      renderFileViewer();
+      fetchFileViewerBlob(data);
+    } catch (err) {
+      if (fileViewerState.activePath !== imagePath) return;
+      fileViewerState.loading = false;
+      fileViewerState.error = err.message || '无法打开生成图片';
+      fileViewerState.data = null;
+      renderFileViewer();
+    }
+  }
+
+  function createImageSegmentElement(segment = {}) {
+    if (!segment.src) return null;
+    const wrap = document.createElement('figure');
+    wrap.className = 'msg-image-segment msg-segment';
+    const imgButton = document.createElement('button');
+    imgButton.type = 'button';
+    imgButton.className = 'msg-generated-image-button';
+    imgButton.title = segment.path ? '打开图片预览' : '在新窗口打开图片';
+    const img = document.createElement('img');
+    img.className = 'msg-generated-image';
+    img.src = segment.src;
+    img.alt = segment.alt || 'Generated image';
+    img.loading = 'lazy';
+    imgButton.appendChild(img);
+    imgButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openGeneratedImageInViewer(segment);
+    });
+    wrap.appendChild(imgButton);
+
+    const caption = document.createElement('figcaption');
+    caption.className = 'msg-image-caption';
+    const title = document.createElement('span');
+    title.className = 'msg-image-title';
+    title.textContent = 'AI 生成图片';
+    caption.appendChild(title);
+    if (segment.path) {
+      const pathBtn = document.createElement('button');
+      pathBtn.type = 'button';
+      pathBtn.className = 'msg-image-path';
+      pathBtn.textContent = segment.path;
+      pathBtn.title = '点击后在右侧文件预览器打开图片';
+      pathBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openGeneratedImageInViewer(segment);
+      });
+      caption.appendChild(pathBtn);
+    }
+    wrap.appendChild(caption);
+    return wrap;
+  }
+
   function buildMessageSegmentElement(segment) {
     if (!segment) return null;
     if (segment.type === 'tool_group') {
@@ -5436,6 +9663,9 @@
       const details = createToolCallElement(segment.id || nextLocalId('saved'), segment, segment.done !== false);
       details.classList.add('msg-segment');
       return details;
+    }
+    if (segment.type === 'image') {
+      return createImageSegmentElement(segment);
     }
     const text = typeof segment.text === 'string' ? segment.text : '';
     if (!text) return null;
@@ -5448,6 +9678,11 @@
 
   function renderAssistantSegments(bubble, message) {
     if (!bubble) return;
+    const msgEl = bubble.closest('.msg');
+    if (msgEl) {
+      msgEl.dataset.rawText = getMessageBaseCopyTextFromData(message);
+      msgEl.dataset.copyText = getMessageCopyTextFromData(message);
+    }
     bubble.innerHTML = '';
     // History: always collapse thinking/process/tools once the turn is complete.
     appendSegmentsWithProcessCollapse(bubble, normalizeMessageSegments(message), {
@@ -5455,6 +9690,7 @@
       processOpen: false,
     });
     appendMessageAttachments(bubble, message?.attachments || []);
+    appendMessageFileRefs(bubble, message?.fileRefs || []);
   }
 
   function renderStreamingSegments(segments) {
@@ -5466,7 +9702,7 @@
       forceCollapseProcess: false,
       processOpen: true,
     });
-    updateLiveProcessIndicator();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function markStreamingProcessTextSegments() {
@@ -5482,9 +9718,55 @@
     updateLiveProcessIndicator();
   }
 
-  function buildMsgElement(m) {
-    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || []);
-    const el = createMsgElement('assistant', '', [], m.model || '');
+  function resolveMessageDisplayTimes(message, previousUserTimestamp = null) {
+    const messageTimestamp = message?.timestamp || message?.createdAt || null;
+    if (message?.role !== 'assistant') {
+      return { startedAt: messageTimestamp, completedAt: null };
+    }
+    return {
+      startedAt: previousUserTimestamp || message.startedAt || messageTimestamp,
+      completedAt: message.completedAt || message.finishedAt || messageTimestamp,
+    };
+  }
+
+  function refreshRenderedMessageIndexes() {
+    if (!messagesDiv) return;
+    const messageEls = Array.from(messagesDiv.querySelectorAll(':scope > .msg'))
+      .filter((el) => !el.classList.contains('welcome-msg'));
+    messageEls.forEach((el, index) => {
+      el.dataset.messageIndex = String(index);
+      const role = el.classList.contains('user') ? 'user'
+        : (el.classList.contains('assistant') ? 'assistant'
+          : (el.classList.contains('system') ? 'system' : ''));
+      if (role) el.dataset.messageRole = role;
+      if (role === 'user' && !el.querySelector('.msg-edit-btn')) {
+        const actions = el.querySelector('.msg-actions');
+        if (!actions) return;
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'msg-action-btn msg-edit-btn';
+        editBtn.textContent = '✎';
+        editBtn.title = '修改这条消息并重置后续回答';
+        editBtn.setAttribute('aria-label', '修改这条消息并重置后续回答');
+        editBtn.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          beginEditMessageFromButton(editBtn);
+        });
+        actions.appendChild(editBtn);
+      }
+    });
+  }
+
+  function buildMsgElement(m, previousUserTimestamp = null, messageIndex = null) {
+    const displayTimes = resolveMessageDisplayTimes(m, previousUserTimestamp);
+    const messageMeta = Number.isInteger(Number(messageIndex)) ? { messageIndex: Number(messageIndex) } : {};
+    if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt, null, messageMeta);
+    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt, messageMeta);
+    if (m.streaming === true) {
+      el.id = 'streaming-msg';
+      el.dataset.streaming = 'true';
+    }
     renderAssistantSegments(el.querySelector('.msg-bubble'), m);
     return el;
   }
@@ -5503,8 +9785,13 @@
     }
     if (options.immediate) {
       const frag = document.createDocumentFragment();
-      messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
+      let latestUserTimestamp = null;
+      messages.forEach((message, index) => {
+        frag.appendChild(buildMsgElement(message, latestUserTimestamp, index));
+        if (message?.role === 'user') latestUserTimestamp = message.timestamp || message.createdAt || latestUserTimestamp;
+      });
       messagesDiv.appendChild(frag);
+      refreshRenderedMessageIndexes();
       scrollToBottom();
       requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
       return;
@@ -5532,9 +9819,17 @@
     }
 
     // Render first batch immediately
+    const previousUserTimestamps = [];
+    let latestUserTimestamp = null;
+    for (let i = 0; i < len; i++) {
+      previousUserTimestamps[i] = latestUserTimestamp;
+      if (messages[i]?.role === 'user') latestUserTimestamp = messages[i].timestamp || messages[i].createdAt || latestUserTimestamp;
+    }
+
     const frag0 = document.createDocumentFragment();
-    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
+    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
     messagesDiv.appendChild(frag0);
+    refreshRenderedMessageIndexes();
     scrollToBottom();
     requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
 
@@ -5550,8 +9845,9 @@
       const prevScrollTop = messagesDiv.scrollTop;
       
       const frag = document.createDocumentFragment();
-      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
+      for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], previousUserTimestamps[i] || null, i));
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+      refreshRenderedMessageIndexes();
       
       // Compensate scrollTop so visible area stays unchanged
       messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
@@ -5577,7 +9873,11 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const frag = document.createDocumentFragment();
-    messages.forEach((m) => frag.appendChild(buildMsgElement(m)));
+    let latestUserTimestamp = null;
+    messages.forEach((m) => {
+      frag.appendChild(buildMsgElement(m, latestUserTimestamp));
+      if (m?.role === 'user') latestUserTimestamp = m.timestamp || m.createdAt || latestUserTimestamp;
+    });
     if (!preserveScroll) {
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       if (!skipScrollbar) updateScrollbar();
@@ -5860,7 +10160,7 @@
     } else {
       bubble.appendChild(details);
     }
-    maybeScrollToBottom();
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   function updateToolCall(toolUseId, result) {
@@ -6286,37 +10586,46 @@
     div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  function isNearBottom(threshold = SCROLL_NEAR_BOTTOM_PX) {
-    const distance = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
-    return distance <= threshold;
+  const MESSAGE_BOTTOM_THRESHOLD = 72;
+  let shouldFollowMessageStream = true;
+  let messageScrollProgrammatic = false;
+
+  function getMessageBottomDistance() {
+    return Math.max(0, messagesDiv.scrollHeight - messagesDiv.clientHeight - messagesDiv.scrollTop);
   }
 
-  function updateScrollToBottomButton(forceHide = false) {
-    if (!scrollToBottomBtn) return;
-    const shouldShow = !forceHide && !composeState.stickToBottom && !isNearBottom();
-    scrollToBottomBtn.hidden = !shouldShow;
+  function isMessagesNearBottom() {
+    return getMessageBottomDistance() <= MESSAGE_BOTTOM_THRESHOLD;
   }
 
-  function forceScrollToBottom() {
-    composeState.stickToBottom = true;
-    requestAnimationFrame(() => {
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  function setJumpToLatestVisible(visible) {
+    if (!jumpToLatestBtn) return;
+    jumpToLatestBtn.hidden = !visible;
+  }
+
+  function syncMessageFollowStateFromScroll() {
+    shouldFollowMessageStream = isMessagesNearBottom();
+    setJumpToLatestVisible(!shouldFollowMessageStream);
+  }
+
+  function scrollToBottom(options = {}) {
+    const onlyIfFollowing = options.onlyIfFollowing === true;
+    if (onlyIfFollowing && !shouldFollowMessageStream) {
+      setJumpToLatestVisible(true);
       updateScrollbar();
-      updateScrollToBottomButton(true);
+      return;
+    }
+    requestAnimationFrame(() => {
+      messageScrollProgrammatic = true;
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      shouldFollowMessageStream = true;
+      setJumpToLatestVisible(false);
+      updateScrollbar();
+      requestAnimationFrame(() => { messageScrollProgrammatic = false; });
     });
   }
 
-  function maybeScrollToBottom() {
-    if (composeState.stickToBottom || isNearBottom()) {
-      forceScrollToBottom();
-      return;
-    }
-    updateScrollToBottomButton();
-  }
-
-  function scrollToBottom() {
-    forceScrollToBottom();
-  }
+  jumpToLatestBtn.addEventListener('click', () => scrollToBottom());
 
   // --- Custom Scrollbar ---
   const scrollbarEl = document.getElementById('custom-scrollbar');
@@ -6339,8 +10648,7 @@
 
   messagesDiv.addEventListener('scroll', () => {
     updateScrollbar();
-    composeState.stickToBottom = isNearBottom();
-    updateScrollToBottomButton(composeState.stickToBottom);
+    if (!messageScrollProgrammatic) syncMessageFollowStateFromScroll();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
     clearTimeout(scrollbarEl._hideTimer);
@@ -6523,7 +10831,8 @@
 
   function buildSessionItem(s) {
     const item = document.createElement('div');
-    item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${s.isRunning ? ' is-running' : ''}`;
+    const sessionBusy = !!s.isRunning;
+    item.className = `session-item${s.id === sessionState.currentSessionId ? ' active' : ''}${s.hasUnread ? ' has-unread' : ''}${sessionBusy ? ' is-running' : ''}`;
     item.dataset.id = s.id;
     item.setAttribute('tabindex', '0');
     item.setAttribute('role', 'button');
@@ -6554,7 +10863,7 @@
       right.appendChild(unread);
     }
 
-    if (s.isRunning) {
+    if (sessionBusy) {
       const status = document.createElement('span');
       status.className = 'session-item-status';
       status.textContent = '运行中';
@@ -6600,6 +10909,7 @@
           }
           if (localStorage.getItem('webcoding-session') === s.id) localStorage.removeItem('webcoding-session');
           invalidateSessionCache(s.id);
+          forgetOpenChatTabs(s.id, { render: false });
           send({ type: 'delete_session', sessionId: s.id });
           if (s.id === sessionState.currentSessionId) {
             resetChatView(selectedAgent);
@@ -6630,20 +10940,341 @@
     return item;
   }
 
+  function startForkSession(session, event, options = {}) {
+    if (!session?.id) return;
+    const messageIndex = Number(options.messageIndex);
+    const sent = send({
+      type: 'fork_session',
+      sessionId: session.id,
+      mode: 'normal',
+      worktree: false,
+      ...(Number.isInteger(messageIndex) && messageIndex >= 0 ? { messageIndex } : {}),
+    });
+    if (sent) {
+      showToast('正在分叉会话…');
+    }
+  }
+
   function saveCollapsedProjects() {
     localStorage.setItem('webcoding-collapsed-projects', JSON.stringify([...collapsedProjects]));
   }
 
+  function saveSelectedProject() {
+    if (!selectedProject?.id) {
+      localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify({
+      id: selectedProject.id,
+      path: selectedProject.path || null,
+    }));
+  }
+
+  function getFileTreeCwd() {
+    return selectedProject?.path || sessionState.currentCwd || null;
+  }
+
+  function collapseProjectsExcept(projectId) {
+    const ids = new Set(projects.map((project) => project.id).filter(Boolean));
+    sessionList.querySelectorAll('.project-group[data-project-id]').forEach((group) => {
+      if (group.dataset.projectId) ids.add(group.dataset.projectId);
+    });
+    for (const id of ids) {
+      if (id === projectId) collapsedProjects.delete(id);
+      else collapsedProjects.add(id);
+    }
+    saveCollapsedProjects();
+  }
+
+  function selectProjectGroup(project, options = {}) {
+    if (!project?.id) return;
+    selectedProject = { id: project.id, path: project.path || null };
+    saveSelectedProject();
+    if (options.collapseOthers !== false) {
+      collapseProjectsExcept(project.id);
+    } else {
+      collapsedProjects.delete(project.id);
+      saveCollapsedProjects();
+    }
+    if (options.loadFiles !== false) {
+      if (project.path) loadFileTree(project.path);
+      else clearFileTree();
+    }
+    if (options.render !== false) renderSessionList();
+    renderWorkspaceInsights();
+  }
+
+  function selectProjectForCwd(cwd, options = {}) {
+    if (!cwd) return;
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    const project = findBestProjectForSession({ cwd }, projectsById) || buildVirtualProjectFromCwd(cwd);
+    selectProjectGroup(project, options);
+  }
+
+  function reconcileSelectedProjectWithSavedProjects() {
+    if (!selectedProject?.id) return;
+    const saved = projects.find((project) => project.id === selectedProject.id);
+    if (saved && saved.path !== selectedProject.path) {
+      selectedProject = { id: saved.id, path: saved.path || null };
+      saveSelectedProject();
+      return;
+    }
+    if (!saved && selectedProject.path) {
+      const pathMatched = projects.find((project) => normalizeComparablePath(project.path) === normalizeComparablePath(selectedProject.path));
+      if (pathMatched) {
+        selectedProject = { id: pathMatched.id, path: pathMatched.path || null };
+        saveSelectedProject();
+      }
+    }
+  }
+
+  function clearProjectDragClasses() {
+    sessionList.querySelectorAll('.project-group.dragging, .project-group.drag-over-target, .project-group.drag-over-before, .project-group.drag-over-after')
+      .forEach((group) => group.classList.remove('dragging', 'drag-over-target', 'drag-over-before', 'drag-over-after'));
+  }
+
+  function reorderProjectsLocally(draggedId, targetId, placeAfter) {
+    if (!draggedId || !targetId || draggedId === targetId) return false;
+    const fromIndex = projects.findIndex((project) => project.id === draggedId);
+    const targetIndex = projects.findIndex((project) => project.id === targetId);
+    if (fromIndex < 0 || targetIndex < 0) return false;
+    const nextProjects = [...projects];
+    const [draggedProject] = nextProjects.splice(fromIndex, 1);
+    let insertIndex = nextProjects.findIndex((project) => project.id === targetId);
+    if (insertIndex < 0) return false;
+    if (placeAfter) insertIndex += 1;
+    nextProjects.splice(insertIndex, 0, draggedProject);
+    projects = nextProjects;
+    return true;
+  }
+
+  function persistProjectOrder() {
+    send({ type: 'reorder_projects', projectIds: projects.map((project) => project.id) });
+  }
+
+  function bindProjectDragHandlers(group, project, isVirtualCwd) {
+    if (isVirtualCwd || !project?.id) return;
+    group.draggable = true;
+    group.classList.add('project-group-draggable');
+
+    group.addEventListener('dragstart', (e) => {
+      if (e.target instanceof Element && e.target.closest('.project-group-actions, .project-group-menu, .session-item')) {
+        e.preventDefault();
+        return;
+      }
+      suppressProjectHeaderClickUntil = Date.now() + 500;
+      projectDragState = { projectId: project.id };
+      group.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', project.id);
+      }
+    });
+
+    group.addEventListener('dragover', (e) => {
+      const draggedId = projectDragState?.projectId || e.dataTransfer?.getData('text/plain');
+      if (!draggedId || draggedId === project.id) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      const rect = group.getBoundingClientRect();
+      const placeAfter = e.clientY > rect.top + rect.height / 2;
+      group.classList.add('drag-over-target');
+      group.classList.toggle('drag-over-before', !placeAfter);
+      group.classList.toggle('drag-over-after', placeAfter);
+    });
+
+    group.addEventListener('dragleave', (e) => {
+      if (e.relatedTarget instanceof Node && group.contains(e.relatedTarget)) return;
+      group.classList.remove('drag-over-target', 'drag-over-before', 'drag-over-after');
+    });
+
+    group.addEventListener('drop', (e) => {
+      const draggedId = projectDragState?.projectId || e.dataTransfer?.getData('text/plain');
+      if (!draggedId || draggedId === project.id) return;
+      e.preventDefault();
+      suppressProjectHeaderClickUntil = Date.now() + 500;
+      const rect = group.getBoundingClientRect();
+      const placeAfter = e.clientY > rect.top + rect.height / 2;
+      clearProjectDragClasses();
+      projectDragState = null;
+      if (reorderProjectsLocally(draggedId, project.id, placeAfter)) {
+        persistProjectOrder();
+        renderSessionList();
+      }
+    });
+
+    group.addEventListener('dragend', () => {
+      suppressProjectHeaderClickUntil = Date.now() + 500;
+      projectDragState = null;
+      clearProjectDragClasses();
+    });
+  }
+
+  function getTouchByIdentifier(touchList, identifier) {
+    for (const touch of touchList) {
+      if (touch.identifier === identifier) return touch;
+    }
+    return null;
+  }
+
+  function isProjectTouchDragBlockedTarget(target) {
+    return target instanceof Element && !!target.closest(
+      '.project-group-actions, .project-group-menu, .session-item, button, a, input, textarea, select, [contenteditable="true"]'
+    );
+  }
+
+  function getProjectTouchDropPlacement(clientY, draggedId) {
+    const groups = [...sessionList.querySelectorAll('.project-group[data-project-id]')]
+      .filter((node) => {
+        const projectId = node.dataset.projectId;
+        return projectId
+          && projectId !== draggedId
+          && projects.some((project) => project.id === projectId && !project.isVirtualCwd);
+      });
+    if (!groups.length) return null;
+
+    let fallback = null;
+    for (const group of groups) {
+      const rect = group.getBoundingClientRect();
+      const placeAfter = clientY > rect.top + rect.height / 2;
+      if (!placeAfter) {
+        return { targetId: group.dataset.projectId, group, placeAfter: false };
+      }
+      fallback = { targetId: group.dataset.projectId, group, placeAfter: true };
+    }
+    return fallback;
+  }
+
+  function updateProjectTouchDragOver(clientY) {
+    if (!projectTouchDragState?.dragging) return;
+    const draggedId = projectTouchDragState.projectId;
+    const placement = getProjectTouchDropPlacement(clientY, draggedId);
+    clearProjectDragClasses();
+    projectTouchDragState.group.classList.add('dragging');
+    projectTouchDragState.targetId = placement?.targetId || null;
+    projectTouchDragState.placeAfter = !!placement?.placeAfter;
+    if (placement?.group) {
+      placement.group.classList.add('drag-over-target');
+      placement.group.classList.toggle('drag-over-before', !placement.placeAfter);
+      placement.group.classList.toggle('drag-over-after', placement.placeAfter);
+    }
+  }
+
+  function maybeAutoScrollProjectList(clientY) {
+    const rect = sessionList.getBoundingClientRect();
+    if (clientY < rect.top + PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE) {
+      sessionList.scrollTop -= PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP;
+    } else if (clientY > rect.bottom - PROJECT_TOUCH_DRAG_EDGE_SCROLL_ZONE) {
+      sessionList.scrollTop += PROJECT_TOUCH_DRAG_EDGE_SCROLL_STEP;
+    }
+  }
+
+  function startProjectTouchDrag() {
+    const state = projectTouchDragState;
+    if (!state || state.dragging) return;
+    state.timer = null;
+    state.dragging = true;
+    projectDragState = { projectId: state.projectId, touch: true };
+    document.body.classList.add('project-touch-dragging');
+    document.querySelectorAll('.project-group-menu:not([hidden])').forEach((menu) => {
+      menu.hidden = true;
+      menu.style.top = '';
+      menu.style.left = '';
+      menu._triggerBtn?.classList.remove('active');
+    });
+    updateProjectTouchDragOver(state.startY);
+  }
+
+  function cancelProjectTouchDrag(options = {}) {
+    const state = projectTouchDragState;
+    if (state?.timer) window.clearTimeout(state.timer);
+    projectTouchDragState = null;
+    projectDragState = null;
+    document.body.classList.remove('project-touch-dragging');
+    clearProjectDragClasses();
+    if (options.suppressClick) suppressProjectHeaderClickUntil = Date.now() + 500;
+  }
+
+  function finishProjectTouchDrag(e) {
+    const state = projectTouchDragState;
+    if (!state) return;
+    const wasDragging = state.dragging;
+    const targetId = state.targetId;
+    const placeAfter = state.placeAfter;
+    cancelProjectTouchDrag({ suppressClick: wasDragging });
+    if (!wasDragging) return;
+    e.preventDefault();
+    if (targetId && reorderProjectsLocally(state.projectId, targetId, placeAfter)) {
+      persistProjectOrder();
+      renderSessionList();
+    }
+  }
+
+  function bindProjectTouchDragHandlers(header, group, project, isVirtualCwd) {
+    if (isVirtualCwd || !project?.id || !('TouchEvent' in window)) return;
+
+    header.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1 || isProjectTouchDragBlockedTarget(e.target)) return;
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      if (projectTouchDragState) cancelProjectTouchDrag();
+      projectTouchDragState = {
+        projectId: project.id,
+        group,
+        identifier: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        targetId: null,
+        placeAfter: false,
+        dragging: false,
+        timer: window.setTimeout(startProjectTouchDrag, PROJECT_TOUCH_DRAG_LONG_PRESS_MS),
+      };
+    }, { passive: true });
+
+    header.addEventListener('touchmove', (e) => {
+      const state = projectTouchDragState;
+      if (!state) return;
+      if (e.touches.length !== 1) {
+        cancelProjectTouchDrag({ suppressClick: state.dragging });
+        return;
+      }
+      const touch = getTouchByIdentifier(e.touches, state.identifier);
+      if (!touch) return;
+      const dx = touch.clientX - state.startX;
+      const dy = touch.clientY - state.startY;
+      if (!state.dragging) {
+        if (Math.hypot(dx, dy) > PROJECT_TOUCH_DRAG_CANCEL_DISTANCE) {
+          cancelProjectTouchDrag();
+        }
+        return;
+      }
+      e.preventDefault();
+      maybeAutoScrollProjectList(touch.clientY);
+      updateProjectTouchDragOver(touch.clientY);
+    }, { passive: false });
+
+    header.addEventListener('touchend', (e) => {
+      const state = projectTouchDragState;
+      if (!state || !getTouchByIdentifier(e.changedTouches, state.identifier)) return;
+      finishProjectTouchDrag(e);
+    }, { passive: false });
+
+    header.addEventListener('touchcancel', () => {
+      cancelProjectTouchDrag({ suppressClick: projectTouchDragState?.dragging });
+    });
+  }
+
   function renderProjectGroup(project, groupSessions, container, timestampCache) {
     const isVirtualCwd = Boolean(project.isVirtualCwd);
-    const containsCurrentSession = groupSessions.some((session) => session.id === sessionState.currentSessionId);
+    const isSelectedProject = selectedProject?.id === project.id
+      || (!!selectedProject?.path && !!project.path && normalizeComparablePath(selectedProject.path) === normalizeComparablePath(project.path));
     const isCollapsed = collapsedProjects.has(project.id);
     const runningCount = groupSessions.reduce((count, session) => count + (session.isRunning ? 1 : 0), 0);
     const unreadCount = groupSessions.reduce((count, session) => count + (session.hasUnread ? 1 : 0), 0);
 
     const group = document.createElement('section');
     group.className = 'project-group'
-      + (containsCurrentSession ? ' active-project' : '')
+      + (isSelectedProject ? ' active-project' : '')
       + (groupSessions.length === 0 ? ' empty-project' : '')
       + (runningCount ? ' has-running' : '')
       + (unreadCount ? ' has-unread' : '');
@@ -6651,14 +11282,19 @@
     group.dataset.sessionCount = String(groupSessions.length);
     if (runningCount) group.dataset.runningCount = String(runningCount);
     if (unreadCount) group.dataset.unreadCount = String(unreadCount);
+    bindProjectDragHandlers(group, project, isVirtualCwd);
 
     const header = document.createElement('div');
     header.className = 'project-group-header' + (isCollapsed ? ' collapsed' : '');
     header.dataset.projectId = project.id;
-    header.setAttribute('role', 'button');
-    header.tabIndex = 0;
+    if (!isVirtualCwd && project?.id) {
+      header.draggable = true;
+      header.classList.add('project-group-drag-handle');
+    }
     header.setAttribute('aria-expanded', String(!isCollapsed));
-    header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话`);
+    header.setAttribute('aria-selected', String(isSelectedProject));
+    header.setAttribute('aria-label', `${project.name}，${groupSessions.length} 个会话${runningCount ? `，${runningCount} 个运行中` : ''}`);
+    bindProjectTouchDragHandlers(header, group, project, isVirtualCwd);
 
     const main = document.createElement('div');
     main.className = 'project-group-main';
@@ -6671,6 +11307,13 @@
     const copy = document.createElement('div');
     copy.className = 'project-group-copy';
 
+    if (runningCount || unreadCount) {
+      const statusDot = document.createElement('span');
+      statusDot.className = `project-group-status-dot ${runningCount ? 'is-running' : 'is-unread'}`;
+      statusDot.setAttribute('aria-hidden', 'true');
+      main.appendChild(statusDot);
+    }
+
     const nameSpan = document.createElement('span');
     nameSpan.className = 'project-group-name';
     nameSpan.textContent = project.name;
@@ -6682,20 +11325,81 @@
     pathLine.textContent = parentPath;
     if (project.path) pathLine.title = project.path;
 
-    const countBadge = document.createElement('span');
-    countBadge.className = 'project-group-count';
-    countBadge.textContent = String(groupSessions.length);
-    countBadge.title = `${groupSessions.length} 个会话`;
-
     copy.appendChild(nameSpan);
     if (parentPath) copy.appendChild(pathLine);
 
     main.appendChild(chevron);
     main.appendChild(copy);
-    main.appendChild(countBadge);
 
     const actions = document.createElement('div');
     actions.className = 'project-group-actions';
+
+    const createProjectSession = (agent = selectedAgent, mode = getSavedModeForAgent(agent)) => {
+      const preference = applyNewSessionAgentPreference(agent, mode, { syncMode: !sessionState.currentSessionId });
+      send(normalizeProjectSessionPayload(project, isVirtualCwd, preference.agent, preference.mode));
+    };
+
+    /* --- Quick new chat button --- */
+    const newChatBtn = document.createElement('button');
+    newChatBtn.className = 'project-group-new-btn';
+    newChatBtn.title = '新建会话';
+    newChatBtn.type = 'button';
+    newChatBtn.setAttribute('aria-label', `在 ${project.name} 中新建会话`);
+    newChatBtn.textContent = '+';
+    actions.appendChild(newChatBtn);
+
+    const newSessionMenu = document.createElement('div');
+    newSessionMenu.className = 'project-group-menu project-group-new-session-menu';
+    newSessionMenu.hidden = true;
+
+    function buildProjectNewSessionMenuRow(agent) {
+      const targetAgent = normalizeAgent(agent);
+      const row = document.createElement('div');
+      row.className = 'project-group-new-session-row';
+
+      const copy = document.createElement('div');
+      copy.className = 'project-group-new-session-copy';
+
+      const name = document.createElement('div');
+      name.className = 'project-group-new-session-name';
+      name.textContent = AGENT_LABELS[targetAgent] || targetAgent;
+
+      const hint = document.createElement('div');
+      hint.className = 'project-group-new-session-hint';
+      hint.textContent = `默认 ${MODE_LABELS[getDefaultModeForAgent(targetAgent)] || getDefaultModeForAgent(targetAgent)}`;
+
+      copy.appendChild(name);
+      copy.appendChild(hint);
+
+      const modePicker = document.createElement('select');
+      modePicker.className = 'project-group-new-session-mode';
+      modePicker.dataset.newSessionAgent = targetAgent;
+      modePicker.setAttribute('aria-label', `${AGENT_LABELS[targetAgent] || targetAgent} 权限模式`);
+      modePicker.innerHTML = buildPermissionModeOptionsHtml(getSavedModeForAgent(targetAgent));
+      modePicker.addEventListener('click', (e) => e.stopPropagation());
+      modePicker.addEventListener('change', () => {
+        saveModeForAgent(targetAgent, modePicker.value);
+      });
+
+      const launch = document.createElement('button');
+      launch.type = 'button';
+      launch.className = 'project-group-new-session-launch';
+      launch.textContent = '创建';
+      launch.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeOpenProjectMenus();
+        createProjectSession(targetAgent, modePicker.value);
+      });
+
+      row.appendChild(copy);
+      row.appendChild(modePicker);
+      row.appendChild(launch);
+      return row;
+    }
+
+    newSessionMenu.appendChild(buildProjectNewSessionMenuRow('codex'));
+    newSessionMenu.appendChild(buildProjectNewSessionMenuRow('claude'));
+    document.body.appendChild(newSessionMenu);
 
     /* --- "..." trigger button --- */
     const moreBtn = document.createElement('button');
@@ -6710,20 +11414,6 @@
     const menu = document.createElement('div');
     menu.className = 'project-group-menu';
     menu.hidden = true;
-
-    const menuCreate = document.createElement('button');
-    menuCreate.type = 'button';
-    menuCreate.className = 'project-group-menu-item';
-    menuCreate.textContent = '新建会话';
-    menuCreate.addEventListener('click', (e) => {
-      e.stopPropagation();
-      closeMenu();
-      const nextMode = getSavedModeForAgent(selectedAgent);
-      send(isVirtualCwd
-        ? { type: 'new_session', cwd: project.path, agent: selectedAgent, mode: nextMode }
-        : { type: 'new_session', projectId: project.id, agent: selectedAgent, mode: nextMode });
-    });
-    menu.appendChild(menuCreate);
 
     const menuRename = document.createElement('button');
     menuRename.type = 'button';
@@ -6748,6 +11438,36 @@
     });
     menu.appendChild(menuRename);
 
+    const cleanupProjectSessionsForRemoval = () => {
+      const removedSessionIds = new Set(groupSessions.map((session) => session.id).filter(Boolean));
+      for (const session of groupSessions) {
+        if (!session?.id) continue;
+        const sessionAgent = normalizeAgent(session.agent);
+        if (getLastSessionForAgent(sessionAgent) === session.id) {
+          localStorage.removeItem(getAgentSessionStorageKey(sessionAgent));
+        }
+        if (localStorage.getItem('webcoding-session') === session.id) {
+          localStorage.removeItem('webcoding-session');
+        }
+        invalidateSessionCache(session.id);
+      }
+      forgetOpenChatTabs([...removedSessionIds], { render: false });
+      if (removedSessionIds.has(sessionState.currentSessionId)) {
+        resetChatView(selectedAgent);
+      } else {
+        renderChatTabs();
+      }
+    };
+
+    const confirmProjectRemoval = (label) => {
+      const sessionCount = groupSessions.length;
+      return confirm(
+        `确定移除${label}「${project.name}」？\n`
+        + `将先删除下面的 ${sessionCount} 个对话，然后移除${label}记录。\n`
+        + '此操作不可撤销。'
+      );
+    };
+
     const menuDelete = document.createElement('button');
     menuDelete.type = 'button';
     menuDelete.className = 'project-group-menu-item project-group-menu-item--danger';
@@ -6756,30 +11476,33 @@
       e.stopPropagation();
       closeMenu();
       if (isVirtualCwd) {
-        if (confirm(`确定移除「${project.name}」分组？\n（会话将变为独立显示）`)) {
+        if (confirmProjectRemoval('分组')) {
           pendingProjectSaveCallback = (updatedProjects) => {
             const saved = updatedProjects.find((p) => p.path === project.path);
-            if (saved) send({ type: 'delete_project', projectId: saved.id });
+            if (saved) {
+              cleanupProjectSessionsForRemoval();
+              send({ type: 'delete_project', projectId: saved.id });
+            }
           };
           send({ type: 'save_project', path: project.path, name: project.name });
         }
-      } else {
-        if (confirm(`确定移除项目「${project.name}」？\n（不会删除会话，会话仍会保留）`)) {
-          send({ type: 'delete_project', projectId: project.id });
-        }
+      } else if (confirmProjectRemoval('项目')) {
+        cleanupProjectSessionsForRemoval();
+        send({ type: 'delete_project', projectId: project.id });
       }
     });
     menu.appendChild(menuDelete);
 
     document.body.appendChild(menu);
 
-    function positionMenu() {
-      const rect = moreBtn.getBoundingClientRect();
+    function positionProjectFloatingMenu(targetMenu, triggerBtn, options = {}) {
+      const rect = triggerBtn.getBoundingClientRect();
       // Measure menu without affecting layout
-      menu.style.visibility = 'hidden';
-      menu.hidden = false;
-      const menuRect = menu.getBoundingClientRect();
+      targetMenu.style.visibility = 'hidden';
+      targetMenu.hidden = false;
+      const menuRect = targetMenu.getBoundingClientRect();
       const viewportH = window.innerHeight;
+      const viewportW = window.innerWidth;
       const spaceBelow = viewportH - rect.bottom;
       const spaceAbove = rect.top;
 
@@ -6789,12 +11512,25 @@
       } else {
         top = rect.top - menuRect.height - 4;
       }
-      // Ensure menu stays within viewport vertically
+      // Ensure menu stays within viewport vertically/horizontally
       top = Math.max(4, Math.min(top, viewportH - menuRect.height - 4));
+      const baseLeft = rect.right - menuRect.width;
+      const anchoredLeft = options.alignToViewportRight
+        ? viewportW - menuRect.width - 4
+        : baseLeft;
+      const left = Math.max(4, Math.min(anchoredLeft, viewportW - menuRect.width - 4));
 
-      menu.style.top = top + 'px';
-      menu.style.left = Math.max(4, rect.right - menuRect.width) + 'px';
-      menu.style.visibility = '';
+      targetMenu.style.top = top + 'px';
+      targetMenu.style.left = left + 'px';
+      targetMenu.style.visibility = '';
+    }
+
+    function positionMenu() {
+      positionProjectFloatingMenu(menu, moreBtn);
+    }
+
+    function positionNewSessionMenu() {
+      positionProjectFloatingMenu(newSessionMenu, moreBtn);
     }
 
     function closeMenu() {
@@ -6804,16 +11540,26 @@
       moreBtn.classList.remove('active');
     }
 
+    function closeNewSessionMenu() {
+      newSessionMenu.hidden = true;
+      newSessionMenu.style.top = '';
+      newSessionMenu.style.left = '';
+      newChatBtn.classList.remove('active');
+    }
+
+    function closeOpenProjectMenus() {
+      document.querySelectorAll('.project-group-menu:not([hidden])').forEach((m) => {
+        m.hidden = true;
+        m.style.top = '';
+        m.style.left = '';
+        m._triggerBtn?.classList.remove('active');
+      });
+    }
+
     function toggleMenu(e) {
       e.stopPropagation();
       if (menu.hidden) {
-        // Close any other open project menus
-        document.querySelectorAll('.project-group-menu:not([hidden])').forEach((m) => {
-          m.hidden = true;
-          m.style.top = '';
-          m.style.left = '';
-          m._triggerBtn?.classList.remove('active');
-        });
+        closeOpenProjectMenus();
         moreBtn.classList.add('active');
         menu._triggerBtn = moreBtn;
         // Position immediately
@@ -6823,31 +11569,68 @@
       }
     }
 
+    function toggleNewSessionMenu(e) {
+      e.stopPropagation();
+      if (newSessionMenu.hidden) {
+        newSessionMenu.querySelectorAll('.project-group-new-session-mode').forEach((select) => {
+          const agent = normalizeAgent(select.dataset.newSessionAgent);
+          select.innerHTML = buildPermissionModeOptionsHtml(getSavedModeForAgent(agent));
+        });
+        closeOpenProjectMenus();
+        newChatBtn.classList.add('active');
+        newSessionMenu._triggerBtn = newChatBtn;
+        positionNewSessionMenu();
+      } else {
+        closeNewSessionMenu();
+      }
+    }
+
     moreBtn.addEventListener('click', toggleMenu);
+    newChatBtn.addEventListener('click', toggleNewSessionMenu);
 
     // Close on outside click
     const outsideHandler = (e) => {
-      if (!menu.hidden && !actions.contains(e.target)) {
+      const target = e.target;
+      if ((!menu.hidden || !newSessionMenu.hidden)
+          && !actions.contains(target)
+          && !menu.contains(target)
+          && !newSessionMenu.contains(target)) {
         closeMenu();
+        closeNewSessionMenu();
       }
     };
     document.addEventListener('click', outsideHandler);
     // Clean up when group is removed
-    group._cleanupMenu = () => document.removeEventListener('click', outsideHandler);
+    group._cleanupMenu = () => {
+      document.removeEventListener('click', outsideHandler);
+      menu.remove();
+      newSessionMenu.remove();
+    };
 
     header.appendChild(main);
     header.appendChild(actions);
 
     header.addEventListener('click', (e) => {
-      // Ignore clicks on the actions area (more btn / menu)
-      if (actions.contains(e.target)) return;
-      if (isCollapsed) {
-        collapsedProjects.delete(project.id);
-      } else {
-        collapsedProjects.add(project.id);
+      if (Date.now() < suppressProjectHeaderClickUntil) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
       }
-      saveCollapsedProjects();
-      renderSessionList();
+      // Ignore clicks on the actions area (new chat / more btn / menu)
+      if (actions.contains(e.target)) return;
+
+      if (isSelectedProject) {
+        if (collapsedProjects.has(project.id)) {
+          collapsedProjects.delete(project.id);
+        } else {
+          collapsedProjects.add(project.id);
+        }
+        saveCollapsedProjects();
+        renderSessionList();
+        return;
+      }
+
+      selectProjectGroup(project);
     });
     header.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -6866,10 +11649,36 @@
         const aTs = timestampCache?.get(a.id) ?? getSessionUpdatedTimestamp(a);
         return bTs - aTs;
       });
-      for (const s of sortedSessions) {
-        body.appendChild(buildSessionItem(s));
+      const totalCount = sortedSessions.length;
+      const limit = DEFAULT_VISIBLE_SESSIONS_PER_PROJECT;
+      const isExpanded = expandedProjectSessions.has(project.id);
+      // 选中的会话即便排在 5 条之外，也要保证可见，避免当前对话被折叠隐藏。
+      const activeIndex = sortedSessions.findIndex((s) => s.id === sessionState.currentSessionId);
+      const activeInTail = activeIndex >= limit;
+      const showAll = isExpanded || activeInTail;
+      const visibleCount = showAll ? totalCount : Math.min(limit, totalCount);
+      for (let i = 0; i < visibleCount; i += 1) {
+        body.appendChild(buildSessionItem(sortedSessions[i]));
       }
-      if (sortedSessions.length === 0) {
+      const hiddenCount = totalCount - visibleCount;
+      // 「强制展开」（当前对话排在尾部）撑开的列表不给收起按钮：点了也收不回去，只会让按钮闪没。
+      if (totalCount > limit && !activeInTail) {
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'project-group-show-more';
+        toggle.textContent = isExpanded ? '收起' : `查看更多（${hiddenCount}）`;
+        toggle.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (expandedProjectSessions.has(project.id)) {
+            expandedProjectSessions.delete(project.id);
+          } else {
+            expandedProjectSessions.add(project.id);
+          }
+          renderSessionList();
+        });
+        body.appendChild(toggle);
+      }
+      if (totalCount === 0) {
         const empty = document.createElement('div');
         empty.className = 'project-group-empty';
         empty.textContent = '这个项目下还没有对话。';
@@ -6930,6 +11739,7 @@
         : '暂无会话，点击“新建/打开项目”开始。';
       listFragment.appendChild(empty);
       sessionList.appendChild(listFragment);
+      renderChatTabs();
       renderWorkspaceInsights();
       return;
     }
@@ -6969,7 +11779,6 @@
     const groupEntries = projects.map((project) => ({
       project,
       groupSessions: grouped.get(project.id) || [],
-      containsCurrentSession: (grouped.get(project.id) || []).some((session) => session.id === sessionState.currentSessionId),
       isVirtual: false,
       latestTimestamp: getLatestSessionTimestamp(grouped.get(project.id) || [], sessionTimestampCache),
     }));
@@ -6979,27 +11788,11 @@
       groupEntries.push({
         project,
         groupSessions,
-        containsCurrentSession: groupSessions.some((session) => session.id === sessionState.currentSessionId),
         isVirtual: true,
         latestTimestamp: getLatestSessionTimestamp(groupSessions, sessionTimestampCache),
       });
     }
 
-    groupEntries.sort((a, b) => {
-      if (a.containsCurrentSession !== b.containsCurrentSession) {
-        return a.containsCurrentSession ? -1 : 1;
-      }
-      const aHasSessions = a.groupSessions.length > 0;
-      const bHasSessions = b.groupSessions.length > 0;
-      if (aHasSessions !== bHasSessions) {
-        return aHasSessions ? -1 : 1;
-      }
-      const latestDiff = b.latestTimestamp - a.latestTimestamp;
-      if (latestDiff !== 0) return latestDiff;
-      return SESSION_LIST_COLLATOR.compare(a.project.name || '', b.project.name || '');
-    });
-
-    const searching = !!sessionSearchQuery.trim();
     for (const entry of groupEntries) {
       // While searching, hide empty project folders that have no matching sessions.
       if (searching && entry.groupSessions.length === 0) continue;
@@ -7018,6 +11811,7 @@
       }
     }
     sessionList.appendChild(listFragment);
+    renderChatTabs();
     renderWorkspaceInsights();
     sessionList.scrollTop = savedScrollTop;
   }
@@ -7061,6 +11855,7 @@
     document.querySelectorAll('.session-item').forEach((el) => {
       el.classList.toggle('active', el.dataset.id === sessionState.currentSessionId);
     });
+    highlightActiveChatTab();
   }
 
   // --- Header title editing (contenteditable) ---
@@ -7120,44 +11915,10 @@
     sidebarOverlay.hidden = true;
   }
 
-  function isHorizontallyScrollableElement(el) {
-    if (!el || el.nodeType !== 1) return false;
-    let style;
-    try { style = window.getComputedStyle(el); } catch { return false; }
-    const overflowX = style.overflowX || '';
-    if (overflowX !== 'auto' && overflowX !== 'scroll' && overflowX !== 'overlay') {
-      // Tables are rendered as display:block;overflow-x:auto — still check scroll metrics.
-      if (!el.matches?.('table, pre, .code-block-wrapper, .table-scroll')) return false;
-    }
-    return el.scrollWidth > el.clientWidth + 2;
-  }
-
-  function getHorizontalScrollAncestor(target) {
-    let el = target instanceof Element ? target : target?.parentElement;
-    while (el && el !== document.body && el !== document.documentElement) {
-      if (isHorizontallyScrollableElement(el)) return el;
-      // Known wide content surfaces even before overflow metrics settle.
-      if (el.matches?.('table, pre, .code-block-wrapper pre, .code-block-wrapper, .table-scroll, .msg-bubble table')) {
-        if (el.scrollWidth > el.clientWidth + 2) return el;
-      }
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  function canOpenSidebarBySwipe(target, touch) {
-    if (!window.matchMedia('(max-width: 768px), (pointer: coarse)').matches) return false;
-    if (sidebar.classList.contains('open')) return false;
-    if (sessionLoadingOverlay && !sessionLoadingOverlay.hidden) return false;
-    if (!chatMain || !target || !chatMain.contains(target)) return false;
-    if (!app.hidden && target && target.closest('input, textarea, select, button, .modal-panel, .settings-panel, .option-picker, .cmd-menu')) {
-      return false;
-    }
-    // Do not steal horizontal pans on wide tables / code blocks (issue #4).
-    if (getHorizontalScrollAncestor(target)) return false;
-    // Edge-only open: full-width table cells still receive touches in the middle.
-    if (touch && Number(touch.clientX) > SIDEBAR_SWIPE_EDGE_PX) return false;
-    return true;
+  function canOpenSidebarBySwipe(target) {
+    // 手机端禁止通过从左向右滑动呼出目录/聊天侧栏，避免阅读或横向操作时误触。
+    // 保留顶部菜单按钮打开侧栏，也保留侧栏已打开时左滑关闭。
+    return false;
   }
 
   function canCloseSidebarBySwipe(target) {
@@ -7317,10 +12078,99 @@
     document.body.classList.remove('git-panel-resizing');
   }
 
+  function handleFileViewerResizeStart(e) {
+    if (!fileViewerState.open || !canResizeFileViewer()) return;
+    if (typeof e.button === 'number' && e.button !== 0) return;
+    fileViewerResizeState = {
+      startX: e.clientX,
+      startWidth: fileViewerPanel.getBoundingClientRect().width,
+    };
+    document.body.classList.add('file-viewer-resizing');
+    const resizer = getFileViewerResizer();
+    if (typeof resizer?.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      resizer.setPointerCapture(e.pointerId);
+    }
+    e.preventDefault();
+  }
+
+  function handleFileViewerResizeMove(e) {
+    if (!fileViewerResizeState) return;
+    const deltaX = fileViewerResizeState.startX - e.clientX;
+    applyFileViewerWidth(fileViewerResizeState.startWidth + deltaX, { skipPersist: true });
+  }
+
+  function handleFileViewerResizeEnd(e) {
+    if (!fileViewerResizeState) return;
+    const releasedPointerId = e?.pointerId;
+    const resizer = getFileViewerResizer();
+    if (typeof resizer?.releasePointerCapture === 'function' && releasedPointerId !== undefined) {
+      try { resizer.releasePointerCapture(releasedPointerId); } catch {}
+    }
+    const currentWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--file-viewer-width'), 10)
+      || fileViewerPanel?.getBoundingClientRect().width
+      || FILE_VIEWER_DEFAULT_WIDTH;
+    applyFileViewerWidth(currentWidth);
+    fileViewerResizeState = null;
+    document.body.classList.remove('file-viewer-resizing');
+  }
+
+  function handleSideChatResizeStart(e) {
+    if (!sideChatState.open || !canResizeSideChat()) return;
+    if (typeof e.button === 'number' && e.button !== 0) return;
+    sideChatResizeState = {
+      startX: e.clientX,
+      startWidth: sideChatPanel.getBoundingClientRect().width,
+    };
+    document.body.classList.add('side-chat-resizing');
+    if (typeof sideChatResizer?.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      sideChatResizer.setPointerCapture(e.pointerId);
+    }
+    e.preventDefault();
+  }
+
+  function handleSideChatResizeMove(e) {
+    if (!sideChatResizeState) return;
+    const deltaX = sideChatResizeState.startX - e.clientX;
+    applySideChatWidth(sideChatResizeState.startWidth + deltaX, { skipPersist: true });
+  }
+
+  function handleSideChatResizeEnd(e) {
+    if (!sideChatResizeState) return;
+    const releasedPointerId = e?.pointerId;
+    if (typeof sideChatResizer?.releasePointerCapture === 'function' && releasedPointerId !== undefined) {
+      try { sideChatResizer.releasePointerCapture(releasedPointerId); } catch {}
+    }
+    const currentWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--side-chat-width'), 10)
+      || sideChatPanel?.getBoundingClientRect().width
+      || SIDE_CHAT_DEFAULT_WIDTH;
+    applySideChatWidth(currentWidth);
+    sideChatResizeState = null;
+    document.body.classList.remove('side-chat-resizing');
+  }
+
   // --- Slash Command Menu ---
   function applySlashCommandSelection(cmd) {
     if (!cmd) return;
-    // Insert command text only — all slash commands are sent to the CLI as-is.
+    if (cmd === '/model') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showModelPicker();
+      return;
+    }
+    if (cmd === '/mode') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showModePicker();
+      return;
+    }
+    if (cmd === '/reasoning' || cmd === '/effort') {
+      hideCmdMenu();
+      msgInput.value = '';
+      showReasoningEffortPicker();
+      return;
+    }
+    // For non-core commands (CLI-native/skills), just insert the command text
+    // so it gets sent as a regular message to the CLI process
     msgInput.value = `${cmd} `;
     hideCmdMenu();
     msgInput.focus();
@@ -7518,11 +12368,153 @@
     });
   }
 
+  function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
+    hideOptionPicker();
+
+    const picker = document.createElement('div');
+    picker.className = 'option-picker model-picker-claude';
+    picker.id = 'option-picker';
+
+    // Determine which entry is currently active
+    let activeAlias = 'default';
+    if (currentFull) {
+      const fullToAlias = {};
+      if (models.opus) fullToAlias[models.opus] = 'opus';
+      if (models.sonnet) fullToAlias[models.sonnet] = 'sonnet';
+      if (models.haiku) fullToAlias[models.haiku] = 'haiku';
+      activeAlias = fullToAlias[currentFull] || currentAlias || currentFull;
+    } else if (currentAlias && currentAlias !== 'default' && currentAlias !== '') {
+      activeAlias = currentAlias;
+    }
+
+    const entries = (Array.isArray(menuEntries) && menuEntries.length > 0)
+      ? menuEntries.map((entry) => Object.assign({}, entry, { value: entry.value || entry.alias }))
+      : CLAUDE_MODEL_ENTRIES.map((entry) => Object.assign({}, entry));
+
+    // If current model isn't in the list, add it
+    const isStandard = entries.some((e) => e.alias === activeAlias || (currentFull && (e.value || e.alias) === currentFull));
+    if (!isStandard && currentFull) {
+      entries.push({
+        alias: currentAlias || currentFull,
+        value: currentFull,
+        label: currentAlias || currentFull,
+        desc: currentFull,
+        pricing: '',
+      });
+    }
+
+    let focusIdx = entries.findIndex((e) => e.alias === activeAlias || (currentFull && (e.value || e.alias) === currentFull));
+    if (focusIdx < 0) focusIdx = 0;
+
+    // Build items HTML
+    const itemsHtml = entries.map((e, i) => {
+      const itemValue = e.value || e.alias;
+      const isCurrent = e.alias === activeAlias || (currentFull && itemValue === currentFull);
+      const isFocused = i === focusIdx;
+      const descText = e.desc + (e.pricing ? ' \u00b7 ' + e.pricing : '');
+      return `
+        <div class="option-picker-item${isCurrent ? ' active' : ''}${isFocused ? ' focused' : ''}" data-value="${escapeHtml(itemValue)}" data-index="${i}">
+          <span class="mp-cursor">${isFocused ? '\u276f' : '\u2003'}</span>
+          <span class="mp-num">${i + 1}.</span>
+          <div class="option-picker-item-info">
+            <div class="option-picker-item-label">${escapeHtml(e.label)}${isCurrent ? ' <span class="mp-check">\u2714</span>' : ''}</div>
+            <div class="option-picker-item-desc">${escapeHtml(descText)}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    picker.innerHTML = `
+      <div class="mp-header">
+        <div class="option-picker-title">选择模型</div>
+        <div class="mp-subtitle">切换当前会话使用的 Claude 模型。<br>如果要指定其他或旧版模型名，请使用 <code>--model</code>。</div>
+      </div>
+      <div class="mp-items">${itemsHtml}</div>
+      <div class="mp-custom">
+        <input type="text" id="model-custom-input" class="mp-custom-input" placeholder="输入自定义模型 ID，例如 claude-fable-5">
+      </div>
+      <div class="mp-hint">回车确认 \u00b7 Esc 关闭</div>
+    `;
+
+    const chatMain = document.querySelector('.chat-main');
+    chatMain.appendChild(picker);
+    const itemsContainer = picker.querySelector('.mp-items');
+
+    function scrollFocusedItemIntoView() {
+      const activeEl = picker.querySelector(`.option-picker-item[data-index="${focusIdx}"]`);
+      if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+    }
+
+    // Update focus indicators without full re-render
+    function updateFocus(newIdx) {
+      focusIdx = newIdx;
+      picker.querySelectorAll('.option-picker-item').forEach((el, i) => {
+        el.classList.toggle('focused', i === focusIdx);
+        const cur = el.querySelector('.mp-cursor');
+        if (cur) cur.textContent = i === focusIdx ? '\u276f' : '\u2003';
+      });
+      if (itemsContainer) scrollFocusedItemIntoView();
+    }
+
+    // Click & hover on items
+    picker.querySelectorAll('.option-picker-item').forEach(el => {
+      el.addEventListener('click', () => {
+        sendCoreMessage(`/model ${el.dataset.value}`);
+        hideOptionPicker();
+      });
+      el.addEventListener('mouseenter', () => updateFocus(parseInt(el.dataset.index)));
+    });
+
+    // Keyboard navigation
+    function handleKeyDown(e) {
+      const customInput = picker.querySelector('#model-custom-input');
+      if (document.activeElement === customInput) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const val = customInput.value.trim();
+          if (val) {
+            sendCoreMessage(`/model ${val}`);
+            hideOptionPicker();
+          }
+        } else if (e.key === 'Escape') {
+          hideOptionPicker();
+        }
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'j') {
+        e.preventDefault();
+        updateFocus((focusIdx + 1) % entries.length);
+      } else if (e.key === 'ArrowUp' || e.key === 'k') {
+        e.preventDefault();
+        updateFocus((focusIdx - 1 + entries.length) % entries.length);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        sendCoreMessage(`/model ${entries[focusIdx].value || entries[focusIdx].alias}`);
+        hideOptionPicker();
+      } else if (e.key === 'Escape') {
+        hideOptionPicker();
+      } else if (e.key >= '1' && e.key <= '9') {
+        const idx = parseInt(e.key) - 1;
+        if (idx < entries.length) {
+          e.preventDefault();
+          updateFocus(idx);
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown);
+    picker._keyHandler = handleKeyDown;
+
+    requestAnimationFrame(() => {
+      if (itemsContainer) scrollFocusedItemIntoView();
+    });
+  }
+
   function showModePicker() {
     showOptionPicker('选择权限模式', getModePickerOptions(), sessionState.currentMode, (value) => {
       sessionState.currentMode = value;
       modeSelect.value = sessionState.currentMode;
-      localStorage.setItem(getAgentModeStorageKey(sessionState.currentAgent), sessionState.currentMode);
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
       if (sessionState.currentSessionId) {
         send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
       }
@@ -7531,18 +12523,333 @@
     });
   }
 
+  function showReasoningEffortPicker() {
+    if (sessionState.currentAgent !== 'codex') {
+      appendSystemMessage('思考级别仅对 Codex 会话生效。');
+      return;
+    }
+    showOptionPicker('选择 Codex 思考级别', CODEX_REASONING_EFFORT_OPTIONS, sessionState.currentReasoningEffort, (value) => {
+      applyReasoningEffortSelection(value);
+    });
+  }
+
+  // --- Queued Messages ---
+  function queueSessionMatchesCurrent(item) {
+    if (!item) return false;
+    if (!item.sessionId) return !sessionState.currentSessionId;
+    return item.sessionId === sessionState.currentSessionId;
+  }
+
+  function normalizeQueuedMessages(value) {
+    if (!Array.isArray(value)) return [];
+    return value.slice(0, MAX_QUEUED_MESSAGES).map((raw) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const text = typeof raw.text === 'string' ? raw.text : '';
+      const attachments = Array.isArray(raw.attachments)
+        ? attachmentTransportPayloads(raw.attachments).slice(0, MAX_QUEUED_ATTACHMENTS)
+        : [];
+      const fileRefs = Array.isArray(raw.fileRefs)
+        ? raw.fileRefs.filter(Boolean).map((ref) => ({ ...ref })).slice(0, MAX_PENDING_FILE_REFS)
+        : [];
+      if (!text.trim() && attachments.length === 0 && fileRefs.length === 0) return null;
+      return {
+        id: typeof raw.id === 'string' && raw.id ? raw.id : nextLocalId('queued'),
+        sessionId: typeof raw.sessionId === 'string' && raw.sessionId ? raw.sessionId : null,
+        text,
+        attachments,
+        fileRefs,
+        mode: typeof raw.mode === 'string' ? raw.mode : '',
+        reasoningEffort: typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort : '',
+        fastMode: normalizeCodexFastMode(raw.fastMode),
+        agent: normalizeAgent(raw.agent || sessionState.currentAgent || selectedAgent),
+        createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : (Date.parse(raw.createdAt || '') || Date.now()),
+        serverQueued: raw.serverQueued === true,
+        localOnly: raw.localOnly === true,
+      };
+    }).filter(Boolean);
+  }
+
+  function persistQueuedMessages() {
+    try {
+      if (!queuedMessages.length) {
+        localStorage.removeItem(QUEUED_MESSAGES_STORAGE_KEY);
+        return;
+      }
+      localStorage.setItem(QUEUED_MESSAGES_STORAGE_KEY, JSON.stringify(queuedMessages));
+    } catch (error) {
+      console.warn('[WEBCODING]', 'persist queued messages failed', error);
+    }
+  }
+
+  function loadPersistedQueuedMessages() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(QUEUED_MESSAGES_STORAGE_KEY) || '[]');
+      queuedMessages = normalizeQueuedMessages(parsed);
+      queuedMessagesRestoredAt = queuedMessages.length ? Date.now() : 0;
+      queuedMessagesRestoredSawRunning = false;
+      persistQueuedMessages();
+    } catch (error) {
+      console.warn('[WEBCODING]', 'load queued messages failed', error);
+      queuedMessages = [];
+      localStorage.removeItem(QUEUED_MESSAGES_STORAGE_KEY);
+    }
+  }
+
+  function getVisibleQueuedMessages() {
+    return composeState.queuedMessages.filter(queueSessionMatchesCurrent);
+  }
+
+  function submitQueuedMessageToServer(item, targetSessionId) {
+    if (!item || !targetSessionId) return false;
+    return send({
+      type: 'enqueue_message',
+      id: item.id,
+      sessionId: targetSessionId,
+      text: item.text || '',
+      attachments: attachmentTransportPayloads(item.attachments),
+      fileRefs: Array.isArray(item.fileRefs) ? item.fileRefs.map((ref) => ({ ...ref })) : [],
+      mode: item.mode || sessionState.currentMode,
+      reasoningEffort: item.reasoningEffort || sessionState.currentReasoningEffort || '',
+      fastMode: normalizeCodexFastMode(Object.prototype.hasOwnProperty.call(item, 'fastMode') ? item.fastMode : sessionState.currentFastMode),
+      agent: item.agent || sessionState.currentAgent,
+    });
+  }
+
+  function bindUnassignedQueuedMessagesToSession(sessionId) {
+    if (!sessionId) return;
+    let changed = false;
+    for (const item of composeState.queuedMessages) {
+      if (!item.sessionId) {
+        item.sessionId = sessionId;
+        changed = true;
+      }
+      if (item.localOnly && item.sessionId === sessionId && submitQueuedMessageToServer(item, sessionId)) {
+        item.localOnly = false;
+        item.serverQueued = true;
+        changed = true;
+      }
+    }
+    if (changed) {
+      persistQueuedMessages();
+      renderQueuedMessages();
+    }
+  }
+
+  function formatQueuedMessageSummary(item) {
+    const parts = [];
+    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+    if (text) parts.push(text);
+    const attachmentCount = Array.isArray(item?.attachments) ? item.attachments.length : 0;
+    const fileRefCount = Array.isArray(item?.fileRefs) ? item.fileRefs.length : 0;
+    if (attachmentCount > 0) parts.push(`${attachmentCount} 个附件`);
+    if (fileRefCount > 0) parts.push(`${fileRefCount} 个文件引用`);
+    return parts.join(' · ') || '空消息';
+  }
+
+  function isCurrentSessionBusyForQueuedDispatch() {
+    if (composeState.isGenerating) return true;
+    // A blocking or non-blocking session reload can replace the message DOM with
+    // the freshly loaded snapshot. Wait until it finishes so the queued user
+    // bubble is not immediately overwritten and the session id is settled.
+    if (sessionState.activeSessionLoad) return true;
+    if (sessionState.currentSessionRunning) return true;
+    const meta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+    return !!meta?.isRunning;
+  }
+
+  function scheduleQueuedMessageDispatch() {
+    if (queuedDispatchTimer) return;
+    const restoredGraceMs = queuedMessagesRestoredAt ? Math.max(0, 1200 - (Date.now() - queuedMessagesRestoredAt)) : 0;
+    queuedDispatchTimer = setTimeout(() => {
+      queuedDispatchTimer = null;
+      dispatchNextQueuedMessage();
+    }, restoredGraceMs);
+  }
+
+  function scheduleQueuedMessageFollowupAfterIdle() {
+    if (generationIdleFinalizeTimer) return;
+    generationIdleFinalizeTimer = setTimeout(() => {
+      generationIdleFinalizeTimer = null;
+      if (sessionState.currentSessionRunning) return;
+      const meta = sessionState.currentSessionId ? getSessionMeta(sessionState.currentSessionId) : null;
+      if (meta?.isRunning) return;
+      if (sessionState.activeSessionLoad) return;
+      if (composeState.isGenerating) {
+        finishGenerating(sessionState.currentSessionId || undefined);
+        return;
+      }
+      if (queuedMessagesRestoredAt && !queuedMessagesRestoredSawRunning) {
+        renderQueuedMessages();
+        return;
+      }
+      queuedMessagesRestoredAt = 0;
+      queuedMessagesRestoredSawRunning = false;
+      scheduleQueuedMessageDispatch();
+    }, 0);
+  }
+
+  function renderQueuedMessages() {
+    if (!queuedMessageList) return;
+    const visible = getVisibleQueuedMessages();
+    queuedMessageList.innerHTML = '';
+    queuedMessageList.hidden = visible.length === 0;
+    if (visible.length === 0) return;
+
+    visible.forEach((item, index) => {
+      const row = document.createElement('div');
+      row.className = 'queued-message-item';
+      row.dataset.queuedMessageId = item.id;
+
+      const lead = document.createElement('div');
+      lead.className = 'queued-message-lead';
+      lead.textContent = index === 0 ? '↳' : String(index + 1);
+
+      const body = document.createElement('div');
+      body.className = 'queued-message-body';
+      const label = document.createElement('div');
+      label.className = 'queued-message-label';
+      label.textContent = index === 0 ? '服务端队列：当前回复结束后发送' : '服务端队列中等待发送';
+      const text = document.createElement('div');
+      text.className = 'queued-message-text';
+      text.textContent = formatQueuedMessageSummary(item);
+      body.appendChild(label);
+      body.appendChild(text);
+
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'queued-message-cancel';
+      cancel.title = '撤销这条队列消息';
+      cancel.setAttribute('aria-label', '撤销这条队列消息');
+      cancel.dataset.queuedMessageCancel = item.id;
+      cancel.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></svg>';
+
+      row.appendChild(lead);
+      row.appendChild(body);
+      row.appendChild(cancel);
+      queuedMessageList.appendChild(row);
+    });
+  }
+
+  function removeQueuedMessage(id) {
+    const item = composeState.queuedMessages.find((queued) => queued.id === id);
+    const before = composeState.queuedMessages.length;
+    composeState.queuedMessages = composeState.queuedMessages.filter((queued) => queued.id !== id);
+    if (item?.serverQueued && item.sessionId) {
+      send({ type: 'cancel_queued_message', sessionId: item.sessionId, id: item.id });
+    }
+    if (composeState.queuedMessages.length !== before) {
+      renderQueuedMessages();
+      showToast('已撤销队列消息');
+    }
+  }
+
+  function enqueueCurrentDraft() {
+    const text = msgInput.value.trim();
+    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) return false;
+    if (composeState.queuedMessages.length >= MAX_QUEUED_MESSAGES) {
+      showToast(`最多排队 ${MAX_QUEUED_MESSAGES} 条消息，请先撤销一部分`);
+      return false;
+    }
+    if (text.startsWith('/') && (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0)) {
+      appendError('命令消息暂不支持附带附件或文件引用，请先移除后再发送命令。');
+      return false;
+    }
+
+    const item = {
+      id: nextLocalId('queued'),
+      sessionId: sessionState.currentSessionId || null,
+      text,
+      attachments: attachmentTransportPayloads(composeState.pendingAttachments),
+      fileRefs: composeState.pendingFileRefs.map((ref) => ({ ...ref })),
+      mode: sessionState.currentMode,
+      reasoningEffort: sessionState.currentReasoningEffort,
+      fastMode: sessionState.currentFastMode,
+      agent: sessionState.currentAgent,
+      createdAt: Date.now(),
+      serverQueued: false,
+      localOnly: true,
+    };
+
+    if (item.sessionId && submitQueuedMessageToServer(item, item.sessionId)) {
+      item.serverQueued = true;
+      item.localOnly = false;
+    }
+
+    queuedMessagesRestoredAt = 0;
+    composeState.queuedMessages = [...composeState.queuedMessages, item];
+    msgInput.value = '';
+    composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
+    renderPendingAttachments();
+    renderContextBar();
+    renderQueuedMessages();
+    autoResize();
+    hideCmdMenu();
+    hideOptionPicker();
+    showToast(item.serverQueued ? '已加入服务端队列，关闭浏览器也会继续执行' : '已暂存队列，拿到会话后会提交到服务端');
+    return true;
+  }
+
+  function dispatchNextQueuedMessage() {
+    // 队列现在由服务端在当前 run 结束后派发；前端只负责把尚未绑定
+    // session 的极短窗口本地队列补提交到服务端，不再本地续发。
+    if (!sessionState.currentSessionId) {
+      renderQueuedMessages();
+      return false;
+    }
+    let changed = false;
+    for (const item of composeState.queuedMessages) {
+      if (item.localOnly && queueSessionMatchesCurrent(item) && submitQueuedMessageToServer(item, sessionState.currentSessionId)) {
+        item.localOnly = false;
+        item.serverQueued = true;
+        changed = true;
+      }
+    }
+    if (changed) persistQueuedMessages();
+    renderQueuedMessages();
+    return false;
+  }
+
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
-    if ((!text && composeState.pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
+    const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
+    const nativeStreamingBehavior = isPiNativeStreamingQueueActive() ? piStreamingBehavior : null;
+    if (isBlockingSessionLoad()) return;
+    if (editingMessageState) {
+      submitEditedMessage(text);
+      return;
+    }
+    if (!text && composeState.pendingAttachments.length === 0 && composeState.pendingFileRefs.length === 0) return;
+    if (composeState.isGenerating && !isPlanModeActive && !isActivePlanTurn() && !nativeStreamingBehavior) {
+      enqueueCurrentDraft();
+      return;
+    }
     hideCmdMenu();
     hideOptionPicker();
-    const nativeStreamingBehavior = isPiNativeStreamingQueueActive() ? piStreamingBehavior : null;
 
     // Slash commands: platform local, TUI-blocked, or CLI passthrough (server decides).
     if (text.startsWith('/')) {
-      if (composeState.pendingAttachments.length > 0) {
-        appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
+      if (composeState.pendingAttachments.length > 0 || composeState.pendingFileRefs.length > 0) {
+        appendError('命令消息暂不支持附带附件或文件引用，请先移除后再发送命令。');
+        return;
+      }
+      if (text === '/model' || text === '/model ') {
+        showModelPicker();
+        msgInput.value = '';
+        autoResize();
+        return;
+      }
+      if (text === '/mode' || text === '/mode ') {
+        showModePicker();
+        msgInput.value = '';
+        autoResize();
+        return;
+      }
+      if (text === '/reasoning' || text === '/reasoning ' || text === '/effort' || text === '/effort ') {
+        showReasoningEffortPicker();
+        msgInput.value = '';
+        autoResize();
         return;
       }
       const commandItem = {
@@ -7573,10 +12880,12 @@
       return;
     }
 
-    const attachments = composeState.pendingAttachments.map((attachment) => ({ ...attachment }));
+    const attachments = attachmentTransportPayloads(composeState.pendingAttachments);
+    const fileRefs = composeState.pendingFileRefs.map((ref) => ({ ...ref }));
     const item = {
       text,
       attachments,
+      fileRefs,
       sessionId: sessionState.currentSessionId,
       mode: sessionState.currentMode,
       agent: sessionState.currentAgent,
@@ -7589,21 +12898,24 @@
       if (!enqueueSendItem({ ...item, reason: 'busy' })) return;
       msgInput.value = '';
       composeState.pendingAttachments = [];
+      composeState.pendingFileRefs = [];
       renderPendingAttachments();
+      renderContextBar();
       autoResize();
       return;
     }
 
-    // Offline: queue for reconnect flush.
     if (!isWsOpen()) {
       if (!enqueueSendItem({ ...item, reason: 'offline' })) return;
       msgInput.value = '';
       composeState.pendingAttachments = [];
+      composeState.pendingFileRefs = [];
       renderPendingAttachments();
+      renderContextBar();
       autoResize();
       showStatusBanner({
         level: 'warn',
-        message: `连接已断开，${pendingSendQueue.filter((i) => isQueueItemForCurrentView(i)).length} 条消息将在恢复后自动发送。`,
+        message: `连接已断开，${pendingSendQueue.filter((entry) => isQueueItemForCurrentView(entry)).length} 条消息将在恢复后自动发送。`,
         actionLabel: '立即重连',
         onAction: () => {
           connectionState.reconnectAttempts = 0;
@@ -7614,11 +12926,12 @@
       return;
     }
 
-    // Always enqueue then flush so ack/timeout paths own the lifecycle.
     if (!enqueueSendItem({ ...item, reason: 'queued' }, { toast: false })) return;
     msgInput.value = '';
     composeState.pendingAttachments = [];
+    composeState.pendingFileRefs = [];
     renderPendingAttachments();
+    renderContextBar();
     autoResize();
     flushSendQueue();
   }
@@ -7674,6 +12987,56 @@
     window.addEventListener('pointerup', handleGitPanelResizeEnd);
     window.addEventListener('pointercancel', handleGitPanelResizeEnd);
   }
+  const fileViewerResizer = getFileViewerResizer();
+  if (fileViewerResizer) {
+    fileViewerResizer.addEventListener('pointerdown', handleFileViewerResizeStart);
+    fileViewerResizer.addEventListener('dblclick', () => applyFileViewerWidth(FILE_VIEWER_DEFAULT_WIDTH));
+    window.addEventListener('pointermove', handleFileViewerResizeMove);
+    window.addEventListener('pointerup', handleFileViewerResizeEnd);
+    window.addEventListener('pointercancel', handleFileViewerResizeEnd);
+  }
+  if (sideChatResizer) {
+    sideChatResizer.addEventListener('pointerdown', handleSideChatResizeStart);
+    sideChatResizer.addEventListener('dblclick', () => applySideChatWidth(SIDE_CHAT_DEFAULT_WIDTH));
+    window.addEventListener('pointermove', handleSideChatResizeMove);
+    window.addEventListener('pointerup', handleSideChatResizeEnd);
+    window.addEventListener('pointercancel', handleSideChatResizeEnd);
+  }
+  if (fileViewerClose) fileViewerClose.addEventListener('click', closeFileViewer);
+  if (sideChatClose) sideChatClose.addEventListener('click', closeSideChat);
+  if (sideChatRestoreBtn) {
+    sideChatRestoreBtn.addEventListener('click', toggleSideChatPanel);
+  }
+  if (sideChatSend) sideChatSend.addEventListener('click', () => sendSideChatMessage());
+  if (sideChatAbort) sideChatAbort.addEventListener('click', abortSideChat);
+  if (sideChatInput) {
+    sideChatInput.addEventListener('input', autoResizeSideChatInput);
+    sideChatInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendSideChatMessage();
+      }
+    });
+  }
+  if (messagesDiv) {
+    messagesDiv.addEventListener('mouseup', () => scheduleSideChatSelectionPopover(0));
+    messagesDiv.addEventListener('touchend', () => scheduleSideChatSelectionPopover(350), { passive: true });
+    document.addEventListener('selectionchange', () => {
+      if (!window.matchMedia('(pointer: coarse)').matches) return;
+      scheduleSideChatSelectionPopover(180);
+    });
+  }
+  document.addEventListener('mousedown', (event) => {
+    if (sideChatSelectionPopover && !sideChatSelectionPopover.contains(event.target)) {
+      hideSideChatSelectionPopover();
+    }
+  });
+  if (messagesWrap) messagesWrap.addEventListener('scroll', hideSideChatSelectionPopover, { passive: true });
+  window.addEventListener('resize', hideSideChatSelectionPopover);
+  if (fileViewerPreviewTab) fileViewerPreviewTab.addEventListener('click', () => setFileViewerTab('preview'));
+  if (fileViewerSourceTab) fileViewerSourceTab.addEventListener('click', () => setFileViewerTab('source'));
+  if (fileViewerRefresh) fileViewerRefresh.addEventListener('click', refreshFileViewer);
+  if (fileViewerDownload) fileViewerDownload.addEventListener('click', downloadFileViewerFile);
   document.addEventListener('touchstart', handleSidebarSwipeStart, { passive: true });
   document.addEventListener('touchmove', handleSidebarSwipeMove, { passive: false });
   document.addEventListener('touchend', handleSidebarSwipeEnd, { passive: true });
@@ -7687,7 +13050,36 @@
     });
   });
 
-  // Mobile agent select
+  function applyReasoningEffortSelection(value) {
+    const effort = normalizeCodexReasoningEffort(value);
+    sessionState.currentReasoningEffort = effort;
+    localStorage.setItem(getAgentReasoningEffortStorageKey(sessionState.currentAgent), effort);
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_reasoning_effort', sessionId: sessionState.currentSessionId, reasoningEffort: effort });
+    }
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  function applyFastModeSelection(value) {
+    if (sessionState.currentAgent !== 'codex') return;
+    const fastMode = normalizeCodexFastMode(value);
+    sessionState.currentFastMode = fastMode;
+    localStorage.setItem(getAgentFastModeStorageKey(sessionState.currentAgent), getCodexSpeedValue(fastMode));
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_fast_mode', sessionId: sessionState.currentSessionId, fastMode });
+    }
+    renderWorkspaceInsights();
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+  }
+
+  // Topbar agent/reasoning/speed selectors
+  const mobileReasoningSelect = document.getElementById('mobile-reasoning-select');
+  const desktopReasoningSelect = document.getElementById('desktop-reasoning-select');
   if (mobileAgentSelect) {
     mobileAgentSelect.addEventListener('change', () => {
       const targetAgent = normalizeAgent(mobileAgentSelect.value);
@@ -7696,20 +13088,25 @@
   }
   if (mobileModeSelect) {
     mobileModeSelect.addEventListener('change', () => {
-      handleModeSelectionChange(mobileModeSelect.value);
+      const mode = mobileModeSelect.value;
+      sessionState.currentMode = mode;
+      modeSelect.value = mode;
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
+      updateAgentScopedUI();
+      if (sessionState.currentSessionId) send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
+      renderWorkspaceInsights();
     });
   }
-  bindMobilePicker(mobileAgentPicker, (value) => handleAgentSelectionChange(normalizeAgent(value)));
-  bindMobilePicker(mobileModePicker, handleModeSelectionChange);
-  document.addEventListener('pointerdown', (event) => {
-    if (!event.target.closest?.('.mobile-picker')) closeMobilePickers();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeMobilePickers();
-  });
-  window.addEventListener('resize', () => {
-    if (window.innerWidth > 728) closeMobilePickers();
-  });
+  if (mobileReasoningSelect) {
+    mobileReasoningSelect.addEventListener('change', () => {
+      applyReasoningEffortSelection(mobileReasoningSelect.value);
+    });
+  }
+  if (desktopReasoningSelect) {
+    desktopReasoningSelect.addEventListener('change', () => {
+      applyReasoningEffortSelection(desktopReasoningSelect.value);
+    });
+  }
 
   function handleWorkspaceActionClick(actionBtn, event) {
     if (!actionBtn) return;
@@ -7731,6 +13128,10 @@
     }
     if (action === 'switch-model') {
       showModelPicker();
+      return;
+    }
+    if (action === 'switch-reasoning') {
+      showReasoningEffortPicker();
       return;
     }
     if (action === 'switch-mode') {
@@ -7781,6 +13182,29 @@
 
   function handleGlobalDocumentClick(event) {
     const target = event.target;
+
+    const attachmentPreviewBtn = target instanceof Element ? target.closest('.image-attachment-preview') : null;
+    if (attachmentPreviewBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openAttachmentPreview({
+        id: attachmentPreviewBtn.dataset.attachmentId || '',
+        filename: attachmentPreviewBtn.dataset.filename || 'image',
+        size: Number(attachmentPreviewBtn.dataset.size || 0) || 0,
+        mime: attachmentPreviewBtn.dataset.mime || '',
+        previewUrl: attachmentPreviewBtn.dataset.previewSrc || '',
+      }).catch((error) => appendError(error.message || '无法打开图片'));
+      return;
+    }
+
+    const documentDownloadBtn = target instanceof Element ? target.closest('.document-attachment-download') : null;
+    if (documentDownloadBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = documentDownloadBtn.dataset.attachmentId || '';
+      if (id) window.open(attachmentRawUrl(id), '_blank', 'noopener');
+      return;
+    }
 
     // Git panel toggle button
     if (target instanceof Element && (target === gitPanelBtn || target.closest('#git-panel-btn'))) {
@@ -7880,96 +13304,62 @@
     }
   });
   sendBtn.addEventListener('click', sendMessage);
+  if (editMessageCancel) editMessageCancel.addEventListener('click', () => clearEditingMessageState({ clearInput: true }));
   abortBtn.addEventListener('click', () => {
-    if (composeState.isAborting) {
-      showToast('正在停止…');
-      return;
-    }
-    if (!send({ type: 'abort' })) return;
-    composeState.isAborting = true;
-    setCurrentSessionRunningState(true, { phase: 'aborting' });
+    if (abortBtn.disabled) return;
     abortBtn.disabled = true;
-    abortBtn.classList.add('is-aborting');
     abortBtn.title = '正在停止…';
-    showToast('已请求停止');
-    // If the process is stuck, re-enable after a grace period so the user can retry.
-    setTimeout(() => {
-      if (!composeState.isAborting) return;
-      abortBtn.disabled = false;
-      abortBtn.classList.remove('is-aborting');
-      abortBtn.title = '停止生成';
-      composeState.isAborting = false;
-      showToast('停止可能仍在进行，可再次点击');
-    }, 5000);
+    abortBtn.setAttribute('aria-label', '正在停止…');
+    send({ type: 'abort', sessionId: sessionState.currentSessionId || undefined });
   });
-  if (sendQueueClear) {
-    sendQueueClear.addEventListener('click', () => clearSendQueue());
-  }
-  piQueueModeButtons.forEach((button) => {
-    button.addEventListener('click', () => {
-      const behavior = button.dataset.streamingBehavior;
-      if (behavior !== 'steer' && behavior !== 'followUp') return;
-      piStreamingBehavior = behavior;
-      localStorage.setItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY, behavior);
-      syncPiQueueModeButtons();
-      msgInput.focus({ preventScroll: true });
+  if (queuedMessageList) {
+    queuedMessageList.addEventListener('click', (event) => {
+      const btn = event.target instanceof Element ? event.target.closest('[data-queued-message-cancel]') : null;
+      if (!btn) return;
+      event.preventDefault();
+      removeQueuedMessage(btn.dataset.queuedMessageCancel || '');
     });
+  }
+  if (filePanelRefresh) filePanelRefresh.addEventListener('click', () => loadFileTree(getFileTreeCwd()));
+  bindFileTreeExternalUpload();
+  renderContextBar();
+  if (attachBtn) {
+    attachBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleAttachMenu();
+    });
+  }
+  if (attachUploadFile && fileUploadInput) {
+    attachUploadFile.addEventListener('click', () => {
+      closeAttachMenu();
+      fileUploadInput.click();
+    });
+  }
+  if (attachReferenceFile) {
+    attachReferenceFile.addEventListener('click', () => {
+      closeAttachMenu();
+      openFileRefPicker();
+    });
+  }
+  if (fileUploadInput) {
+    fileUploadInput.addEventListener('change', () => {
+      handleSelectedAttachmentFiles(fileUploadInput.files);
+      fileUploadInput.value = '';
+    });
+  }
+  document.addEventListener('click', (event) => {
+    if (!attachMenu || attachMenu.hidden) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target && (attachMenu.contains(target) || attachBtn?.contains(target))) return;
+    closeAttachMenu();
   });
-  if (appStatusBannerAction) {
-    appStatusBannerAction.addEventListener('click', () => {
-      const action = statusBannerAction;
-      if (typeof action === 'function') action();
-    });
-  }
-  if (appStatusBannerClose) {
-    appStatusBannerClose.addEventListener('click', () => hideStatusBanner());
-  }
-  if (sessionSearchInput) {
-    sessionSearchInput.addEventListener('input', () => {
-      sessionSearchQuery = sessionSearchInput.value || '';
-      if (sessionSearchClear) sessionSearchClear.hidden = !sessionSearchQuery.trim();
-      renderSessionList();
-    });
-    sessionSearchInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        sessionSearchInput.value = '';
-        sessionSearchQuery = '';
-        if (sessionSearchClear) sessionSearchClear.hidden = true;
-        renderSessionList();
-        sessionSearchInput.blur();
-      }
-    });
-  }
-  if (sessionSearchClear) {
-    sessionSearchClear.addEventListener('click', () => {
-      if (sessionSearchInput) sessionSearchInput.value = '';
-      sessionSearchQuery = '';
-      sessionSearchClear.hidden = true;
-      renderSessionList();
-      sessionSearchInput?.focus();
-    });
-  }
-  if (attachBtn && imageUploadInput) {
-    attachBtn.addEventListener('click', () => imageUploadInput.click());
-    imageUploadInput.addEventListener('change', () => {
-      handleSelectedImageFiles(imageUploadInput.files);
-    });
-  }
-  if (inputWrapper) {
-    inputWrapper.addEventListener('dragover', (e) => {
-      if (!e.dataTransfer?.types?.includes('Files')) return;
-      e.preventDefault();
-      inputWrapper.classList.add('drag-active');
-    });
-    inputWrapper.addEventListener('dragleave', (e) => {
-      if (e.target === inputWrapper) inputWrapper.classList.remove('drag-active');
-    });
-    inputWrapper.addEventListener('drop', (e) => {
-      e.preventDefault();
-      inputWrapper.classList.remove('drag-active');
-      handleSelectedImageFiles(e.dataTransfer?.files);
-    });
-  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeAttachMenu();
+    closeFileRefPicker();
+  });
+  bindComposeDropTarget(inputWrapper);
+  bindComposeDropTarget(messagesWrap);
 
   // Mode selector (hidden select kept for legacy sync)
   modeSelect.value = sessionState.currentMode;
@@ -7978,14 +13368,51 @@
   // Mode tabs click
   document.querySelectorAll('.mode-tab').forEach((btn) => {
     btn.addEventListener('click', () => {
-      handleModeSelectionChange(btn.dataset.mode);
+      const mode = btn.dataset.mode;
+      sessionState.currentMode = mode;
+      modeSelect.value = mode;
+      saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
+      updateAgentScopedUI();
+      if (sessionState.currentSessionId) {
+        send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
+      }
+      renderWorkspaceInsights();
     });
   });
   modeSelect.addEventListener('change', () => {
-    handleModeSelectionChange(modeSelect.value);
+    sessionState.currentMode = modeSelect.value;
+    saveModeForAgent(sessionState.currentAgent, sessionState.currentMode);
+    updateAgentScopedUI();
+    if (sessionState.currentSessionId) {
+      send({ type: 'set_mode', sessionId: sessionState.currentSessionId, mode: sessionState.currentMode });
+    }
+    renderWorkspaceInsights();
+  });
+
+  let msgInputComposing = false;
+  let msgInputCompositionEndedAt = 0;
+
+  function isMsgInputComposing(e) {
+    // IME candidate confirmation (Chinese/Japanese/etc.) can press Enter while
+    // composing. Some browsers report it via isComposing/keyCode 229; others
+    // fire compositionend immediately before the Enter keydown, so keep a tiny
+    // grace window to avoid sending the draft while accepting a candidate.
+    const justEndedComposition = e.key === 'Enter' && msgInputCompositionEndedAt > 0 &&
+      performance.now() - msgInputCompositionEndedAt < 120;
+    return msgInputComposing || e.isComposing || e.keyCode === 229 || e.which === 229 || justEndedComposition;
+  }
+
+  msgInput.addEventListener('compositionstart', () => {
+    msgInputComposing = true;
+  });
+
+  msgInput.addEventListener('compositionend', () => {
+    msgInputComposing = false;
+    msgInputCompositionEndedAt = performance.now();
   });
 
   msgInput.addEventListener('input', () => {
+    renderContextBar();
     autoResize();
     const val = msgInput.value;
     // Show slash command menu
@@ -7997,8 +13424,7 @@
   });
 
   msgInput.addEventListener('keydown', (e) => {
-    // Do not hijack Enter while IME is composing (Chinese/Japanese/Korean).
-    if (e.isComposing || e.keyCode === 229) return;
+    if (isMsgInputComposing(e)) return;
 
     // Command menu navigation
     if (!cmdMenu.hidden) {
@@ -8020,14 +13446,7 @@
         e.preventDefault();
         // If menu is open and user presses Enter, select the item
         selectCmdMenuItem();
-        return;
-      }
-
-      const sendOnEnter = getSendOnEnterMode() === 'enter';
-      const modifierPressed = e.ctrlKey || e.metaKey;
-      if (sendOnEnter || modifierPressed) {
-        // Enter-send mode: plain Enter sends; modifier mode: only ⌘/Ctrl+Enter.
-        // In Enter-send mode, still allow modifier+Enter as send.
+      } else {
         e.preventDefault();
         sendMessage();
       }
@@ -8042,7 +13461,7 @@
       .filter(Boolean);
     if (files.length > 0) {
       e.preventDefault();
-      handleSelectedImageFiles(files);
+      handleSelectedAttachmentFiles(files);
     }
   });
 
@@ -8255,13 +13674,15 @@
           </div>
         </div>
         <div class="settings-field">
-          <label>发送快捷键</label>
-          <select class="settings-select" id="send-on-enter-select">
-            <option value="modifier">⌘/Ctrl + Enter 发送（Enter 换行）</option>
-            <option value="enter">Enter 发送（Shift+Enter 换行）</option>
+          <label>配色方案</label>
+          <select class="settings-select" id="theme-select">
+            <option value="auto">跟随时间（18:00-06:00 夜间）</option>
+            <option value="default">默认主题</option>
+            <option value="localhost">极简主题</option>
+            <option value="night">夜间模式</option>
           </select>
         </div>
-        <div class="settings-inline-note">桌面端生效。移动端始终通过发送按钮发送。</div>
+        <div class="settings-inline-note">切换工作台外观，不影响功能或会话数据。自动模式按当前设备/浏览器本地时区判断，18:00-06:00 使用夜间模式，其余时间恢复上次选择的日间主题（如极简主题）。</div>
         <div class="settings-status" id="theme-status"></div>
       </div>
 
@@ -8953,23 +14374,12 @@
       selectedCodexChannel = codexModeSelect.value;
       renderTemplateArea();
     });
-    if (piModeSelect) {
-      piModeSelect.addEventListener('change', () => {
-        selectedPiChannel = piModeSelect.value;
-        renderTemplateArea();
-      });
-    }
-    const sendOnEnterSelect = panel.querySelector('#send-on-enter-select');
-    if (sendOnEnterSelect) {
-      sendOnEnterSelect.value = getSendOnEnterMode();
-      sendOnEnterSelect.addEventListener('change', () => {
-        const next = setSendOnEnterMode(sendOnEnterSelect.value);
-        showAppearanceStatus(
-          next === 'enter' ? '已切换为 Enter 发送' : '已切换为 ⌘/Ctrl+Enter 发送',
-          'success'
-        );
-      });
-    }
+    themeSelect.value = getStoredTheme();
+    themeSelect.addEventListener('change', () => {
+      const nextTheme = applyTheme(themeSelect.value);
+      themeSelect.value = nextTheme;
+      showThemeStatus(`已切换为 ${getThemePreferenceLabel(nextTheme)}`, 'success');
+    });
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
 
     unifiedSaveBtn.addEventListener('click', async () => {
@@ -9462,6 +14872,10 @@
     if (e.key === 'Escape') hideSettingsPanel();
   }
 
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', toggleQuickTheme);
+  }
+
   if (settingsBtn) {
     settingsBtn.addEventListener('click', showSettingsPanel);
   }
@@ -9631,6 +15045,19 @@
           <button class="modal-close-btn" id="ns-close-btn" aria-label="关闭">\u2715</button>
         </div>
         <div class="modal-body modal-body-project">
+          <div class="new-session-preferences" id="ns-preferences">
+            <div class="new-session-agent-tabs" id="ns-agent-tabs" aria-label="选择新会话 Agent">
+              <button type="button" class="new-session-agent-tab" data-ns-agent="codex">Codex</button>
+              <button type="button" class="new-session-agent-tab" data-ns-agent="claude">Claude</button>
+            </div>
+            <label class="new-session-mode-field">
+              <span>权限模式</span>
+              <select id="ns-mode-select" class="new-session-mode-select">
+                ${buildPermissionModeOptionsHtml('default')}
+              </select>
+            </label>
+            <div class="new-session-mode-hint" id="ns-mode-hint">Codex 默认 YOLO；Claude 默认“默认”。</div>
+          </div>
           <div class="modal-stack project-flow-shell" id="ns-step-projects" style="display:none">
             <div class="project-picker-head">
               <div class="project-picker-head-copy">
@@ -9882,7 +15309,8 @@
   }
 
   function showNewSessionModal() {
-    const targetAgent = selectedAgent;
+    let targetAgent = selectedAgent;
+    let targetMode = getSavedModeForAgent(targetAgent);
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
     overlay.id = 'new-session-overlay';
@@ -9908,25 +15336,42 @@
     const currentNameEl = overlay.querySelector('#ns-current-name');
     const currentPathEl = overlay.querySelector('#ns-current-path');
     const selectionHintEl = overlay.querySelector('#ns-selection-hint');
-    const createDirBtn = overlay.querySelector('#ns-create-dir-btn');
-    const createDirRow = overlay.querySelector('#ns-create-dir-row');
-    const createDirInput = overlay.querySelector('#ns-create-dir-input');
-    const createDirConfirm = overlay.querySelector('#ns-create-dir-confirm');
-    const createDirStatus = overlay.querySelector('#ns-create-dir-status');
+    const agentTabsEl = overlay.querySelector('#ns-agent-tabs');
+    const modeSelectEl = overlay.querySelector('#ns-mode-select');
+    const modeHintEl = overlay.querySelector('#ns-mode-hint');
 
-    let createDirMode = false;
-    function setCreateDirMode(enabled) {
-      createDirMode = enabled;
-      createDirRow.style.display = enabled ? 'flex' : 'none';
-      createDirStatus.textContent = '';
-      createDirStatus.classList.remove('error');
-      createDirInput.disabled = false;
-      createDirConfirm.disabled = false;
-      if (enabled) {
-        createDirInput.value = '';
-        createDirInput.focus();
+    function updateNewSessionPreferenceControls() {
+      targetAgent = normalizeAgent(targetAgent);
+      targetMode = normalizeMode(targetMode) || getSavedModeForAgent(targetAgent);
+      agentTabsEl?.querySelectorAll('[data-ns-agent]').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.nsAgent === targetAgent);
+      });
+      if (modeSelectEl) modeSelectEl.value = targetMode;
+      if (modeHintEl) {
+        const agentLabel = AGENT_LABELS[targetAgent] || targetAgent;
+        const defaultModeLabel = MODE_LABELS[getDefaultModeForAgent(targetAgent)] || getDefaultModeForAgent(targetAgent);
+        modeHintEl.textContent = `${agentLabel} 默认 ${defaultModeLabel}，这里改动会记住为下次默认。`;
       }
     }
+
+    agentTabsEl?.querySelectorAll('[data-ns-agent]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        targetAgent = normalizeAgent(btn.dataset.nsAgent);
+        targetMode = getSavedModeForAgent(targetAgent);
+        applyNewSessionAgentPreference(targetAgent, targetMode, { syncMode: !sessionState.currentSessionId });
+        updateNewSessionPreferenceControls();
+      });
+    });
+    modeSelectEl?.addEventListener('change', () => {
+      targetMode = saveModeForAgent(targetAgent, modeSelectEl.value);
+      if (targetAgent === sessionState.currentAgent && !sessionState.currentSessionId) {
+        sessionState.currentMode = targetMode;
+        modeSelect.value = targetMode;
+        updateAgentScopedUI();
+      }
+      updateNewSessionPreferenceControls();
+    });
+    updateNewSessionPreferenceControls();
 
     // --- Step 1: Render project list ---
     function renderProjectPicker() {
@@ -9938,7 +15383,7 @@
         getSessionCount: (project) => getCurrentProjectSessionCount(project),
         onProjectSelect: (project) => {
           close();
-          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: getSavedModeForAgent(targetAgent) });
+          send({ type: 'new_session', projectId: project.id, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent), fastMode: getSavedFastModeForAgent(targetAgent) });
         },
       });
       if (projects.length === 0) {
@@ -10104,9 +15549,9 @@
       const existingProject = projects.find((project) => normalizeComparablePath(project?.path) === normalizedCwd) || null;
       close();
       send(existingProject
-        ? { type: 'save_project', id: existingProject.id, path: cwd }
-        : { type: 'save_project', path: cwd, name: getPathLeaf(cwd) || cwd });
-      send({ type: 'new_session', cwd, agent: targetAgent, mode: getSavedModeForAgent(targetAgent) });
+        ? { type: 'save_project', id: projectId, path: cwd }
+        : { type: 'save_project', id: projectId, path: cwd, name: getPathLeaf(cwd) || cwd });
+      send({ type: 'new_session', cwd, agent: targetAgent, mode: targetMode, reasoningEffort: getSavedReasoningEffortForAgent(targetAgent), fastMode: getSavedFastModeForAgent(targetAgent) });
     });
 
     // Initialize — default directly into directory browser
@@ -10462,6 +15907,50 @@
     return '';
   }
 
+  function closeImageLightbox() {
+    document.getElementById('image-lightbox-overlay')?.remove();
+    document.body.classList.remove('image-lightbox-open');
+  }
+
+  function openImageLightbox(src, alt = '') {
+    const safeSrc = String(src || '').trim();
+    if (!safeSrc) return;
+    closeImageLightbox();
+    const overlay = document.createElement('div');
+    overlay.id = 'image-lightbox-overlay';
+    overlay.className = 'image-lightbox-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', '图片预览');
+    overlay.innerHTML = `
+      <div class="image-lightbox-window">
+        <button type="button" class="image-lightbox-close" aria-label="关闭图片预览">×</button>
+        <img class="image-lightbox-img" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(alt || '图片预览')}">
+      </div>
+    `;
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) closeImageLightbox();
+    });
+    overlay.querySelector('.image-lightbox-close')?.addEventListener('click', closeImageLightbox);
+    document.body.appendChild(overlay);
+    document.body.classList.add('image-lightbox-open');
+    overlay.querySelector('.image-lightbox-close')?.focus({ preventScroll: true });
+  }
+
+  function handleMarkdownLocalImageClick(event) {
+    const link = event.target?.closest?.('.markdown-local-image-link');
+    if (!link) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const src = link.getAttribute('data-full-src') || link.getAttribute('href') || '';
+    const alt = link.querySelector('img')?.getAttribute('alt') || '';
+    openImageLightbox(src, alt);
+  }
+
+  function handleImageLightboxKeydown(event) {
+    if (event.key === 'Escape') closeImageLightbox();
+  }
+
   function buildUpdateStatusHtml(info) {
     const latestVersion = escapeHtml(info?.latestVersion || '');
     const localVersion = escapeHtml(info?.localVersion || '');
@@ -10489,14 +15978,38 @@
   }
 
   // --- Init ---
+  loadPersistedQueuedMessages();
   setSelectedAgent(selectedAgent, { syncMode: true });
   resetChatView(selectedAgent);
-  updateSendShortcutHints();
+  const initialSideChatSnapshot = loadPersistedSideChatState();
+  if (hasRestorableSideChat(initialSideChatSnapshot)) {
+    restoreSideChatFromSnapshot(initialSideChatSnapshot, {
+      open: !!initialSideChatSnapshot.open && !!connectionState.authToken,
+    });
+  } else {
+    syncSideChatRestoreButton();
+  }
   connect();
+  document.addEventListener('click', handleMarkdownLocalImageClick);
+  document.addEventListener('keydown', handleImageLightboxKeydown);
   window.addEventListener('resize', updateCwdBadge);
+  window.addEventListener('pagehide', persistSideChatStateNow);
+  window.addEventListener('beforeunload', persistSideChatStateNow);
+  document.addEventListener('webcoding-auth-restored', () => {
+    const snapshot = loadPersistedSideChatState();
+    if (!sideChatState.open && snapshot?.open) {
+      restoreSideChatFromSnapshot(snapshot, { open: true });
+    } else if (sideChatState.open && !sideChatState.authed) {
+      connectSideChatSocket();
+    }
+    syncSideChatRestoreButton();
+  });
   window.addEventListener('online', () => {
     connectionState.reconnectAttempts = 0;
     if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) connect();
+    if (sideChatState.open && (!sideChatState.ws || sideChatState.ws.readyState > WebSocket.OPEN)) {
+      connectSideChatSocket();
+    }
   });
 
   // Register Service Worker for mobile push notifications
@@ -10513,10 +16026,17 @@
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      persistSideChatStateNow();
+      return;
+    }
     if (document.visibilityState !== 'visible') return;
     const now = Date.now();
     if (now - lastVisibilityResyncAt < VISIBILITY_RESYNC_THROTTLE_MS) return;
     lastVisibilityResyncAt = now;
+    if (sideChatState.open && (!sideChatState.ws || sideChatState.ws.readyState > WebSocket.OPEN)) {
+      connectSideChatSocket();
+    }
     if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) {
       // WS is dead, force reconnect
       connect();

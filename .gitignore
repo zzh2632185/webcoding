@@ -59,3 +59,11 @@ coverage/
 .cache/
 tmp/
 .codegraph/
+
+config/bridge-usage.jsonl
+config/bridge-debug*.jsonl
+config/*.bak*
+
+config/generated-message-images/
+
+.codex

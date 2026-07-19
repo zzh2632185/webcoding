@@ -48,8 +48,47 @@ function assert(condition, message) {
   }
 }
 
+function readRepoText(...parts) {
+  return fs.readFileSync(path.join(REPO_DIR, ...parts), 'utf8');
+}
+
+function extractFunctionSource(source, functionName) {
+  const signatureRe = new RegExp(`function\\s+${functionName}\\s*\\([^)]*\\)\\s*\\{`);
+  const match = signatureRe.exec(source);
+  assert(match, `Missing function ${functionName}`);
+
+  let depth = 0;
+  const bodyStart = match.index + match[0].length - 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const ch = source[index];
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(match.index, index + 1);
+    }
+  }
+  throw new Error(`Could not parse function ${functionName}`);
+}
+
 function runSqliteScript(dbPath, script) {
   const result = spawnSync('sqlite3', [dbPath, script], { encoding: 'utf8' });
+  if (result.error?.code === 'ENOENT') {
+    const { DatabaseSync } = require('node:sqlite');
+    const database = new DatabaseSync(dbPath);
+    try {
+      const source = String(script || '').trim();
+      if (/^(?:select|with|pragma)\b/i.test(source) && !source.includes('\n')) {
+        const rows = database.prepare(source.replace(/;\s*$/, '')).all();
+        return rows
+          .map((row) => Object.values(row).map((value) => value === null ? '' : String(value)).join('|'))
+          .join('\n');
+      }
+      database.exec(source);
+      return '';
+    } finally {
+      database.close();
+    }
+  }
   if (result.status !== 0) {
     const preview = String(script || '').trim().slice(0, 160);
     throw new Error(result.stderr || `sqlite3 failed: ${preview}`);
@@ -206,9 +245,22 @@ async function startServer(env) {
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+    if (process.env.REGRESSION_DEBUG_STDERR === '1') process.stderr.write(chunk);
+  });
   await waitForPort(env.PORT, 10000);
   return { child, stdout: () => stdout, stderr: () => stderr, env };
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
 }
 
 async function stopServer(handle) {
@@ -415,46 +467,60 @@ async function stopBridgeProcess(handle) {
   await stopServer(handle.child);
 }
 
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+function readProcNullSeparatedFile(filePath) {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
+    return fs.readFileSync(filePath, 'utf8').split('\0').filter(Boolean);
+  } catch {
+    return [];
   }
 }
 
-async function cleanupRegressionBridgeProcesses(tempRoot) {
-  const statePaths = [];
-  const pendingDirs = [tempRoot];
-  while (pendingDirs.length > 0) {
-    const currentDir = pendingDirs.pop();
-    let entries = [];
-    try { entries = fs.readdirSync(currentDir, { withFileTypes: true }); } catch { continue; }
-    for (const entry of entries) {
-      const entryPath = path.join(currentDir, entry.name);
-      if (entry.isDirectory()) pendingDirs.push(entryPath);
-      else if (entry.isFile() && entry.name === 'bridge-state.json') statePaths.push(entryPath);
-    }
+function readProcEnvMap(pid) {
+  const env = new Map();
+  for (const item of readProcNullSeparatedFile(path.join('/proc', String(pid), 'environ'))) {
+    const index = item.indexOf('=');
+    if (index <= 0) continue;
+    env.set(item.slice(0, index), item.slice(index + 1));
   }
+  return env;
+}
 
-  const pids = new Set();
-  for (const statePath of statePaths) {
-    try {
-      const pid = Number.parseInt(JSON.parse(fs.readFileSync(statePath, 'utf8'))?.pid, 10);
-      if (isPidAlive(pid)) pids.add(pid);
-    } catch {}
+function listRegressionBridgeProcesses() {
+  if (process.platform === 'win32') return [];
+  let entries = [];
+  try { entries = fs.readdirSync('/proc', { withFileTypes: true }); } catch { return []; }
+  const scriptPath = path.resolve(BRIDGE_PATH);
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
+    const cmdline = readProcNullSeparatedFile(path.join('/proc', entry.name, 'cmdline'));
+    if (!cmdline.some((arg) => path.resolve(String(arg || '')) === scriptPath)) continue;
+    const env = readProcEnvMap(pid);
+    matches.push({
+      pid,
+      statePath: env.get('CC_WEB_BRIDGE_STATE_PATH') || '',
+      runtimePath: env.get('CC_WEB_BRIDGE_RUNTIME_PATH') || '',
+    });
   }
-  for (const pid of pids) {
-    try { process.kill(pid, 'SIGTERM'); } catch {}
+  return matches;
+}
+
+async function cleanupRegressionBridgeProcesses(predicate) {
+  if (process.platform === 'win32') return 0;
+  let killed = 0;
+  for (const info of listRegressionBridgeProcesses()) {
+    if (!predicate(info)) continue;
+    try { process.kill(-info.pid, 'SIGKILL'); } catch {
+      try { process.kill(info.pid, 'SIGKILL'); } catch {}
+    }
+    killed += 1;
   }
-  const deadline = Date.now() + 1500;
-  while ([...pids].some(isPidAlive) && Date.now() < deadline) await sleep(30);
-  for (const pid of pids) {
-    if (!isPidAlive(pid)) continue;
-    try { process.kill(pid, 'SIGKILL'); } catch {}
+  if (killed > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  return killed;
 }
 
 async function startResponsesFallbackUpstream(port, options = {}) {
@@ -1026,7 +1092,7 @@ function nextMessage(messages, ws, predicate, timeoutMs = 5000) {
     timeout = setTimeout(() => {
       waiters.delete(waiter);
       const tailTypes = messages.slice(-12).map((msg) => msg && msg.type).filter(Boolean).join(', ');
-      reject(new Error(`Timed out waiting for expected WebSocket message (${caller}) tail=[${tailTypes}]`));
+      reject(new Error(`Timed out after ${timeoutMs}ms waiting for expected WebSocket message (${caller}) tail=[${tailTypes}]`));
     }, timeoutMs);
   });
 }
@@ -1081,10 +1147,499 @@ async function saveConfigAndWait(client, saveType, config, responseType) {
   );
 }
 
+function runFrontendStreamingPlaceholderSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const styleSource = readRepoText('public', 'style.css');
+  const findReusableSource = extractFunctionSource(appSource, 'findReusableAssistantPlaceholder');
+  const startGeneratingSource = extractFunctionSource(appSource, 'startGenerating');
+  const getStreamingBubbleSource = extractFunctionSource(appSource, 'getStreamingBubble');
+  const resumeGeneratingSource = extractFunctionSource(appSource, 'handleResumeGeneratingMessage');
+  const applySnapshotSource = extractFunctionSource(appSource, 'applySessionSnapshot');
+  const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
+  const sessionListSource = extractFunctionSource(appSource, 'handleSessionListMessage');
+  const markReadSource = extractFunctionSource(appSource, 'markSessionReadLocally');
+  const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
+
+  assert(
+    findReusableSource.includes('getLastMessageElement()'),
+    'Streaming placeholder reuse must be limited to the tail message',
+  );
+  assert(
+    !findReusableSource.includes("querySelectorAll('.msg.assistant')")
+      && !findReusableSource.includes('querySelectorAll(".msg.assistant")'),
+    'Streaming placeholder reuse must not globally scan old assistant placeholders',
+  );
+  assert(
+    startGeneratingSource.includes('createIfMissing: true')
+      && startGeneratingSource.includes('cleanupStale: true')
+      && startGeneratingSource.includes('requireAfterLatestUser: true'),
+    'startGenerating must create a fresh latest-user placeholder and clean stale empty assistants',
+  );
+  assert(
+    getStreamingBubbleSource.includes('createIfMissing: true'),
+    'Streaming deltas must recreate the placeholder if the DOM id is missing',
+  );
+  assert(
+    resumeGeneratingSource.includes('ensurePendingPlaceholder(bubble)')
+      && resumeGeneratingSource.includes("ensurePendingPlaceholder(document.querySelector('#streaming-msg .msg-bubble'))"),
+    'resume_generating without text/segments must keep the three-dot placeholder visible',
+  );
+  assert(
+    applySnapshotSource.includes('options.preserveStreaming && composeState.isGenerating && snapshot.sessionId === sessionState.currentSessionId')
+      && !applySnapshotSource.includes('snapshot.sessionId === sessionState.currentSessionId && snapshot.isRunning'),
+    'Early session_info snapshots must not wipe optimistic streaming placeholders',
+  );
+  assert(
+    sessionInfoSource.includes('msg.isRunning || composeState.isGenerating || sessionState.currentSessionRunning'),
+    'session_info must preserve optimistic running UI while the backend is starting',
+  );
+  assert(
+    sessionListSource.includes("currentMetaRunning && (!composeState.isGenerating || !document.getElementById('streaming-msg'))")
+      && sessionListSource.includes('startGenerating();'),
+    'session_list running=true must restore the local placeholder/abort UI if a snapshot wiped it',
+  );
+  assert(
+    markReadSource.includes('hasUnread: false')
+      && markReadSource.includes('cacheEntry.meta.hasUnread = false')
+      && markReadSource.includes('cacheEntry.snapshot.hasUnread = false'),
+    'Opening a session must clear unread state in session meta and cached snapshots immediately',
+  );
+  assert(
+    applySnapshotSource.includes('const wasUnread = !!snapshot.hasUnread')
+      && applySnapshotSource.includes('markSessionReadLocally(snapshot.sessionId, snapshot)')
+      && applySnapshotSource.includes('snapshot.hasUnread = false')
+      && applySnapshotSource.includes('if (wasUnread && !options.suppressUnreadToast)'),
+    'Viewed session snapshots must preserve unread toast intent but clear unread UI state before rendering tabs',
+  );
+  assert(
+    sessionListSource.includes('session.id === sessionState.currentSessionId ? false : !!session.hasUnread'),
+    'Stale session_list payloads must not re-mark the currently viewed session as unread',
+  );
+  assert(
+    /#streaming-msg\s+\.msg-actions\s*\{[^}]*display:\s*none;/.test(styleSource),
+    'Streaming placeholder must hide message actions/copy button while loading',
+  );
+  assert(
+    createMessageActionsSource.includes("role === 'assistant'")
+      && createMessageActionsSource.includes('msg-jump-top-btn')
+      && createMessageActionsSource.includes('handleMessageJumpTopClick(topBtn)'),
+    'Assistant message actions must include a per-message jump-to-top button',
+  );
+  assert(
+    scrollMessageToTopSource.includes('getBoundingClientRect()')
+      && scrollMessageToTopSource.includes('messagesDiv.scrollTo')
+      && scrollMessageToTopSource.includes('shouldFollowMessageStream = false'),
+    'Message jump-to-top must scroll the message container to the selected message head without re-enabling stream follow',
+  );
+  assert(
+    styleSource.includes('.msg-jump-top-btn'),
+    'Message jump-to-top button must have a dedicated CSS hook',
+  );
+}
+
+function runMessageCopyContextSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const buildCopySource = extractFunctionSource(appSource, 'buildMessageCopyText');
+  const dataCopySource = extractFunctionSource(appSource, 'getMessageCopyTextFromData');
+  const createMessageSource = extractFunctionSource(appSource, 'createMsgElement');
+  const renderAssistantSource = extractFunctionSource(appSource, 'renderAssistantSegments');
+  const editSource = extractFunctionSource(appSource, 'beginEditMessageFromButton');
+
+  assert(
+    buildCopySource.includes('formatAttachmentCopyLines(attachments)')
+      && buildCopySource.includes('formatFileRefCopyLines(fileRefs)')
+      && buildCopySource.includes('附件：')
+      && buildCopySource.includes('引用：'),
+    'Message copy text must include existing attachment and file reference sections',
+  );
+  const attachmentCopySource = extractFunctionSource(appSource, 'formatAttachmentCopyLines');
+  assert(
+    attachmentCopySource.includes('attachmentRawUrl(id)')
+      && attachmentCopySource.includes('window.location.origin')
+      && attachmentCopySource.includes('服务器引用：')
+      && attachmentCopySource.includes('附件ID：'),
+    'Attachment copy text must include the server-side attachment reference instead of pretending to copy the original file',
+  );
+  assert(
+    dataCopySource.includes('getMessageBaseCopyTextFromData(message)')
+      && dataCopySource.includes('message.attachments || []')
+      && dataCopySource.includes('message.fileRefs || []'),
+    'Message copy text from stored data must preserve attachment and reference metadata',
+  );
+  assert(
+    createMessageSource.includes('div.dataset.rawText = rawText')
+      && createMessageSource.includes('div.dataset.copyText = buildMessageCopyText(rawText, attachments, fileRefs)'),
+    'Rendered user/assistant messages must keep raw text separate from the richer copy payload',
+  );
+  assert(
+    renderAssistantSource.includes('msgEl.dataset.rawText = getMessageBaseCopyTextFromData(message)')
+      && renderAssistantSource.includes('msgEl.dataset.copyText = getMessageCopyTextFromData(message)'),
+    'Assistant segment rendering must refresh both raw edit text and rich copy text',
+  );
+  assert(
+    editSource.includes('getMessageRawTextFromElement(msgEl)')
+      && !editSource.includes('msgEl.dataset.copyText || getMessageCopyTextFromElement(msgEl)'),
+    'Message edit must use raw text, not the attachment/reference-enriched copy payload',
+  );
+}
+
+function runMessageEditSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const serverSource = readRepoText('server.js');
+  const htmlSource = readRepoText('public', 'index.html');
+  const styleSource = readRepoText('public', 'style.css');
+  const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const sendMessageSource = extractFunctionSource(appSource, 'sendMessage');
+  const submitEditedSource = extractFunctionSource(appSource, 'submitEditedMessage');
+  const handleEditSource = extractFunctionSource(serverSource, 'handleEditMessage');
+  const clearRuntimeSource = extractFunctionSource(serverSource, 'clearRuntimeForEditedMessage');
+  const sessionInfoSource = extractFunctionSource(appSource, 'handleSessionInfoMessage');
+
+  assert(
+    htmlSource.includes('id="edit-message-bar"')
+      && styleSource.includes('.edit-message-bar')
+      && styleSource.includes('.msg-edit-btn'),
+    'Message edit UI must expose a quiet edit bar and a dedicated pencil action style',
+  );
+  assert(
+    createMessageActionsSource.includes("role === 'user'")
+      && createMessageActionsSource.includes('msg-edit-btn')
+      && createMessageActionsSource.includes('beginEditMessageFromButton(editBtn)'),
+    'User message actions must include a pencil edit button wired to edit mode',
+  );
+  assert(
+    sendMessageSource.includes('editingMessageState')
+      && sendMessageSource.includes('submitEditedMessage(text)'),
+    'Composer send must route editing drafts through edit_message instead of normal send/enqueue',
+  );
+  assert(
+    submitEditedSource.includes("type: 'edit_message'")
+      && submitEditedSource.includes('messageIndex')
+      && submitEditedSource.includes('pendingEditResetSessionId = editingMessageState.sessionId')
+      && submitEditedSource.includes('Do not optimistically start the streaming placeholder here'),
+    'Edited message submit must call the backend edit_message path and wait for the editReset snapshot before rerendering',
+  );
+  assert(
+    sessionInfoSource.includes('msg.editReset === true')
+      && sessionInfoSource.includes('!isEditResetSnapshot')
+      && sessionInfoSource.includes('pendingEditResetSessionId = null'),
+    'editReset session_info snapshots must force rerender instead of preserving stale streaming DOM',
+  );
+  assert(
+    serverSource.includes("case 'edit_message'")
+      && serverSource.includes('handleEditMessage(ws, msg)'),
+    'WebSocket router must expose edit_message to the backend handler',
+  );
+  assert(
+    handleEditSource.includes('activeProcesses.has(sessionId)')
+      && handleEditSource.includes('session.messages = historyBefore')
+      && handleEditSource.includes('session.queuedMessages = []')
+      && handleEditSource.includes('clearRuntimeForEditedMessage(session)')
+      && handleEditSource.includes('handleMessage(ws')
+      && handleEditSource.includes('editReset: true'),
+    'Backend edit must reject running sessions, truncate following history, clear queued messages/runtime, emit editReset, and restart via handleMessage',
+  );
+  assert(
+    clearRuntimeSource.includes('clearRuntimeSessionId(session')
+      && clearRuntimeSource.includes('session.codexThreadId = null')
+      && clearRuntimeSource.includes('session.claudeSessionId = null'),
+    'Edited message reset must clear Codex and Claude runtime thread mirrors, not just visible messages',
+  );
+}
+
+function runClaudeRuntimeToolResultAndRetrySourceRegressionCase() {
+  const runtimeSource = readRepoText('lib', 'agent-runtime.js');
+  const appSource = readRepoText('public', 'app.js');
+  const processClaudeSource = extractFunctionSource(runtimeSource, 'processClaudeEvent');
+  const completeToolSource = extractFunctionSource(runtimeSource, 'completeClaudeToolResult');
+  const retryWarningSource = extractFunctionSource(runtimeSource, 'sendClaudeApiRetryWarning');
+
+  assert(
+    processClaudeSource.includes("case 'user'")
+      && processClaudeSource.includes("block?.type === 'tool_result'")
+      && processClaudeSource.includes('completeClaudeToolResult(entry, block, sessionId)'),
+    'Claude user/tool_result events must complete running tool cards after Claude Code output format changes',
+  );
+  assert(
+    completeToolSource.includes("type: 'tool_end'")
+      && completeToolSource.includes('updateEntryToolSegment(entry, toolUseId')
+      && completeToolSource.includes('tc.done = true'),
+    'Claude tool_result handling must update stored segments and emit tool_end',
+  );
+  assert(
+    processClaudeSource.includes("event.subtype === 'api_retry'")
+      && retryWarningSource.includes("type: 'runtime_warning'"),
+    'Claude api_retry system events must be surfaced as visible runtime warnings',
+  );
+  assert(
+    appSource.includes('runtime_warning: (msg)')
+      && appSource.includes("appendError(msg.message, { type: 'warning'"),
+    'Frontend must render runtime_warning without finishing the running response',
+  );
+}
+
+function runClaudeNativeHistoryToolResultSourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const parseSource = extractFunctionSource(serverSource, 'parseJsonlToMessages');
+  assert(
+    parseSource.includes("b?.type === 'tool_result'")
+      && parseSource.includes('lastAssistant.toolCalls.find')
+      && parseSource.includes('segment.done = true'),
+    'Claude native history import must apply user/tool_result blocks to previous assistant tool calls',
+  );
+  assert(
+    parseSource.includes("done: false"),
+    'Claude imported tool_use blocks must remain running until their user/tool_result block is seen',
+  );
+}
+
+function runCodexGeneratedImageRecoverySourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const appendSource = extractFunctionSource(serverSource, 'appendCodexRolloutImagesToEntry');
+  const collectSessionSource = extractFunctionSource(serverSource, 'collectSessionImageIdentities');
+  const collectAssistantSource = extractFunctionSource(serverSource, 'collectAssistantImageSegments');
+
+  assert(
+    appendSource.includes('collectSessionImageIdentities(session)')
+      && appendSource.includes('collectEntryImageIdentities(entry)'),
+    'Codex rollout image recovery must de-dupe against already persisted session images and current entry images',
+  );
+  assert(
+    appendSource.includes('earliestImageTimestampMs')
+      && appendSource.includes('record.timestampMs < earliestImageTimestampMs'),
+    'Codex rollout image recovery must not scan and append old images from earlier turns',
+  );
+  assert(
+    appendSource.includes('known.has(identity)')
+      && appendSource.includes('known.add(identity)'),
+    'Codex rollout image recovery must track appended image identities to prevent duplicate image_delta events',
+  );
+  assert(
+    collectSessionSource.includes('session?.messages')
+      && collectSessionSource.includes('message?.segments'),
+    'Session image identity collection must inspect persisted message segments',
+  );
+  assert(
+    collectAssistantSource.includes('timestampMs')
+      && collectAssistantSource.includes('image: segment'),
+    'Assistant image collection must keep image timestamps for per-turn recovery filtering',
+  );
+}
+
+function runCodexFastModeSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const indexSource = readRepoText('public', 'index.html');
+  const serverSource = readRepoText('server.js');
+  const agentRuntimeSource = readRepoText('lib', 'agent-runtime.js');
+  const bridgeSource = readRepoText('lib', 'local-api-bridge.js');
+  const spawnSource = extractFunctionSource(agentRuntimeSource, 'buildCodexSpawnSpec');
+  const normalizeTierSource = extractFunctionSource(bridgeSource, 'normalizeOpenAiServiceTier');
+
+  assert(
+    !indexSource.includes('desktop-speed-select')
+      && !indexSource.includes('mobile-speed-select')
+      && appSource.includes('const CODEX_FAST_MODE_ENABLED = false')
+      && !appSource.includes('showFastModePicker')
+      && !appSource.includes("cmd === '/fast'")
+      && !appSource.includes("action === 'switch-speed'"),
+    'Frontend must keep Webcoding Codex Fast controls disabled and hide speed selectors',
+  );
+  assert(
+    serverSource.includes('function normalizeCodexFastMode')
+      && serverSource.includes('function isCodexFastModeEnabled')
+      && serverSource.includes("case 'set_fast_mode'")
+      && serverSource.includes('handleSetFastMode')
+      && serverSource.includes('clearRuntimeSessionId(session)')
+      && serverSource.includes('Webcoding 内已关闭 Fast 速度选择'),
+    'Server must force Webcoding Fast mode off while preserving a compatibility handler',
+  );
+  assert(
+    spawnSource.includes('CC_WEB_CODEX_FAST_MODE_ENABLED')
+      && spawnSource.includes('fastModeEnabled && session.fastMode === true')
+      && spawnSource.includes('features.fast_mode=true')
+      && spawnSource.includes("service_tier=${quoted('fast')}")
+      && !spawnSource.includes("service_tier=${quoted('standard')}"),
+    'Codex app-server spawn must only pass Fast mode overrides when the env gate and session flag are both enabled',
+  );
+  assert(
+    normalizeTierSource.includes("serviceTier !== 'fast'")
+      && normalizeTierSource.includes("service_tier: 'priority'"),
+    'Local OpenAI-compatible bridge must normalize Codex service_tier fast to priority for CPAP compatibility',
+  );
+  assert(
+    bridgeSource.includes('function shouldRetryWithoutServiceTier')
+      && bridgeSource.includes('stripOpenAiServiceTier')
+      && bridgeSource.includes('responses_service_tier_retry_standard')
+      && bridgeSource.includes('chat_completions_fallback_service_tier_retry_standard'),
+    'Local bridge must retry without service_tier if upstream rejects Fast/priority, so Fast cannot make Codex unusable',
+  );
+}
+
+function runCodexGoalStatusAgentIsolationSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const agentRuntimeSource = readRepoText('lib', 'agent-runtime.js');
+  const runtimeStatusSource = extractFunctionSource(appSource, 'handleRuntimeStatusMessage');
+
+  assert(
+    agentRuntimeSource.includes('const baseSendEntryMessage')
+      && agentRuntimeSource.includes('? { ...data, agent: entry.agent }'),
+    'Runtime messages must carry the entry agent so Codex events cannot leak into Claude UI state',
+  );
+  assert(
+    appSource.includes('function isMessageForCurrentAgent')
+      && appSource.includes('msgAgent === sessionState.currentAgent'),
+    'Frontend must provide an agent guard for runtime messages',
+  );
+  assert(
+    runtimeStatusSource.includes('!isMessageForCurrentAgent(msg)')
+      && runtimeStatusSource.includes("code === 'codex_goal'")
+      && runtimeStatusSource.includes("if (code === 'codex_goal') return;")
+      && runtimeStatusSource.indexOf("code === 'codex_goal'") < runtimeStatusSource.indexOf('startGenerating()'),
+    'Frontend must silently drop Codex goal status before creating a streaming placeholder',
+  );
+}
+
+function runHandoffRemovalSourceRegressionCase() {
+  const appSource = readRepoText('public', 'app.js');
+  const indexSource = readRepoText('public', 'index.html');
+  const styleSource = readRepoText('public', 'style.css');
+  const serverSource = readRepoText('server.js');
+  assert(
+    !/handoff_session|handleHandoffSession|generateAiHandoffSummary|handoff_status|activeHandoffProcesses|handoffPending/.test(serverSource),
+    'Server handoff session feature must remain removed',
+  );
+  assert(
+    !/sendHandoffMessage|handleHandoffStatusMessage|handoff_status|handoffPending|currentHandoffPending|handoffBtn/.test(appSource),
+    'Frontend handoff session feature must remain removed',
+  );
+  assert(
+    !/handoff-btn/.test(indexSource) && !/handoff-btn/.test(styleSource),
+    'Handoff button markup/styles must remain removed',
+  );
+}
+
+function runSessionForkSourceRegressionCase() {
+  const serverSource = readRepoText('server.js');
+  const appSource = readRepoText('public', 'app.js');
+  const styleSource = readRepoText('public', 'style.css');
+  const forkHandlerSource = extractFunctionSource(serverSource, 'handleForkSession');
+  const codexForkSource = extractFunctionSource(serverSource, 'forkCodexNativeThread');
+  const completedMessagesSource = extractFunctionSource(serverSource, 'getCompletedMessagesForFork');
+  const rollbackCountSource = extractFunctionSource(serverSource, 'countCodexRollbackTurnsForFork');
+  const worktreeSource = extractFunctionSource(serverSource, 'createGitWorktreeForFork');
+  const createActionsSource = extractFunctionSource(appSource, 'createMessageActions');
+  const assistantForkSource = extractFunctionSource(appSource, 'beginForkFromAssistantButton');
+  const startForkSource = extractFunctionSource(appSource, 'startForkSession');
+
+  assert(
+    serverSource.includes("case 'fork_session'")
+      && serverSource.includes('handleForkSession(ws, msg)'),
+    'WebSocket router must expose fork_session to the backend fork handler',
+  );
+  assert(
+    codexForkSource.includes("client.request('thread/fork'")
+      && codexForkSource.includes("client.request('thread/rollback'")
+      && codexForkSource.includes('setRuntimeSessionState(newSession')
+      && codexForkSource.includes('sourceThreadId')
+      && codexForkSource.includes('threadSource'),
+    'Codex session fork must call native app-server thread/fork, rollback the forked thread when forking from an older answer, and bind the returned thread id to the new session',
+  );
+  assert(
+    completedMessagesSource.includes('throughMessageIndex')
+      && completedMessagesSource.includes('messages.slice(0')
+      && completedMessagesSource.includes('activeProcesses.has(session?.id)')
+      && completedMessagesSource.includes("tail?.role === 'assistant'")
+      && rollbackCountSource.includes("message?.role === 'user'"),
+    'Fork history must support assistant-message checkpoints, exclude the unfinished tail turn, and compute native rollback turns from later user turns',
+  );
+  assert(
+    forkHandlerSource.includes('runtimeContexts = { claude: {}, codex: {} }')
+      && forkHandlerSource.includes('forkedFromSessionId')
+      && forkHandlerSource.includes('nativeFork')
+      && forkHandlerSource.includes('handleLoadSession(ws, newSession.id)'),
+    'Forked Webcoding sessions must be independent, traceable to their parent, and opened through the normal session loader',
+  );
+  assert(
+    serverSource.includes("execFileSync('git', args")
+      && worktreeSource.includes("runGitText(repoRoot, ['worktree', 'add', '-b'")
+      && worktreeSource.includes('branchName')
+      && forkHandlerSource.includes("msg?.worktree === true || msg?.mode === 'worktree'"),
+    'Worktree fork mode must create a git worktree on a fresh branch and switch the fork cwd to that path',
+  );
+  assert(
+    !appSource.includes('session-item-btn fork')
+      && createActionsSource.includes('msg-fork-btn')
+      && createActionsSource.includes('beginForkFromAssistantButton(forkBtn, event)')
+      && assistantForkSource.includes('msg.assistant')
+      && assistantForkSource.includes('messageIndex')
+      && startForkSource.includes("type: 'fork_session'")
+      && startForkSource.includes("mode: 'normal'")
+      && startForkSource.includes('worktree: false')
+      && startForkSource.includes('messageIndex')
+      && !appSource.includes('window.prompt(')
+      && !appSource.includes('chooseForkModeForSession')
+      && appSource.includes('session_forked: handleSessionForkedMessage')
+      && styleSource.includes('.msg-fork-btn'),
+    'Frontend must expose fork only in assistant message actions beside Copy, send normal same-project fork_session with messageIndex without a chooser, and handle completion feedback',
+  );
+}
+
+function runProcessWithInput(command, args, { input = '', env = {}, cwd = REPO_DIR, timeoutMs = 8000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      reject(new Error(`process timeout: ${command} ${args.join(' ')}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function runCodexNativeGoalContinuationRegressionCase() {
+  const runtimePath = path.join(REPO_DIR, 'lib', 'codex-native-runtime.js');
+  const result = await runProcessWithInput(process.execPath, [runtimePath], {
+    input: '/goal trigger codex active goal auto continuation',
+    env: {
+      CODEX_PATH: MOCK_CODEX,
+      WEBCODING_CODEX_PATH: MOCK_CODEX,
+      WEBCODING_CODEX_APP_SERVER_ARGS: JSON.stringify(['app-server', '--listen', 'stdio://']),
+      WEBCODING_CODEX_GOAL_AUTO_WAIT_MS: '10',
+      WEBCODING_CODEX_GOAL_MAX_CONTINUATIONS: '3',
+      WEBCODING_CODEX_REQUEST_TIMEOUT_MS: '4000',
+    },
+    timeoutMs: 10000,
+  });
+  assert(result.code === 0, `native goal continuation runtime should exit 0, got code=${result.code} signal=${result.signal}\nstderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert(/mock goal step 1 done/.test(result.stdout), 'native /goal should run the first goal turn');
+  assert(/mock goal step 2 complete/.test(result.stdout), 'native /goal should automatically run a continuation turn while goal remains active');
+  assert(/thread\.goal\.runner\.continuing/.test(result.stdout), 'native goal runner should emit an explicit continuation event for fallback turns');
+  assert(/"status":"complete"/.test(result.stdout) || /"status":"complete"/.test(result.stderr), 'native goal continuation should stop after the mock marks the goal complete');
+  assert(!/isConservativeNaturalGoal|shouldNaturalGoal/.test(readRepoText('lib', 'codex-native-runtime.js')), 'Codex native goal continuation must not restore natural-language triggers');
+}
+
 function createTestRunner() {
   const results = [];
+  const filter = String(process.env.REGRESSION_FILTER || '').trim().toLowerCase();
   return {
     async run(name, fn) {
+      if (filter && !name.toLowerCase().includes(filter)) return;
       const startedAt = Date.now();
       try {
         await fn();
@@ -2005,7 +2560,11 @@ function writeFakeCodexRolloutInHome(codexHome, threadId) {
       type: 'event_msg',
       payload: {
         type: 'token_count',
-        info: { total_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 8 } },
+        info: {
+          total_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 8, total_tokens: 28 },
+          last_token_usage: { input_tokens: 12, cached_input_tokens: 4, output_tokens: 3, total_tokens: 15 },
+          model_context_window: 258400,
+        },
       },
     }),
   ];
@@ -3677,13 +4236,23 @@ async function runPiAgentRegressionCase({ port, password, sessionsDir, logsDir }
     process.kill(terminatedSpawn.pid, 'SIGTERM');
     const terminatedError = await client.waitForType(
       'error',
-      (msg) => msg.sessionId === terminatedSession.sessionId && /Pi 任务被外部终止（信号 SIGTERM）/.test(msg.message || ''),
+      (msg) => msg.sessionId === terminatedSession.sessionId && (
+        process.platform === 'win32'
+          ? /Pi 任务失败（退出码 1）/.test(msg.message || '')
+          : /Pi 任务被外部终止（信号 SIGTERM）/.test(msg.message || '')
+      ),
       8000,
     );
-    assert(!/退出码 1/.test(terminatedError.message || ''), 'Pi SIGTERM must not be mislabeled as exit code 1');
+    if (process.platform !== 'win32') {
+      assert(!/退出码 1/.test(terminatedError.message || ''), 'Pi SIGTERM must not be mislabeled as exit code 1');
+    }
     await client.waitForType('done', (msg) => msg.sessionId === terminatedSession.sessionId, 8000);
     const terminatedComplete = JSON.parse(findProcessLogLine(logsDir, terminatedSession.sessionId, 'process_complete'));
-    assert(terminatedComplete.exitCode === null && terminatedComplete.signal === 'SIGTERM', 'Pi SIGTERM should preserve the real process outcome in logs');
+    if (process.platform === 'win32') {
+      assert(terminatedComplete.exitCode === 1 && terminatedComplete.signal === null, 'Windows child termination should preserve Node\'s native exit result');
+    } else {
+      assert(terminatedComplete.exitCode === null && terminatedComplete.signal === 'SIGTERM', 'Pi SIGTERM should preserve the real process outcome in logs');
+    }
 
     // Session dir should exist under sessions/_pi-sessions
     const piRoot = path.join(sessionsDir, '_pi-sessions');
@@ -4016,33 +4585,55 @@ async function runPiRpcCapacityRegressionCase({ tempRoot, password }) {
 
 async function runAttachmentBoundaryRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ token }) => {
-    try {
-      const oversizedUpload = await uploadAttachmentExpectFailure(
-        port,
-        token,
-        {
-          filename: 'too-large.png',
-          mime: 'image/png',
-          data: Buffer.alloc(10 * 1024 * 1024 + 1, 0),
-        },
-        413,
-      );
-      assert(/10MB/.test(oversizedUpload.payload.message || ''), 'Oversized attachment should be rejected with size limit message');
-    } catch (error) {
-      assert(/fetch failed|socket hang up|ECONNRESET/i.test(error.message || ''), 'Oversized attachment should be rejected or connection aborted by the server');
-    }
-
-    const invalidTypeUpload = await uploadAttachmentExpectFailure(
+    const pngBytesWithWrongMime = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+      'base64',
+    );
+    const sniffedImageUpload = await uploadAttachment(
       port,
       token,
       {
-        filename: 'not-an-image.txt',
-        mime: 'text/plain',
-        data: Buffer.from('plain text is not a supported image'),
+        filename: 'clipboard-image',
+        mime: 'application/octet-stream',
+        data: pngBytesWithWrongMime,
       },
-      400,
     );
-    assert(/仅支持/.test(invalidTypeUpload.payload.message || ''), 'Unsupported attachment mime type should be rejected');
+    assert(sniffedImageUpload.kind === 'image', 'Image attachments should be detected from file magic even when browser MIME is generic');
+    assert(sniffedImageUpload.mime === 'image/png', 'Sniffed image MIME should be persisted for preview');
+    const imageResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/${sniffedImageUpload.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(imageResponse.ok, 'Sniffed image attachment should be downloadable for preview');
+    assert(/^image\/png/i.test(imageResponse.headers.get('content-type') || ''), 'Sniffed image preview response should use image/png content type');
+
+    const genericUpload = await uploadAttachment(
+      port,
+      token,
+      {
+        filename: 'project.zip',
+        mime: 'application/zip',
+        data: Buffer.from('fake zip payload used by regression'),
+      },
+    );
+    assert(genericUpload.kind === 'file', 'Unsupported document/image types should be accepted as generic file attachments');
+    assert(genericUpload.filename === 'project.zip', 'Generic attachment should preserve the uploaded filename');
+    assert(genericUpload.size > 0, 'Generic attachment should report uploaded size');
+    const genericResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/${genericUpload.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(genericResponse.ok, 'Generic file attachments should be downloadable');
+
+    const largerUpload = await uploadAttachment(
+      port,
+      token,
+      {
+        filename: 'large.bin',
+        mime: 'application/octet-stream',
+        data: Buffer.alloc(10 * 1024 * 1024 + 1, 0),
+      },
+    );
+    assert(largerUpload.kind === 'file', 'Large arbitrary files below 1GB should be accepted');
+    assert(largerUpload.size === 10 * 1024 * 1024 + 1, 'Large arbitrary file size should be preserved');
   });
 }
 
@@ -4095,11 +4686,66 @@ async function runExpiredAttachmentCleanupRegressionCase({ port, password, expir
     }));
     const expiredAttachmentError = await client.waitForType(
       'error',
-      (msg) => /图片附件已过期或不可用/.test(msg.message || ''),
+      (msg) => /附件已过期或不可用/.test(msg.message || ''),
       5000,
     );
-    assert(/图片附件已过期或不可用/.test(expiredAttachmentError.message || ''), 'Sending an expired attachment reference should be rejected');
+    assert(/附件已过期或不可用/.test(expiredAttachmentError.message || ''), 'Sending an expired attachment reference should be rejected');
   });
+}
+
+
+async function runServerQueuedMessagesRegressionCase({ port, password, sessionsDir }) {
+  const connection = await connectAuthedClient(port, password);
+  let sessionId = null;
+  try {
+    const session = await connection.client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger codex slow stream serverqueue', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'trigger codex slow stream serverqueue',
+    );
+    sessionId = session.sessionId;
+    await connection.client.waitForType('text_delta', (msg) => /slow-start:serverqueue/.test(msg.text || ''), 5000);
+
+    connection.client.send({
+      type: 'enqueue_message',
+      id: 'queued-server-regression',
+      sessionId,
+      text: 'queued after browser close',
+      mode: 'yolo',
+      agent: 'codex',
+    });
+    const queued = await connection.client.waitForType(
+      'queue_update',
+      (msg) => msg.sessionId === sessionId && (msg.queuedMessages || []).some((item) => item.text === 'queued after browser close'),
+      5000,
+    );
+    assert(queued.queuedMessages.length === 1, 'Server queue should contain the queued message');
+  } finally {
+    await closeWs(connection.ws);
+  }
+
+  const sessionPath = path.join(sessionsDir, `${sessionId}.json`);
+  await waitForCondition(() => {
+    if (!fs.existsSync(sessionPath)) return false;
+    const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const contents = (session.messages || []).map((msg) => msg.content || '').join('\n');
+    return /queued after browser close/.test(contents)
+      && /Codex mock handled \(0 image\): queued after browser close/.test(contents)
+      && Array.isArray(session.queuedMessages)
+      && session.queuedMessages.length === 0;
+  }, { timeoutMs: 12000, intervalMs: 120, label: 'server queued message dispatch after disconnect' });
+
+  const resumed = await connectAuthedClient(port, password);
+  try {
+    resumed.client.send({ type: 'load_session', sessionId });
+    const loaded = await resumed.client.waitForType('session_info', (msg) => msg.sessionId === sessionId, 5000);
+    const contents = (loaded.messages || []).map((msg) => msg.content || '').join('\n');
+    assert(/queued after browser close/.test(contents), 'Reloaded session should include the queued user message');
+    assert(/Codex mock handled \(0 image\): queued after browser close/.test(contents), 'Reloaded session should include queued assistant response');
+    assert(!loaded.queuedMessages || loaded.queuedMessages.length === 0, 'Server queue should be empty after dispatch');
+  } finally {
+    await closeWs(resumed.ws);
+  }
 }
 
 async function runConcurrentSessionsRegressionCase({ port, password }) {
@@ -4149,13 +4795,66 @@ async function runConcurrentSessionsRegressionCase({ port, password }) {
     );
     assert(/slow-start:alpha/.test(resumedSessionA.text || ''), 'Second client should receive current stream snapshot for active session');
 
-    await closeWs(connectionA.ws);
-    await connectionC.client.waitForType('done', (msg) => msg.sessionId === sessionA.sessionId, 10000);
+    const cMessageIndexAfterResume = connectionC.messages.length;
+    const cNewSession = await connectionC.client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && msg.sessionId !== sessionA.sessionId,
+      5000,
+    );
+    assert(cNewSession.isRunning === false, 'Second client new chat should not inherit session alpha running state');
+
+    await connectionA.client.waitForType('text_delta', (msg) => (
+      msg.sessionId === sessionA.sessionId && /slow-mid:alpha|slow-end:alpha/.test(msg.text || '')
+    ), 7000);
+    const cLeakedAfterDetach = connectionC.messages.slice(cMessageIndexAfterResume).filter((msg) => (
+      msg.sessionId === sessionA.sessionId
+      && ['text_delta', 'tool_start', 'tool_end', 'done', 'resume_generating', 'usage', 'cost', 'system_message', 'error'].includes(msg.type)
+    ));
+    assert(cLeakedAfterDetach.length === 0, 'Detaching the second client should not keep streaming alpha into its new chat');
+
+    await connectionA.client.waitForType('done', (msg) => msg.sessionId === sessionA.sessionId, 10000);
     await connectionB.client.waitForType('done', (msg) => msg.sessionId === sessionB.sessionId, 10000);
   } finally {
     if (connectionA) await closeWs(connectionA.ws);
     if (connectionB) await closeWs(connectionB.ws);
     if (connectionC) await closeWs(connectionC.ws);
+  }
+}
+
+async function runNewSessionDetachRegressionCase({ port, password, tempRoot }) {
+  let connection = null;
+  try {
+    connection = await connectAuthedClient(port, password);
+    const sessionA = await connection.client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger codex slow stream detach-leak', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'trigger codex slow stream detach-leak',
+    );
+    const firstDelta = await connection.client.waitForType(
+      'text_delta',
+      (msg) => msg.sessionId === sessionA.sessionId && /slow-start:detach-leak/.test(msg.text || ''),
+      5000,
+    );
+    assert(firstDelta.sessionId === sessionA.sessionId, 'Streaming delta should include the source sessionId');
+
+    const newSession = await connection.client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd: tempRoot, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'New Chat' && msg.sessionId !== sessionA.sessionId,
+      5000,
+    );
+    assert(newSession.isRunning === false, 'Fresh new_session should not inherit running state from the previous session');
+
+    const afterNewSessionIndex = connection.messages.length;
+    await sleep(3600);
+    const leakedMessages = connection.messages.slice(afterNewSessionIndex).filter((msg) => (
+      msg.sessionId === sessionA.sessionId
+      && ['text_delta', 'tool_start', 'tool_end', 'done', 'resume_generating', 'usage', 'cost', 'system_message', 'error'].includes(msg.type)
+    ));
+    assert(leakedMessages.length === 0, 'Previous running session should not stream into a freshly created chat');
+  } finally {
+    if (connection) await closeWs(connection.ws);
   }
 }
 
@@ -5466,7 +6165,7 @@ async function runClaudeLocalModelMapRegressionCase({ tempRoot }) {
   mkdirp(path.dirname(claudeSettingsPath));
   fs.writeFileSync(claudeSettingsPath, JSON.stringify({
     env: {
-      ANTHROPIC_API_KEY: 'sk-local-custom',
+      ANTHROPIC_API_KEY: 'test-local-custom-key',
       ANTHROPIC_BASE_URL: 'https://local.example.test',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'local-opus-model',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'local-sonnet-model',
@@ -5586,7 +6285,7 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Backup Regression',
           templates: [{
             name: 'Claude Backup Regression',
-            apiKey: 'sk-regression',
+            apiKey: 'test-regression-key',
             apiBase: 'https://example.com/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -5755,7 +6454,7 @@ async function runClaudeConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Carryover Unified',
           templates: [{
             name: 'Claude Carryover Unified',
-            apiKey: 'sk-carryover',
+            apiKey: 'test-carryover-key',
             apiBase: 'https://unified.carryover.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -5803,7 +6502,7 @@ async function runClaudeConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Carryover Unified',
           templates: [{
             name: 'Claude Carryover Unified',
-            apiKey: 'sk-carryover',
+            apiKey: 'test-carryover-key',
             apiBase: 'https://unified.carryover.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-opus-4-6',
@@ -5946,7 +6645,7 @@ async function runClaudeStickyResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Claude Sticky Unified',
           templates: [{
             name: 'Claude Sticky Unified',
-            apiKey: 'sk-claude-sticky',
+            apiKey: 'test-claude-sticky',
             apiBase: 'https://sticky-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'claude-sonnet-4-6',
@@ -6075,6 +6774,179 @@ async function runCodexLocalConfigFingerprintRegressionCase({ tempRoot }) {
   });
 }
 
+async function runCodexLocalBridgeRuntimeRegressionCase({ tempRoot }) {
+  const caseRoot = path.join(tempRoot, 'codex-local-bridge-runtime');
+  const configDir = path.join(caseRoot, 'config');
+  const sessionsDir = path.join(caseRoot, 'sessions');
+  const logsDir = path.join(caseRoot, 'logs');
+  const homeDir = path.join(caseRoot, 'home');
+  mkdirp(configDir);
+  mkdirp(sessionsDir);
+  mkdirp(logsDir);
+  mkdirp(homeDir);
+
+  const codexDir = path.join(homeDir, '.codex');
+  mkdirp(codexDir);
+  fs.writeFileSync(path.join(codexDir, 'instruction.md'), 'local instruction should be linked');
+  fs.writeFileSync(path.join(codexDir, 'AGENTS.md'), 'local agents should be linked');
+  mkdirp(path.join(codexDir, 'skills', 'exa-search'));
+  fs.writeFileSync(path.join(codexDir, 'skills', 'exa-search', 'SKILL.md'), '# exa-search regression skill');
+  fs.writeFileSync(path.join(codexDir, 'config.toml'), [
+    'model_provider = "cliproxyapi"',
+    'model = "gpt-5.5"',
+    'model_context_window = 400000',
+    'model_instructions_file = "./instruction.md"',
+    '',
+    '[model_providers.cliproxyapi]',
+    'name = "cliproxyapi"',
+    'wire_api = "responses"',
+    'base_url = "https://cpap.example.test/v1"',
+    '',
+    '[mcp_servers.nocturne_memory]',
+    'url = "http://127.0.0.1:9000/mcp"',
+  ].join('\n'));
+  fs.writeFileSync(path.join(codexDir, 'auth.json'), JSON.stringify({
+    OPENAI_API_KEY: 'local-cpap-key',
+  }, null, 2));
+
+  const port = await getFreePort();
+  const password = 'Regression!234';
+  const serverEnv = {
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  };
+
+  await withServer(serverEnv, async () => {
+    await withAuthedClient(port, password, async ({ client }) => {
+      const session = await client.sendAndWaitType(
+        { type: 'new_session', agent: 'codex', cwd: caseRoot, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === 'codex' && msg.cwd === caseRoot,
+      );
+
+      client.send(buildAgentMessagePayload({ text: 'local bridge codex run', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+      const spawnLine = findProcessLogLine(logsDir, session.sessionId, 'codex_app_turn_start');
+      const spawnArgs = spawnLine ? (JSON.parse(spawnLine).args || '') : '';
+      assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Local Codex with API key should be forced through openai_compat bridge');
+      assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Local Codex spawn should point at webcoding bridge base_url');
+      assert(spawnArgs.includes('-c model="gpt-5.5"'), 'Local Codex bridge should keep the local configured model');
+
+      const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
+      assert(runtimeToml.includes('[mcp_servers.nocturne_memory]'), 'Local Codex bridge runtime should preserve local MCP config');
+      assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Local Codex bridge runtime should rewrite active provider base_url to local bridge');
+      assert(runtimeToml.includes('env_key = "CODEX_OPENAI_COMPAT_KEY"'), 'Local Codex bridge runtime should force dedicated bridge token env key');
+      const runtimeInstructionPath = path.join(configDir, 'codex-runtime-home', 'instruction.md');
+      const runtimeAgentsPath = path.join(configDir, 'codex-runtime-home', 'AGENTS.md');
+      const runtimeSkillsPath = path.join(configDir, 'codex-runtime-home', 'skills');
+      assert(fs.lstatSync(runtimeInstructionPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink relative instruction file');
+      assert(fs.readFileSync(runtimeInstructionPath, 'utf8') === 'local instruction should be linked', 'Local Codex bridge runtime instruction symlink should read source content');
+      assert(fs.lstatSync(runtimeAgentsPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink local AGENTS.md');
+      assert(fs.readFileSync(runtimeAgentsPath, 'utf8') === 'local agents should be linked', 'Local Codex bridge runtime AGENTS symlink should read source content');
+      assert(fs.lstatSync(runtimeSkillsPath).isSymbolicLink(), 'Local Codex bridge runtime should symlink local skills directory');
+      assert(fs.existsSync(path.join(runtimeSkillsPath, 'exa-search', 'SKILL.md')), 'Local Codex bridge runtime skills symlink should expose local skills');
+
+      const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
+      const bridgeEntry = bridgeRuntime?.runtimes
+        ? Object.values(bridgeRuntime.runtimes).find((entry) => entry?.upstream?.name === '本地 Codex: cliproxyapi')
+        : null;
+      assert(bridgeEntry?.upstream?.apiBase === 'https://cpap.example.test/v1', 'Local Codex bridge should forward to original CPAP base URL');
+      assert(bridgeEntry?.upstream?.apiKey === 'local-cpap-key', 'Local Codex bridge should use local Codex auth key upstream');
+    });
+  });
+}
+
+async function runCodexBridgeRealtimeUsageRegressionCase({ tempRoot }) {
+  const caseRoot = path.join(tempRoot, 'codex-bridge-realtime-usage');
+  const configDir = path.join(caseRoot, 'config');
+  const sessionsDir = path.join(caseRoot, 'sessions');
+  const logsDir = path.join(caseRoot, 'logs');
+  const homeDir = path.join(caseRoot, 'home');
+  mkdirp(configDir);
+  mkdirp(sessionsDir);
+  mkdirp(logsDir);
+  mkdirp(homeDir);
+
+  const codexDir = path.join(homeDir, '.codex');
+  mkdirp(codexDir);
+  fs.writeFileSync(path.join(codexDir, 'config.toml'), [
+    'model_provider = "cliproxyapi"',
+    'model = "gpt-5.5"',
+    'model_context_window = 400000',
+    '',
+    '[model_providers.cliproxyapi]',
+    'name = "cliproxyapi"',
+    'wire_api = "responses"',
+    'base_url = "https://cpap.example.test/v1"',
+  ].join('\n'));
+  fs.writeFileSync(path.join(codexDir, 'auth.json'), JSON.stringify({
+    OPENAI_API_KEY: 'local-cpap-key',
+  }, null, 2));
+
+  const port = await getFreePort();
+  const password = 'Regression!234';
+  const serverEnv = {
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  };
+
+  await withServer(serverEnv, async () => {
+    await withAuthedClient(port, password, async ({ client }) => {
+      const session = await client.sendAndWaitType(
+        { type: 'new_session', agent: 'codex', cwd: caseRoot, mode: 'yolo' },
+        'session_info',
+        (msg) => msg.agent === 'codex' && msg.cwd === caseRoot,
+      );
+
+      client.send(buildAgentMessagePayload({ text: 'trigger codex slow stream realtime-usage', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await client.waitForType('text_delta', (msg) => msg.sessionId === session.sessionId && /slow-start:realtime-usage/.test(msg.text || ''), 5000);
+
+      const bridgeRuntimePath = path.join(configDir, 'bridge-runtime.json');
+      await waitForCondition(() => fs.existsSync(bridgeRuntimePath), { timeoutMs: 3000, label: 'bridge runtime token' });
+      const bridgeRuntime = JSON.parse(fs.readFileSync(bridgeRuntimePath, 'utf8'));
+      const bridgeEntry = bridgeRuntime?.runtimes
+        ? Object.values(bridgeRuntime.runtimes).find((entry) => entry?.upstream?.name === '本地 Codex: cliproxyapi')
+        : null;
+      assert(bridgeEntry?.token, 'Realtime bridge usage regression should have an active bridge token');
+
+      fs.appendFileSync(path.join(configDir, 'bridge-usage.jsonl'), `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        token: bridgeEntry.token,
+        provider: 'openai',
+        model: 'gpt-5.5',
+        endpoint: 'responses_stream',
+        usage: { input_tokens: 12345, cached_tokens: 10000, output_tokens: 67, total_tokens: 12412 },
+      })}\n`);
+
+      const usageMsg = await client.waitForType(
+        'usage',
+        (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 12345,
+        5000,
+      );
+      assert(usageMsg.currentUsage?.outputTokens === 67, 'Realtime bridge usage should preserve output tokens');
+      assert(usageMsg.currentUsage?.totalTokens === 12412, 'Realtime bridge usage should preserve total tokens');
+
+      await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 10000);
+      const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+      assert(stored.lastUsage?.inputTokens === 12345, 'Realtime bridge usage should persist session lastUsage before process completion');
+    });
+  });
+}
+
+
 async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
   const caseRoot = path.join(tempRoot, 'codex-config-carryover');
   const configDir = path.join(caseRoot, 'config');
@@ -6142,7 +7014,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Carryover Unified',
           templates: [{
             name: 'Codex Carryover Unified',
-            apiKey: 'sk-codex-carryover',
+            apiKey: 'test-codex-carryover',
             apiBase: 'https://codex-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4',
@@ -6197,7 +7069,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Carryover Unified',
           templates: [{
             name: 'Codex Carryover Unified',
-            apiKey: 'sk-codex-carryover',
+            apiKey: 'test-codex-carryover',
             apiBase: 'https://codex-unified.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4-large',
@@ -6243,7 +7115,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
       const resumedCodexSpawnLines = findProcessLogLines(logsDir, session.sessionId, 'codex_app_turn_start');
       const resumedCodexSpawn = resumedCodexSpawnLines[resumedCodexSpawnLines.length - 1] || '';
       assert(resumedCodexSpawn.includes('"resume":true'), 'Codex carryover unified model change should resume the existing thread');
-      assert(resumedCodexSpawn.includes('"operation":"thread/resume"'), 'Codex carryover unified model change should use thread/resume');
+      assert(resumedCodexSpawn.includes('"transport":"app-server"'), 'Codex carryover unified model change should use native App Server transport');
 
       await saveConfigAndWait(
         client,
@@ -6284,7 +7156,7 @@ async function runCodexConfigCarryoverRegressionCase({ tempRoot }) {
       const restoredSpawnLines = findProcessLogLines(logsDir, session.sessionId, 'codex_app_turn_start');
       const restoredSpawn = restoredSpawnLines[restoredSpawnLines.length - 1] || '';
       assert(restoredSpawn.includes('"resume":true'), 'Codex carryover switch back to local should resume the original local thread');
-      assert(restoredSpawn.includes('"operation":"thread/resume"'), 'Codex carryover switch back to local should use thread/resume');
+      assert(restoredSpawn.includes('"transport":"app-server"'), 'Codex carryover switch back to local should use native App Server transport');
     });
   });
 }
@@ -6324,7 +7196,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Sticky Unified A',
           templates: [{
             name: 'Codex Sticky Unified A',
-            apiKey: 'sk-codex-sticky-a',
+            apiKey: 'test-codex-sticky-a',
             apiBase: 'https://codex-sticky-a.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4',
@@ -6371,7 +7243,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
           activeTemplate: 'Codex Sticky Unified B',
           templates: [{
             name: 'Codex Sticky Unified B',
-            apiKey: 'sk-codex-sticky-b',
+            apiKey: 'test-codex-sticky-b',
             apiBase: 'https://codex-sticky-b.example.test/v1',
             upstreamType: 'openai',
             defaultModel: 'gpt-5.4-large',
@@ -6422,7 +7294,7 @@ async function runCodexStickyUnifiedResumeRegressionCase({ tempRoot }) {
       const spawnLines = findProcessLogLines(logsDir, session.sessionId, 'codex_app_turn_start');
       const latestSpawnLine = spawnLines[spawnLines.length - 1] || '';
       assert(latestSpawnLine.includes('"resume":true'), 'Codex sticky unified resume should keep resume enabled after channel switch');
-      assert(latestSpawnLine.includes('"operation":"thread/resume"'), 'Codex sticky unified resume should use thread/resume after channel switch');
+      assert(latestSpawnLine.includes('"transport":"app-server"'), 'Codex sticky unified resume should use native App Server transport after channel switch');
     });
   });
 }
@@ -6437,7 +7309,7 @@ async function runCodexConfigMigrationRegressionCase({ port, password, sessionsD
         activeTemplate: 'Regression Unified API',
         templates: [{
           name: 'Regression Unified API',
-          apiKey: 'sk-regression',
+          apiKey: 'test-regression-key',
           apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'custom-regression-model',
@@ -6504,7 +7376,7 @@ async function runCodexReasoningEffortRegressionCase({ port, password, tempRoot,
         activeTemplate: 'Reasoning Regression API',
         templates: [{
           name: 'Reasoning Regression API',
-          apiKey: 'sk-regression',
+          apiKey: 'test-regression-key',
           apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'gpt-5.4',
@@ -6560,7 +7432,7 @@ async function runCodexBridgeProtocolNormalizationRegressionCase({ port, passwor
         activeTemplate: 'Codex Bridge Mislabel',
         templates: [{
           name: 'Codex Bridge Mislabel',
-          apiKey: 'sk-codex-bridge-mislabel',
+          apiKey: 'test-codex-bridge-mislabel',
           apiBase: 'https://bridge-mislabel.example.test',
           upstreamType: 'anthropic',
           defaultModel: 'gpt-5.4-large',
@@ -6607,6 +7479,71 @@ async function runCodexBridgeProtocolNormalizationRegressionCase({ port, passwor
   });
 }
 
+
+async function runCodexAnomalousUsageRegressionCase({ port, password, sessionsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const cwd = path.join(os.tmpdir(), 'webcoding-codex-usage');
+    mkdirp(cwd);
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.cwd === cwd,
+    );
+
+    client.send(buildAgentMessagePayload({
+      text: 'trigger codex anomalous usage',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+
+    const usageMsg = await client.waitForType(
+      'usage',
+      (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 210000,
+    );
+    assert(usageMsg.contextWindowTokens === 400000, 'Codex usage should preserve reported context window');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+    const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+    assert(stored.lastUsage?.inputTokens === 210000, 'Codex anomalous turn.completed usage should not overwrite last_token_usage');
+    assert(stored.lastUsage?.totalTokens === 210900, 'Codex last usage total should come from last_token_usage');
+  });
+}
+
+async function runCodexCumulativeUsageWithinWindowRegressionCase({ port, password, sessionsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const cwd = path.join(os.tmpdir(), 'webcoding-codex-cumulative-usage');
+    mkdirp(cwd);
+    const session = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd, mode: 'yolo' },
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.cwd === cwd,
+    );
+
+    client.send(buildAgentMessagePayload({
+      text: 'trigger codex cumulative usage within window',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+
+    const usageMsg = await client.waitForType(
+      'usage',
+      (msg) => msg.sessionId === session.sessionId && msg.currentUsage?.inputTokens === 15351,
+    );
+    assert(usageMsg.currentUsage?.totalTokens === 15365, 'Codex current usage should come from last_token_usage total_tokens');
+    assert(usageMsg.totalUsage?.inputTokens === 28201, 'Codex total usage should still keep cumulative total_token_usage');
+    assert(usageMsg.contextWindowTokens === 258400, 'Codex cumulative usage should preserve reported context window');
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId);
+
+    const stored = readStoredSessionFile(sessionsDir, session.sessionId);
+    assert(stored.lastUsage?.inputTokens === 15351, 'Codex in-window cumulative turn.completed usage should not overwrite last_token_usage');
+    assert(stored.lastUsage?.totalTokens === 15365, 'Codex stored lastUsage total should match CPAP/current request usage');
+    assert(stored.totalUsage?.inputTokens === 28201, 'Codex stored totalUsage should remain cumulative');
+    assert(stored.contextWindowTokens === 258400, 'Codex stored session should keep context window');
+  });
+}
+
 async function runCodexMetadataWarningRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ client, messages }) => {
     const warningCwd = path.join(os.tmpdir(), 'webcoding-codex-warning');
@@ -6632,7 +7569,8 @@ async function runCodexMetadataWarningRegressionCase({ port, password }) {
 }
 
 async function runHappyPathRegressionCase({ port, password, tempRoot, configDir, sessionsDir, logsDir, homeDir, codexFixture, tinyPng }) {
-  await withAuthedClient(port, password, async ({ client, token }) => {
+  await withAuthedClient(port, password, async ({ client, token, messages }) => {
+    const codexWorkspace = path.resolve('/tmp/codex-space');
     const modelConfigMsg = await saveConfigAndWait(
       client,
       'save_model_config',
@@ -6641,10 +7579,8 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
         activeTemplate: 'Regression Unified API',
         templates: [{
           name: 'Regression Unified API',
-          apiKey: 'sk-regression',
-          // Keep /model fallback deterministic; an external example domain can
-          // take longer than the WebSocket assertion timeout on slow networks.
-          apiBase: 'http://127.0.0.1:1/v1',
+          apiKey: 'test-regression-key',
+          apiBase: 'https://example.com/v1',
           upstreamType: 'openai',
           defaultModel: 'custom-regression-model',
           opusModel: 'claude-opus-4-6',
@@ -6675,9 +7611,9 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     assert(codexConfigMsg.config.enableSearch === false, 'Codex config should ignore unsupported search toggle');
 
     const codexSession = await client.sendAndWaitType(
-      { type: 'new_session', agent: 'codex', cwd: '/tmp/codex-space', mode: 'plan' },
+      { type: 'new_session', agent: 'codex', cwd: codexWorkspace, mode: 'plan' },
       'session_info',
-      (msg) => msg.agent === 'codex' && msg.cwd === '/tmp/codex-space',
+      (msg) => msg.agent === 'codex' && msg.cwd === codexWorkspace,
     );
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
     assert(codexSession.model === null, 'Codex new_session should not inject a default model');
@@ -6715,15 +7651,53 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId);
     const spawnLine = findProcessLogLine(logsDir, firstMessageSession.sessionId, 'codex_app_turn_start');
     const spawnArgs = spawnLine ? (JSON.parse(spawnLine).args || '') : '';
-    const appTurnLog = spawnLine ? JSON.parse(spawnLine) : null;
-    assert(appTurnLog?.attachmentCount === 1 && !spawnLine.includes('--search'), 'Codex App Server should receive one local image without unsupported --search flags');
+    assert(
+      spawnLine && !spawnLine.includes('--search') && spawnLine.includes('"attachmentCount":1') && spawnLine.includes('"transport":"app-server"'),
+      'Codex App Server should receive the image as localImage input without the unsupported --search flag',
+    );
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex unified runtime should write isolated runtime auth mode');
     assert(runtimeToml.includes('name = "Regression Unified API"'), 'Codex unified runtime should point at the active unified API template');
     assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Codex unified runtime should route through the local bridge base_url');
+    assert(runtimeToml.includes('env_key = "CODEX_OPENAI_COMPAT_KEY"'), 'Codex unified runtime should use dedicated bridge token env key');
     assert(/# bridge_api_key = "/.test(runtimeToml), 'Codex unified runtime should expose local bridge token in generated config comments');
     assert(spawnArgs.includes('-c model_provider="openai_compat"'), 'Codex spawn should force openai_compat provider via CLI overrides');
     assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex spawn should force bridge base_url via CLI overrides');
+    const nativeRuntimeSource = readRepoText('lib', 'codex-native-runtime.js');
+    const parseGoalSource = extractFunctionSource(nativeRuntimeSource, 'parseGoalCommand');
+    assert(nativeRuntimeSource.includes('开始执行该 goal'), 'Codex native /goal set should tell the user it is starting execution');
+    assert(nativeRuntimeSource.includes('turnInputText = action.objective || inputText'), 'Codex native /goal set should continue with turn/start using the goal objective');
+    assert(!/查看|进度|继续|恢复|暂停|清除|清空/.test(parseGoalSource), 'Codex native /goal parser must not hard-code Chinese natural-language semantics');
+    assert(parseGoalSource.includes('/^(get|status)$/i.test(arg)'), 'Codex native /goal parser should only map explicit get/status subcommands to get');
+    assert(parseGoalSource.includes('/^(resume|active)$/i.test(arg)'), 'Codex native /goal parser should only map explicit resume/active subcommands to resume');
+    assert(!nativeRuntimeSource.includes('isConservativeNaturalGoal'), 'Codex native goal should only be triggered by explicit /goal commands');
+    assert(!nativeRuntimeSource.includes('shouldNaturalGoal'), 'Codex native runtime must not trigger goal from natural language');
+    assert(!/if \(!goalCommand\) \{\s*turnDone = true;\s*legacyEvent\('turn\.completed',[\s\S]{0,180}?return;\s*\}/.test(nativeRuntimeSource), 'Codex native /goal set must not return immediately after thread/goal/set');
+    const serverSource = readRepoText('server.js');
+    assert(serverSource.includes('abortedByUser'), 'Server should distinguish user abort from runtime failure');
+    assert(/const hasNonZeroExit = !abortedByUser &&/.test(serverSource), 'User abort exit code 130 should not be mapped to task failure');
+    assert(serverSource.includes('已停止当前任务。'), 'User abort should surface a stop confirmation instead of an error');
+
+    const slashPassthroughStart = messages.length;
+    const slashPrompt = '/cp 规划一个长需求\n这里模拟用户写了很多内容，不能因为未知指令丢失。';
+    client.send(buildAgentMessagePayload({ text: slashPrompt, sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await client.waitForType('text_delta', (msg) => msg.sessionId === firstMessageSession.sessionId && /\/cp 规划一个长需求/.test(msg.text || ''), 8000);
+    await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId, 8000);
+    const slashStoredSession = readStoredSessionFile(sessionsDir, firstMessageSession.sessionId);
+    assert(slashStoredSession.messages.some((message) => message.role === 'user' && message.content === slashPrompt), 'Non-core slash prompt should be persisted in history');
+    assertNoSystemMessageSince(messages, slashPassthroughStart, /未知指令:\s*\/cp/, 'Codex /cp passthrough should not be rejected as unknown');
+
+    const codexDocument = await uploadAttachment(port, token, {
+      filename: 'requirements.md',
+      mime: 'text/markdown',
+      data: Buffer.from('# Requirement\nBuild a temporary document attachment flow.'),
+    });
+    assert(codexDocument.kind === 'document', 'Markdown upload should be stored as a document attachment');
+    client.send(buildAgentMessagePayload({ text: 'read uploaded doc', attachments: [codexDocument], sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await client.waitForType('text_delta', (msg) => /temporary document attachment flow/.test(msg.text || ''), 8000);
+    await client.waitForType('done', (msg) => msg.sessionId === firstMessageSession.sessionId, 8000);
+    const storedDocSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${firstMessageSession.sessionId}.json`), 'utf8'));
+    assert(storedDocSession.messages.some((message) => Array.isArray(message.attachments) && message.attachments.some((attachment) => attachment.kind === 'document')), 'Document attachment metadata should persist in history');
 
     client.send(buildAgentMessagePayload({ text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await client.waitForType('system_message', (msg) => /正在执行 Codex \/compact/.test(msg.message || ''));
@@ -6731,24 +7705,29 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     const compactDoneMsg = await client.waitForType('system_message', (msg) => /已执行 Codex \/compact/.test(msg.message || ''));
     assert(/已执行 Codex \/compact/.test(compactDoneMsg.message || ''), 'Codex /compact should complete with Codex-specific status message');
 
-    const autoCompactCwd = path.join(tempRoot, 'codex-auto-compact');
-    mkdirp(autoCompactCwd);
-    const autoCompactSession = await client.sendAndWaitType(
-      { type: 'new_session', agent: 'codex', cwd: autoCompactCwd, mode: 'yolo' },
+    const contextLimitCwd = path.join(tempRoot, 'codex-context-limit-no-auto-compact');
+    mkdirp(contextLimitCwd);
+    const contextLimitSession = await client.sendAndWaitType(
+      { type: 'new_session', agent: 'codex', cwd: contextLimitCwd, mode: 'yolo' },
       'session_info',
-      (msg) => msg.agent === 'codex' && msg.cwd === autoCompactCwd,
+      (msg) => msg.agent === 'codex' && msg.cwd === contextLimitCwd,
     );
-    client.send(buildAgentMessagePayload({ text: 'warm up auto compact', sessionId: autoCompactSession.sessionId, mode: 'yolo', agent: 'codex' }));
-    await client.waitForType('done', (msg) => msg.sessionId === autoCompactSession.sessionId);
-    client.send(buildAgentMessagePayload({ text: 'trigger codex context limit', sessionId: autoCompactSession.sessionId, mode: 'yolo', agent: 'codex' }));
-    const autoCompactStart = await client.waitForType('system_message', (msg) => /正在按 Codex \/compact 自动压缩/.test(msg.message || ''));
-    assert(/Codex \/compact/.test(autoCompactStart.message || ''), 'Codex auto /compact should announce auto compact start');
-    const autoCompactDone = await client.waitForType('system_message', (msg) => /已执行 Codex \/compact/.test(msg.message || ''));
-    assert(/已执行 Codex \/compact/.test(autoCompactDone.message || ''), 'Codex auto /compact should finish compact step');
-    const autoCompactResume = await client.waitForType('system_message', (msg) => /按 Codex 压缩计划继续执行/.test(msg.message || ''));
-    assert(/继续执行/.test(autoCompactResume.message || ''), 'Codex auto /compact should announce retry');
-    const autoCompactRetryText = await client.waitForType('text_delta', (msg) => /trigger codex context limit/.test(msg.text || ''), 8000);
-    assert(/trigger codex context limit/.test(autoCompactRetryText.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
+    client.send(buildAgentMessagePayload({ text: 'warm up no auto compact', sessionId: contextLimitSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    await client.waitForType('done', (msg) => msg.sessionId === contextLimitSession.sessionId);
+    const contextLimitStartIndex = messages.length;
+    client.send(buildAgentMessagePayload({ text: 'trigger codex context limit', sessionId: contextLimitSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const contextLimitError = await client.waitForType(
+      'error',
+      (msg) => msg.sessionId === contextLimitSession.sessionId && /Context window exceeded|Codex 任务失败/.test(msg.message || ''),
+    );
+    assert(/Context window exceeded/.test(contextLimitError.message || ''), 'Codex context-limit errors should be surfaced instead of auto-compacted');
+    await client.waitForType('done', (msg) => msg.sessionId === contextLimitSession.sessionId);
+    assertNoSystemMessageSince(
+      messages,
+      contextLimitStartIndex,
+      /正在按 Codex \/compact 自动压缩|已执行 Codex \/compact|按 Codex 压缩计划继续执行/,
+      'Codex context-limit handling should not run automatic /compact',
+    );
 
     const claudeModelCwd = path.join(tempRoot, 'claude-model-space');
     mkdirp(claudeModelCwd);
@@ -6828,6 +7807,8 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
     );
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+    assert(importedCodex.lastUsage?.inputTokens === 12, 'Codex import should expose last_token_usage separately from total usage');
+    assert(importedCodex.contextWindowTokens === 258400, 'Codex import should preserve model context window');
 
     const importedSessionId = importedCodex.sessionId;
     client.send({ type: 'delete_session', sessionId: importedSessionId });
@@ -6847,6 +7828,21 @@ async function runHappyPathRegressionCase({ port, password, tempRoot, configDir,
 }
 
 async function main() {
+  await cleanupRegressionBridgeProcesses((info) => /\/tmp\/webcoding-regression-[^/]+\//.test(info.statePath || ''));
+  const sourceRunner = createTestRunner();
+  await sourceRunner.run('frontend streaming placeholder source guard', runFrontendStreamingPlaceholderSourceRegressionCase);
+  await sourceRunner.run('message copy context source guard', runMessageCopyContextSourceRegressionCase);
+  await sourceRunner.run('message edit reset source guard', runMessageEditSourceRegressionCase);
+  await sourceRunner.run('claude runtime tool result and retry source guard', runClaudeRuntimeToolResultAndRetrySourceRegressionCase);
+  await sourceRunner.run('claude native history tool result source guard', runClaudeNativeHistoryToolResultSourceRegressionCase);
+  await sourceRunner.run('codex generated image recovery source guard', runCodexGeneratedImageRecoverySourceRegressionCase);
+  await sourceRunner.run('codex fast mode source guard', runCodexFastModeSourceRegressionCase);
+  await sourceRunner.run('codex goal status agent isolation source guard', runCodexGoalStatusAgentIsolationSourceRegressionCase);
+  await sourceRunner.run('handoff removal source guard', runHandoffRemovalSourceRegressionCase);
+  await sourceRunner.run('session fork source guard', runSessionForkSourceRegressionCase);
+  await sourceRunner.run('codex native goal continuation runner', runCodexNativeGoalContinuationRegressionCase);
+  sourceRunner.finish();
+
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-regression-'));
   try {
     const configDir = path.join(tempRoot, 'config');
@@ -6942,11 +7938,15 @@ async function main() {
       await runner.run('claude config switch carryover', () => runClaudeConfigCarryoverRegressionCase(ctx));
       await runner.run('claude sticky resume across channel switch', () => runClaudeStickyResumeRegressionCase(ctx));
       await runner.run('codex local config fingerprint refresh', () => runCodexLocalConfigFingerprintRegressionCase(ctx));
+      await runner.run('codex local bridge runtime', () => runCodexLocalBridgeRuntimeRegressionCase(ctx));
+      await runner.run('codex bridge realtime usage', () => runCodexBridgeRealtimeUsageRegressionCase(ctx));
       await runner.run('codex config switch carryover', () => runCodexConfigCarryoverRegressionCase(ctx));
       await runner.run('codex sticky resume inside managed runtime home', () => runCodexStickyUnifiedResumeRegressionCase(ctx));
       await runner.run('codex config migration', () => runCodexConfigMigrationRegressionCase(ctx));
       await runner.run('codex ignores legacy reasoning effort config', () => runCodexReasoningEffortRegressionCase(ctx));
       await runner.run('codex bridge protocol normalization', () => runCodexBridgeProtocolNormalizationRegressionCase(ctx));
+      await runner.run('codex anomalous usage guard', () => runCodexAnomalousUsageRegressionCase(ctx));
+      await runner.run('codex in-window cumulative usage guard', () => runCodexCumulativeUsageWithinWindowRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('http asset and markdown security', () => runHttpSecurityRegressionCase(ctx));
@@ -6963,7 +7963,9 @@ async function main() {
       await runner.run('attachment boundary handling', () => runAttachmentBoundaryRegressionCase(ctx));
       await runner.run('expired attachment cleanup', () => runExpiredAttachmentCleanupRegressionCase(ctx));
       await runner.run('websocket guard rails', () => runWebSocketGuardRegressionCase(ctx));
+      await runner.run('server queued messages after disconnect', () => runServerQueuedMessagesRegressionCase(ctx));
       await runner.run('concurrent sessions and multi-client attachment', () => runConcurrentSessionsRegressionCase(ctx));
+      await runner.run('new session detaches previous stream', () => runNewSessionDetachRegressionCase(ctx));
       await runner.run('websocket reconnect resume', () => runReconnectResumeRegressionCase(ctx));
       await runner.run('happy path regression flow', () => runHappyPathRegressionCase(ctx));
       await runner.run('server restart recovery', () => runServerRestartRecoveryRegressionCase(ctx));
@@ -6972,8 +7974,9 @@ async function main() {
       runner.finish();
     });
   } finally {
-    await cleanupRegressionBridgeProcesses(tempRoot);
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    await cleanupRegressionBridgeProcesses((info) => String(info.statePath || '').startsWith(tempRoot + path.sep));
+    if (process.env.REGRESSION_KEEP_TEMP === '1') console.error(`Regression temp retained: ${tempRoot}`);
+    else fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 

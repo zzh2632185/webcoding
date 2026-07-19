@@ -35,10 +35,44 @@ function isExecutable(filePath) {
   }
 }
 
+function findExecutableCandidate(filePath) {
+  const candidates = [];
+  if (process.platform === 'win32' && !path.extname(filePath)) {
+    const extensions = ['.PS1', ...String(process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+      .split(';')
+      .map((extension) => extension.trim())
+      .filter(Boolean)];
+    candidates.push(...extensions.map((extension) => `${filePath}${extension}`));
+  }
+  candidates.push(filePath);
+  return candidates.find(isExecutable) || null;
+}
+
+function windowsPowerShellCommandSpec(command, args) {
+  if (process.platform === 'win32' && path.extname(command).toLowerCase() === '.ps1') {
+    try {
+      const shim = fs.readFileSync(command, 'utf8');
+      const basedir = path.dirname(command);
+      const candidates = [...shim.matchAll(/"\$basedir\/([^"\r\n]+\.(?:exe|js|cjs|mjs))"/gi)]
+        .map((match) => path.resolve(basedir, match[1].replace(/\//g, path.sep)))
+        .filter((candidate) => fs.existsSync(candidate) && !/^node\.exe$/i.test(path.basename(candidate)));
+      const executable = candidates.find((candidate) => path.extname(candidate).toLowerCase() === '.exe');
+      if (executable) return { command: executable, args };
+      const script = candidates.find((candidate) => /\.(?:js|cjs|mjs)$/i.test(candidate));
+      if (script) return { command: process.execPath, args: [script, ...args] };
+    } catch {}
+    return { command: 'pwsh', args: ['-NoProfile', '-File', command, ...args] };
+  }
+  return { command, args };
+}
+
 function resolveCommand(envValue, defaultName) {
   const requested = String(envValue || '').trim();
   const name = requested || defaultName;
-  if (path.isAbsolute(name) && isExecutable(name)) return name;
+  if (path.isAbsolute(name)) {
+    const absolute = findExecutableCandidate(name);
+    if (absolute) return absolute;
+  }
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const candidates = [
     path.join(home, '.local', 'bin', name),
@@ -48,7 +82,11 @@ function resolveCommand(envValue, defaultName) {
     path.join('/opt/homebrew/bin', name),
     ...String(process.env.PATH || '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, name)),
   ];
-  return candidates.find(isExecutable) || name;
+  for (const candidate of candidates) {
+    const resolved = findExecutableCandidate(candidate);
+    if (resolved) return resolved;
+  }
+  return name;
 }
 
 const CLAUDE = resolveCommand(process.env.CLAUDE_PATH, 'claude');
@@ -109,6 +147,15 @@ function cleanEnv(overrides = {}, remove = []) {
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function removeProtocolTempTree(targetPath) {
+  try {
+    fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    if (process.platform === 'win32' && ['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) return;
+    throw error;
+  }
 }
 
 async function startMockChatUpstream() {
@@ -465,21 +512,22 @@ async function checkPi(tempRoot, bridge) {
     rejectDone = reject;
   });
   done.catch(() => {});
+  const piCommand = windowsPowerShellCommandSpec(PI, [
+    '--mode', 'rpc',
+    '--session-dir', sessionDir,
+    '--session-id', crypto.randomUUID(),
+    '--no-approve',
+    '--provider', 'webcoding',
+    '--model', MODEL,
+    '--no-extensions',
+    '--no-skills',
+    '--no-prompt-templates',
+    '--no-themes',
+    '--no-context-files',
+  ]);
   const client = new PiRpcClient({
-    command: PI,
-    args: [
-      '--mode', 'rpc',
-      '--session-dir', sessionDir,
-      '--session-id', crypto.randomUUID(),
-      '--no-approve',
-      '--provider', 'webcoding',
-      '--model', MODEL,
-      '--no-extensions',
-      '--no-skills',
-      '--no-prompt-templates',
-      '--no-themes',
-      '--no-context-files',
-    ],
+    command: piCommand.command,
+    args: piCommand.args,
     env: cleanEnv({
       PI_CODING_AGENT_DIR: agentDir,
       WEBCODING_PI_API_KEY: bridge.token,
@@ -572,10 +620,11 @@ async function checkClaude(tempRoot, bridge) {
     claudeArgs.push('--permission-mode', 'bypassPermissions');
   }
   claudeArgs.push('--model', MODEL, '--settings', settingsPath, '--no-session-persistence');
+  const claudeCommand = windowsPowerShellCommandSpec(CLAUDE, claudeArgs);
 
   const client = new ClaudeStreamClient({
-    command: CLAUDE,
-    args: claudeArgs,
+    command: claudeCommand.command,
+    args: claudeCommand.args,
     env: cleanEnv({
       ANTHROPIC_API_KEY: bridge.token,
       ANTHROPIC_AUTH_TOKEN: bridge.token,
@@ -658,18 +707,19 @@ async function checkCodex(tempRoot, bridge) {
     rejectDone = reject;
   });
   done.catch(() => {});
+  const codexCommand = windowsPowerShellCommandSpec(CODEX, [
+    'app-server', '--listen', 'stdio://',
+    '-c', 'preferred_auth_method="apikey"',
+    '-c', 'model_provider="openai_compat"',
+    '-c', `model_providers.openai_compat.name=${tomlString('Protocol Contract Chat')}`,
+    '-c', `model_providers.openai_compat.base_url=${tomlString(bridge.openaiBaseUrl)}`,
+    '-c', 'model_providers.openai_compat.env_key="OPENAI_API_KEY"',
+    '-c', 'model_providers.openai_compat.wire_api="responses"',
+    '-c', `model=${tomlString(MODEL)}`,
+  ]);
   const client = new CodexAppServerClient({
-    command: CODEX,
-    args: [
-      'app-server', '--listen', 'stdio://',
-      '-c', 'preferred_auth_method="apikey"',
-      '-c', 'model_provider="openai_compat"',
-      '-c', `model_providers.openai_compat.name=${tomlString('Protocol Contract Chat')}`,
-      '-c', `model_providers.openai_compat.base_url=${tomlString(bridge.openaiBaseUrl)}`,
-      '-c', 'model_providers.openai_compat.env_key="OPENAI_API_KEY"',
-      '-c', 'model_providers.openai_compat.wire_api="responses"',
-      '-c', `model=${tomlString(MODEL)}`,
-    ],
+    command: codexCommand.command,
+    args: codexCommand.args,
     env: cleanEnv({
       CODEX_HOME: codexHome,
       OPENAI_API_KEY: bridge.token,
@@ -754,7 +804,13 @@ function loadRealUpstreamRuntime(filePath) {
 
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-protocol-contract-'));
-  const selectedAgent = String(process.env.WEBCODING_PROTOCOL_AGENT || 'all').trim().toLowerCase();
+  const selectedAgents = new Set(
+    String(process.env.WEBCODING_PROTOCOL_AGENT || 'claude,codex')
+      .split(',')
+      .map((agent) => agent.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const checksAgent = (agent) => selectedAgents.has('all') || selectedAgents.has(agent);
   const selectedProtocol = String(process.env.WEBCODING_UPSTREAM_PROTOCOL || 'all').trim().toLowerCase();
   let upstream = null;
   try {
@@ -772,21 +828,21 @@ async function main() {
           real.upstreamProtocol,
           real.upstream,
         );
-        if (selectedAgent === 'all' || selectedAgent === 'pi') {
+        if (checksAgent('pi')) {
           await checkPi(path.join(protocolRoot, 'pi'), realBridge);
           console.log(`ok - Pi RPC real upstream call (${real.upstreamProtocol})`);
         }
-        if (selectedAgent === 'all' || selectedAgent === 'claude') {
+        if (checksAgent('claude')) {
           await checkClaude(path.join(protocolRoot, 'claude'), realBridge);
           console.log(`ok - Claude Code real upstream call (${real.upstreamProtocol})`);
         }
-        if (selectedAgent === 'all' || selectedAgent === 'codex') {
+        if (checksAgent('codex')) {
           await checkCodex(path.join(protocolRoot, 'codex'), realBridge);
           console.log(`ok - Codex App Server real upstream call (${real.upstreamProtocol})`);
         }
       } finally {
         await realBridge?.close().catch(() => {});
-        fs.rmSync(protocolRoot, { recursive: true, force: true });
+        removeProtocolTempTree(protocolRoot);
       }
       return;
     }
@@ -809,14 +865,14 @@ async function main() {
         bridge = await startBridge(path.join(protocolRoot, 'bridge'), upstream.port, upstreamProtocol);
         let requestStart;
         let newRequests;
-        if (selectedAgent === 'all' || selectedAgent === 'pi') {
+        if (checksAgent('pi')) {
           requestStart = upstream.requests.length;
           await checkPi(path.join(protocolRoot, 'pi'), bridge);
           newRequests = upstream.requests.slice(requestStart);
           assert(newRequests.some((request) => request.path === expectedPaths[upstreamProtocol] && request.stream), `Pi did not reach ${upstreamProtocol} as a stream`);
           console.log(`ok - Pi RPC real protocol call (${upstreamProtocol})`);
         }
-        if (selectedAgent === 'all' || selectedAgent === 'claude') {
+        if (checksAgent('claude')) {
           requestStart = upstream.requests.length;
           try {
             await checkClaude(path.join(protocolRoot, 'claude'), bridge);
@@ -828,7 +884,7 @@ async function main() {
           assert(newRequests.some((request) => request.path === expectedPaths[upstreamProtocol] && request.stream), `Claude Code did not reach ${upstreamProtocol} as a stream`);
           console.log(`ok - Claude Code real protocol call (${upstreamProtocol})`);
         }
-        if (selectedAgent === 'all' || selectedAgent === 'codex') {
+        if (checksAgent('codex')) {
           requestStart = upstream.requests.length;
           await checkCodex(path.join(protocolRoot, 'codex'), bridge);
           newRequests = upstream.requests.slice(requestStart);
@@ -837,12 +893,12 @@ async function main() {
         }
       } finally {
         await bridge?.close().catch(() => {});
-        fs.rmSync(protocolRoot, { recursive: true, force: true });
+        removeProtocolTempTree(protocolRoot);
       }
     }
   } finally {
     await upstream?.close().catch(() => {});
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeProtocolTempTree(tempRoot);
   }
 }
 
