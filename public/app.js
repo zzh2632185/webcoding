@@ -5372,7 +5372,7 @@
     const headerMeta = document.getElementById('chat-session-meta');
     let short = '';
     if (sessionState.currentCwd) {
-      const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/);
+      const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/).filter(Boolean);
       short = '~/' + (parts.slice(-2).join('/') || sessionState.currentCwd);
     }
     const hideForOverlay = sessionState.currentSessionRunning && shouldOverlayRuntimeBadge();
@@ -9033,7 +9033,7 @@
     else actions.appendChild(nextTime);
   }
 
-  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null, messageMeta = {}) {
+  function createMsgElement(role, content, attachments = [], fileRefs = [], timestamp = null, completedAt = null, messageMeta = {}, model = '') {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
     div.dataset.messageRole = role;
@@ -9836,7 +9836,7 @@
     const displayTimes = resolveMessageDisplayTimes(m, previousUserTimestamp);
     const messageMeta = Number.isInteger(Number(messageIndex)) ? { messageIndex: Number(messageIndex) } : {};
     if (m.role !== 'assistant') return createMsgElement(m.role, m.content, m.attachments || [], m.fileRefs || [], displayTimes.startedAt, null, messageMeta);
-    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt, messageMeta);
+    const el = createMsgElement('assistant', '', [], [], displayTimes.startedAt, displayTimes.completedAt, messageMeta, m.model || '');
     if (m.streaming === true) {
       el.id = 'streaming-msg';
       el.dataset.streaming = 'true';
@@ -10752,7 +10752,7 @@
   }
 
   function appendStreamingAssistantBubble() {
-    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
+    const msgEl = createMsgElement('assistant', '', [], [], null, null, {}, getConcreteModelLabel());
     msgEl.id = 'streaming-msg';
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';

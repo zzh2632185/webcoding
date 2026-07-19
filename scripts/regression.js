@@ -1163,6 +1163,7 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
   const applyThemeSource = extractFunctionSource(appSource, 'applyTheme');
   const updateCwdBadgeSource = extractFunctionSource(appSource, 'updateCwdBadge');
+  const createMsgElementSource = extractFunctionSource(appSource, 'createMsgElement');
 
   assert(
     appSource.includes("const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';")
@@ -1192,6 +1193,11 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && updateCwdBadgeSource.includes('if (headerCwd)')
       && updateCwdBadgeSource.includes('if (headerMeta)'),
     'CWD rendering must target the merged header and tolerate optional elements',
+  );
+  assert(
+    createMsgElementSource.includes("messageMeta = {}, model = ''")
+      && appSource.includes("messageMeta, m.model || ''"),
+    'Customized assistant model labels must retain an explicit model parameter after v2.1 message metadata',
   );
   assert(
     indexSource.includes('id="send-queue-bar"')
