@@ -1179,6 +1179,12 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && appSource.includes('function forceScrollToBottom()'),
     'Upstream scroll calls must retain a compatibility bridge to the customized scroll controller',
   );
+  assert(
+    appSource.includes('let currentRuntimeCapabilities = null;')
+      && appSource.includes('const SHOW_SIDEBAR_COST = false;')
+      && appSource.includes('const searching = !!sessionSearchQuery.trim();'),
+    'Merged runtime and sidebar state must be declared before frontend rendering',
+  );
   for (const helperName of [
     'appendStreamingAssistantBubble',
     'ensureStreamingThinkingSegment',

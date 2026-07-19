@@ -6,6 +6,7 @@
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 180;
   const STREAMING_PLAIN_TEXT_THRESHOLD = 120_000;
+  const SHOW_SIDEBAR_COST = false;
 
   // The live model catalog comes from the backend/CLI. Keep only a neutral
   // fallback so stale hard-coded Claude aliases never override discovery.
@@ -173,6 +174,7 @@
   let currentFastMode = false;
   let currentActiveRuntime = null;
   let currentRuntimeCount = 0;
+  let currentRuntimeCapabilities = null;
   const savedAgent = localStorage.getItem('webcoding-agent');
   let selectedAgent = AGENT_LABELS[savedAgent] ? savedAgent : DEFAULT_AGENT;
   let currentAgent = selectedAgent;
@@ -11879,6 +11881,7 @@
   function renderSessionList() {
     const savedScrollTop = sessionList.scrollTop;
     sessionList.innerHTML = '';
+    const searching = !!sessionSearchQuery.trim();
     const visibleSessions = getVisibleSessions();
     const listFragment = document.createDocumentFragment();
     const hasProjects = projects.length > 0;
