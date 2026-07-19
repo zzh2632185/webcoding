@@ -1179,6 +1179,21 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && appSource.includes('function forceScrollToBottom()'),
     'Upstream scroll calls must retain a compatibility bridge to the customized scroll controller',
   );
+  for (const helperName of [
+    'appendStreamingAssistantBubble',
+    'ensureStreamingThinkingSegment',
+    'finalizeStreamingAssistantForPiContinuation',
+    'getHorizontalScrollAncestor',
+    'getModePickerOptions',
+    'getModeTooltip',
+    'maybeScrollToBottom',
+    'refreshAssistantAvatarModels',
+    'removeLiveProcessIndicator',
+    'setMobilePickerOpen',
+    'updateLiveProcessIndicator',
+  ]) {
+    assert(appSource.includes(`function ${helperName}(`), `Merged frontend is missing helper ${helperName}`);
+  }
 
   assert(
     findReusableSource.includes('getLastMessageElement()'),

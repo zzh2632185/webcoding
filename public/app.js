@@ -5460,6 +5460,48 @@
     }
   }
 
+  function refreshAssistantAvatarModels() {
+    const modelId = getConcreteModelLabel();
+    if (!modelId || !messagesDiv) return;
+    messagesDiv.querySelectorAll('.msg.assistant').forEach((msgEl) => {
+      const stored = msgEl.dataset.model || '';
+      const col = msgEl.querySelector('.msg-avatar-col');
+      applyModelToAvatarCol(col, stored || modelId);
+      if (!msgEl.dataset.model && modelId) msgEl.dataset.model = modelId;
+    });
+  }
+
+  function getModeTooltip(mode) {
+    const agent = sessionState.currentSessionId ? sessionState.currentAgent : selectedAgent;
+    if (mode === 'yolo') {
+      if (agent === 'codex') return 'YOLO：Codex 跳过审批与沙箱限制';
+      if (agent === 'pi') return 'YOLO：Pi 信任项目本地扩展和技能（--approve），工具不受限';
+      return 'YOLO：Claude 跳过权限检查（bypassPermissions）';
+    }
+    if (mode === 'plan') {
+      if (agent === 'codex') return 'Plan：Codex 原生 Plan 协作模式 + 只读沙箱';
+      if (agent === 'pi') return 'Plan：Pi 仅启用 read、grep、find、ls 只读工具';
+      return 'Plan：Claude 原生 plan 权限模式';
+    }
+    if (agent === 'codex') {
+      return currentRuntimeCapabilities?.interactiveApproval === false
+        ? '默认：Codex exec 自动策略（兼容模式不支持网页审批）'
+        : '默认：Codex workspace-write；需要确认时在网页显示审批';
+    }
+    if (agent === 'pi') return '默认：Pi 使用完整工具，但忽略项目本地扩展和技能的自动信任（--no-approve）';
+    return currentRuntimeCapabilities?.interactiveApproval === false
+      ? '默认：Claude 使用兼容单轮模式，无法在网页回应权限请求'
+      : '默认：Claude 使用原生权限流程；审批和用户问题会在网页中显示';
+  }
+
+  function getModePickerOptions() {
+    return ['yolo', 'default', 'plan'].map((value) => ({
+      value,
+      label: MODE_LABELS[value],
+      desc: getModeTooltip(value),
+    }));
+  }
+
   function normalizeMode(value) {
     return Object.prototype.hasOwnProperty.call(MODE_LABELS, value) ? value : '';
   }
@@ -7533,6 +7575,22 @@
       retryLabel: msg.retryable ? '重试' : '',
       onRetry: msg.retryable ? showModelPicker : null,
     });
+  }
+
+  function setMobilePickerOpen(picker, open, options = {}) {
+    if (!picker) return;
+    const trigger = picker.querySelector('.mobile-picker-trigger');
+    const menu = picker.querySelector('.mobile-picker-menu');
+    if (!trigger || !menu) return;
+    picker.classList.toggle('is-open', open);
+    trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menu.hidden = !open;
+    if (open && options.focusSelected) {
+      const selected = menu.querySelector('.mobile-picker-option[aria-selected="true"]')
+        || menu.querySelector('.mobile-picker-option');
+      selected?.focus({ preventScroll: true });
+    }
+    if (!open && options.restoreFocus) trigger.focus({ preventScroll: true });
   }
 
   function handleEffortListMessage(msg) {
@@ -10635,8 +10693,92 @@
     });
   }
 
+  function removeLiveProcessIndicator(bubble = getStreamingBubble()) {
+    bubble?.querySelector('.msg-process-live')?.remove();
+  }
+
+  function updateLiveProcessIndicator() {
+    const bubble = getStreamingBubble();
+    if (!bubble || !composeState.isGenerating) return;
+    const hasProcess = !!(
+      bubble.querySelector('.msg-segment-thinking')
+      || bubble.querySelector('.msg-segment-process')
+      || bubble.querySelector('.tool-call, .tool-group')
+    );
+    if (!hasProcess) {
+      removeLiveProcessIndicator(bubble);
+      return;
+    }
+    let live = bubble.querySelector('.msg-process-live');
+    if (!live) {
+      live = document.createElement('div');
+      live.className = 'msg-process-live msg-segment';
+      bubble.insertBefore(live, bubble.firstChild);
+    }
+    const runningTools = bubble.querySelectorAll('.tool-call-state.running').length;
+    const toolCount = bubble.querySelectorAll('.tool-call').length;
+    const thinking = bubble.querySelector('.msg-segment-thinking');
+    if (runningTools > 0) {
+      live.innerHTML = `<span class="msg-process-live-dot"></span>正在执行工具（${runningTools}/${Math.max(toolCount, runningTools)}）…`;
+    } else if (thinking) {
+      live.innerHTML = '<span class="msg-process-live-dot"></span>思考中…';
+    } else {
+      live.innerHTML = '<span class="msg-process-live-dot"></span>处理中…';
+    }
+  }
+
+  function finalizeStreamingAssistantForPiContinuation() {
+    drainThinkingBuffer();
+    if (composeState.pendingText) flushRender();
+    collapseStreamingProcessForCompletedTurn();
+    const streamEl = document.getElementById('streaming-msg');
+    if (streamEl) {
+      const bubble = streamEl.querySelector('.msg-bubble');
+      const hasContent = !!(bubble && (
+        bubble.querySelector('.msg-segment-text, .tool-call, .msg-process-group, .msg-text')
+        || String(bubble.textContent || '').trim()
+      ));
+      if (hasContent) streamEl.removeAttribute('id');
+      else streamEl.remove();
+    }
+    composeState.pendingText = '';
+    composeState.activeToolCalls.clear();
+  }
+
+  function appendStreamingAssistantBubble() {
+    const msgEl = createMsgElement('assistant', '', [], getConcreteModelLabel());
+    msgEl.id = 'streaming-msg';
+    const bubble = msgEl.querySelector('.msg-bubble');
+    bubble.innerHTML = '';
+    bubble.appendChild(createStreamingPlaceholder());
+    messagesDiv.appendChild(msgEl);
+    return msgEl;
+  }
+
+  function ensureStreamingThinkingSegment() {
+    const bubble = getStreamingBubble();
+    if (!bubble) return null;
+    clearStreamingPlaceholder(bubble);
+    let cursor = bubble.lastElementChild;
+    while (cursor && cursor.classList.contains('msg-process-live')) {
+      cursor = cursor.previousElementSibling;
+    }
+    if (cursor && cursor.classList.contains('msg-segment-thinking')) {
+      return cursor;
+    }
+    const thinking = createTextSegmentElement('', { phase: 'process' });
+    thinking.classList.add('msg-segment-thinking');
+    bubble.appendChild(thinking);
+    updateLiveProcessIndicator();
+    return thinking;
+  }
+
   function forceScrollToBottom() {
     scrollToBottom();
+  }
+
+  function maybeScrollToBottom() {
+    scrollToBottom({ onlyIfFollowing: true });
   }
 
   jumpToLatestBtn.addEventListener('click', () => scrollToBottom());
@@ -12380,6 +12522,29 @@
       mode: sessionState.currentMode,
       agent: sessionState.currentAgent,
     });
+  }
+
+  function isHorizontallyScrollableElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    let style;
+    try { style = window.getComputedStyle(el); } catch { return false; }
+    const overflowX = style.overflowX || '';
+    if (overflowX !== 'auto' && overflowX !== 'scroll' && overflowX !== 'overlay') {
+      if (!el.matches?.('table, pre, .code-block-wrapper, .table-scroll')) return false;
+    }
+    return el.scrollWidth > el.clientWidth + 2;
+  }
+
+  function getHorizontalScrollAncestor(target) {
+    let el = target instanceof Element ? target : target?.parentElement;
+    while (el && el !== document.body && el !== document.documentElement) {
+      if (isHorizontallyScrollableElement(el)) return el;
+      if (el.matches?.('table, pre, .code-block-wrapper pre, .code-block-wrapper, .table-scroll, .msg-bubble table')) {
+        if (el.scrollWidth > el.clientWidth + 2) return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
   }
 
   function showClaudeModelPicker(menuEntries, models, currentAlias, currentFull) {
@@ -15363,6 +15528,25 @@
     const agentTabsEl = overlay.querySelector('#ns-agent-tabs');
     const modeSelectEl = overlay.querySelector('#ns-mode-select');
     const modeHintEl = overlay.querySelector('#ns-mode-hint');
+    const createDirBtn = overlay.querySelector('#ns-create-dir-btn');
+    const createDirRow = overlay.querySelector('#ns-create-dir-row');
+    const createDirInput = overlay.querySelector('#ns-create-dir-input');
+    const createDirConfirm = overlay.querySelector('#ns-create-dir-confirm');
+    const createDirStatus = overlay.querySelector('#ns-create-dir-status');
+    let createDirMode = false;
+
+    function setCreateDirMode(enabled) {
+      createDirMode = enabled;
+      createDirRow.style.display = enabled ? 'flex' : 'none';
+      createDirStatus.textContent = '';
+      createDirStatus.classList.remove('error');
+      createDirInput.disabled = false;
+      createDirConfirm.disabled = false;
+      if (enabled) {
+        createDirInput.value = '';
+        createDirInput.focus();
+      }
+    }
 
     function updateNewSessionPreferenceControls() {
       targetAgent = normalizeAgent(targetAgent);
