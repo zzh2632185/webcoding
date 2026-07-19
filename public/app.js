@@ -407,7 +407,7 @@
   const chatTitle = $('#chat-title');
   const chatAgentContext = $('#chat-agent-context');
   const chatRuntimeState = $('#chat-runtime-state');
-  const chatCwd = $('#topbar-chat-cwd');
+  const chatCwd = $('#chat-header-cwd');
   const chatTabs = $('#chat-tabs');
   const costDisplay = $('#topbar-cost-display');
   const appStatusBanner = $('#app-status-banner');
@@ -5373,12 +5373,16 @@
     let short = '';
     if (sessionState.currentCwd) {
       const parts = sessionState.currentCwd.replace(/[\\/]+$/, '').split(/[\\/]+/);
-      const short = parts.slice(-2).join('/') || sessionState.currentCwd;
-      chatCwd.textContent = '~/' + short;
-      chatCwd.title = sessionState.currentCwd;
-    } else {
-      chatCwd.textContent = '';
-      chatCwd.title = '';
+      short = '~/' + (parts.slice(-2).join('/') || sessionState.currentCwd);
+    }
+    const hideForOverlay = sessionState.currentSessionRunning && shouldOverlayRuntimeBadge();
+    const showCwd = !!(sessionState.currentCwd && !hideForOverlay);
+    if (headerCwd) {
+      headerCwd.textContent = showCwd ? short : '';
+      headerCwd.title = sessionState.currentCwd || '';
+    }
+    if (headerMeta) {
+      headerMeta.hidden = !showCwd;
     }
   }
 
@@ -13504,6 +13508,9 @@
       msgInput.focus({ preventScroll: true });
     });
   });
+  if (sendQueueClear) {
+    sendQueueClear.addEventListener('click', () => clearSendQueue());
+  }
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {
       const btn = event.target instanceof Element ? event.target.closest('[data-queued-message-cancel]') : null;

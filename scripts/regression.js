@@ -1149,6 +1149,7 @@ async function saveConfigAndWait(client, saveType, config, responseType) {
 
 function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const appSource = readRepoText('public', 'app.js');
+  const indexSource = readRepoText('public', 'index.html');
   const styleSource = readRepoText('public', 'style.css');
   const findReusableSource = extractFunctionSource(appSource, 'findReusableAssistantPlaceholder');
   const startGeneratingSource = extractFunctionSource(appSource, 'startGenerating');
@@ -1161,6 +1162,7 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
   const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
   const applyThemeSource = extractFunctionSource(appSource, 'applyTheme');
+  const updateCwdBadgeSource = extractFunctionSource(appSource, 'updateCwdBadge');
 
   assert(
     appSource.includes("const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';")
@@ -1184,6 +1186,18 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && appSource.includes('const SHOW_SIDEBAR_COST = false;')
       && appSource.includes('const searching = !!sessionSearchQuery.trim();'),
     'Merged runtime and sidebar state must be declared before frontend rendering',
+  );
+  assert(
+    appSource.includes("const chatCwd = $('#chat-header-cwd');")
+      && updateCwdBadgeSource.includes('if (headerCwd)')
+      && updateCwdBadgeSource.includes('if (headerMeta)'),
+    'CWD rendering must target the merged header and tolerate optional elements',
+  );
+  assert(
+    indexSource.includes('id="send-queue-bar"')
+      && indexSource.includes('id="pi-queue-mode"')
+      && indexSource.includes('id="send-queue-clear"'),
+    'Customized composer must retain the v2.1 persistent and Pi streaming queue controls',
   );
   for (const helperName of [
     'appendStreamingAssistantBubble',
