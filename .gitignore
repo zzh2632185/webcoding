@@ -20,8 +20,11 @@ config/codex.json
 config/pi.json
 config/bridge-runtime.json
 config/bridge-state.json
+config/*.jsonl
+config/*.bak-*
 config/claude-settings-backup.json
 config/projects.json
+config/generated-message-images/
 config/cloudflared*
 config/tunnel-state.json
 config/codex-runtime-home/
