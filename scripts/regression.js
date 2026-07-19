@@ -1164,6 +1164,7 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const applyThemeSource = extractFunctionSource(appSource, 'applyTheme');
   const updateCwdBadgeSource = extractFunctionSource(appSource, 'updateCwdBadge');
   const createMsgElementSource = extractFunctionSource(appSource, 'createMsgElement');
+  const finishSessionSwitchSource = extractFunctionSource(appSource, 'finishSessionSwitch');
 
   assert(
     appSource.includes("const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';")
@@ -1198,6 +1199,11 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
     createMsgElementSource.includes("messageMeta = {}, model = ''")
       && appSource.includes("messageMeta, m.model || ''"),
     'Customized assistant model labels must retain an explicit model parameter after v2.1 message metadata',
+  );
+  assert(
+    finishSessionSwitchSource.includes('clearSessionLoading(sessionId);')
+      && !finishSessionSwitchSource.includes('requestAnimationFrame(() => clearSessionLoading(sessionId))'),
+    'Session loading must unblock even when background tabs throttle animation frames',
   );
   assert(
     indexSource.includes('id="send-queue-bar"')

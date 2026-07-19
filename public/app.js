@@ -5909,7 +5909,7 @@
   function finishSessionSwitch(sessionId) {
     if (isBlockingSessionLoad(sessionId)) {
       scrollToBottom();
-      requestAnimationFrame(() => clearSessionLoading(sessionId));
+      clearSessionLoading(sessionId);
       return;
     }
     clearSessionLoading(sessionId);
