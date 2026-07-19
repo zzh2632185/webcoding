@@ -92,6 +92,7 @@
   const SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS = 60000;
   const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
   const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';
+  const SEND_ON_ENTER_STORAGE_KEY = 'webcoding-send-on-enter';
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
@@ -472,13 +473,13 @@
     loginPassword.value = rememberedPassword;
   }
 
+  function getStoredTheme() {
+    const raw = localStorage.getItem(THEME_STORAGE_KEY);
+    return THEME_LABELS[raw] ? raw : DEFAULT_THEME;
+  }
+
   function getStoredColorScheme() {
-    const raw = localStorage.getItem(COLOR_SCHEME_STORAGE_KEY);
-    if (raw === 'light' || raw === 'dark') return raw;
-    if (localStorage.getItem(LEGACY_THEME_STORAGE_KEY)) {
-      localStorage.removeItem(LEGACY_THEME_STORAGE_KEY);
-    }
-    return DEFAULT_COLOR_SCHEME;
+    return resolveEffectiveTheme(getStoredTheme()) === THEME_NIGHT_VALUE ? 'dark' : 'light';
   }
 
   function updateColorSchemeButtons(scheme) {
@@ -595,11 +596,18 @@
       document.body.dataset.themePreference = nextTheme;
     }
     updateThemeToggleButton(nextTheme, effectiveTheme);
+    updateColorSchemeButtons(effectiveTheme === THEME_NIGHT_VALUE ? 'dark' : 'light');
     scheduleAutoThemeRefresh(nextTheme);
     if (!options.skipPersist) {
-      localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, nextScheme);
+      localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
     }
-    return nextScheme;
+    return nextTheme;
+  }
+
+  function applyColorScheme(scheme, options = {}) {
+    const nextTheme = scheme === 'dark' ? THEME_NIGHT_VALUE : getStoredDayTheme();
+    applyTheme(nextTheme, options);
+    return scheme === 'dark' ? 'dark' : 'light';
   }
 
   function toggleColorScheme() {
@@ -888,7 +896,7 @@
 
   setVH();
   refreshInputMaxHeightCache();
-  applyColorScheme(getStoredColorScheme(), { skipPersist: true });
+  applyTheme(getStoredTheme(), { skipPersist: true });
   window.addEventListener('resize', setVH);
   window.addEventListener('orientationchange', () => setTimeout(setVH, 100));
   window.addEventListener('resize', refreshInputMaxHeightCache);

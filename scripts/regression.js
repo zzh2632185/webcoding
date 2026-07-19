@@ -1160,11 +1160,19 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const markReadSource = extractFunctionSource(appSource, 'markSessionReadLocally');
   const createMessageActionsSource = extractFunctionSource(appSource, 'createMessageActions');
   const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
+  const applyThemeSource = extractFunctionSource(appSource, 'applyTheme');
 
   assert(
     appSource.includes("const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';")
       && appSource.includes('localStorage.setItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY, behavior);'),
     'Pi streaming behavior must define and persist its storage key before frontend initialization',
+  );
+  assert(
+    appSource.includes('function getStoredTheme()')
+      && appSource.includes('applyTheme(getStoredTheme(), { skipPersist: true });')
+      && applyThemeSource.includes('localStorage.setItem(THEME_STORAGE_KEY, nextTheme);')
+      && !applyThemeSource.includes('nextScheme'),
+    'Customized theme initialization must remain self-contained after merging upstream color controls',
   );
 
   assert(
