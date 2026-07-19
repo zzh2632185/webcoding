@@ -2966,6 +2966,23 @@ function usesOfficialClaudeModelCatalog(entries) {
   return entries.some((entry) => /^claude-(?:fable|opus|sonnet|haiku)-/i.test(String(entry?.value || '')));
 }
 
+const CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE = '检测到 Webcoding 正以 root 用户运行，Claude 的 YOLO 模式会被 CLI 拒绝；已自动降级为默认模式。';
+
+function isRootProcessOnUnix() {
+  return process.platform !== 'win32'
+    && typeof process.getuid === 'function'
+    && process.getuid() === 0;
+}
+
+function resolvePermissionModeForAgent(agent, mode) {
+  const normalizedAgent = normalizeAgent(agent);
+  const requestedMode = ['default', 'plan', 'yolo'].includes(mode) ? mode : 'yolo';
+  if (normalizedAgent === 'claude' && requestedMode === 'yolo' && isRootProcessOnUnix()) {
+    return { mode: 'default', requestedMode, downgraded: true, message: CLAUDE_ROOT_YOLO_DOWNGRADE_MESSAGE };
+  }
+  return { mode: requestedMode, requestedMode, downgraded: false, message: '' };
+}
+
 function claudeLocalModelEntriesFromEnv(env) {
   const entries = [];
   for (const [key, desc] of CLAUDE_LOCAL_MODEL_FIELDS) {
@@ -7675,7 +7692,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
       ];
       wsSend(ws, { type: 'system_message', sessionId: targetSessionId, message: lines.join('\n') });
     } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
-      const mode = modeInput.toLowerCase();
+      const resolvedMode = resolvePermissionModeForAgent(agent, modeInput.toLowerCase());
+      const mode = resolvedMode.mode;
       const running = !!(targetSessionId && activeProcesses.has(targetSessionId));
       if (session) {
         session.permissionMode = mode;
@@ -7687,7 +7705,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
       wsSend(ws, {
         type: 'system_message',
         sessionId: targetSessionId,
-        message: `权限模式已切换为:\n${formatPermissionModeHelp(agent, mode)}${timing ? `\n${timing}` : ''}`,
+        message: resolvedMode.downgraded
+          ? resolvedMode.message
+          : `权限模式已切换为:\n${formatPermissionModeHelp(agent, mode)}${timing ? `\n${timing}` : ''}`,
       });
       wsSend(ws, { type: 'mode_changed', mode, sessionId: targetSessionId, appliesNextTurn: running });
     } else {
@@ -7926,7 +7946,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent, clientMessageIdR
 function handleNewSession(ws, msg) {
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
   const agent = normalizeAgent(msg?.agent);
-  const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
+  const resolvedMode = resolvePermissionModeForAgent(agent, msg?.mode);
+  const requestedMode = resolvedMode.mode;
   let projectId = msg?.projectId || null;
   let resolvedCwd = cwd;
   if (!resolvedCwd && projectId) {
@@ -7991,6 +8012,9 @@ function handleNewSession(ws, msg) {
     isRunning: false,
     ...buildSessionRuntimeMeta(session),
   });
+  if (resolvedMode.downgraded) {
+    wsSend(ws, { type: 'system_message', sessionId: id, message: resolvedMode.message });
+  }
   sendSessionList(ws);
 }
 
@@ -8294,23 +8318,28 @@ function handleSetMode(ws, sessionId, mode) {
   if (!mode || !VALID_MODES.includes(mode)) return;
   const safeSessionId = sessionId ? sanitizeId(sessionId) : null;
   const running = !!(safeSessionId && activeProcesses.has(safeSessionId));
+  let resolvedMode = resolvePermissionModeForAgent('claude', mode);
   if (safeSessionId) {
     const session = loadSession(safeSessionId);
     if (session) {
-      session.permissionMode = mode;
+      resolvedMode = resolvePermissionModeForAgent(getSessionAgent(session), mode);
+      session.permissionMode = resolvedMode.mode;
       // Mode only affects next spawn flags; keep runtime id for resume continuity.
       session.updated = new Date().toISOString();
       saveSession(session);
-      if (running) {
+      if (running && !resolvedMode.downgraded) {
         wsSend(ws, {
           type: 'system_message',
           sessionId: safeSessionId,
-          message: `权限模式将切换为 ${PERMISSION_MODE_META[mode]?.label || mode}（当前轮次仍按原模式运行，下一轮生效）\n${formatPermissionModeHelp(getSessionAgent(session), mode)}`,
+          message: `权限模式将切换为 ${PERMISSION_MODE_META[resolvedMode.mode]?.label || resolvedMode.mode}（当前轮次仍按原模式运行，下一轮生效）\n${formatPermissionModeHelp(getSessionAgent(session), resolvedMode.mode)}`,
         });
       }
     }
   }
-  wsSend(ws, { type: 'mode_changed', mode, sessionId: safeSessionId, appliesNextTurn: running });
+  if (resolvedMode.downgraded) {
+    wsSend(ws, { type: 'system_message', sessionId: safeSessionId, message: resolvedMode.message });
+  }
+  wsSend(ws, { type: 'mode_changed', mode: resolvedMode.mode, sessionId: safeSessionId, appliesNextTurn: running });
 }
 
 function handleDisconnect(ws, wsId) {
@@ -10704,7 +10733,7 @@ function handleMessage(ws, msg, options = {}) {
       piSessionId: null,
       runtimeContexts: { claude: {}, codex: {}, pi: {} },
       model: null,
-      permissionMode: mode || 'yolo',
+      permissionMode: resolvePermissionModeForAgent(agent, mode).mode,
       totalCost: 0,
       totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
       messages: [],
@@ -10713,12 +10742,17 @@ function handleMessage(ws, msg, options = {}) {
   }
   normalizeSession(session);
 
-  if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
+  const permissionResolution = resolvePermissionModeForAgent(
+    getSessionAgent(session),
+    mode && ['default', 'plan', 'yolo'].includes(mode) ? mode : session.permissionMode,
+  );
+  session.permissionMode = permissionResolution.mode;
+  if (permissionResolution.downgraded) {
+    wsSend(ws, { type: 'system_message', sessionId: session.id, message: permissionResolution.message });
   }
 
-  if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
-    session.permissionMode = mode;
+  if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
+    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
   }
 
   if (!hideInHistory && normalizedText !== '/compact' && getRuntimeSessionId(session)) {

@@ -8,6 +8,7 @@
 - Claude 本地配置使用官方模型 ID 时，模型菜单补充 Fable 5、Opus 4.8、Sonnet 5 和 Haiku 4.5，不修改全局 Claude 默认模型
 - 安装与更新入口切换回 `zzh2632185/webcoding`，避免个人部署从上游或旧分支拉取错误版本
 - CLI 契约检查支持用 `CC_WEB_CONTRACT_AGENTS` 限定已安装的 Agent；当前生产环境只验收 Claude 与 Codex，不强制安装未使用的 Pi
+- Linux root 部署下 Claude YOLO 自动降级为默认权限模式，避免新版 Claude Code 拒绝 `bypassPermissions` 并导致会话无法启动
 
 ## v2.1.0 - 2026-07-15
 

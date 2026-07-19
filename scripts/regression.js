@@ -1241,6 +1241,10 @@ async function runAgentRuntimeEnvironmentRegressionCase({ tempRoot }) {
   const claudeSpec = runtime.buildClaudeSpawnSpec(session);
   assert(claudeSpec.args.includes('--input-format') && claudeSpec.args.includes('stream-json'), 'Claude text turns should always use structured stream-json input');
   assert(claudeSpec.args.includes('--include-partial-messages') && claudeSpec.args.includes('--include-hook-events'), 'Claude stream transport should request partial messages and hook events');
+  if (process.platform !== 'win32' && typeof process.getuid === 'function' && process.getuid() === 0) {
+    assert(!claudeSpec.args.includes('bypassPermissions'), 'Claude root runtime must not pass bypassPermissions');
+    assert(claudeSpec.mode === 'default' && /root/.test(claudeSpec.warningMessage || ''), 'Claude root YOLO should downgrade to default with a warning');
+  }
   const claudeEffortSpec = runtime.buildClaudeSpawnSpec({ ...session, effort: 'high' });
   assert(claudeEffortSpec.args.includes('--effort') && claudeEffortSpec.args.includes('high'), 'Claude effort should use the native --effort flag');
   const localClaudeModelSpec = runtime.buildClaudeSpawnSpec({ ...session, model: 'claude-local-explicit' });

@@ -559,21 +559,23 @@ async function checkClaude(tempRoot, bridge) {
     rejectDone = reject;
   });
   done.catch(() => {});
+  const claudeArgs = [
+    '-p',
+    '--input-format', 'stream-json',
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--include-partial-messages',
+    '--include-hook-events',
+    '--replay-user-messages',
+  ];
+  if (!(process.platform !== 'win32' && typeof process.getuid === 'function' && process.getuid() === 0)) {
+    claudeArgs.push('--permission-mode', 'bypassPermissions');
+  }
+  claudeArgs.push('--model', MODEL, '--settings', settingsPath, '--no-session-persistence');
+
   const client = new ClaudeStreamClient({
     command: CLAUDE,
-    args: [
-      '-p',
-      '--input-format', 'stream-json',
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--include-partial-messages',
-      '--include-hook-events',
-      '--replay-user-messages',
-      '--permission-mode', 'bypassPermissions',
-      '--model', MODEL,
-      '--settings', settingsPath,
-      '--no-session-persistence',
-    ],
+    args: claudeArgs,
     env: cleanEnv({
       ANTHROPIC_API_KEY: bridge.token,
       ANTHROPIC_AUTH_TOKEN: bridge.token,
