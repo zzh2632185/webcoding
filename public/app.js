@@ -399,6 +399,8 @@
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
+  const sessionSearchInput = $('#session-search-input');
+  const sessionSearchClear = $('#session-search-clear');
   const sidebarFilePanel = $('#sidebar-file-panel');
   const fileTree = $('#file-tree');
   const filePanelRefresh = $('#file-panel-refresh');
@@ -13510,6 +13512,30 @@
   });
   if (sendQueueClear) {
     sendQueueClear.addEventListener('click', () => clearSendQueue());
+  }
+  if (sessionSearchInput) {
+    sessionSearchInput.addEventListener('input', () => {
+      sessionSearchQuery = sessionSearchInput.value || '';
+      if (sessionSearchClear) sessionSearchClear.hidden = !sessionSearchQuery.trim();
+      renderSessionList();
+    });
+    sessionSearchInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      sessionSearchInput.value = '';
+      sessionSearchQuery = '';
+      if (sessionSearchClear) sessionSearchClear.hidden = true;
+      renderSessionList();
+      sessionSearchInput.blur();
+    });
+  }
+  if (sessionSearchClear) {
+    sessionSearchClear.addEventListener('click', () => {
+      if (sessionSearchInput) sessionSearchInput.value = '';
+      sessionSearchQuery = '';
+      sessionSearchClear.hidden = true;
+      renderSessionList();
+      sessionSearchInput?.focus();
+    });
   }
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {

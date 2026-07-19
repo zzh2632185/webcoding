@@ -1211,6 +1211,12 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && indexSource.includes('id="send-queue-clear"'),
     'Customized composer must retain the v2.1 persistent and Pi streaming queue controls',
   );
+  assert(
+    appSource.includes("const sessionSearchInput = $('#session-search-input');")
+      && appSource.includes("sessionSearchInput.addEventListener('input'")
+      && appSource.includes("sessionSearchClear.addEventListener('click'"),
+    'Session search controls must remain bound after restoring the customized sidebar',
+  );
   for (const helperName of [
     'appendStreamingAssistantBubble',
     'ensureStreamingThinkingSegment',
