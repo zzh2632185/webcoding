@@ -1174,6 +1174,11 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
       && !applyThemeSource.includes('nextScheme'),
     'Customized theme initialization must remain self-contained after merging upstream color controls',
   );
+  assert(
+    appSource.includes("const scrollToBottomBtn = $('#scroll-to-bottom-btn');")
+      && appSource.includes('function forceScrollToBottom()'),
+    'Upstream scroll calls must retain a compatibility bridge to the customized scroll controller',
+  );
 
   assert(
     findReusableSource.includes('getLastMessageElement()'),

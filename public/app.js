@@ -428,6 +428,7 @@
   const attachUploadFile = $('#attach-upload-file');
   const attachReferenceFile = $('#attach-reference-file');
   const messagesDiv = $('#messages');
+  const scrollToBottomBtn = $('#scroll-to-bottom-btn');
   const messagesWrap = messagesDiv?.closest('.messages-wrap');
   const jumpToLatestBtn = document.createElement('button');
   jumpToLatestBtn.type = 'button';
@@ -10632,6 +10633,10 @@
       updateScrollbar();
       requestAnimationFrame(() => { messageScrollProgrammatic = false; });
     });
+  }
+
+  function forceScrollToBottom() {
+    scrollToBottom();
   }
 
   jumpToLatestBtn.addEventListener('click', () => scrollToBottom());
