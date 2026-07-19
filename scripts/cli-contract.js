@@ -68,6 +68,12 @@ function resolveCommand(envValue, defaultName) {
 const CLAUDE = resolveCommand(process.env.CLAUDE_PATH, 'claude');
 const CODEX = resolveCommand(process.env.CODEX_PATH, 'codex');
 const PI = resolveCommand(process.env.PI_PATH, 'pi');
+const CONTRACT_AGENTS = new Set(
+  String(process.env.CC_WEB_CONTRACT_AGENTS || 'claude,codex,pi')
+    .split(',')
+    .map((agent) => agent.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 function fail(message) {
   throw new Error(message);
@@ -349,12 +355,18 @@ async function checkPi(tempRoot) {
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webcoding-cli-contract-'));
   try {
-    const claudeVersion = checkClaude();
-    const codexVersion = checkCodex(tempRoot);
-    const piVersion = await checkPi(tempRoot);
-    console.log(`ok - Claude Code contract (${claudeVersion})`);
-    console.log(`ok - Codex App Server contract (${codexVersion})`);
-    console.log(`ok - Pi RPC contract (${piVersion})`);
+    if (CONTRACT_AGENTS.has('claude')) {
+      const claudeVersion = checkClaude();
+      console.log(`ok - Claude Code contract (${claudeVersion})`);
+    }
+    if (CONTRACT_AGENTS.has('codex')) {
+      const codexVersion = checkCodex(tempRoot);
+      console.log(`ok - Codex App Server contract (${codexVersion})`);
+    }
+    if (CONTRACT_AGENTS.has('pi')) {
+      const piVersion = await checkPi(tempRoot);
+      console.log(`ok - Pi RPC contract (${piVersion})`);
+    }
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
