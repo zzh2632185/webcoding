@@ -1,14 +1,14 @@
 ﻿# Webcoding 一键安装与服务管理脚本 (Windows PowerShell)
 #
 # 交互安装：
-#   $s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
+#   $s = irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
 # 指定安装目录：
-#   $env:WEBCODING_DIR = 'D:\Apps\webcoding'; $s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
+#   $env:WEBCODING_DIR = 'D:\Apps\webcoding'; $s = irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
 
 $ErrorActionPreference = 'Stop'
 
-$REPO = 'https://github.com/HsMirage/webcoding.git'
-$RAW_BASE = 'https://raw.githubusercontent.com/HsMirage/webcoding/main'
+$REPO = 'https://github.com/zzh2632185/webcoding.git'
+$RAW_BASE = 'https://raw.githubusercontent.com/zzh2632185/webcoding/main'
 $SERVICE_SCRIPT_RELATIVE = 'deploy\windows\service.ps1'
 $_isPiped = -not [Environment]::UserInteractive -or ($Host.Name -eq 'ConsoleHost' -and $MyInvocation.InvocationName -eq '')
 

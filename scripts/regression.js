@@ -5504,6 +5504,25 @@ async function runClaudeLocalModelMapRegressionCase({ tempRoot }) {
       assert(modelIds.has('local-haiku-model'), 'Claude local model list should read haiku mapping from settings.json env');
       assert(modelList.defaultModel === 'local-opus-model', 'Claude local model list should use ANTHROPIC_MODEL as the real default');
       assert(!modelIds.has('sonnet[1m]') && !modelIds.has('opus[1m]'), 'Claude local model list must not inject fixed aliases');
+
+      fs.writeFileSync(claudeSettingsPath, JSON.stringify({
+        model: 'opus[1M]',
+        env: {
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-opus-4-8',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+          ANTHROPIC_REASONING_MODEL: 'claude-opus-4-8',
+        },
+      }, null, 2));
+      const currentModelList = await client.sendAndWaitType(
+        buildAgentMessagePayload({ text: '/model', sessionId: session.sessionId, mode: 'yolo', agent: 'claude' }),
+        'model_list',
+        (msg) => msg.agent === 'claude' && msg !== modelList,
+      );
+      const currentModelIds = new Set((currentModelList.entries || []).map((entry) => entry.value));
+      for (const currentModel of ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001']) {
+        assert(currentModelIds.has(currentModel), `Claude official local model list should include ${currentModel}`);
+      }
     });
   });
 }

@@ -2955,6 +2955,17 @@ const CLAUDE_LOCAL_MODEL_FIELDS = [
   ['ANTHROPIC_REASONING_MODEL', 'Claude 本地推理模型'],
 ];
 
+const CLAUDE_CURRENT_MODEL_CATALOG = [
+  { value: 'claude-fable-5', label: 'Claude Fable 5', desc: '最高能力，适合复杂、长时间任务' },
+  { value: 'claude-opus-4-8', label: 'Claude Opus 4.8', desc: '复杂编码与高质量通用任务' },
+  { value: 'claude-sonnet-5', label: 'Claude Sonnet 5', desc: '速度与能力平衡，适合日常开发' },
+  { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', desc: '低延迟快速任务' },
+];
+
+function usesOfficialClaudeModelCatalog(entries) {
+  return entries.some((entry) => /^claude-(?:fable|opus|sonnet|haiku)-/i.test(String(entry?.value || '')));
+}
+
 function claudeLocalModelEntriesFromEnv(env) {
   const entries = [];
   for (const [key, desc] of CLAUDE_LOCAL_MODEL_FIELDS) {
@@ -2994,9 +3005,13 @@ function loadClaudeLocalModelInfo() {
   for (const source of sources) {
     const configuredDefault = String(source.env?.ANTHROPIC_MODEL || '').trim()
       || resolveClaudeConfiguredModel(source.configuredModel, source.env);
-    const entries = mergeModelEntries(
+    const configuredEntries = mergeModelEntries(
       configuredDefault ? [{ value: configuredDefault, label: configuredDefault, desc: 'Claude 本地配置默认模型' }] : [],
       claudeLocalModelEntriesFromEnv(source.env),
+    );
+    const entries = mergeModelEntries(
+      configuredEntries,
+      ...(usesOfficialClaudeModelCatalog(configuredEntries) ? [CLAUDE_CURRENT_MODEL_CATALOG] : []),
     );
     if (!entries.length) continue;
     return {

@@ -40,13 +40,13 @@ npm install -g @earendil-works/pi-coding-agent
 Linux / macOS:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh)
 ```
 
 Windows PowerShell:
 
 ```powershell
-$s = irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
+$s = irm https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.ps1; Invoke-Expression ($s.TrimStart([char]0xFEFF))
 ```
 
 The installer first asks for the install/runtime directory, then offers install, start/restart, update, dependency reinstall, stop, status, and uninstall actions. On Windows, if the selected parent directory already contains files (for example, `D:\AI\Tools`), the installer automatically uses its `webcoding` subdirectory so existing files are not overwritten and Git clone does not fail. Startup automatically configures a persistent background service: user-level `systemd` on Linux, a LaunchAgent on macOS, and a per-user Scheduled Task on Windows. Closing the terminal no longer stops Webcoding; native service-manager setups also start again after the next login.
@@ -68,7 +68,7 @@ After startup:
 <summary>Manual installation</summary>
 
 ```bash
-git clone https://github.com/HsMirage/webcoding.git
+git clone https://github.com/zzh2632185/webcoding.git
 cd webcoding
 npm install
 npm start

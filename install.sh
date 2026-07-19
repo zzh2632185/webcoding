@@ -2,16 +2,16 @@
 # Webcoding 一键安装与服务管理脚本 (Linux / macOS)
 #
 # 交互安装：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh)
 # 指定安装目录：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh) ~/my-webcoding
+#   bash <(curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh) ~/my-webcoding
 # 非交互安装：
-#   curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh | bash -s -- ~/my-webcoding
+#   curl -fsSL https://raw.githubusercontent.com/zzh2632185/webcoding/main/install.sh | bash -s -- ~/my-webcoding
 
 set -e
 
-REPO="https://github.com/HsMirage/webcoding.git"
-RAW_BASE="https://raw.githubusercontent.com/HsMirage/webcoding/main"
+REPO="https://github.com/zzh2632185/webcoding.git"
+RAW_BASE="https://raw.githubusercontent.com/zzh2632185/webcoding/main"
 DEFAULT_INSTALL_DIR="$HOME/webcoding"
 
 # ── 颜色与输出 ────────────────────────────────────────────────
