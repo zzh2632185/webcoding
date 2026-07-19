@@ -91,6 +91,7 @@
   const SIDE_CHAT_MAX_PERSISTED_MESSAGES = 80;
   const SIDE_CHAT_MAX_PERSISTED_MESSAGE_CHARS = 60000;
   const QUEUED_MESSAGES_STORAGE_KEY = 'webcoding-queued-messages-v1';
+  const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';
   const THEME_STORAGE_KEY = 'webcoding-theme';
   const THEME_DAY_STORAGE_KEY = 'webcoding-day-theme';
   const SELECTED_PROJECT_STORAGE_KEY = 'webcoding-selected-project';
@@ -13311,6 +13312,16 @@
     abortBtn.title = '正在停止…';
     abortBtn.setAttribute('aria-label', '正在停止…');
     send({ type: 'abort', sessionId: sessionState.currentSessionId || undefined });
+  });
+  piQueueModeButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const behavior = button.dataset.streamingBehavior;
+      if (behavior !== 'steer' && behavior !== 'followUp') return;
+      piStreamingBehavior = behavior;
+      localStorage.setItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY, behavior);
+      syncPiQueueModeButtons();
+      msgInput.focus({ preventScroll: true });
+    });
   });
   if (queuedMessageList) {
     queuedMessageList.addEventListener('click', (event) => {

@@ -1162,6 +1162,12 @@ function runFrontendStreamingPlaceholderSourceRegressionCase() {
   const scrollMessageToTopSource = extractFunctionSource(appSource, 'scrollMessageToTop');
 
   assert(
+    appSource.includes("const PI_STREAMING_BEHAVIOR_STORAGE_KEY = 'webcoding-pi-streaming-behavior';")
+      && appSource.includes('localStorage.setItem(PI_STREAMING_BEHAVIOR_STORAGE_KEY, behavior);'),
+    'Pi streaming behavior must define and persist its storage key before frontend initialization',
+  );
+
+  assert(
     findReusableSource.includes('getLastMessageElement()'),
     'Streaming placeholder reuse must be limited to the tail message',
   );
